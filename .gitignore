@@ -1,0 +1,23 @@
+# Environment and secrets
+.env
+.env.*
+*.pem
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build and run artifacts
+output/
+*.log
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
