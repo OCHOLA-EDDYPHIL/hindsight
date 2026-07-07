@@ -1,0 +1,17 @@
+services:
+  crdb:
+    image: cockroachdb/cockroach:latest-v25.2
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - crdb-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "-e", "SELECT 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  crdb-data:
