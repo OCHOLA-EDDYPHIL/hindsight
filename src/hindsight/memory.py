@@ -426,30 +426,38 @@ class MemoryStore:
         self,
         *,
         episode_id: str | None = None,
+        limit: int | None = None,
         decision_id: str | None = None,
         reader: str | None = None,
         purpose: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return non-invalidated episodic memories, optionally tracking the read."""
 
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be at least 1")
+        limit_clause = " LIMIT %s" if limit is not None else ""
         if episode_id:
+            params: tuple[Any, ...] = (episode_id,) if limit is None else (episode_id, limit)
             rows = self._fetch_all(
-                """
+                f"""
                     SELECT *
                     FROM current_episodic_memories
                     WHERE episode_id = %s
                     ORDER BY t_valid DESC, written_at DESC
+                    {limit_clause}
                 """,
-                (episode_id,),
+                params,
             )
         else:
+            params = () if limit is None else (limit,)
             rows = self._fetch_all(
-                """
+                f"""
                     SELECT *
                     FROM current_episodic_memories
                     ORDER BY t_valid DESC, written_at DESC
+                    {limit_clause}
                 """,
-                (),
+                params,
             )
         self._record_retrieval(
             rows,
@@ -464,30 +472,38 @@ class MemoryStore:
         self,
         *,
         namespace: str | None = None,
+        limit: int | None = None,
         decision_id: str | None = None,
         reader: str | None = None,
         purpose: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return non-invalidated semantic memories, optionally tracking the read."""
 
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be at least 1")
+        limit_clause = " LIMIT %s" if limit is not None else ""
         if namespace:
+            params: tuple[Any, ...] = (namespace,) if limit is None else (namespace, limit)
             rows = self._fetch_all(
-                """
+                f"""
                     SELECT *
                     FROM current_semantic_memories
                     WHERE namespace = %s
                     ORDER BY t_valid DESC, written_at DESC
+                    {limit_clause}
                 """,
-                (namespace,),
+                params,
             )
         else:
+            params = () if limit is None else (limit,)
             rows = self._fetch_all(
-                """
+                f"""
                     SELECT *
                     FROM current_semantic_memories
                     ORDER BY t_valid DESC, written_at DESC
+                    {limit_clause}
                 """,
-                (),
+                params,
             )
         self._record_retrieval(
             rows,

@@ -36,6 +36,7 @@ def test_memory_schema_objects_exist():
         "semantic_memory_embeddings",
         "memory_reads",
         "memory_operations",
+        "mcp_audit_events",
     }
     expected_views = {"current_episodic_memories", "current_semantic_memories"}
 

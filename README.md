@@ -8,6 +8,23 @@ The memory layer is built on CockroachDB, which stores the agent's episodic memo
 
 This project is under active development for the CockroachDB and AWS "Build with Agentic Memory" hackathon. The roadmap, design decisions, and open questions live in this repository's Issues and Milestones rather than in documents in the codebase — start with the pinned issue titled "North Star" for the full picture.
 
+## MCP memory inspection
+
+Hindsight exposes a read-only MCP server for inspecting the agent's memory from an MCP client:
+
+```bash
+uv run python scripts/run_mcp_server.py
+```
+
+The server uses `DATABASE_URL` for the CockroachDB cluster and exposes four tools:
+
+- `current_beliefs`: current semantic memories by namespace, or episodic memories by episode id.
+- `beliefs_as_of`: semantic belief state visible at an ISO-8601 timestamp.
+- `provenance_chain`: a memory row, its origin/invalidation provenance, and decisions that read it.
+- `mcp_audit_log`: recent MCP audit events.
+
+Each inspection tool records an `mcp_audit_events` row with the tool name, actor, purpose, arguments, result count, and timestamp. Memory-row inspection also records `memory_reads` rows so MCP reads appear in the same provenance trail as agent reads.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
