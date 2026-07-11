@@ -150,3 +150,16 @@ def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_
     assert rows[0][3] == "inc-payment-latency-2026-06-14"
     assert rows[0][6] == "payments-api"
     assert rows[0][8] == "payments-latency-triage"
+
+    wrapped_rows = store.recall_similar_incidents(
+        namespace=namespace,
+        query="payment retry fanout latency",
+        service_slug="payments-api",
+        limit=5,
+    )
+
+    assert len(wrapped_rows) == 1
+    assert wrapped_rows[0]["memory_id"] == payment_memory["id"]
+    assert wrapped_rows[0]["incident_slug"] == "inc-payment-latency-2026-06-14"
+    assert wrapped_rows[0]["service_slug"] == "payments-api"
+    assert wrapped_rows[0]["runbook_slug"] == "payments-latency-triage"

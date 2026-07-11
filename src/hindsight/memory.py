@@ -544,6 +544,82 @@ class MemoryStore:
         )
         return rows
 
+    def recall_similar_incidents(
+        self,
+        *,
+        namespace: str,
+        query: str,
+        service_slug: str,
+        limit: int = 5,
+        decision_id: str | None = None,
+        reader: str | None = None,
+        purpose: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Find similar current memories and join them to incident facts.
+
+        This is the demo showpiece query: one CockroachDB statement combines
+        namespace-scoped vector similarity, explicit memory validity, and
+        transactional filters over incidents, services, and runbooks.
+        """
+
+        if self._embedding_provider is None:
+            raise RuntimeError("recall_similar_incidents requires an embedding provider")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        if not namespace or not namespace.strip():
+            raise ProvenanceError("namespace is required")
+        if not service_slug or not service_slug.strip():
+            raise ProvenanceError("service_slug is required")
+
+        query_vector = vector_literal(
+            self._embedding_provider.embed(query),
+            dimensions=self._embedding_provider.dimensions,
+        )
+        rows = self._fetch_all(
+            f"""
+                SELECT
+                    m.id,
+                    m.id AS memory_id,
+                    m.content AS memory_content,
+                    e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance,
+                    i.slug AS incident_slug,
+                    i.title AS incident_title,
+                    i.severity,
+                    s.slug AS service_slug,
+                    s.name AS service_name,
+                    r.slug AS runbook_slug,
+                    r.title AS runbook_title
+                FROM current_semantic_memories AS m
+                JOIN semantic_memory_embeddings AS e
+                    ON e.memory_id = m.id
+                JOIN incident_semantic_memories AS im
+                    ON im.memory_id = m.id
+                JOIN incidents AS i
+                    ON i.id = im.incident_id
+                JOIN incident_services AS isvc
+                    ON isvc.incident_id = i.id
+                JOIN services AS s
+                    ON s.id = isvc.service_id
+                LEFT JOIN incident_runbooks AS ir
+                    ON ir.incident_id = i.id
+                LEFT JOIN runbooks AS r
+                    ON r.id = ir.runbook_id
+                WHERE m.namespace = %s
+                    AND s.slug = %s
+                ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                LIMIT %s
+            """,
+            (query_vector, namespace, service_slug, query_vector, limit),
+        )
+        self._record_retrieval(
+            rows,
+            memory_kind="semantic",
+            decision_id=decision_id,
+            reader=reader,
+            purpose=purpose,
+        )
+        return rows
+
     def audit_memory(self, *, memory_kind: MemoryKind, memory_id: str) -> dict[str, Any] | None:
         """Return a memory row whether it is current or invalidated."""
 
