@@ -1,6 +1,8 @@
 """Database-backed tests for bi-temporal memory and provenance."""
 
 import os
+from datetime import timedelta
+from time import sleep
 from uuid import uuid4
 
 import pytest
@@ -33,6 +35,7 @@ def test_memory_schema_objects_exist():
         "semantic_memories",
         "semantic_memory_embeddings",
         "memory_reads",
+        "memory_operations",
     }
     expected_views = {"current_episodic_memories", "current_semantic_memories"}
 
@@ -85,6 +88,40 @@ def test_writes_without_provenance_are_rejected(memory_store):
             content="missing provenance",
             provenance=Provenance(writer="", source_ref="turn-1", justification="test"),
         )
+
+
+@requires_db
+def test_public_memory_api_remembers_recalls_and_invalidates(memory_store):
+    from hindsight.memory import Provenance
+
+    namespace = f"incident-{uuid4()}"
+    memory = memory_store.remember(
+        memory_kind="semantic",
+        namespace=namespace,
+        content="payment timeout recovered after retry fanout was throttled",
+        provenance=Provenance(
+            writer="agent.reflect",
+            source_ref="incident:memory-api",
+            justification="Capture the resolution as reusable memory",
+        ),
+    )
+
+    recalled = memory_store.recall(
+        namespace=namespace,
+        query="retry fanout",
+    )
+
+    assert [row["id"] for row in recalled] == [memory["id"]]
+
+    invalidated = memory_store.invalidate(
+        memory_id=str(memory["id"]),
+        actor="agent.rewind",
+        reason="Superseded by later incident review",
+    )
+
+    assert invalidated is not None
+    assert invalidated["invalidated_by"] == "agent.rewind"
+    assert memory_store.recall(namespace=namespace, query="retry fanout") == []
 
 
 @requires_db
@@ -235,6 +272,95 @@ def test_semantic_write_creates_embedding_row():
             "stable-hash-v1",
             1024,
         )
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@requires_db
+def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
+    from hindsight.db import connect
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    conn = connect()
+    try:
+        store = MemoryStore(conn, embedding_provider=DeterministicEmbeddingProvider())
+        namespace = f"incident-{uuid4()}"
+        good = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="payment latency came from retry fanout to the processor",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:good",
+                justification="Known-good resolution before poisoning",
+            ),
+        )
+        sleep(0.05)
+        rewind_target = conn.execute("SELECT now()").fetchone()[0] + timedelta(milliseconds=1)
+        conn.commit()
+        sleep(0.05)
+
+        poisoned = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="payment latency came from certificate expiry",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:poisoned",
+                justification="Bad hypothesis introduced by poisoned memory",
+            ),
+        )
+        decision_id = f"decision-{uuid4()}"
+        recalled = store.recall(
+            namespace=namespace,
+            query="certificate expiry",
+            limit=1,
+            decision_id=decision_id,
+            reader="agent.triage",
+            purpose="choose remediation from memory",
+        )
+        assert [row["id"] for row in recalled] == [poisoned["id"]]
+
+        derived = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="rotate certificates to fix payment latency",
+            provenance=Provenance(
+                writer="agent.plan",
+                source_ref=decision_id,
+                justification="Derived from the poisoned decision context",
+            ),
+        )
+
+        result = store.rewind(
+            timestamp=rewind_target,
+            namespace=namespace,
+            actor="agent.rewind",
+            reason="Poisoned memory led to the wrong remediation plan",
+        )
+
+        assert [row["id"] for row in result.restored_memories] == [good["id"]]
+        assert {row["id"] for row in result.invalidated_memories} == {
+            poisoned["id"],
+            derived["id"],
+        }
+        assert result.operation["operation_type"] == "rewind"
+        assert result.operation["namespace"] == namespace
+        assert set(result.operation["invalidated_memory_ids"]) == {
+            str(poisoned["id"]),
+            str(derived["id"]),
+        }
+        assert store.audit_memory(memory_kind="semantic", memory_id=str(poisoned["id"]))[
+            "t_invalid"
+        ] is not None
+        assert store.audit_memory(memory_kind="semantic", memory_id=str(derived["id"]))[
+            "t_invalid"
+        ] is not None
+        assert [row["id"] for row in store.recall(namespace=namespace, query="payment")] == [
+            good["id"]
+        ]
     finally:
         conn.rollback()
         conn.close()

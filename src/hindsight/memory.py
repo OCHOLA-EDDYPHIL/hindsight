@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -52,8 +53,22 @@ class Provenance:
             raise ProvenanceError(f"Missing provenance field(s): {', '.join(missing)}")
 
 
+@dataclass(frozen=True)
+class RewindResult:
+    """The audited result of restoring memory to an earlier belief state."""
+
+    operation: dict[str, Any]
+    restored_memories: list[dict[str, Any]]
+    invalidated_memories: list[dict[str, Any]]
+
+
 class MemoryStore:
-    """Small SQL wrapper for valid-time memory writes, reads, and audit trails."""
+    """Product-facing memory API backed by CockroachDB.
+
+    Agent code should use ``remember``, ``recall``, ``invalidate``, and
+    ``rewind`` instead of issuing raw SQL. Each memory row carries provenance,
+    and corrections are explicit invalidations rather than silent deletes.
+    """
 
     def __init__(
         self,
@@ -74,6 +89,133 @@ class MemoryStore:
     def close(self) -> None:
         if self._owns_connection:
             self._conn.close()
+
+    def remember(
+        self,
+        *,
+        memory_kind: MemoryKind,
+        content: str,
+        provenance: Provenance,
+        namespace: str | None = None,
+        episode_id: str | None = None,
+        role: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        t_valid: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Persist a new belief with provenance.
+
+        Semantic memories require a ``namespace`` so later recalls and rewinds
+        can be scoped to one incident or agent. Episodic memories require an
+        ``episode_id`` and ``role`` so the conversation history remains
+        reconstructable.
+        """
+
+        with self._conn.transaction():
+            if memory_kind == "semantic":
+                if not namespace or not namespace.strip():
+                    raise ProvenanceError("namespace is required for semantic memory")
+                return self.write_semantic(
+                    namespace=namespace,
+                    content=content,
+                    provenance=provenance,
+                    metadata=metadata,
+                    t_valid=t_valid,
+                )
+            if memory_kind == "episodic":
+                if not episode_id or not episode_id.strip():
+                    raise ProvenanceError("episode_id is required for episodic memory")
+                if not role or not role.strip():
+                    raise ProvenanceError("role is required for episodic memory")
+                return self.write_episodic(
+                    episode_id=episode_id,
+                    role=role,
+                    content=content,
+                    provenance=provenance,
+                    metadata=metadata,
+                    t_valid=t_valid,
+                )
+        raise ValueError(f"Unsupported memory kind: {memory_kind}")
+
+    def recall(
+        self,
+        *,
+        query: str,
+        namespace: str,
+        as_of: datetime | None = None,
+        limit: int = 5,
+        decision_id: str | None = None,
+        reader: str | None = None,
+        purpose: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retrieve semantic beliefs for an incident namespace.
+
+        With no ``as_of`` timestamp, recall uses vector similarity when an
+        embedding provider is configured. With ``as_of``, recall reconstructs
+        the belief set visible at that point in CockroachDB time, then applies
+        valid-time filters so rewinds can re-plan from a past state.
+        """
+
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        if not namespace or not namespace.strip():
+            raise ProvenanceError("namespace is required")
+        if as_of is None and self._embedding_provider is not None:
+            return self.recall_semantic(
+                namespace=namespace,
+                query=query,
+                limit=limit,
+                decision_id=decision_id,
+                reader=reader,
+                purpose=purpose,
+            )
+        if as_of is not None:
+            rows = self._semantic_beliefs_as_of(
+                namespace=namespace,
+                as_of=as_of,
+                limit=limit,
+                query=query,
+            )
+            with self._conn.transaction():
+                self._record_retrieval(
+                    rows,
+                    memory_kind="semantic",
+                    decision_id=decision_id,
+                    reader=reader,
+                    purpose=purpose,
+                )
+            return rows
+
+        with self._conn.transaction():
+            rows = self._fetch_all(
+                """
+                    SELECT *
+                    FROM current_semantic_memories
+                    WHERE namespace = %s
+                        AND content ILIKE %s
+                    ORDER BY t_valid DESC, written_at DESC
+                    LIMIT %s
+                """,
+                (namespace, f"%{query}%", limit),
+            )
+            if not rows:
+                rows = self._fetch_all(
+                    """
+                        SELECT *
+                        FROM current_semantic_memories
+                        WHERE namespace = %s
+                        ORDER BY t_valid DESC, written_at DESC
+                        LIMIT %s
+                    """,
+                    (namespace, limit),
+                )
+            self._record_retrieval(
+                rows,
+                memory_kind="semantic",
+                decision_id=decision_id,
+                reader=reader,
+                purpose=purpose,
+            )
+            return rows
 
     def write_episodic(
         self,
@@ -152,19 +294,121 @@ class MemoryStore:
     def invalidate(
         self,
         *,
+        memory_id: str,
+        reason: str,
+        memory_kind: MemoryKind = "semantic",
+        actor: str | None = None,
+        invalidated_by: str | None = None,
+        t_invalid: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Invalidate a memory by updating valid time; rows are not deleted."""
+
+        invalidator = actor or invalidated_by
+        if not invalidator or not invalidator.strip():
+            raise ProvenanceError("actor is required")
+        if not reason or not reason.strip():
+            raise ProvenanceError("reason is required")
+
+        with self._conn.transaction():
+            return self._invalidate_one(
+                memory_kind=memory_kind,
+                memory_id=memory_id,
+                invalidated_by=invalidator,
+                reason=reason,
+                t_invalid=t_invalid,
+            )
+
+    def rewind(
+        self,
+        *,
+        timestamp: datetime,
+        reason: str,
+        actor: str,
+        namespace: str | None = None,
+    ) -> RewindResult:
+        """Restore the active belief set to an earlier CockroachDB timestamp.
+
+        Rewind is intentionally a state mutation, not only a historical query.
+        It reconstructs the semantic belief set at ``timestamp``, invalidates
+        current memories written later, follows one or more read-provenance hops
+        to invalidate derived memories, records an auditable operation row, and
+        returns the restored beliefs for immediate replanning.
+        """
+
+        if not actor or not actor.strip():
+            raise ProvenanceError("actor is required")
+        if not reason or not reason.strip():
+            raise ProvenanceError("reason is required")
+
+        restored = self._semantic_beliefs_as_of(
+            namespace=namespace,
+            as_of=timestamp,
+            limit=None,
+            query=None,
+        )
+
+        with self._conn.transaction():
+            invalidated = self._semantic_rewind_candidates(
+                timestamp=timestamp,
+                namespace=namespace,
+            )
+            invalidated_by_id = {str(row["id"]): row for row in invalidated}
+            pending_ids = set(invalidated_by_id)
+
+            while pending_ids:
+                derived = self._derived_semantic_memories(
+                    memory_ids=sorted(pending_ids),
+                    namespace=namespace,
+                )
+                next_ids = {
+                    str(row["id"])
+                    for row in derived
+                    if str(row["id"]) not in invalidated_by_id
+                }
+                for row in derived:
+                    invalidated_by_id.setdefault(str(row["id"]), row)
+                pending_ids = next_ids
+
+            invalidated_rows = []
+            for memory_id in sorted(invalidated_by_id):
+                memory = invalidated_by_id[memory_id]
+                invalid_at = timestamp
+                if memory["t_valid"] > timestamp:
+                    invalid_at = memory["t_valid"]
+                row = self._invalidate_one(
+                    memory_kind="semantic",
+                    memory_id=memory_id,
+                    invalidated_by=actor,
+                    reason=reason,
+                    t_invalid=invalid_at,
+                )
+                if row is not None:
+                    invalidated_rows.append(row)
+
+            operation = self._record_memory_operation(
+                operation_type="rewind",
+                actor=actor,
+                reason=reason,
+                target_timestamp=timestamp,
+                namespace=namespace,
+                invalidated_memory_ids=[str(row["id"]) for row in invalidated_rows],
+                restored_memory_ids=[str(row["id"]) for row in restored],
+            )
+            return RewindResult(
+                operation=operation,
+                restored_memories=restored,
+                invalidated_memories=invalidated_rows,
+            )
+
+    def _invalidate_one(
+        self,
+        *,
         memory_kind: MemoryKind,
         memory_id: str,
         invalidated_by: str,
         reason: str,
         t_invalid: datetime | None = None,
     ) -> dict[str, Any] | None:
-        """Invalidate a memory by updating valid time; rows are not deleted."""
-
-        if not invalidated_by or not invalidated_by.strip():
-            raise ProvenanceError("invalidated_by is required")
-        if not reason or not reason.strip():
-            raise ProvenanceError("reason is required")
-
         table = self._table_for_kind(memory_kind)
         query = f"""
             UPDATE {table}
@@ -416,6 +660,132 @@ class MemoryStore:
             )
             for memory_id in memory_ids
         ]
+
+    def _semantic_beliefs_as_of(
+        self,
+        *,
+        namespace: str | None,
+        as_of: datetime,
+        limit: int | None,
+        query: str | None,
+    ) -> list[dict[str, Any]]:
+        where = [
+            "t_valid <= %s",
+            "(t_invalid IS NULL OR t_invalid > %s)",
+        ]
+        as_of_literal = sql.Literal(as_of.isoformat()).as_string(self._conn)
+        params: list[Any] = [as_of, as_of]
+        if namespace is not None:
+            where.append("namespace = %s")
+            params.append(namespace)
+        if query:
+            where.append("content ILIKE %s")
+            params.append(f"%{query}%")
+        query_sql = f"""
+            SELECT *, NULL::FLOAT8 AS distance
+            FROM semantic_memories
+            WHERE {" AND ".join(where)}
+            ORDER BY t_valid DESC, written_at DESC
+        """
+        if limit is not None:
+            query_sql += " LIMIT %s"
+            params.append(limit)
+        self._conn.commit()
+        try:
+            with self._conn.transaction():
+                self._conn.execute(f"SET TRANSACTION AS OF SYSTEM TIME {as_of_literal}")
+                rows = self._fetch_all(query_sql, tuple(params))
+        except Exception:
+            self._conn.rollback()
+            raise
+        if query and not rows:
+            return self._semantic_beliefs_as_of(
+                namespace=namespace,
+                as_of=as_of,
+                limit=limit,
+                query=None,
+            )
+        return rows
+
+    def _semantic_rewind_candidates(
+        self,
+        *,
+        timestamp: datetime,
+        namespace: str | None,
+    ) -> list[dict[str, Any]]:
+        where = ["written_at > %s"]
+        params: list[Any] = [timestamp]
+        if namespace is not None:
+            where.append("namespace = %s")
+            params.append(namespace)
+        return self._fetch_all(
+            f"""
+                SELECT *
+                FROM current_semantic_memories
+                WHERE {" AND ".join(where)}
+                ORDER BY written_at ASC
+            """,
+            tuple(params),
+        )
+
+    def _derived_semantic_memories(
+        self,
+        *,
+        memory_ids: list[str],
+        namespace: str | None,
+    ) -> list[dict[str, Any]]:
+        if not memory_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        params: list[Any] = [*memory_ids]
+        namespace_filter = ""
+        if namespace is not None:
+            namespace_filter = "AND m.namespace = %s"
+            params.append(namespace)
+        return self._fetch_all(
+            f"""
+                SELECT DISTINCT m.*
+                FROM current_semantic_memories AS m
+                JOIN memory_reads AS r
+                    ON m.source_ref = r.decision_id
+                WHERE r.memory_kind = 'semantic'
+                    AND r.memory_id IN ({placeholders})
+                    {namespace_filter}
+                ORDER BY m.written_at ASC
+            """,
+            tuple(params),
+        )
+
+    def _record_memory_operation(
+        self,
+        *,
+        operation_type: str,
+        actor: str,
+        reason: str,
+        target_timestamp: datetime,
+        namespace: str | None,
+        invalidated_memory_ids: list[str],
+        restored_memory_ids: list[str],
+    ) -> dict[str, Any]:
+        return self._fetch_one(
+            """
+                INSERT INTO memory_operations (
+                    operation_type, actor, reason, target_timestamp, namespace,
+                    invalidated_memory_ids, restored_memory_ids
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """,
+            (
+                operation_type,
+                actor,
+                reason,
+                target_timestamp,
+                namespace,
+                Jsonb(invalidated_memory_ids),
+                Jsonb(restored_memory_ids),
+            ),
+        )
 
     def _insert_semantic_embedding(
         self,
