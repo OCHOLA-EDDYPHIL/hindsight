@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down migrate test lint lambda-zip
+.PHONY: dev-up dev-down migrate test lint lambda-zip mcp-server
 
 dev-up:
 	docker compose up -d --wait
@@ -18,3 +18,6 @@ lint:
 
 lambda-zip:
 	uv run python scripts/build_lambda_zip.py
+
+mcp-server:
+	uv run python scripts/run_mcp_server.py
