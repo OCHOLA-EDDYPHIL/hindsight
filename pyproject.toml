@@ -5,6 +5,7 @@ description = "Incident-response copilot with rewindable, auditable agent memory
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
+    "boto3>=1.43.46",
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
 ]

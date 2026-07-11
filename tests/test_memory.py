@@ -28,7 +28,12 @@ def memory_store():
 def test_memory_schema_objects_exist():
     from hindsight.db import connect
 
-    expected_tables = {"episodic_memories", "semantic_memories", "memory_reads"}
+    expected_tables = {
+        "episodic_memories",
+        "semantic_memories",
+        "semantic_memory_embeddings",
+        "memory_reads",
+    }
     expected_views = {"current_episodic_memories", "current_semantic_memories"}
 
     with connect() as conn:
@@ -56,6 +61,17 @@ def test_memory_schema_objects_exist():
 
     assert expected_tables <= tables
     assert expected_views <= views
+
+
+@requires_db
+def test_semantic_vector_index_exists():
+    from hindsight.db import connect
+
+    with connect() as conn:
+        rows = conn.execute("SHOW INDEXES FROM semantic_memory_embeddings").fetchall()
+
+    index_names = {row[1] for row in rows}
+    assert "semantic_memory_embeddings_namespace_embedding_idx" in index_names
 
 
 @requires_db
@@ -183,3 +199,106 @@ def test_provenance_and_decision_read_tracking(memory_store):
     joined = memory_store.memories_for_decision(decision_id=decision_id)
     assert joined[0]["semantic_content"] == "restart the worker after clearing the stuck lease"
     assert joined[0]["semantic_writer"] == "human.sre"
+
+
+@requires_db
+def test_semantic_write_creates_embedding_row():
+    from hindsight.db import connect
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    conn = connect()
+    try:
+        store = MemoryStore(conn, embedding_provider=DeterministicEmbeddingProvider())
+        memory = store.write_semantic(
+            namespace=f"incident-{uuid4()}",
+            content="payment timeout in worker",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:vector-write",
+                justification="Embedding write test",
+            ),
+        )
+
+        row = conn.execute(
+            """
+                SELECT namespace, provider, model, dimensions
+                FROM semantic_memory_embeddings
+                WHERE memory_id = %s
+            """,
+            (memory["id"],),
+        ).fetchone()
+
+        assert row == (
+            memory["namespace"],
+            "deterministic",
+            "stable-hash-v1",
+            1024,
+        )
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@requires_db
+def test_vector_recall_is_namespace_scoped_current_and_tracked():
+    from hindsight.db import connect
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    conn = connect()
+    try:
+        store = MemoryStore(conn, embedding_provider=DeterministicEmbeddingProvider())
+        namespace = f"incident-{uuid4()}"
+        other_namespace = f"incident-{uuid4()}"
+        decision_id = f"decision-{uuid4()}"
+        target = store.write_semantic(
+            namespace=namespace,
+            content="payment timeout in worker",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:target",
+                justification="Relevant prior incident",
+            ),
+        )
+        stale = store.write_semantic(
+            namespace=namespace,
+            content="payment timeout stale hypothesis",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:stale",
+                justification="Superseded memory",
+            ),
+        )
+        store.write_semantic(
+            namespace=other_namespace,
+            content="payment timeout in worker",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:other-namespace",
+                justification="Same content in another namespace",
+            ),
+        )
+        store.invalidate(
+            memory_kind="semantic",
+            memory_id=str(stale["id"]),
+            invalidated_by="agent.rewind",
+            reason="Stale vector memory should not be recalled",
+        )
+
+        recalled = store.recall_semantic(
+            namespace=namespace,
+            query="payment timeout",
+            limit=5,
+            decision_id=decision_id,
+            reader="agent.triage",
+            purpose="retrieve similar memory",
+        )
+
+        assert [row["id"] for row in recalled] == [target["id"]]
+        assert recalled[0]["distance"] is not None
+        reads = store.reads_for_decision(decision_id=decision_id)
+        assert [row["memory_id"] for row in reads] == [target["id"]]
+    finally:
+        conn.rollback()
+        conn.close()
