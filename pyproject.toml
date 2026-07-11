@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
     "boto3>=1.43.46",
+    "certifi>=2026.6.17",
     "google-genai>=2.11.0",
     "langchain-cockroachdb>=0.2.1",
     "langgraph>=1.2.9",

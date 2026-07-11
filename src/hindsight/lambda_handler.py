@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import boto3
 
@@ -102,11 +104,13 @@ def runtime_settings(
     client = ssm_client
     if client is None and _needs_ssm(env):
         client = boto3.client("ssm", region_name=env.get("AWS_REGION"))
-    database_url = _secret_value(
-        env=env,
-        client=client,
-        param_env=DATABASE_URL_PARAM_ENV,
-        fallback_env="DATABASE_URL",
+    database_url = _database_url_for_lambda(
+        _secret_value(
+            env=env,
+            client=client,
+            param_env=DATABASE_URL_PARAM_ENV,
+            fallback_env="DATABASE_URL",
+        )
     )
     provider_env = {
         "LLM_PROVIDER": env.get("LLM_PROVIDER", "gemini"),
@@ -115,14 +119,15 @@ def runtime_settings(
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }
-    gemini_key = _optional_secret_value(
-        env=env,
-        client=client,
-        param_env=GEMINI_API_KEY_PARAM_ENV,
-        fallback_env="GEMINI_API_KEY",
-    )
-    if gemini_key:
-        provider_env["GEMINI_API_KEY"] = gemini_key
+    if provider_env["LLM_PROVIDER"].strip().lower() == "gemini":
+        gemini_key = _optional_secret_value(
+            env=env,
+            client=client,
+            param_env=GEMINI_API_KEY_PARAM_ENV,
+            fallback_env="GEMINI_API_KEY",
+        )
+        if gemini_key:
+            provider_env["GEMINI_API_KEY"] = gemini_key
     settings = RuntimeSettings(
         database_url=database_url,
         provider_env=provider_env,
@@ -226,6 +231,7 @@ def _error_response(
             "elapsed_ms": elapsed_ms,
             "cold_start": cold_start,
             "error_type": type(exc).__name__ if exc else "ValueError",
+            "error_detail": _safe_error_detail(exc),
         }
     )
     return {
@@ -357,3 +363,26 @@ def _optional_str(value: Any) -> str | None:
 
 def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
+
+
+def _safe_error_detail(exc: Exception | None) -> str | None:
+    if exc is None:
+        return None
+    detail = str(exc).replace("\n", " ")
+    detail = re.sub(r"(postgres(?:ql)?://[^:\s/]+:)[^@\s/]+@", r"\1***@", detail)
+    detail = re.sub(
+        r"(?i)\b(password|token|secret|api[_-]?key)=([^&\s]+)",
+        r"\1=***",
+        detail,
+    )
+    return detail[:500]
+
+
+def _database_url_for_lambda(url: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if query.get("sslmode") == "verify-full" and "sslrootcert" not in query:
+        import certifi
+
+        query["sslrootcert"] = certifi.where()
+    return urlunsplit(parts._replace(query=urlencode(query)))

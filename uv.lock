@@ -233,6 +233,7 @@ version = "0.0.1.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
+    { name = "certifi" },
     { name = "google-genai" },
     { name = "langchain-cockroachdb" },
     { name = "langgraph" },
@@ -249,6 +250,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.43.46" },
+    { name = "certifi", specifier = ">=2026.6.17" },
     { name = "google-genai", specifier = ">=2.11.0" },
     { name = "langchain-cockroachdb", specifier = ">=0.2.1" },
     { name = "langgraph", specifier = ">=1.2.9" },

@@ -1,6 +1,7 @@
 """Unit tests for the Lambda incident endpoint."""
 
 import json
+from urllib.parse import parse_qs, urlsplit
 from types import SimpleNamespace
 
 import pytest
@@ -171,3 +172,77 @@ def test_runtime_settings_uses_local_fallbacks_without_ssm_client():
 
     assert settings.database_url == "postgresql://local"
     assert settings.provider_env["GEMINI_API_KEY"] == "local-key"
+
+
+def test_runtime_settings_skips_gemini_secret_for_deterministic_provider():
+    from hindsight.lambda_handler import (
+        DATABASE_URL_PARAM_ENV,
+        GEMINI_API_KEY_PARAM_ENV,
+        runtime_settings,
+    )
+
+    class FakeSsm:
+        def get_parameter(self, *, Name, WithDecryption):
+            assert Name == "/hindsight/test/database-url"
+            return {"Parameter": {"Value": "postgresql://db"}}
+
+    settings = runtime_settings(
+        environ={
+            DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
+            GEMINI_API_KEY_PARAM_ENV: "/hindsight/test/missing-gemini-key",
+            "LLM_PROVIDER": "deterministic",
+        },
+        ssm_client=FakeSsm(),
+        use_cache=False,
+    )
+
+    assert settings.database_url == "postgresql://db"
+    assert "GEMINI_API_KEY" not in settings.provider_env
+
+
+def test_runtime_settings_adds_certifi_root_for_verify_full_database_url():
+    import certifi
+
+    from hindsight.lambda_handler import DATABASE_URL_PARAM_ENV, runtime_settings
+
+    class FakeSsm:
+        def get_parameter(self, *, Name, WithDecryption):
+            return {
+                "Parameter": {
+                    "Value": (
+                        "postgresql://user:pass@example.com:26257/db"
+                        "?sslmode=verify-full"
+                    )
+                }
+            }
+
+    settings = runtime_settings(
+        environ={
+            DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
+            "LLM_PROVIDER": "deterministic",
+        },
+        ssm_client=FakeSsm(),
+        use_cache=False,
+    )
+
+    assert "sslmode=verify-full" in settings.database_url
+    query = parse_qs(urlsplit(settings.database_url).query)
+    assert query["sslrootcert"] == [certifi.where()]
+
+
+def test_safe_error_detail_redacts_connection_secrets():
+    from hindsight.lambda_handler import _safe_error_detail
+
+    detail = _safe_error_detail(
+        RuntimeError(
+            "failed postgresql://user:supersecret@example.com/db?sslmode=verify-full "
+            "password=hidden token=opaque api_key=abc123"
+        )
+    )
+
+    assert detail is not None
+    assert "supersecret" not in detail
+    assert "hidden" not in detail
+    assert "opaque" not in detail
+    assert "abc123" not in detail
+    assert "postgresql://user:***@example.com/db" in detail
