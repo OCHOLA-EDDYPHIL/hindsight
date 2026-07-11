@@ -70,6 +70,15 @@ def test_mcp_current_beliefs_records_memory_and_tool_audit():
 
 
 @requires_db
+def test_mcp_current_beliefs_rejects_blank_semantic_namespace():
+    from hindsight.db import database_url
+    from hindsight.mcp_server import inspect_current_beliefs
+
+    with pytest.raises(ValueError, match="namespace is required"):
+        inspect_current_beliefs(namespace="", db_url=database_url())
+
+
+@requires_db
 def test_mcp_provenance_chain_and_audit_log_are_visible():
     from hindsight.db import database_url
     from hindsight.mcp_server import inspect_mcp_audit_log, inspect_provenance_chain

@@ -21,6 +21,13 @@ def seeded_conn():
     conn = connect()
     try:
         with conn.transaction():
+            conn.execute("DELETE FROM incident_semantic_memories")
+            conn.execute("DELETE FROM incident_runbooks")
+            conn.execute("DELETE FROM incident_events")
+            conn.execute("DELETE FROM incident_services")
+            conn.execute("DELETE FROM runbooks")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM services")
             conn.execute(DEMO_FIXTURE.read_text())
             yield conn
             raise RuntimeError("rollback fixture data")
@@ -131,6 +138,32 @@ def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_
                 ('30000000-0000-0000-0000-000000000002', %s, 'root_cause')
         """,
         (payment_memory["id"], stale_memory["id"], gateway_memory["id"]),
+    )
+    seeded_conn.execute(
+        """
+            INSERT INTO incident_services (incident_id, service_id, impact)
+            VALUES (
+                '30000000-0000-0000-0000-000000000001',
+                '10000000-0000-0000-0000-000000000002',
+                'Edge gateway contributed client-facing retries.'
+            )
+            ON CONFLICT (incident_id, service_id) DO UPDATE SET
+                impact = excluded.impact
+        """
+    )
+    seeded_conn.execute(
+        """
+            INSERT INTO incident_runbooks (incident_id, runbook_id, usage_note, outcome)
+            VALUES (
+                '30000000-0000-0000-0000-000000000001',
+                '20000000-0000-0000-0000-000000000002',
+                'Checked gateway certificates while investigating retries.',
+                'Gateway checks were not the payments remediation.'
+            )
+            ON CONFLICT (incident_id, runbook_id) DO UPDATE SET
+                usage_note = excluded.usage_note,
+                outcome = excluded.outcome
+        """
     )
     store.invalidate(
         memory_kind="semantic",

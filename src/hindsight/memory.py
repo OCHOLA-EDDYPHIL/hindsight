@@ -7,17 +7,18 @@ agent believed before a correction or rewind.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
+from uuid import uuid4
 
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from hindsight.db import connect
+from hindsight.db import connect, database_url
 from hindsight.embeddings import (
     EMBEDDING_DIMENSIONS,
     EmbeddingProvider,
@@ -76,7 +77,8 @@ class MemoryStore:
         url: str | None = None,
         embedding_provider: EmbeddingProvider | None = None,
     ):
-        self._conn = conn or connect(url)
+        self._url = url or (database_url() if conn is None else None)
+        self._conn = conn or connect(self._url)
         self._owns_connection = conn is None
         self._embedding_provider = embedding_provider
 
@@ -261,10 +263,14 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Write a semantic memory row and return the inserted row."""
 
+        provenance.validate()
+        if not namespace or not namespace.strip():
+            raise ProvenanceError("namespace is required")
         embedding = None
         if self._embedding_provider is not None:
+            self._validate_embedding_provider_dimensions()
             embedding = self._embedding_provider.embed(content)
-        provenance.validate()
+            self._validate_semantic_embedding(embedding)
         query = """
             INSERT INTO semantic_memories (
                 namespace, content, metadata, t_valid,
@@ -282,14 +288,18 @@ class MemoryStore:
             provenance.source_ref,
             provenance.justification,
         )
-        row = self._fetch_one(query, params)
-        if self._embedding_provider is not None and embedding is not None:
-            self._insert_semantic_embedding(
-                memory_id=str(row["id"]),
-                namespace=namespace,
-                embedding=embedding,
-            )
-        return row
+
+        def write_row() -> dict[str, Any]:
+            row = self._fetch_one(query, params)
+            if self._embedding_provider is not None and embedding is not None:
+                self._insert_semantic_embedding(
+                    memory_id=str(row["id"]),
+                    namespace=namespace,
+                    embedding=embedding,
+                )
+            return row
+
+        return self._in_savepoint(write_row)
 
     def invalidate(
         self,
@@ -481,8 +491,10 @@ class MemoryStore:
 
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
+        if namespace is not None and not namespace.strip():
+            raise ProvenanceError("namespace is required")
         limit_clause = " LIMIT %s" if limit is not None else ""
-        if namespace:
+        if namespace is not None:
             params: tuple[Any, ...] = (namespace,) if limit is None else (namespace, limit)
             rows = self._fetch_all(
                 f"""
@@ -616,10 +628,18 @@ class MemoryStore:
                     ON isvc.incident_id = i.id
                 JOIN services AS s
                     ON s.id = isvc.service_id
-                LEFT JOIN incident_runbooks AS ir
-                    ON ir.incident_id = i.id
-                LEFT JOIN runbooks AS r
-                    ON r.id = ir.runbook_id
+                LEFT JOIN (
+                    SELECT
+                        ir.incident_id,
+                        r.service_id,
+                        r.slug,
+                        r.title
+                    FROM incident_runbooks AS ir
+                    JOIN runbooks AS r
+                        ON r.id = ir.runbook_id
+                ) AS r
+                    ON r.incident_id = i.id
+                    AND r.service_id = s.id
                 WHERE m.namespace = %s
                     AND s.slug = %s
                 ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
@@ -765,7 +785,6 @@ class MemoryStore:
             "t_valid <= %s",
             "(t_invalid IS NULL OR t_invalid > %s)",
         ]
-        as_of_literal = sql.Literal(as_of.isoformat()).as_string(self._conn)
         params: list[Any] = [as_of, as_of]
         if namespace is not None:
             where.append("namespace = %s")
@@ -782,14 +801,11 @@ class MemoryStore:
         if limit is not None:
             query_sql += " LIMIT %s"
             params.append(limit)
-        self._conn.commit()
-        try:
-            with self._conn.transaction():
-                self._conn.execute(f"SET TRANSACTION AS OF SYSTEM TIME {as_of_literal}")
-                rows = self._fetch_all(query_sql, tuple(params))
-        except Exception:
-            self._conn.rollback()
-            raise
+        with connect(self._historical_read_url()) as read_conn:
+            as_of_literal = sql.Literal(as_of.isoformat()).as_string(read_conn)
+            with read_conn.transaction():
+                read_conn.execute(f"SET TRANSACTION AS OF SYSTEM TIME {as_of_literal}")
+                rows = self._fetch_all_on(read_conn, query_sql, tuple(params))
         if query and not rows:
             return self._semantic_beliefs_as_of(
                 namespace=namespace,
@@ -888,11 +904,7 @@ class MemoryStore:
     ) -> dict[str, Any]:
         if self._embedding_provider is None:
             raise RuntimeError("embedding provider is not configured")
-        if self._embedding_provider.dimensions != EMBEDDING_DIMENSIONS:
-            raise ValueError(
-                f"semantic vector store expects {EMBEDDING_DIMENSIONS} dimensions, "
-                f"got {self._embedding_provider.dimensions}"
-            )
+        self._validate_semantic_embedding(embedding)
         return self._fetch_one(
             f"""
                 INSERT INTO semantic_memory_embeddings (
@@ -960,3 +972,45 @@ class MemoryStore:
         with self._conn.cursor(row_factory=dict_row) as cur:
             cur.execute(query, params)
             return [dict(row) for row in cur.fetchall()]
+
+    @staticmethod
+    def _fetch_all_on(
+        conn: psycopg.Connection, query: str, params: tuple[Any, ...]
+    ) -> list[dict[str, Any]]:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def _historical_read_url(self) -> str:
+        if self._url is not None:
+            return self._url
+        try:
+            return database_url()
+        except RuntimeError:
+            return self._conn.info.dsn
+
+    def _validate_embedding_provider_dimensions(self) -> None:
+        if self._embedding_provider is None:
+            raise RuntimeError("embedding provider is not configured")
+        if self._embedding_provider.dimensions != EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"semantic vector store expects {EMBEDDING_DIMENSIONS} dimensions, "
+                f"got {self._embedding_provider.dimensions}"
+            )
+
+    def _validate_semantic_embedding(self, embedding: list[float]) -> None:
+        self._validate_embedding_provider_dimensions()
+        if len(embedding) != EMBEDDING_DIMENSIONS:
+            raise ValueError(f"expected {EMBEDDING_DIMENSIONS} dimensions, got {len(embedding)}")
+
+    def _in_savepoint(self, callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        savepoint = sql.Identifier(f"hindsight_memory_{uuid4().hex}").as_string(self._conn)
+        self._conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            result = callback()
+        except Exception:
+            self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return result
