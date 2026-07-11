@@ -68,6 +68,103 @@ def test_gemini_provider_uses_injected_client_without_network():
     assert calls[0]["config"]["max_output_tokens"] == 64
 
 
+def test_bedrock_provider_uses_injected_client_without_network():
+    from hindsight.reasoning import BedrockReasoningProvider, ReasoningRequest
+
+    calls = []
+
+    class FakeBedrockClient:
+        def converse(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "output": {"message": {"content": [{"text": "scale down retry workers"}]}},
+                "usage": {"inputTokens": 8, "outputTokens": 5},
+            }
+
+    provider = BedrockReasoningProvider(
+        model_name="bedrock-test",
+        client=FakeBedrockClient(),
+    )
+
+    response = provider.generate(
+        ReasoningRequest(
+            system="You are an incident commander.",
+            prompt="Plan mitigation.",
+            max_output_tokens=32,
+        )
+    )
+
+    assert response.text == "scale down retry workers"
+    assert response.provider == "bedrock"
+    assert response.model == "bedrock-test"
+    assert response.usage["inputTokens"] == 8
+    assert calls[0]["modelId"] == "bedrock-test"
+    assert calls[0]["system"] == [{"text": "You are an incident commander."}]
+    assert calls[0]["inferenceConfig"]["maxTokens"] == 32
+
+
+def test_retrying_reasoning_provider_records_attempts_after_retry():
+    from hindsight.reasoning import (
+        ReasoningProviderError,
+        ReasoningRequest,
+        ReasoningResponse,
+        retrying_reasoning_provider,
+    )
+
+    class FlakyProvider:
+        provider_name = "flaky"
+        model_name = "flaky-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                raise ReasoningProviderError("temporary")
+            return ReasoningResponse(
+                text="recovered",
+                provider=self.provider_name,
+                model=self.model_name,
+                usage={"tokens": 3},
+            )
+
+    provider = FlakyProvider()
+    response = retrying_reasoning_provider(provider, max_attempts=2).generate(
+        ReasoningRequest(prompt="recover")
+    )
+
+    assert provider.calls == 2
+    assert response.text == "recovered"
+    assert response.usage["tokens"] == 3
+    assert response.usage["attempts"] == 2
+
+
+def test_provider_from_env_supports_bedrock(monkeypatch):
+    from hindsight.reasoning import BedrockReasoningProvider, reasoning_provider_from_env
+
+    class FakeBedrockProvider(BedrockReasoningProvider):
+        def __init__(self, *, model_name, region_name=None, client=None):
+            super().__init__(
+                model_name=model_name,
+                region_name=region_name,
+                client=object(),
+            )
+
+    monkeypatch.setattr("hindsight.reasoning.BedrockReasoningProvider", FakeBedrockProvider)
+
+    provider = reasoning_provider_from_env(
+        {
+            "LLM_PROVIDER": "bedrock",
+            "BEDROCK_MODEL": "bedrock-env",
+            "AWS_REGION": "us-east-1",
+        }
+    )
+
+    assert provider.provider_name == "bedrock"
+    assert provider.model_name == "bedrock-env"
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVE_GEMINI_REASONING") != "1",
     reason="live Gemini reasoning invocation is opt-in",

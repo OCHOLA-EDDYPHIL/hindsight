@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Hindsight incident agent Lambda endpoint
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+  DatabaseUrlParameterName:
+    Type: String
+    Default: /hindsight/dev/database-url
+  GeminiApiKeyParameterName:
+    Type: String
+    Default: /hindsight/dev/gemini-api-key
+  LlmProvider:
+    Type: String
+    Default: gemini
+    AllowedValues:
+      - gemini
+      - bedrock
+      - deterministic
+  GeminiModel:
+    Type: String
+    Default: gemini-2.5-flash
+  BedrockModel:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+  ReasoningMaxAttempts:
+    Type: Number
+    Default: 2
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 1024
+    Timeout: 60
+    Architectures:
+      - x86_64
+
+Resources:
+  HindsightAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub hindsight-agent-${StageName}
+      CodeUri: ../../build/lambda/hindsight-agent.zip
+      Handler: hindsight.lambda_handler.handler
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+      Environment:
+        Variables:
+          HINDSIGHT_DATABASE_URL_PARAM: !Ref DatabaseUrlParameterName
+          HINDSIGHT_GEMINI_API_KEY_PARAM: !Ref GeminiApiKeyParameterName
+          LLM_PROVIDER: !Ref LlmProvider
+          GEMINI_MODEL: !Ref GeminiModel
+          BEDROCK_MODEL: !Ref BedrockModel
+          REASONING_MAX_ATTEMPTS: !Ref ReasoningMaxAttempts
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DatabaseUrlParameterName}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GeminiApiKeyParameterName}
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource: "*"
+
+  HindsightAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${HindsightAgentFunction}
+      RetentionInDays: 14
+
+Outputs:
+  HindsightAgentFunctionName:
+    Value: !Ref HindsightAgentFunction
+  HindsightAgentFunctionUrl:
+    Value: !GetAtt HindsightAgentFunctionUrl.FunctionUrl

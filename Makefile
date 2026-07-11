@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down migrate test lint
+.PHONY: dev-up dev-down migrate test lint lambda-zip
 
 dev-up:
 	docker compose up -d --wait
@@ -15,3 +15,6 @@ test:
 
 lint:
 	uv run ruff check .
+
+lambda-zip:
+	uv run python scripts/build_lambda_zip.py
