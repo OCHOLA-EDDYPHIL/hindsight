@@ -17,6 +17,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hindsight.db import connect
+from hindsight.embeddings import (
+    EMBEDDING_DIMENSIONS,
+    EmbeddingProvider,
+    vector_literal,
+)
 
 MemoryKind = Literal["episodic", "semantic"]
 
@@ -50,9 +55,15 @@ class Provenance:
 class MemoryStore:
     """Small SQL wrapper for valid-time memory writes, reads, and audit trails."""
 
-    def __init__(self, conn: psycopg.Connection | None = None, url: str | None = None):
+    def __init__(
+        self,
+        conn: psycopg.Connection | None = None,
+        url: str | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ):
         self._conn = conn or connect(url)
         self._owns_connection = conn is None
+        self._embedding_provider = embedding_provider
 
     def __enter__(self) -> MemoryStore:
         return self
@@ -108,6 +119,9 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Write a semantic memory row and return the inserted row."""
 
+        embedding = None
+        if self._embedding_provider is not None:
+            embedding = self._embedding_provider.embed(content)
         provenance.validate()
         query = """
             INSERT INTO semantic_memories (
@@ -126,7 +140,14 @@ class MemoryStore:
             provenance.source_ref,
             provenance.justification,
         )
-        return self._fetch_one(query, params)
+        row = self._fetch_one(query, params)
+        if self._embedding_provider is not None and embedding is not None:
+            self._insert_semantic_embedding(
+                memory_id=str(row["id"]),
+                namespace=namespace,
+                embedding=embedding,
+            )
+        return row
 
     def invalidate(
         self,
@@ -224,6 +245,52 @@ class MemoryStore:
                 """,
                 (),
             )
+        self._record_retrieval(
+            rows,
+            memory_kind="semantic",
+            decision_id=decision_id,
+            reader=reader,
+            purpose=purpose,
+        )
+        return rows
+
+    def recall_semantic(
+        self,
+        *,
+        namespace: str,
+        query: str,
+        limit: int = 5,
+        decision_id: str | None = None,
+        reader: str | None = None,
+        purpose: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return nearest current semantic memories within one namespace."""
+
+        if self._embedding_provider is None:
+            raise RuntimeError("recall_semantic requires an embedding provider")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        query_vector = vector_literal(
+            self._embedding_provider.embed(query),
+            dimensions=self._embedding_provider.dimensions,
+        )
+        rows = self._fetch_all(
+            f"""
+                SELECT
+                    m.*,
+                    e.provider AS embedding_provider,
+                    e.model AS embedding_model,
+                    e.embedded_at,
+                    e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance
+                FROM current_semantic_memories AS m
+                JOIN semantic_memory_embeddings AS e
+                    ON e.memory_id = m.id
+                WHERE m.namespace = %s
+                ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                LIMIT %s
+            """,
+            (query_vector, namespace, query_vector, limit),
+        )
         self._record_retrieval(
             rows,
             memory_kind="semantic",
@@ -349,6 +416,38 @@ class MemoryStore:
             )
             for memory_id in memory_ids
         ]
+
+    def _insert_semantic_embedding(
+        self,
+        *,
+        memory_id: str,
+        namespace: str,
+        embedding: list[float],
+    ) -> dict[str, Any]:
+        if self._embedding_provider is None:
+            raise RuntimeError("embedding provider is not configured")
+        if self._embedding_provider.dimensions != EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"semantic vector store expects {EMBEDDING_DIMENSIONS} dimensions, "
+                f"got {self._embedding_provider.dimensions}"
+            )
+        return self._fetch_one(
+            f"""
+                INSERT INTO semantic_memory_embeddings (
+                    memory_id, namespace, embedding, provider, model, dimensions
+                )
+                VALUES (%s, %s, %s::VECTOR({EMBEDDING_DIMENSIONS}), %s, %s, %s)
+                RETURNING memory_id, namespace, provider, model, dimensions, embedded_at
+            """,
+            (
+                memory_id,
+                namespace,
+                vector_literal(embedding),
+                self._embedding_provider.provider_name,
+                self._embedding_provider.model_name,
+                self._embedding_provider.dimensions,
+            ),
+        )
 
     def _record_retrieval(
         self,
