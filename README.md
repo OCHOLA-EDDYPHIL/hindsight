@@ -25,6 +25,16 @@ The server uses `DATABASE_URL` for the CockroachDB cluster and exposes four tool
 
 Each inspection tool records an `mcp_audit_events` row with the tool name, actor, purpose, arguments, result count, and timestamp. Memory-row inspection also records `memory_reads` rows so MCP reads appear in the same provenance trail as agent reads.
 
+## Telemetry ingestion demo
+
+Hindsight includes a scriptable telemetry demo that turns an induced checkout failure into incident context:
+
+```bash
+uv run python scripts/run_telemetry_demo.py
+```
+
+The demo service emits Prometheus-style checkout metrics and structured JSON log events. Its retry-fanout failure produces a webhook-equivalent telemetry signal, opens an `incidents` row, writes an `incident_events` telemetry alert, stores the metric/log excerpt as semantic memory with `telemetry.ingest` provenance, and then runs the incident agent against that namespace.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).

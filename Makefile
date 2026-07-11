@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down migrate test lint lambda-zip mcp-server
+.PHONY: dev-up dev-down migrate test lint lambda-zip mcp-server telemetry-demo
 
 dev-up:
 	docker compose up -d --wait
@@ -21,3 +21,6 @@ lambda-zip:
 
 mcp-server:
 	uv run python scripts/run_mcp_server.py
+
+telemetry-demo:
+	uv run python scripts/run_telemetry_demo.py
