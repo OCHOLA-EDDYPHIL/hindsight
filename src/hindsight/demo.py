@@ -8,7 +8,6 @@ from time import sleep
 from typing import Any
 from uuid import uuid4
 
-from hindsight.agent import IncidentInput, IncidentAgentResult, run_incident_agent
 from hindsight.db import connect, database_url
 from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.mcp_server import inspect_decision_trace
@@ -238,38 +237,90 @@ def run_demo_agent_turn(
     """Run one deterministic incident-agent turn for the poison/rewind demo."""
 
     thread_id = f"{namespace}:{label}"
-    result = run_incident_agent(
-        IncidentInput(
-            user_input=DEMO_INPUT,
-            incident_id=f"{DEMO_INCIDENT_ID}-{label}",
-            namespace=namespace,
-            service_slug=DEMO_SERVICE_SLUG,
-            severity="sev2",
-            title=DEMO_TITLE,
-            metadata={"demo": "poison-rewind", "label": label},
-        ),
-        thread_id=thread_id,
-        db_url=db_url or database_url(),
-        reasoning_provider=reasoning_provider or MemoryBiasedDemoReasoningProvider(),
+    decision_id = f"agent:{thread_id}:plan"
+    provider = reasoning_provider or MemoryBiasedDemoReasoningProvider()
+    with MemoryStore(
+        url=db_url or database_url(),
         embedding_provider=DeterministicEmbeddingProvider(),
-    )
-    return summarize_agent_run(label=label, result=result)
-
-
-def summarize_agent_run(*, label: str, result: IncidentAgentResult) -> AgentRunSummary:
-    """Return the fields a demo operator needs to narrate one turn."""
-
-    recalled_memory_ids = [
-        str(row.get("memory_id") or row.get("id"))
-        for row in result.state.get("recalled_memories", [])
-        if row.get("memory_id") or row.get("id")
-    ]
+    ) as store:
+        recalled = store.recall(
+            namespace=namespace,
+            query=DEMO_INPUT,
+            limit=5,
+            decision_id=decision_id,
+            reader="agent.recall",
+            purpose="retrieve semantic incident context",
+        )
+        plan = provider.generate(
+            ReasoningRequest(
+                system=(
+                    "You are Hindsight, an incident-response copilot. "
+                    "Use recalled memories as context, but propose only reversible, "
+                    "operator-reviewable remediation steps."
+                ),
+                prompt=_demo_plan_prompt(recalled),
+                max_output_tokens=512,
+            )
+        ).text
+        proposed_action = (
+            f"Review and execute the safest reversible step for {DEMO_SERVICE_SLUG}: {plan}"
+        )
+        reflected = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content=(
+                f"Incident {DEMO_INCIDENT_ID}-{label} plan: {plan} "
+                f"Proposed action (approved): {proposed_action}"
+            ),
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref=decision_id,
+                justification="Capture incident plan and proposed remediation for future recall",
+            ),
+            metadata={
+                "thread_id": thread_id,
+                "incident_id": f"{DEMO_INCIDENT_ID}-{label}",
+                "service_slug": DEMO_SERVICE_SLUG,
+                "recalled_memory_ids": [
+                    str(row.get("memory_id") or row.get("id"))
+                    for row in recalled
+                    if row.get("memory_id") or row.get("id")
+                ],
+                "action_approved": True,
+            },
+        )
     return AgentRunSummary(
         label=label,
-        thread_id=result.thread_id,
-        decision_id=f"agent:{result.thread_id}:plan",
-        plan=result.plan,
-        proposed_action=result.proposed_action,
-        reflected_memory_id=result.reflected_memory_id,
-        recalled_memory_ids=recalled_memory_ids,
+        thread_id=thread_id,
+        decision_id=decision_id,
+        plan=plan,
+        proposed_action=proposed_action,
+        reflected_memory_id=str(reflected["id"]),
+        recalled_memory_ids=[
+            str(row.get("memory_id") or row.get("id"))
+            for row in recalled
+            if row.get("memory_id") or row.get("id")
+        ],
+    )
+
+
+def _demo_plan_prompt(recalled: list[dict[str, Any]]) -> str:
+    memory_lines = []
+    for idx, memory in enumerate(recalled, start=1):
+        content = memory.get("memory_content") or memory.get("content") or ""
+        memory_lines.append(f"{idx}. {content}")
+    if not memory_lines:
+        memory_lines.append("No prior memories were recalled.")
+    return "\n".join(
+        [
+            f"Incident: {DEMO_TITLE}",
+            "Severity: sev2",
+            f"Service: {DEMO_SERVICE_SLUG}",
+            f"Current report: {DEMO_INPUT}",
+            "",
+            "Recalled memories:",
+            *memory_lines,
+            "",
+            "Return a concise triage plan with suspected cause, checks, and safe next action.",
+        ]
     )

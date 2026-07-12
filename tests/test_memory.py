@@ -670,3 +670,50 @@ def test_vector_recall_is_namespace_scoped_current_and_tracked():
     finally:
         conn.rollback()
         conn.close()
+
+
+@requires_db
+def test_vector_recall_commits_read_tracking_when_store_owns_connection():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"incident-{uuid4()}"
+    decision_id = f"decision-{uuid4()}"
+    with MemoryStore(
+        url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="payment timeout in worker",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:owned-store-read-tracking",
+                justification="Relevant prior incident",
+            ),
+        )
+
+    with MemoryStore(
+        url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ) as store:
+        recalled = store.recall_semantic(
+            namespace=namespace,
+            query="payment timeout",
+            decision_id=decision_id,
+            reader="agent.recall",
+            purpose="retrieve memory for planning",
+        )
+
+    with MemoryStore(url=database_url()) as verifier:
+        reads = verifier.reads_for_decision(decision_id=decision_id)
+        verifier.invalidate(
+            memory_id=str(memory["id"]),
+            actor="pytest.cleanup",
+            reason="Clean up committed read-tracking regression fixture",
+        )
+
+    assert [row["id"] for row in recalled] == [memory["id"]]
+    assert [row["memory_id"] for row in reads] == [memory["id"]]
