@@ -446,37 +446,38 @@ class MemoryStore:
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
         limit_clause = " LIMIT %s" if limit is not None else ""
-        if episode_id:
-            params: tuple[Any, ...] = (episode_id,) if limit is None else (episode_id, limit)
-            rows = self._fetch_all(
-                f"""
-                    SELECT *
-                    FROM current_episodic_memories
-                    WHERE episode_id = %s
-                    ORDER BY t_valid DESC, written_at DESC
-                    {limit_clause}
-                """,
-                params,
+        with self._conn.transaction():
+            if episode_id:
+                params: tuple[Any, ...] = (episode_id,) if limit is None else (episode_id, limit)
+                rows = self._fetch_all(
+                    f"""
+                        SELECT *
+                        FROM current_episodic_memories
+                        WHERE episode_id = %s
+                        ORDER BY t_valid DESC, written_at DESC
+                        {limit_clause}
+                    """,
+                    params,
+                )
+            else:
+                params = () if limit is None else (limit,)
+                rows = self._fetch_all(
+                    f"""
+                        SELECT *
+                        FROM current_episodic_memories
+                        ORDER BY t_valid DESC, written_at DESC
+                        {limit_clause}
+                    """,
+                    params,
+                )
+            self._record_retrieval(
+                rows,
+                memory_kind="episodic",
+                decision_id=decision_id,
+                reader=reader,
+                purpose=purpose,
             )
-        else:
-            params = () if limit is None else (limit,)
-            rows = self._fetch_all(
-                f"""
-                    SELECT *
-                    FROM current_episodic_memories
-                    ORDER BY t_valid DESC, written_at DESC
-                    {limit_clause}
-                """,
-                params,
-            )
-        self._record_retrieval(
-            rows,
-            memory_kind="episodic",
-            decision_id=decision_id,
-            reader=reader,
-            purpose=purpose,
-        )
-        return rows
+            return rows
 
     def current_semantic(
         self,
@@ -494,37 +495,38 @@ class MemoryStore:
         if namespace is not None and not namespace.strip():
             raise ProvenanceError("namespace is required")
         limit_clause = " LIMIT %s" if limit is not None else ""
-        if namespace is not None:
-            params: tuple[Any, ...] = (namespace,) if limit is None else (namespace, limit)
-            rows = self._fetch_all(
-                f"""
-                    SELECT *
-                    FROM current_semantic_memories
-                    WHERE namespace = %s
-                    ORDER BY t_valid DESC, written_at DESC
-                    {limit_clause}
-                """,
-                params,
+        with self._conn.transaction():
+            if namespace is not None:
+                params: tuple[Any, ...] = (namespace,) if limit is None else (namespace, limit)
+                rows = self._fetch_all(
+                    f"""
+                        SELECT *
+                        FROM current_semantic_memories
+                        WHERE namespace = %s
+                        ORDER BY t_valid DESC, written_at DESC
+                        {limit_clause}
+                    """,
+                    params,
+                )
+            else:
+                params = () if limit is None else (limit,)
+                rows = self._fetch_all(
+                    f"""
+                        SELECT *
+                        FROM current_semantic_memories
+                        ORDER BY t_valid DESC, written_at DESC
+                        {limit_clause}
+                    """,
+                    params,
+                )
+            self._record_retrieval(
+                rows,
+                memory_kind="semantic",
+                decision_id=decision_id,
+                reader=reader,
+                purpose=purpose,
             )
-        else:
-            params = () if limit is None else (limit,)
-            rows = self._fetch_all(
-                f"""
-                    SELECT *
-                    FROM current_semantic_memories
-                    ORDER BY t_valid DESC, written_at DESC
-                    {limit_clause}
-                """,
-                params,
-            )
-        self._record_retrieval(
-            rows,
-            memory_kind="semantic",
-            decision_id=decision_id,
-            reader=reader,
-            purpose=purpose,
-        )
-        return rows
+            return rows
 
     def recall_semantic(
         self,
@@ -546,31 +548,32 @@ class MemoryStore:
             self._embedding_provider.embed(query),
             dimensions=self._embedding_provider.dimensions,
         )
-        rows = self._fetch_all(
-            f"""
-                SELECT
-                    m.*,
-                    e.provider AS embedding_provider,
-                    e.model AS embedding_model,
-                    e.embedded_at,
-                    e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance
-                FROM current_semantic_memories AS m
-                JOIN semantic_memory_embeddings AS e
-                    ON e.memory_id = m.id
-                WHERE m.namespace = %s
-                ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
-                LIMIT %s
-            """,
-            (query_vector, namespace, query_vector, limit),
-        )
-        self._record_retrieval(
-            rows,
-            memory_kind="semantic",
-            decision_id=decision_id,
-            reader=reader,
-            purpose=purpose,
-        )
-        return rows
+        with self._conn.transaction():
+            rows = self._fetch_all(
+                f"""
+                    SELECT
+                        m.*,
+                        e.provider AS embedding_provider,
+                        e.model AS embedding_model,
+                        e.embedded_at,
+                        e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance
+                    FROM current_semantic_memories AS m
+                    JOIN semantic_memory_embeddings AS e
+                        ON e.memory_id = m.id
+                    WHERE m.namespace = %s
+                    ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                    LIMIT %s
+                """,
+                (query_vector, namespace, query_vector, limit),
+            )
+            self._record_retrieval(
+                rows,
+                memory_kind="semantic",
+                decision_id=decision_id,
+                reader=reader,
+                purpose=purpose,
+            )
+            return rows
 
     def recall_similar_incidents(
         self,
@@ -603,58 +606,59 @@ class MemoryStore:
             self._embedding_provider.embed(query),
             dimensions=self._embedding_provider.dimensions,
         )
-        rows = self._fetch_all(
-            f"""
-                SELECT
-                    m.id,
-                    m.id AS memory_id,
-                    m.content AS memory_content,
-                    e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance,
-                    i.slug AS incident_slug,
-                    i.title AS incident_title,
-                    i.severity,
-                    s.slug AS service_slug,
-                    s.name AS service_name,
-                    r.slug AS runbook_slug,
-                    r.title AS runbook_title
-                FROM current_semantic_memories AS m
-                JOIN semantic_memory_embeddings AS e
-                    ON e.memory_id = m.id
-                JOIN incident_semantic_memories AS im
-                    ON im.memory_id = m.id
-                JOIN incidents AS i
-                    ON i.id = im.incident_id
-                JOIN incident_services AS isvc
-                    ON isvc.incident_id = i.id
-                JOIN services AS s
-                    ON s.id = isvc.service_id
-                LEFT JOIN (
+        with self._conn.transaction():
+            rows = self._fetch_all(
+                f"""
                     SELECT
-                        ir.incident_id,
-                        r.service_id,
-                        r.slug,
-                        r.title
-                    FROM incident_runbooks AS ir
-                    JOIN runbooks AS r
-                        ON r.id = ir.runbook_id
-                ) AS r
-                    ON r.incident_id = i.id
-                    AND (r.service_id = s.id OR r.service_id IS NULL)
-                WHERE m.namespace = %s
-                    AND s.slug = %s
-                ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
-                LIMIT %s
-            """,
-            (query_vector, namespace, service_slug, query_vector, limit),
-        )
-        self._record_retrieval(
-            rows,
-            memory_kind="semantic",
-            decision_id=decision_id,
-            reader=reader,
-            purpose=purpose,
-        )
-        return rows
+                        m.id,
+                        m.id AS memory_id,
+                        m.content AS memory_content,
+                        e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance,
+                        i.slug AS incident_slug,
+                        i.title AS incident_title,
+                        i.severity,
+                        s.slug AS service_slug,
+                        s.name AS service_name,
+                        r.slug AS runbook_slug,
+                        r.title AS runbook_title
+                    FROM current_semantic_memories AS m
+                    JOIN semantic_memory_embeddings AS e
+                        ON e.memory_id = m.id
+                    JOIN incident_semantic_memories AS im
+                        ON im.memory_id = m.id
+                    JOIN incidents AS i
+                        ON i.id = im.incident_id
+                    JOIN incident_services AS isvc
+                        ON isvc.incident_id = i.id
+                    JOIN services AS s
+                        ON s.id = isvc.service_id
+                    LEFT JOIN (
+                        SELECT
+                            ir.incident_id,
+                            r.service_id,
+                            r.slug,
+                            r.title
+                        FROM incident_runbooks AS ir
+                        JOIN runbooks AS r
+                            ON r.id = ir.runbook_id
+                    ) AS r
+                        ON r.incident_id = i.id
+                        AND (r.service_id = s.id OR r.service_id IS NULL)
+                    WHERE m.namespace = %s
+                        AND s.slug = %s
+                    ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                    LIMIT %s
+                """,
+                (query_vector, namespace, service_slug, query_vector, limit),
+            )
+            self._record_retrieval(
+                rows,
+                memory_kind="semantic",
+                decision_id=decision_id,
+                reader=reader,
+                purpose=purpose,
+            )
+            return rows
 
     def audit_memory(self, *, memory_kind: MemoryKind, memory_id: str) -> dict[str, Any] | None:
         """Return a memory row whether it is current or invalidated."""
