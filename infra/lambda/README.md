@@ -17,6 +17,7 @@ Create secure parameters before deploy:
 ```bash
 aws ssm put-parameter --name /hindsight/dev/database-url --type SecureString --value "$DATABASE_URL"
 aws ssm put-parameter --name /hindsight/dev/gemini-api-key --type SecureString --value "$GEMINI_API_KEY"
+aws ssm put-parameter --name /hindsight/dev/function-url-token --type SecureString --value "$HINDSIGHT_FUNCTION_AUTH_TOKEN"
 ```
 
 ## Deploy
@@ -31,4 +32,4 @@ sam deploy \
 
 The stack output `HindsightAgentFunctionUrl` is the demo endpoint. The handler exposes
 `POST /incident` to start a thread and `POST /incident/resume` to continue an interrupted
-thread.
+thread. Calls must include `Authorization: Bearer <demo-token>`.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hmac
 import json
 import os
 import re
@@ -24,10 +26,19 @@ from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_
 
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
 GEMINI_API_KEY_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEY_PARAM"
+FUNCTION_AUTH_TOKEN_PARAM_ENV = "HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM"
+FUNCTION_AUTH_TOKEN_ENV = "HINDSIGHT_FUNCTION_AUTH_TOKEN"
 REASONING_MAX_ATTEMPTS_ENV = "REASONING_MAX_ATTEMPTS"
+MAX_BODY_BYTES = 64 * 1024
+MAX_USER_INPUT_CHARS = 8_000
+MAX_IDENTIFIER_CHARS = 128
+MAX_TITLE_CHARS = 200
+MAX_SERVICE_CHARS = 64
+MAX_METADATA_BYTES = 8 * 1024
 
 _COLD_START = True
 _SETTINGS_CACHE: RuntimeSettings | None = None
+_AUTH_TOKEN_CACHE: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,8 @@ def handle_request(
     context: Any,
     *,
     settings: RuntimeSettings | None = None,
+    auth_token: str | None = None,
+    auth_ssm_client: Any | None = None,
 ) -> dict[str, Any]:
     """Handle one start/resume request and return a Function URL response."""
 
@@ -60,7 +73,18 @@ def handle_request(
     route = _route(event)
 
     try:
+        supplied_token = _authorization_bearer_token(event)
+        if supplied_token is None:
+            return _error_response(401, "missing bearer token", started, cold_start, route)
+        expected_token = auth_token or function_auth_token(ssm_client=auth_ssm_client)
+        if not hmac.compare_digest(supplied_token, expected_token):
+            return _error_response(403, "invalid bearer token", started, cold_start, route)
+        if _http_method(event) != "POST":
+            return _error_response(405, "method not allowed", started, cold_start, route)
+        if route not in {"/incident/resume", "/incident", "/incident/start", "/"}:
+            return _error_response(404, f"Unsupported route: {route}", started, cold_start, route)
         payload = _json_body(event)
+        _validate_payload(route, payload)
         resolved_settings = settings or runtime_settings()
         provider = retrying_reasoning_provider(
             reasoning_provider_from_env(resolved_settings.provider_env),
@@ -68,10 +92,8 @@ def handle_request(
         )
         if route == "/incident/resume":
             result = _resume(payload, resolved_settings=resolved_settings, provider=provider)
-        elif route in {"/incident", "/incident/start", "/"}:
-            result = _start(payload, resolved_settings=resolved_settings, provider=provider)
         else:
-            return _error_response(404, f"Unsupported route: {route}", started, cold_start, route)
+            result = _start(payload, resolved_settings=resolved_settings, provider=provider)
         response = _success_response(result, started, cold_start)
         _log_turn(
             route=route,
@@ -86,6 +108,33 @@ def handle_request(
         return _error_response(400, str(exc), started, cold_start, route)
     except Exception as exc:
         return _error_response(500, "incident agent request failed", started, cold_start, route, exc)
+
+
+def function_auth_token(
+    *,
+    environ: Mapping[str, str] | None = None,
+    ssm_client: Any | None = None,
+    use_cache: bool = True,
+) -> str:
+    """Resolve the bearer token required for Lambda Function URL calls."""
+
+    global _AUTH_TOKEN_CACHE
+    env = os.environ if environ is None else environ
+    if use_cache and environ is None and ssm_client is None and _AUTH_TOKEN_CACHE is not None:
+        return _AUTH_TOKEN_CACHE
+
+    client = ssm_client
+    if client is None and env.get(FUNCTION_AUTH_TOKEN_PARAM_ENV):
+        client = boto3.client("ssm", region_name=env.get("AWS_REGION"))
+    token = _secret_value(
+        env=env,
+        client=client,
+        param_env=FUNCTION_AUTH_TOKEN_PARAM_ENV,
+        fallback_env=FUNCTION_AUTH_TOKEN_ENV,
+    )
+    if use_cache and environ is None and ssm_client is None:
+        _AUTH_TOKEN_CACHE = token
+    return token
 
 
 def runtime_settings(
@@ -144,24 +193,38 @@ def _start(
     resolved_settings: RuntimeSettings,
     provider: Any,
 ) -> IncidentAgentResult:
-    user_input = payload.get("user_input") or payload.get("input")
-    incident_id = payload.get("incident_id")
-    if not user_input:
-        raise ValueError("user_input is required")
-    if not incident_id:
-        raise ValueError("incident_id is required")
+    user_input = _required_limited_str(
+        payload,
+        "user_input",
+        max_chars=MAX_USER_INPUT_CHARS,
+        alternate_name="input",
+    )
+    incident_id = _required_limited_str(payload, "incident_id", max_chars=MAX_IDENTIFIER_CHARS)
+    metadata = _metadata(payload)
     return run_incident_agent(
         IncidentInput(
-            user_input=str(user_input),
-            incident_id=str(incident_id),
-            namespace=_optional_str(payload.get("namespace")),
-            service_slug=_optional_str(payload.get("service_slug")),
-            severity=_optional_str(payload.get("severity")),
-            title=_optional_str(payload.get("title")),
-            metadata=dict(payload.get("metadata") or {}),
+            user_input=user_input,
+            incident_id=incident_id,
+            namespace=_optional_limited_str(payload.get("namespace"), "namespace"),
+            service_slug=_optional_limited_str(
+                payload.get("service_slug"),
+                "service_slug",
+                max_chars=MAX_SERVICE_CHARS,
+            ),
+            severity=_optional_limited_str(
+                payload.get("severity"),
+                "severity",
+                max_chars=MAX_SERVICE_CHARS,
+            ),
+            title=_optional_limited_str(
+                payload.get("title"),
+                "title",
+                max_chars=MAX_TITLE_CHARS,
+            ),
+            metadata=metadata,
         ),
-        thread_id=_optional_str(payload.get("thread_id")),
-        pause_before_act=bool(payload.get("pause_before_act", False)),
+        thread_id=_optional_limited_str(payload.get("thread_id"), "thread_id"),
+        pause_before_act=_optional_bool(payload, "pause_before_act", default=False),
         db_url=resolved_settings.database_url,
         reasoning_provider=provider,
         embedding_provider=DeterministicEmbeddingProvider(),
@@ -175,11 +238,10 @@ def _resume(
     provider: Any,
 ) -> IncidentAgentResult:
     thread_id = payload.get("thread_id")
-    if not thread_id:
-        raise ValueError("thread_id is required")
+    thread_id = _required_limited_str(payload, "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     return resume_incident_agent(
-        thread_id=str(thread_id),
-        approved=bool(payload.get("approved", True)),
+        thread_id=thread_id,
+        approved=_optional_bool(payload, "approved", default=True),
         db_url=resolved_settings.database_url,
         reasoning_provider=provider,
         embedding_provider=DeterministicEmbeddingProvider(),
@@ -283,10 +345,44 @@ def _route(event: Mapping[str, Any]) -> str:
     return str(event.get("rawPath") or http.get("path") or "/")
 
 
+def _http_method(event: Mapping[str, Any]) -> str:
+    request_context = event.get("requestContext") or {}
+    http = request_context.get("http") or {}
+    return str(http.get("method") or event.get("httpMethod") or "").upper()
+
+
+def _authorization_bearer_token(event: Mapping[str, Any]) -> str | None:
+    headers = event.get("headers") or {}
+    authorization = None
+    for name, value in headers.items():
+        if str(name).lower() == "authorization":
+            authorization = str(value)
+            break
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
 def _json_body(event: Mapping[str, Any]) -> dict[str, Any]:
     body = event.get("body") or "{}"
+    if not isinstance(body, str):
+        raise ValueError("request body must be a string")
     if event.get("isBase64Encoded"):
-        body = base64.b64decode(body).decode("utf-8")
+        try:
+            body_bytes = base64.b64decode(body, validate=True)
+        except binascii.Error as exc:
+            raise ValueError("request body must be valid base64") from exc
+        if len(body_bytes) > MAX_BODY_BYTES:
+            raise ValueError(f"request body must be at most {MAX_BODY_BYTES} bytes")
+        try:
+            body = body_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("request body must be valid UTF-8") from exc
+    elif len(body.encode("utf-8")) > MAX_BODY_BYTES:
+        raise ValueError(f"request body must be at most {MAX_BODY_BYTES} bytes")
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -294,6 +390,78 @@ def _json_body(event: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("request body must be a JSON object")
     return parsed
+
+
+def _required_limited_str(
+    payload: Mapping[str, Any],
+    name: str,
+    *,
+    max_chars: int,
+    alternate_name: str | None = None,
+) -> str:
+    value = payload.get(name)
+    if value is None and alternate_name:
+        value = payload.get(alternate_name)
+    text = _optional_limited_str(value, name, max_chars=max_chars)
+    if text is None:
+        raise ValueError(f"{name} is required")
+    return text
+
+
+def _optional_limited_str(
+    value: Any,
+    name: str,
+    *,
+    max_chars: int = MAX_IDENTIFIER_CHARS,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        raise ValueError(f"{name} must be at most {max_chars} characters")
+    return text
+
+
+def _optional_bool(payload: Mapping[str, Any], name: str, *, default: bool) -> bool:
+    value = payload.get(name, default)
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be a JSON boolean")
+
+
+def _metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+    value = payload.get("metadata") or {}
+    if not isinstance(value, dict):
+        raise ValueError("metadata must be a JSON object")
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > MAX_METADATA_BYTES:
+        raise ValueError(f"metadata must be at most {MAX_METADATA_BYTES} bytes")
+    return dict(value)
+
+
+def _validate_payload(route: str, payload: Mapping[str, Any]) -> None:
+    if route == "/incident/resume":
+        _required_limited_str(payload, "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
+        _optional_bool(payload, "approved", default=True)
+        return
+    _required_limited_str(
+        payload,
+        "user_input",
+        max_chars=MAX_USER_INPUT_CHARS,
+        alternate_name="input",
+    )
+    _required_limited_str(payload, "incident_id", max_chars=MAX_IDENTIFIER_CHARS)
+    _optional_limited_str(payload.get("namespace"), "namespace")
+    _optional_limited_str(payload.get("thread_id"), "thread_id")
+    _optional_limited_str(payload.get("service_slug"), "service_slug", max_chars=MAX_SERVICE_CHARS)
+    _optional_limited_str(payload.get("severity"), "severity", max_chars=MAX_SERVICE_CHARS)
+    _optional_limited_str(payload.get("title"), "title", max_chars=MAX_TITLE_CHARS)
+    _optional_bool(payload, "pause_before_act", default=False)
+    _metadata(payload)
 
 
 def _secret_value(

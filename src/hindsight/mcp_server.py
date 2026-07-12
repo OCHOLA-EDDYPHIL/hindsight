@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -15,6 +16,11 @@ from hindsight.db import connect, database_url
 from hindsight.memory import MemoryKind, MemoryStore
 
 MCP_READER = "mcp.memory_inspector"
+MCP_ACTOR_ENV = "HINDSIGHT_MCP_ACTOR"
+CURRENT_BELIEFS_PURPOSE = "Inspect current Hindsight memory through MCP"
+BELIEFS_AS_OF_PURPOSE = "Inspect Hindsight belief state at a timestamp through MCP"
+PROVENANCE_CHAIN_PURPOSE = "Inspect Hindsight memory provenance through MCP"
+MCP_AUDIT_LOG_PURPOSE = "Inspect recent Hindsight MCP audit events"
 MAX_LIMIT = 100
 
 
@@ -31,11 +37,9 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
 
     @server.tool()
     def current_beliefs(
-        namespace: str | None = None,
+        namespace: str,
         memory_kind: Literal["semantic", "episodic"] = "semantic",
         limit: int = 10,
-        actor: str = MCP_READER,
-        purpose: str = "Inspect current Hindsight memory through MCP",
     ) -> dict[str, Any]:
         """Return current, non-invalidated memories and audit the MCP read."""
 
@@ -43,8 +47,8 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
             namespace=namespace,
             memory_kind=memory_kind,
             limit=limit,
-            actor=actor,
-            purpose=purpose,
+            actor=_mcp_actor(),
+            purpose=CURRENT_BELIEFS_PURPOSE,
             db_url=db_url,
         )
 
@@ -54,8 +58,6 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
         as_of: str,
         query: str | None = None,
         limit: int = 10,
-        actor: str = MCP_READER,
-        purpose: str = "Inspect Hindsight belief state at a timestamp through MCP",
     ) -> dict[str, Any]:
         """Return semantic memories visible at an ISO-8601 timestamp."""
 
@@ -64,8 +66,8 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
             as_of=as_of,
             query=query,
             limit=limit,
-            actor=actor,
-            purpose=purpose,
+            actor=_mcp_actor(),
+            purpose=BELIEFS_AS_OF_PURPOSE,
             db_url=db_url,
         )
 
@@ -73,31 +75,27 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
     def provenance_chain(
         memory_id: str,
         memory_kind: Literal["semantic", "episodic"] = "semantic",
-        actor: str = MCP_READER,
-        purpose: str = "Inspect Hindsight memory provenance through MCP",
     ) -> dict[str, Any]:
         """Return a memory row, origin metadata, and decisions that read it."""
 
         return inspect_provenance_chain(
             memory_id=memory_id,
             memory_kind=memory_kind,
-            actor=actor,
-            purpose=purpose,
+            actor=_mcp_actor(),
+            purpose=PROVENANCE_CHAIN_PURPOSE,
             db_url=db_url,
         )
 
     @server.tool()
     def mcp_audit_log(
         limit: int = 20,
-        actor: str = MCP_READER,
-        purpose: str = "Inspect recent Hindsight MCP audit events",
     ) -> dict[str, Any]:
         """Return recent MCP audit events, including this audit-log read."""
 
         return inspect_mcp_audit_log(
             limit=limit,
-            actor=actor,
-            purpose=purpose,
+            actor=_mcp_actor(),
+            purpose=MCP_AUDIT_LOG_PURPOSE,
             db_url=db_url,
         )
 
@@ -116,6 +114,8 @@ def inspect_current_beliefs(
     """Return current memories and record both memory-read and MCP audit rows."""
 
     limit = _validated_limit(limit)
+    if not namespace or not namespace.strip():
+        raise ValueError("namespace is required")
     decision_id = _decision_id("current-beliefs")
     with connect(db_url) as conn:
         store = MemoryStore(conn=conn)
@@ -278,15 +278,19 @@ def inspect_mcp_audit_log(
 
     limit = _validated_limit(limit)
     with connect(db_url) as conn:
-        rows = _mcp_audit_events(conn, limit=limit)
         audit_event = _record_mcp_audit_event(
             conn,
             tool_name="mcp_audit_log",
             actor=actor,
             purpose=purpose,
             arguments={"limit": limit},
-            result_count=len(rows),
+            result_count=0,
         )
+        rows = _mcp_audit_events(conn, limit=limit)
+        _update_mcp_audit_result_count(conn, audit_event_id=str(audit_event["id"]), count=len(rows))
+        for row in rows:
+            if str(row["id"]) == str(audit_event["id"]):
+                row["result_count"] = len(rows)
         conn.commit()
     return {
         "tool": "mcp_audit_log",
@@ -326,6 +330,17 @@ def _record_mcp_audit_event(
     if row is None:
         raise RuntimeError("Expected MCP audit event row")
     return dict(row)
+
+
+def _update_mcp_audit_result_count(conn: Any, *, audit_event_id: str, count: int) -> None:
+    conn.execute(
+        """
+            UPDATE mcp_audit_events
+            SET result_count = %s
+            WHERE id = %s
+        """,
+        (count, audit_event_id),
+    )
 
 
 def _memory_reads(conn: Any, *, memory_kind: MemoryKind, memory_id: str) -> list[dict[str, Any]]:
@@ -369,6 +384,10 @@ def _validated_limit(value: int) -> int:
     if value > MAX_LIMIT:
         raise ValueError(f"limit must be at most {MAX_LIMIT}")
     return value
+
+
+def _mcp_actor() -> str:
+    return os.environ.get(MCP_ACTOR_ENV, "mcp.local_client")
 
 
 def _decision_id(prefix: str) -> str:

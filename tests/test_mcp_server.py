@@ -16,6 +16,9 @@ def test_create_mcp_server_registers_tools():
     server = create_mcp_server()
 
     assert server.name == "hindsight-memory"
+    for tool in server._tool_manager._tools.values():
+        assert "actor" not in tool.parameters.get("properties", {})
+        assert "purpose" not in tool.parameters.get("properties", {})
 
 
 @requires_db
@@ -76,6 +79,8 @@ def test_mcp_current_beliefs_rejects_blank_semantic_namespace():
 
     with pytest.raises(ValueError, match="namespace is required"):
         inspect_current_beliefs(namespace="", db_url=database_url())
+    with pytest.raises(ValueError, match="namespace is required"):
+        inspect_current_beliefs(namespace=None, db_url=database_url())
 
 
 def test_mcp_beliefs_as_of_passes_requested_url_to_memory_store(monkeypatch):
@@ -158,3 +163,4 @@ def test_mcp_provenance_chain_and_audit_log_are_visible():
 
     assert audit["count"] >= 1
     assert any(event["tool_name"] == "provenance_chain" for event in audit["events"])
+    assert any(event["id"] == audit["audit_event_id"] for event in audit["events"])

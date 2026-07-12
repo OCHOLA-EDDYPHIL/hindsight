@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, NotRequired, TypedDict
 from uuid import uuid4
@@ -17,6 +18,7 @@ from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 
 AGENT_CHAT_TABLE = "agent_chat_messages"
+_SETUP_DB_URLS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ def run_incident_agent(
 ) -> IncidentAgentResult:
     """Start or continue an incident thread with a new user incident turn."""
 
+    _ensure_sync_entrypoint()
     resolved_thread_id = thread_id or incident.incident_id or f"incident-{uuid4()}"
     namespace = incident.namespace or incident.incident_id
     initial_state: IncidentAgentState = {
@@ -112,6 +115,7 @@ def resume_incident_agent(
 ) -> IncidentAgentResult:
     """Resume an interrupted incident thread in a fresh graph context."""
 
+    _ensure_sync_entrypoint()
     state = _invoke_graph(
         Command(resume=approved),
         thread_id=thread_id,
@@ -139,7 +143,6 @@ def build_incident_graph(
             db_url=resolved_db_url,
         )
         try:
-            history.create_table_if_not_exists()
             previous_messages = history.messages
             history.add_message(HumanMessage(content=state["user_input"]))
             current_messages = history.messages
@@ -161,37 +164,11 @@ def build_incident_graph(
         }
 
     def recall(state: IncidentAgentState) -> dict[str, Any]:
-        memories: list[dict[str, Any]] = []
-        recall_error = None
-        with MemoryStore(
-            url=resolved_db_url,
+        return _recall_for_state(
+            state,
+            db_url=resolved_db_url,
             embedding_provider=resolved_embedding_provider,
-        ) as store:
-            try:
-                service_slug = state.get("service_slug")
-                if service_slug:
-                    memories = store.recall_similar_incidents(
-                        namespace=state["namespace"],
-                        query=state["user_input"],
-                        service_slug=service_slug,
-                        decision_id=state["decision_id"],
-                        reader="agent.recall",
-                        purpose="retrieve similar incident context",
-                    )
-            except Exception as exc:
-                recall_error = str(exc)
-            if not memories:
-                memories = store.recall(
-                    namespace=state["namespace"],
-                    query=state["user_input"],
-                    decision_id=state["decision_id"],
-                    reader="agent.recall",
-                    purpose="retrieve semantic incident context",
-                )
-        update: dict[str, Any] = {"recalled_memories": _jsonable_rows(memories)}
-        if recall_error:
-            update["recall_error"] = recall_error
-        return update
+        )
 
     def plan(state: IncidentAgentState) -> dict[str, Any]:
         provider = reasoning_provider or reasoning_provider_from_env()
@@ -265,7 +242,6 @@ def build_incident_graph(
             db_url=resolved_db_url,
         )
         try:
-            history.create_table_if_not_exists()
             history.add_message(AIMessage(content=content))
         finally:
             history.close()
@@ -290,6 +266,60 @@ def setup_agent_storage(*, db_url: str | None = None) -> None:
     """Create checkpoint and chat-history tables used by the agent runtime."""
 
     resolved_db_url = db_url or database_url()
+    _setup_agent_storage_once(resolved_db_url)
+
+
+def _recall_for_state(
+    state: IncidentAgentState,
+    *,
+    db_url: str,
+    embedding_provider: EmbeddingProvider,
+) -> dict[str, Any]:
+    memories: list[dict[str, Any]] = []
+    recall_error = None
+    with MemoryStore(
+        url=db_url,
+        embedding_provider=embedding_provider,
+    ) as store:
+        try:
+            service_slug = state.get("service_slug")
+            if service_slug:
+                memories = store.recall_similar_incidents(
+                    namespace=state["namespace"],
+                    query=state["user_input"],
+                    service_slug=service_slug,
+                    decision_id=state["decision_id"],
+                    reader="agent.recall",
+                    purpose="retrieve similar incident context",
+                )
+        except Exception as exc:
+            recall_error = str(exc)
+    if not memories:
+        try:
+            fallback_embedding_provider = None if recall_error else embedding_provider
+            with MemoryStore(
+                url=db_url,
+                embedding_provider=fallback_embedding_provider,
+            ) as fallback_store:
+                memories = fallback_store.recall(
+                    namespace=state["namespace"],
+                    query=state["user_input"],
+                    decision_id=state["decision_id"],
+                    reader="agent.recall",
+                    purpose="retrieve semantic incident context",
+                )
+        except Exception as exc:
+            recall_error = _append_error(recall_error, str(exc))
+            memories = []
+    update: dict[str, Any] = {"recalled_memories": _jsonable_rows(memories)}
+    if recall_error:
+        update["recall_error"] = recall_error
+    return update
+
+
+def _setup_agent_storage_once(resolved_db_url: str) -> None:
+    if resolved_db_url in _SETUP_DB_URLS:
+        return
     with CockroachDBSaver.from_conn_string(resolved_db_url) as checkpointer:
         checkpointer.setup()
     history = _chat_history(thread_id="setup", db_url=resolved_db_url)
@@ -297,6 +327,7 @@ def setup_agent_storage(*, db_url: str | None = None) -> None:
         history.create_table_if_not_exists()
     finally:
         history.close()
+    _SETUP_DB_URLS.add(resolved_db_url)
 
 
 def _invoke_graph(
@@ -308,8 +339,8 @@ def _invoke_graph(
     embedding_provider: EmbeddingProvider | None,
 ) -> dict[str, Any]:
     resolved_db_url = db_url or database_url()
+    _setup_agent_storage_once(resolved_db_url)
     with CockroachDBSaver.from_conn_string(resolved_db_url) as checkpointer:
-        checkpointer.setup()
         graph = build_incident_graph(
             db_url=resolved_db_url,
             reasoning_provider=reasoning_provider,
@@ -319,6 +350,23 @@ def _invoke_graph(
             input_or_command,
             {"configurable": {"thread_id": thread_id}},
         )
+
+
+def _ensure_sync_entrypoint() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError(
+        "run_incident_agent and resume_incident_agent are synchronous helpers; "
+        "call them outside an active event loop"
+    )
+
+
+def _append_error(existing: str | None, new_error: str) -> str:
+    if existing:
+        return f"{existing}; {new_error}"
+    return new_error
 
 
 def _chat_history(*, thread_id: str, db_url: str) -> CockroachDBChatMessageHistory:

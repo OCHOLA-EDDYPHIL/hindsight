@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -18,6 +19,22 @@ from hindsight.db import connect, database_url
 from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import DeterministicReasoningProvider, ReasoningProvider
+
+MAX_LOG_EXCERPTS = 5
+MAX_LOG_EXCERPT_BYTES = 2 * 1024
+MAX_LOG_STRING_CHARS = 512
+MAX_MEMORY_CONTENT_CHARS = 12_000
+SENSITIVE_LOG_KEYS = {
+    "authorization",
+    "cookie",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "databaseurl",
+    "dburl",
+}
 
 
 @dataclass(frozen=True)
@@ -181,6 +198,7 @@ class TelemetryIngestor:
         """Open an incident and store telemetry excerpts as semantic memory."""
 
         namespace = f"telemetry:{signal.signal_id}"
+        log_excerpts = _sanitize_log_excerpts(signal.log_excerpts)
         with connect(self._db_url) as conn:
             with conn.transaction():
                 service = _upsert_service(conn, signal)
@@ -198,11 +216,16 @@ class TelemetryIngestor:
                         f"{signal.service_slug} breached {signal.metric_name}.",
                     ),
                 )
-                incident_event = _insert_incident_event(conn, signal, incident_id=incident["id"])
+                incident_event = _insert_incident_event(
+                    conn,
+                    signal,
+                    incident_id=incident["id"],
+                    log_excerpts=log_excerpts,
+                )
                 memory = MemoryStore(conn=conn, embedding_provider=DeterministicEmbeddingProvider()).remember(
                     memory_kind="semantic",
                     namespace=namespace,
-                    content=_memory_content(signal),
+                    content=_memory_content(signal, log_excerpts=log_excerpts),
                     provenance=Provenance(
                         writer="telemetry.ingest",
                         source_ref=f"telemetry:{signal.signal_id}",
@@ -330,6 +353,7 @@ def _insert_incident_event(
     signal: DemoTelemetrySignal,
     *,
     incident_id: Any,
+    log_excerpts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -352,7 +376,7 @@ def _insert_incident_event(
                         "metric_value": signal.metric_value,
                         "threshold": signal.threshold,
                         "labels": signal.labels,
-                        "log_excerpts": signal.log_excerpts,
+                        "log_excerpts": log_excerpts,
                     }
                 ),
             ),
@@ -363,12 +387,12 @@ def _insert_incident_event(
     return dict(row)
 
 
-def _memory_content(signal: DemoTelemetrySignal) -> str:
+def _memory_content(signal: DemoTelemetrySignal, *, log_excerpts: list[dict[str, Any]]) -> str:
     log_lines = [
         json.dumps(excerpt, sort_keys=True, separators=(",", ":"))
-        for excerpt in signal.log_excerpts
+        for excerpt in log_excerpts
     ]
-    return "\n".join(
+    content = "\n".join(
         [
             f"Telemetry alert {signal.alert_name} for {signal.service_slug}: {signal.summary}",
             f"Metric {signal.metric_name}={signal.metric_value} breached threshold {signal.threshold}.",
@@ -377,9 +401,54 @@ def _memory_content(signal: DemoTelemetrySignal) -> str:
             *log_lines,
         ]
     )
+    if len(content) > MAX_MEMORY_CONTENT_CHARS:
+        return content[:MAX_MEMORY_CONTENT_CHARS] + "...[truncated]"
+    return content
 
 
 def _incident_slug(signal: DemoTelemetrySignal) -> str:
     alert = re.sub(r"[^a-z0-9]+", "-", signal.alert_name.lower()).strip("-")
-    suffix = signal.signal_id.replace("signal-", "")[:8]
+    suffix = hashlib.sha256(signal.signal_id.encode("utf-8")).hexdigest()[:12]
     return f"telemetry-{signal.service_slug}-{alert}-{suffix}"
+
+
+def _sanitize_log_excerpts(log_excerpts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        _bound_log_excerpt(_redact_log_value(excerpt))
+        for excerpt in log_excerpts[:MAX_LOG_EXCERPTS]
+    ]
+
+
+def _redact_log_value(value: Any, *, key: str | None = None) -> Any:
+    if key is not None and _sensitive_key(key):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_log_value(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_log_value(item) for item in value[:MAX_LOG_EXCERPTS]]
+    if isinstance(value, str) and len(value) > MAX_LOG_STRING_CHARS:
+        return value[:MAX_LOG_STRING_CHARS] + "...[truncated]"
+    return value
+
+
+def _bound_log_excerpt(value: Any) -> dict[str, Any]:
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    if len(serialized.encode("utf-8")) <= MAX_LOG_EXCERPT_BYTES and isinstance(value, dict):
+        return value
+    return {
+        "truncated": True,
+        "content": serialized[:MAX_LOG_EXCERPT_BYTES] + "...[truncated]",
+    }
+
+
+def _sensitive_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return (
+        normalized in SENSITIVE_LOG_KEYS
+        or normalized.endswith("token")
+        or "password" in normalized
+        or "secret" in normalized
+    )
