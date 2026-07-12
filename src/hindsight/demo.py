@@ -13,6 +13,7 @@ from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.mcp_server import inspect_decision_trace
 from hindsight.memory import MemoryStore, Provenance, RewindResult
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
+from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 DEMO_NAMESPACE = "demo:payments-poison-rewind"
 DEMO_INCIDENT_ID = "demo-payments-checkout-latency"
@@ -107,62 +108,77 @@ def run_poison_rewind_demo(
         namespace = f"{DEMO_NAMESPACE}:{uuid4().hex[:8]}"
     provider = reasoning_provider or MemoryBiasedDemoReasoningProvider()
     embedding_provider = DeterministicEmbeddingProvider()
-    if not keep_existing:
-        reset_poison_rewind_demo(namespace=namespace, db_url=resolved_db_url)
+    with start_span(
+        "hindsight.demo.poison_rewind",
+        {
+            "hindsight.demo.flow": "poison_rewind",
+            "hindsight.memory.namespace": namespace,
+        },
+    ) as span:
+        if not keep_existing:
+            reset_poison_rewind_demo(namespace=namespace, db_url=resolved_db_url)
 
-    with MemoryStore(url=resolved_db_url, embedding_provider=embedding_provider) as store:
-        store.remember(
-            memory_kind="semantic",
+        with MemoryStore(url=resolved_db_url, embedding_provider=embedding_provider) as store:
+            store.remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content=GOOD_MEMORY_CONTENT,
+                provenance=Provenance(
+                    writer="demo.seed",
+                    source_ref="demo:known-good-payment-incident",
+                    justification="Seed known-good payment latency resolution before poisoning",
+                ),
+                metadata={"demo": "poison-rewind", "role": "known-good"},
+            )
+
+        clean_run = run_demo_agent_turn(
+            label="clean",
             namespace=namespace,
-            content=GOOD_MEMORY_CONTENT,
-            provenance=Provenance(
-                writer="demo.seed",
-                source_ref="demo:known-good-payment-incident",
-                justification="Seed known-good payment latency resolution before poisoning",
-            ),
-            metadata={"demo": "poison-rewind", "role": "known-good"},
+            db_url=resolved_db_url,
+            reasoning_provider=provider,
         )
 
-    clean_run = run_demo_agent_turn(
-        label="clean",
-        namespace=namespace,
-        db_url=resolved_db_url,
-        reasoning_provider=provider,
-    )
+        with connect(resolved_db_url) as conn:
+            rewind_target = conn.execute("SELECT now()").fetchone()[0]
+            conn.commit()
+        sleep(0.05)
 
-    with connect(resolved_db_url) as conn:
-        rewind_target = conn.execute("SELECT now()").fetchone()[0]
-        conn.commit()
-    sleep(0.05)
-
-    poison_memory = poison_demo_memory(namespace=namespace, db_url=resolved_db_url)
-    bad_run = run_demo_agent_turn(
-        label="poisoned",
-        namespace=namespace,
-        db_url=resolved_db_url,
-        reasoning_provider=provider,
-    )
-    diagnosis = inspect_decision_trace(
-        decision_id=bad_run.decision_id,
-        actor="demo.operator",
-        purpose="Diagnose poisoned recommendation before rewind",
-        db_url=resolved_db_url,
-    )
-
-    with MemoryStore(url=resolved_db_url, embedding_provider=embedding_provider) as store:
-        rewind = store.rewind(
-            timestamp=rewind_target,
+        poison_memory = poison_demo_memory(namespace=namespace, db_url=resolved_db_url)
+        bad_run = run_demo_agent_turn(
+            label="poisoned",
             namespace=namespace,
+            db_url=resolved_db_url,
+            reasoning_provider=provider,
+        )
+        diagnosis = inspect_decision_trace(
+            decision_id=bad_run.decision_id,
             actor="demo.operator",
-            reason=REWIND_REASON,
+            purpose="Diagnose poisoned recommendation before rewind",
+            db_url=resolved_db_url,
         )
 
-    corrected_run = run_demo_agent_turn(
-        label="corrected",
-        namespace=namespace,
-        db_url=resolved_db_url,
-        reasoning_provider=provider,
-    )
+        with MemoryStore(url=resolved_db_url, embedding_provider=embedding_provider) as store:
+            rewind = store.rewind(
+                timestamp=rewind_target,
+                namespace=namespace,
+                actor="demo.operator",
+                reason=REWIND_REASON,
+            )
+
+        corrected_run = run_demo_agent_turn(
+            label="corrected",
+            namespace=namespace,
+            db_url=resolved_db_url,
+            reasoning_provider=provider,
+        )
+        set_span_attributes(
+            span,
+            {
+                "hindsight.demo.poisoned_memory_id": str(poison_memory["id"]),
+                "hindsight.memory.invalidated.ids": memory_ids(rewind.invalidated_memories),
+                "hindsight.memory.restored.ids": memory_ids(rewind.restored_memories),
+            },
+        )
 
     return PoisonRewindDemoResult(
         namespace=namespace,
@@ -206,25 +222,34 @@ def poison_demo_memory(
 ) -> dict[str, Any]:
     """Insert the plausible-but-wrong memory used by the signature demo."""
 
-    with MemoryStore(
-        url=db_url or database_url(),
-        embedding_provider=DeterministicEmbeddingProvider(),
-    ) as store:
-        return store.remember(
-            memory_kind="semantic",
-            namespace=namespace,
-            content=POISONED_MEMORY_CONTENT,
-            provenance=Provenance(
-                writer="demo.poison",
-                source_ref="demo:simulated-memory-poisoning",
-                justification="Scripted M4 memory poisoning for rewind demonstration",
-            ),
-            metadata={
-                "demo": "poison-rewind",
-                "role": "poison",
-                "attack_class": "memory_poisoning",
-            },
-        )
+    with start_span(
+        "hindsight.demo.poison_memory",
+        {
+            "hindsight.demo.flow": "poison_rewind",
+            "hindsight.memory.namespace": namespace,
+        },
+    ) as span:
+        with MemoryStore(
+            url=db_url or database_url(),
+            embedding_provider=DeterministicEmbeddingProvider(),
+        ) as store:
+            memory = store.remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content=POISONED_MEMORY_CONTENT,
+                provenance=Provenance(
+                    writer="demo.poison",
+                    source_ref="demo:simulated-memory-poisoning",
+                    justification="Scripted M4 memory poisoning for rewind demonstration",
+                ),
+                metadata={
+                    "demo": "poison-rewind",
+                    "role": "poison",
+                    "attack_class": "memory_poisoning",
+                },
+            )
+        set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
+        return memory
 
 
 def run_demo_agent_turn(
@@ -239,54 +264,72 @@ def run_demo_agent_turn(
     thread_id = f"{namespace}:{label}"
     decision_id = f"agent:{thread_id}:plan"
     provider = reasoning_provider or MemoryBiasedDemoReasoningProvider()
-    with MemoryStore(
-        url=db_url or database_url(),
-        embedding_provider=DeterministicEmbeddingProvider(),
-    ) as store:
-        recalled = store.recall(
-            namespace=namespace,
-            query=DEMO_INPUT,
-            limit=5,
-            decision_id=decision_id,
-            reader="agent.recall",
-            purpose="retrieve semantic incident context",
-        )
-        plan = provider.generate(
-            ReasoningRequest(
-                system=(
-                    "You are Hindsight, an incident-response copilot. "
-                    "Use recalled memories as context, but propose only reversible, "
-                    "operator-reviewable remediation steps."
-                ),
-                prompt=_demo_plan_prompt(recalled),
-                max_output_tokens=512,
+    with start_span(
+        "hindsight.demo.agent_turn",
+        {
+            "hindsight.demo.flow": "poison_rewind",
+            "hindsight.demo.label": label,
+            "hindsight.agent.thread_id": thread_id,
+            "hindsight.memory.namespace": namespace,
+            "hindsight.memory.decision_id": decision_id,
+        },
+    ) as span:
+        with MemoryStore(
+            url=db_url or database_url(),
+            embedding_provider=DeterministicEmbeddingProvider(),
+        ) as store:
+            recalled = store.recall(
+                namespace=namespace,
+                query=DEMO_INPUT,
+                limit=5,
+                decision_id=decision_id,
+                reader="agent.recall",
+                purpose="retrieve semantic incident context",
             )
-        ).text
-        proposed_action = (
-            f"Review and execute the safest reversible step for {DEMO_SERVICE_SLUG}: {plan}"
-        )
-        reflected = store.remember(
-            memory_kind="semantic",
-            namespace=namespace,
-            content=(
-                f"Incident {DEMO_INCIDENT_ID}-{label} plan: {plan} "
-                f"Proposed action (approved): {proposed_action}"
-            ),
-            provenance=Provenance(
-                writer="agent.reflect",
-                source_ref=decision_id,
-                justification="Capture incident plan and proposed remediation for future recall",
-            ),
-            metadata={
-                "thread_id": thread_id,
-                "incident_id": f"{DEMO_INCIDENT_ID}-{label}",
-                "service_slug": DEMO_SERVICE_SLUG,
-                "recalled_memory_ids": [
-                    str(row.get("memory_id") or row.get("id"))
-                    for row in recalled
-                    if row.get("memory_id") or row.get("id")
-                ],
-                "action_approved": True,
+            plan = provider.generate(
+                ReasoningRequest(
+                    system=(
+                        "You are Hindsight, an incident-response copilot. "
+                        "Use recalled memories as context, but propose only reversible, "
+                        "operator-reviewable remediation steps."
+                    ),
+                    prompt=_demo_plan_prompt(recalled),
+                    max_output_tokens=512,
+                )
+            ).text
+            proposed_action = (
+                f"Review and execute the safest reversible step for {DEMO_SERVICE_SLUG}: {plan}"
+            )
+            reflected = store.remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content=(
+                    f"Incident {DEMO_INCIDENT_ID}-{label} plan: {plan} "
+                    f"Proposed action (approved): {proposed_action}"
+                ),
+                provenance=Provenance(
+                    writer="agent.reflect",
+                    source_ref=decision_id,
+                    justification="Capture incident plan and proposed remediation for future recall",
+                ),
+                metadata={
+                    "thread_id": thread_id,
+                    "incident_id": f"{DEMO_INCIDENT_ID}-{label}",
+                    "service_slug": DEMO_SERVICE_SLUG,
+                    "recalled_memory_ids": [
+                        str(row.get("memory_id") or row.get("id"))
+                        for row in recalled
+                        if row.get("memory_id") or row.get("id")
+                    ],
+                    "action_approved": True,
+                },
+            )
+        set_span_attributes(
+            span,
+            {
+                "hindsight.memory.ids": memory_ids(recalled),
+                "hindsight.memory.count": len(recalled),
+                "hindsight.memory.id": str(reflected["id"]),
             },
         )
     return AgentRunSummary(

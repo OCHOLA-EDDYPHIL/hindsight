@@ -11,6 +11,9 @@ dependencies = [
     "langchain-cockroachdb>=0.2.1",
     "langgraph>=1.2.9",
     "mcp>=1.28,<2",
+    "opentelemetry-api>=1.43.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+    "opentelemetry-sdk>=1.43.0",
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
 ]

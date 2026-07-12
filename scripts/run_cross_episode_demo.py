@@ -11,10 +11,13 @@ from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from hindsight.cross_episode import CROSS_EPISODE_NAMESPACE, run_cross_episode_demo  # noqa: E402
+from hindsight.tracing import configure_tracing_from_env  # noqa: E402
 
 
 def main() -> None:
     import argparse
+
+    configure_tracing_from_env(service_name="hindsight-demo")
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--namespace", default=CROSS_EPISODE_NAMESPACE)

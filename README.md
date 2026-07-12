@@ -89,6 +89,25 @@ The page receives memory and rewind events through a CockroachDB changefeed-back
 
 For final demo checks against CockroachDB Cloud, point `DATABASE_URL` or `--db-url` at the Cloud cluster explicitly. Local CockroachDB is the default rehearsal target.
 
+## OpenTelemetry memory traces
+
+The memory layer emits safe OpenTelemetry spans for reads, writes, invalidations, rewinds, and agent recall/reasoning/reflection boundaries. Spans include namespaces, memory IDs, counts, decision IDs, and writer names, but do not record raw memory content, prompts, recall queries, DB URLs, secrets, or operator-entered reasons.
+
+Run a local Jaeger collector and a traced demo:
+
+```bash
+make dev-up
+make migrate-local
+make otel-up
+make poison-rewind-trace-local
+```
+
+Open Jaeger at `http://localhost:16686` and search for the `hindsight-demo` service. The poison/rewind trace shows the clean recall, poison write, poisoned recall, rewind invalidation, and corrected recall. The cross-episode trace target similarly shows the consolidation write and episode-two lesson recall:
+
+```bash
+make cross-episode-trace-local
+```
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).

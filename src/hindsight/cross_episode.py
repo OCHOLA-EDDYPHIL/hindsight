@@ -21,6 +21,7 @@ from hindsight.db import connect, database_url
 from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
+from hindsight.tracing import set_span_attributes, start_span
 
 CROSS_EPISODE_NAMESPACE = "demo:cross-episode-payments"
 SERVICE_SLUG = "payments-api"
@@ -123,49 +124,68 @@ def run_cross_episode_demo(
     if namespace == CROSS_EPISODE_NAMESPACE and not keep_existing:
         namespace = f"{CROSS_EPISODE_NAMESPACE}:{uuid4().hex[:8]}"
     provider = reasoning_provider or CrossEpisodeDemoReasoningProvider()
-    if not keep_existing:
-        reset_cross_episode_demo(namespace=namespace, db_url=resolved_db_url)
+    with start_span(
+        "hindsight.demo.cross_episode",
+        {
+            "hindsight.demo.flow": "cross_episode",
+            "hindsight.memory.namespace": namespace,
+        },
+    ) as span:
+        if not keep_existing:
+            reset_cross_episode_demo(namespace=namespace, db_url=resolved_db_url)
 
-    first_incident = open_demo_incident(
-        label="episode-one",
-        namespace=namespace,
-        summary=FIRST_INCIDENT_SUMMARY,
-        db_url=resolved_db_url,
-    )
-    episode_one = _run_episode(
-        label="episode-one",
-        incident=first_incident,
-        namespace=namespace,
-        summary=FIRST_INCIDENT_SUMMARY,
-        db_url=resolved_db_url,
-        reasoning_provider=provider,
-    )
-    resolved_incident = resolve_demo_incident(
-        incident_id=str(first_incident["id"]),
-        reflected_memory_id=episode_one.reflected_memory_id,
-        db_url=resolved_db_url,
-    )
-    consolidation_results = handle_incident_changefeed_event(
-        incident_closed_changefeed_event(resolved_incident),
-        db_url=resolved_db_url,
-    )
-    if not consolidation_results:
-        raise RuntimeError("resolved incident did not produce a consolidation result")
+        first_incident = open_demo_incident(
+            label="episode-one",
+            namespace=namespace,
+            summary=FIRST_INCIDENT_SUMMARY,
+            db_url=resolved_db_url,
+        )
+        episode_one = _run_episode(
+            label="episode-one",
+            incident=first_incident,
+            namespace=namespace,
+            summary=FIRST_INCIDENT_SUMMARY,
+            db_url=resolved_db_url,
+            reasoning_provider=provider,
+        )
+        resolved_incident = resolve_demo_incident(
+            incident_id=str(first_incident["id"]),
+            reflected_memory_id=episode_one.reflected_memory_id,
+            db_url=resolved_db_url,
+        )
+        consolidation_results = handle_incident_changefeed_event(
+            incident_closed_changefeed_event(resolved_incident),
+            db_url=resolved_db_url,
+        )
+        if not consolidation_results:
+            raise RuntimeError("resolved incident did not produce a consolidation result")
 
-    second_incident = open_demo_incident(
-        label="episode-two",
-        namespace=namespace,
-        summary=SECOND_INCIDENT_SUMMARY,
-        db_url=resolved_db_url,
-    )
-    episode_two = _run_episode(
-        label="episode-two",
-        incident=second_incident,
-        namespace=namespace,
-        summary=SECOND_INCIDENT_SUMMARY,
-        db_url=resolved_db_url,
-        reasoning_provider=provider,
-    )
+        second_incident = open_demo_incident(
+            label="episode-two",
+            namespace=namespace,
+            summary=SECOND_INCIDENT_SUMMARY,
+            db_url=resolved_db_url,
+        )
+        episode_two = _run_episode(
+            label="episode-two",
+            incident=second_incident,
+            namespace=namespace,
+            summary=SECOND_INCIDENT_SUMMARY,
+            db_url=resolved_db_url,
+            reasoning_provider=provider,
+        )
+        set_span_attributes(
+            span,
+            {
+                "hindsight.demo.episode_one_steps": episode_one.steps_to_resolution,
+                "hindsight.demo.episode_two_steps": episode_two.steps_to_resolution,
+                "hindsight.demo.steps_saved": episode_one.steps_to_resolution
+                - episode_two.steps_to_resolution,
+                "hindsight.memory.id": str(consolidation_results[0].memory["id"])
+                if consolidation_results[0].memory
+                else None,
+            },
+        )
 
     return CrossEpisodeDemoResult(
         namespace=namespace,
@@ -347,29 +367,48 @@ def _run_episode(
     db_url: str,
     reasoning_provider: ReasoningProvider,
 ) -> CrossEpisodeRunSummary:
-    started = perf_counter()
-    result = run_incident_agent(
-        IncidentInput(
-            user_input=summary,
-            incident_id=incident["slug"],
-            namespace=namespace,
-            service_slug=SERVICE_SLUG,
-            severity=incident["severity"],
-            title=incident["title"],
-            metadata={"demo": "cross-episode-learning", "episode": label},
-        ),
-        thread_id=f"{namespace}:{label}",
-        db_url=db_url,
-        reasoning_provider=reasoning_provider,
-        embedding_provider=DeterministicEmbeddingProvider(),
-    )
-    elapsed_ms = int((perf_counter() - started) * 1000)
-    return _episode_summary(
-        label=label,
-        incident=incident,
-        result=result,
-        elapsed_ms=elapsed_ms,
-    )
+    with start_span(
+        "hindsight.demo.cross_episode.turn",
+        {
+            "hindsight.demo.flow": "cross_episode",
+            "hindsight.demo.label": label,
+            "hindsight.agent.thread_id": f"{namespace}:{label}",
+            "hindsight.memory.namespace": namespace,
+        },
+    ) as span:
+        started = perf_counter()
+        result = run_incident_agent(
+            IncidentInput(
+                user_input=summary,
+                incident_id=incident["slug"],
+                namespace=namespace,
+                service_slug=SERVICE_SLUG,
+                severity=incident["severity"],
+                title=incident["title"],
+                metadata={"demo": "cross-episode-learning", "episode": label},
+            ),
+            thread_id=f"{namespace}:{label}",
+            db_url=db_url,
+            reasoning_provider=reasoning_provider,
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        summary_result = _episode_summary(
+            label=label,
+            incident=incident,
+            result=result,
+            elapsed_ms=elapsed_ms,
+        )
+        set_span_attributes(
+            span,
+            {
+                "hindsight.memory.ids": summary_result.recalled_memory_ids,
+                "hindsight.memory.count": len(summary_result.recalled_memory_ids),
+                "hindsight.memory.id": summary_result.reflected_memory_id,
+                "hindsight.demo.steps_to_resolution": summary_result.steps_to_resolution,
+            },
+        )
+        return summary_result
 
 
 def _episode_summary(

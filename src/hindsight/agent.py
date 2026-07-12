@@ -17,6 +17,7 @@ from hindsight.db import database_url
 from hindsight.embeddings import DeterministicEmbeddingProvider, EmbeddingProvider
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
+from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 AGENT_CHAT_TABLE = "agent_chat_messages"
 _SETUP_DB_URLS: set[str] = set()
@@ -211,25 +212,66 @@ def build_incident_graph(
         }
 
     def recall(state: IncidentAgentState) -> dict[str, Any]:
-        return _recall_for_state(
-            state,
-            db_url=resolved_db_url,
-            embedding_provider=resolved_embedding_provider,
-        )
+        with start_span(
+            "hindsight.agent.recall",
+            {
+                "hindsight.agent.thread_id": state["thread_id"],
+                "hindsight.agent.incident_id": state["incident_id"],
+                "hindsight.memory.namespace": state["namespace"],
+                "hindsight.memory.decision_id": state["decision_id"],
+            },
+        ) as span:
+            update = _recall_for_state(
+                state,
+                db_url=resolved_db_url,
+                embedding_provider=resolved_embedding_provider,
+            )
+            recalled = update.get("recalled_memories", [])
+            set_span_attributes(
+                span,
+                {
+                    "hindsight.memory.count": len(recalled),
+                    "hindsight.memory.ids": memory_ids(recalled),
+                    "hindsight.agent.recall_error": bool(update.get("recall_error")),
+                },
+            )
+            return update
 
     def plan(state: IncidentAgentState) -> dict[str, Any]:
         provider = reasoning_provider or reasoning_provider_from_env()
-        response = provider.generate(
-            ReasoningRequest(
-                system=(
-                    "You are Hindsight, an incident-response copilot. "
-                    "Use recalled memories as context, but propose only reversible, "
-                    "operator-reviewable remediation steps."
-                ),
-                prompt=_plan_prompt(state),
-                max_output_tokens=512,
+        with start_span(
+            "hindsight.agent.reason",
+            {
+                "hindsight.agent.thread_id": state["thread_id"],
+                "hindsight.agent.incident_id": state["incident_id"],
+                "hindsight.memory.namespace": state["namespace"],
+                "hindsight.memory.decision_id": state["decision_id"],
+                "hindsight.reasoning.provider": provider.provider_name,
+                "hindsight.reasoning.model": provider.model_name,
+            },
+        ) as span:
+            response = provider.generate(
+                ReasoningRequest(
+                    system=(
+                        "You are Hindsight, an incident-response copilot. "
+                        "Use recalled memories as context, but propose only reversible, "
+                        "operator-reviewable remediation steps."
+                    ),
+                    prompt=_plan_prompt(state),
+                    max_output_tokens=512,
+                )
             )
-        )
+            set_span_attributes(
+                span,
+                {
+                    "hindsight.reasoning.prompt_characters": response.usage.get(
+                        "prompt_characters"
+                    ),
+                    "hindsight.reasoning.system_characters": response.usage.get(
+                        "system_characters"
+                    ),
+                },
+            )
         return {
             "plan": response.text,
             "reasoning": {
@@ -258,41 +300,51 @@ def build_incident_graph(
         }
 
     def reflect(state: IncidentAgentState) -> dict[str, Any]:
-        content = _reflection_content(state)
-        with MemoryStore(
-            url=resolved_db_url,
-            embedding_provider=resolved_embedding_provider,
-        ) as store:
-            memory = store.remember(
-                memory_kind="semantic",
-                namespace=state["namespace"],
-                content=content,
-                provenance=Provenance(
-                    writer="agent.reflect",
-                    source_ref=state["decision_id"],
-                    justification="Capture incident plan and proposed remediation for future recall",
-                ),
-                metadata={
-                    "thread_id": state["thread_id"],
-                    "incident_id": state["incident_id"],
-                    "service_slug": state.get("service_slug"),
-                    "recalled_memory_ids": [
-                        str(row.get("memory_id") or row.get("id"))
-                        for row in state.get("recalled_memories", [])
-                        if row.get("memory_id") or row.get("id")
-                    ],
-                    "action_approved": state.get("action_approved", False),
-                },
+        with start_span(
+            "hindsight.agent.reflect",
+            {
+                "hindsight.agent.thread_id": state["thread_id"],
+                "hindsight.agent.incident_id": state["incident_id"],
+                "hindsight.memory.namespace": state["namespace"],
+                "hindsight.memory.decision_id": state["decision_id"],
+            },
+        ) as span:
+            content = _reflection_content(state)
+            with MemoryStore(
+                url=resolved_db_url,
+                embedding_provider=resolved_embedding_provider,
+            ) as store:
+                memory = store.remember(
+                    memory_kind="semantic",
+                    namespace=state["namespace"],
+                    content=content,
+                    provenance=Provenance(
+                        writer="agent.reflect",
+                        source_ref=state["decision_id"],
+                        justification="Capture incident plan and proposed remediation for future recall",
+                    ),
+                    metadata={
+                        "thread_id": state["thread_id"],
+                        "incident_id": state["incident_id"],
+                        "service_slug": state.get("service_slug"),
+                        "recalled_memory_ids": [
+                            str(row.get("memory_id") or row.get("id"))
+                            for row in state.get("recalled_memories", [])
+                            if row.get("memory_id") or row.get("id")
+                        ],
+                        "action_approved": state.get("action_approved", False),
+                    },
+                )
+            history = _chat_history(
+                thread_id=state["thread_id"],
+                db_url=resolved_db_url,
             )
-        history = _chat_history(
-            thread_id=state["thread_id"],
-            db_url=resolved_db_url,
-        )
-        try:
-            history.add_message(AIMessage(content=content))
-        finally:
-            history.close()
-        return {"reflected_memory": _jsonable_row(memory)}
+            try:
+                history.add_message(AIMessage(content=content))
+            finally:
+                history.close()
+            set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
+            return {"reflected_memory": _jsonable_row(memory)}
 
     builder = StateGraph(IncidentAgentState)
     builder.add_node("triage", triage)

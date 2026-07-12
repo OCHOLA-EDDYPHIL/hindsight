@@ -23,6 +23,7 @@ from hindsight.agent import (
 )
 from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
+from hindsight.tracing import configure_tracing_from_env
 
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
 GEMINI_API_KEY_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEY_PARAM"
@@ -53,6 +54,7 @@ class RuntimeSettings:
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """AWS Lambda handler compatible with Function URL events."""
 
+    configure_tracing_from_env(service_name="hindsight-agent")
     return handle_request(event, context)
 
 

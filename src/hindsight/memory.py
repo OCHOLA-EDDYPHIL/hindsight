@@ -24,6 +24,7 @@ from hindsight.embeddings import (
     EmbeddingProvider,
     vector_literal,
 )
+from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 MemoryKind = Literal["episodic", "semantic"]
 
@@ -112,31 +113,46 @@ class MemoryStore:
         reconstructable.
         """
 
-        with self._conn.transaction():
-            if memory_kind == "semantic":
-                if not namespace or not namespace.strip():
-                    raise ProvenanceError("namespace is required for semantic memory")
-                return self.write_semantic(
-                    namespace=namespace,
-                    content=content,
-                    provenance=provenance,
-                    metadata=metadata,
-                    t_valid=t_valid,
-                )
-            if memory_kind == "episodic":
-                if not episode_id or not episode_id.strip():
-                    raise ProvenanceError("episode_id is required for episodic memory")
-                if not role or not role.strip():
-                    raise ProvenanceError("role is required for episodic memory")
-                return self.write_episodic(
-                    episode_id=episode_id,
-                    role=role,
-                    content=content,
-                    provenance=provenance,
-                    metadata=metadata,
-                    t_valid=t_valid,
-                )
-        raise ValueError(f"Unsupported memory kind: {memory_kind}")
+        with start_span(
+            "hindsight.memory.remember",
+            {
+                "hindsight.memory.operation": "remember",
+                "hindsight.memory.kind": memory_kind,
+                "hindsight.memory.namespace": namespace,
+                "hindsight.memory.episode_id": episode_id,
+                "hindsight.memory.role": role,
+                "hindsight.provenance.writer": provenance.writer,
+            },
+        ) as span:
+            with self._conn.transaction():
+                if memory_kind == "semantic":
+                    if not namespace or not namespace.strip():
+                        raise ProvenanceError("namespace is required for semantic memory")
+                    memory = self.write_semantic(
+                        namespace=namespace,
+                        content=content,
+                        provenance=provenance,
+                        metadata=metadata,
+                        t_valid=t_valid,
+                    )
+                    set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
+                    return memory
+                if memory_kind == "episodic":
+                    if not episode_id or not episode_id.strip():
+                        raise ProvenanceError("episode_id is required for episodic memory")
+                    if not role or not role.strip():
+                        raise ProvenanceError("role is required for episodic memory")
+                    memory = self.write_episodic(
+                        episode_id=episode_id,
+                        role=role,
+                        content=content,
+                        provenance=provenance,
+                        metadata=metadata,
+                        t_valid=t_valid,
+                    )
+                    set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
+                    return memory
+            raise ValueError(f"Unsupported memory kind: {memory_kind}")
 
     def recall(
         self,
@@ -161,23 +177,86 @@ class MemoryStore:
             raise ValueError("limit must be at least 1")
         if not namespace or not namespace.strip():
             raise ProvenanceError("namespace is required")
-        if as_of is None and self._embedding_provider is not None:
-            return self.recall_semantic(
-                namespace=namespace,
-                query=query,
-                limit=limit,
-                decision_id=decision_id,
-                reader=reader,
-                purpose=purpose,
-            )
-        if as_of is not None:
-            rows = self._semantic_beliefs_as_of(
-                namespace=namespace,
-                as_of=as_of,
-                limit=limit,
-                query=query,
-            )
+        with start_span(
+            "hindsight.memory.recall",
+            {
+                "hindsight.memory.operation": "recall",
+                "hindsight.memory.kind": "semantic",
+                "hindsight.memory.namespace": namespace,
+                "hindsight.memory.limit": limit,
+                "hindsight.memory.as_of": as_of,
+                "hindsight.memory.decision_id": decision_id,
+                "hindsight.memory.reader": reader,
+            },
+        ) as span:
+            if as_of is None and self._embedding_provider is not None:
+                rows = self.recall_semantic(
+                    namespace=namespace,
+                    query=query,
+                    limit=limit,
+                    decision_id=decision_id,
+                    reader=reader,
+                    purpose=purpose,
+                )
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.recall_mode": "vector",
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
+                )
+                return rows
+            if as_of is not None:
+                rows = self._semantic_beliefs_as_of(
+                    namespace=namespace,
+                    as_of=as_of,
+                    limit=limit,
+                    query=query,
+                )
+                with self._conn.transaction():
+                    self._record_retrieval(
+                        rows,
+                        memory_kind="semantic",
+                        decision_id=decision_id,
+                        reader=reader,
+                        purpose=purpose,
+                    )
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.recall_mode": "as_of",
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
+                )
+                return rows
+
             with self._conn.transaction():
+                rows = self._fetch_all(
+                    """
+                        SELECT *
+                        FROM current_semantic_memories
+                        WHERE namespace = %s
+                            AND content ILIKE %s
+                        ORDER BY t_valid DESC, written_at DESC
+                        LIMIT %s
+                    """,
+                    (namespace, f"%{query}%", limit),
+                )
+                recall_mode = "keyword"
+                if not rows:
+                    rows = self._fetch_all(
+                        """
+                            SELECT *
+                            FROM current_semantic_memories
+                            WHERE namespace = %s
+                            ORDER BY t_valid DESC, written_at DESC
+                            LIMIT %s
+                        """,
+                        (namespace, limit),
+                    )
+                    recall_mode = "recent"
                 self._record_retrieval(
                     rows,
                     memory_kind="semantic",
@@ -185,39 +264,15 @@ class MemoryStore:
                     reader=reader,
                     purpose=purpose,
                 )
-            return rows
-
-        with self._conn.transaction():
-            rows = self._fetch_all(
-                """
-                    SELECT *
-                    FROM current_semantic_memories
-                    WHERE namespace = %s
-                        AND content ILIKE %s
-                    ORDER BY t_valid DESC, written_at DESC
-                    LIMIT %s
-                """,
-                (namespace, f"%{query}%", limit),
-            )
-            if not rows:
-                rows = self._fetch_all(
-                    """
-                        SELECT *
-                        FROM current_semantic_memories
-                        WHERE namespace = %s
-                        ORDER BY t_valid DESC, written_at DESC
-                        LIMIT %s
-                    """,
-                    (namespace, limit),
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.recall_mode": recall_mode,
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
                 )
-            self._record_retrieval(
-                rows,
-                memory_kind="semantic",
-                decision_id=decision_id,
-                reader=reader,
-                purpose=purpose,
-            )
-            return rows
+                return rows
 
     def write_episodic(
         self,
@@ -231,26 +286,38 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Write an episodic memory row and return the inserted row."""
 
-        provenance.validate()
-        query = """
-            INSERT INTO episodic_memories (
-                episode_id, role, content, metadata, t_valid,
-                writer, source_ref, justification
+        with start_span(
+            "hindsight.memory.write_episodic",
+            {
+                "hindsight.memory.operation": "write",
+                "hindsight.memory.kind": "episodic",
+                "hindsight.memory.episode_id": episode_id,
+                "hindsight.memory.role": role,
+                "hindsight.provenance.writer": provenance.writer,
+            },
+        ) as span:
+            provenance.validate()
+            query = """
+                INSERT INTO episodic_memories (
+                    episode_id, role, content, metadata, t_valid,
+                    writer, source_ref, justification
+                )
+                VALUES (%s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s)
+                RETURNING *
+            """
+            params = (
+                episode_id,
+                role,
+                content,
+                Jsonb(metadata or {}),
+                t_valid,
+                provenance.writer,
+                provenance.source_ref,
+                provenance.justification,
             )
-            VALUES (%s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s)
-            RETURNING *
-        """
-        params = (
-            episode_id,
-            role,
-            content,
-            Jsonb(metadata or {}),
-            t_valid,
-            provenance.writer,
-            provenance.source_ref,
-            provenance.justification,
-        )
-        return self._fetch_one(query, params)
+            memory = self._fetch_one(query, params)
+            set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
+            return memory
 
     def write_semantic(
         self,
@@ -263,43 +330,54 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Write a semantic memory row and return the inserted row."""
 
-        provenance.validate()
-        if not namespace or not namespace.strip():
-            raise ProvenanceError("namespace is required")
-        embedding = None
-        if self._embedding_provider is not None:
-            self._validate_embedding_provider_dimensions()
-            embedding = self._embedding_provider.embed(content)
-            self._validate_semantic_embedding(embedding)
-        query = """
-            INSERT INTO semantic_memories (
-                namespace, content, metadata, t_valid,
-                writer, source_ref, justification
-            )
-            VALUES (%s, %s, %s, COALESCE(%s, now()), %s, %s, %s)
-            RETURNING *
-        """
-        params = (
-            namespace,
-            content,
-            Jsonb(metadata or {}),
-            t_valid,
-            provenance.writer,
-            provenance.source_ref,
-            provenance.justification,
-        )
-
-        def write_row() -> dict[str, Any]:
-            row = self._fetch_one(query, params)
-            if self._embedding_provider is not None and embedding is not None:
-                self._insert_semantic_embedding(
-                    memory_id=str(row["id"]),
-                    namespace=namespace,
-                    embedding=embedding,
+        with start_span(
+            "hindsight.memory.write_semantic",
+            {
+                "hindsight.memory.operation": "write",
+                "hindsight.memory.kind": "semantic",
+                "hindsight.memory.namespace": namespace,
+                "hindsight.provenance.writer": provenance.writer,
+            },
+        ) as span:
+            provenance.validate()
+            if not namespace or not namespace.strip():
+                raise ProvenanceError("namespace is required")
+            embedding = None
+            if self._embedding_provider is not None:
+                self._validate_embedding_provider_dimensions()
+                embedding = self._embedding_provider.embed(content)
+                self._validate_semantic_embedding(embedding)
+            query = """
+                INSERT INTO semantic_memories (
+                    namespace, content, metadata, t_valid,
+                    writer, source_ref, justification
                 )
-            return row
+                VALUES (%s, %s, %s, COALESCE(%s, now()), %s, %s, %s)
+                RETURNING *
+            """
+            params = (
+                namespace,
+                content,
+                Jsonb(metadata or {}),
+                t_valid,
+                provenance.writer,
+                provenance.source_ref,
+                provenance.justification,
+            )
 
-        return self._in_savepoint(write_row)
+            def write_row() -> dict[str, Any]:
+                row = self._fetch_one(query, params)
+                if self._embedding_provider is not None and embedding is not None:
+                    self._insert_semantic_embedding(
+                        memory_id=str(row["id"]),
+                        namespace=namespace,
+                        embedding=embedding,
+                    )
+                return row
+
+            memory = self._in_savepoint(write_row)
+            set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
+            return memory
 
     def invalidate(
         self,
@@ -319,14 +397,25 @@ class MemoryStore:
         if not reason or not reason.strip():
             raise ProvenanceError("reason is required")
 
-        with self._conn.transaction():
-            return self._invalidate_one(
-                memory_kind=memory_kind,
-                memory_id=memory_id,
-                invalidated_by=invalidator,
-                reason=reason,
-                t_invalid=t_invalid,
-            )
+        with start_span(
+            "hindsight.memory.invalidate",
+            {
+                "hindsight.memory.operation": "invalidate",
+                "hindsight.memory.kind": memory_kind,
+                "hindsight.memory.id": memory_id,
+                "hindsight.memory.actor": invalidator,
+            },
+        ) as span:
+            with self._conn.transaction():
+                row = self._invalidate_one(
+                    memory_kind=memory_kind,
+                    memory_id=memory_id,
+                    invalidated_by=invalidator,
+                    reason=reason,
+                    t_invalid=t_invalid,
+                )
+            set_span_attributes(span, {"hindsight.memory.count": 1 if row is not None else 0})
+            return row
 
     def rewind(
         self,
@@ -350,59 +439,79 @@ class MemoryStore:
         if not reason or not reason.strip():
             raise ProvenanceError("reason is required")
 
-        restored = self._semantic_beliefs_as_of(
-            namespace=namespace,
-            as_of=timestamp,
-            limit=None,
-            query=None,
-        )
-
-        with self._conn.transaction():
-            invalidated = self._semantic_rewind_candidates(
-                timestamp=timestamp,
+        with start_span(
+            "hindsight.memory.rewind",
+            {
+                "hindsight.memory.operation": "rewind",
+                "hindsight.memory.kind": "semantic",
+                "hindsight.memory.namespace": namespace,
+                "hindsight.memory.as_of": timestamp,
+                "hindsight.memory.actor": actor,
+            },
+        ) as span:
+            restored = self._semantic_beliefs_as_of(
                 namespace=namespace,
+                as_of=timestamp,
+                limit=None,
+                query=None,
             )
-            invalidated_by_id = {str(row["id"]): row for row in invalidated}
-            pending_ids = set(invalidated_by_id)
 
-            while pending_ids:
-                derived = self._derived_semantic_memories(
-                    memory_ids=sorted(pending_ids),
+            with self._conn.transaction():
+                invalidated = self._semantic_rewind_candidates(
+                    timestamp=timestamp,
                     namespace=namespace,
                 )
-                next_ids = {
-                    str(row["id"])
-                    for row in derived
-                    if str(row["id"]) not in invalidated_by_id
-                }
-                for row in derived:
-                    invalidated_by_id.setdefault(str(row["id"]), row)
-                pending_ids = next_ids
+                invalidated_by_id = {str(row["id"]): row for row in invalidated}
+                pending_ids = set(invalidated_by_id)
 
-            invalidated_rows = []
-            for memory_id in sorted(invalidated_by_id):
-                memory = invalidated_by_id[memory_id]
-                invalid_at = timestamp
-                if memory["t_valid"] > timestamp:
-                    invalid_at = memory["t_valid"]
-                row = self._invalidate_one(
-                    memory_kind="semantic",
-                    memory_id=memory_id,
-                    invalidated_by=actor,
+                while pending_ids:
+                    derived = self._derived_semantic_memories(
+                        memory_ids=sorted(pending_ids),
+                        namespace=namespace,
+                    )
+                    next_ids = {
+                        str(row["id"])
+                        for row in derived
+                        if str(row["id"]) not in invalidated_by_id
+                    }
+                    for row in derived:
+                        invalidated_by_id.setdefault(str(row["id"]), row)
+                    pending_ids = next_ids
+
+                invalidated_rows = []
+                for memory_id in sorted(invalidated_by_id):
+                    memory = invalidated_by_id[memory_id]
+                    invalid_at = timestamp
+                    if memory["t_valid"] > timestamp:
+                        invalid_at = memory["t_valid"]
+                    row = self._invalidate_one(
+                        memory_kind="semantic",
+                        memory_id=memory_id,
+                        invalidated_by=actor,
+                        reason=reason,
+                        t_invalid=invalid_at,
+                    )
+                    if row is not None:
+                        invalidated_rows.append(row)
+
+                operation = self._record_memory_operation(
+                    operation_type="rewind",
+                    actor=actor,
                     reason=reason,
-                    t_invalid=invalid_at,
+                    target_timestamp=timestamp,
+                    namespace=namespace,
+                    invalidated_memory_ids=[str(row["id"]) for row in invalidated_rows],
+                    restored_memory_ids=[str(row["id"]) for row in restored],
                 )
-                if row is not None:
-                    invalidated_rows.append(row)
-
-            operation = self._record_memory_operation(
-                operation_type="rewind",
-                actor=actor,
-                reason=reason,
-                target_timestamp=timestamp,
-                namespace=namespace,
-                invalidated_memory_ids=[str(row["id"]) for row in invalidated_rows],
-                restored_memory_ids=[str(row["id"]) for row in restored],
+            set_span_attributes(
+                span,
+                {
+                    "hindsight.memory.operation_id": str(operation["id"]),
+                    "hindsight.memory.restored.ids": memory_ids(restored),
+                    "hindsight.memory.restored.count": len(restored),
+                    "hindsight.memory.invalidated.ids": memory_ids(invalidated_rows),
+                    "hindsight.memory.invalidated.count": len(invalidated_rows),
+                },
             )
             return RewindResult(
                 operation=operation,
@@ -446,38 +555,56 @@ class MemoryStore:
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
         limit_clause = " LIMIT %s" if limit is not None else ""
-        with self._conn.transaction():
-            if episode_id:
-                params: tuple[Any, ...] = (episode_id,) if limit is None else (episode_id, limit)
-                rows = self._fetch_all(
-                    f"""
-                        SELECT *
-                        FROM current_episodic_memories
-                        WHERE episode_id = %s
-                        ORDER BY t_valid DESC, written_at DESC
-                        {limit_clause}
-                    """,
-                    params,
+        with start_span(
+            "hindsight.memory.current_episodic",
+            {
+                "hindsight.memory.operation": "current",
+                "hindsight.memory.kind": "episodic",
+                "hindsight.memory.episode_id": episode_id,
+                "hindsight.memory.limit": limit,
+                "hindsight.memory.decision_id": decision_id,
+                "hindsight.memory.reader": reader,
+            },
+        ) as span:
+            with self._conn.transaction():
+                if episode_id:
+                    params: tuple[Any, ...] = (episode_id,) if limit is None else (episode_id, limit)
+                    rows = self._fetch_all(
+                        f"""
+                            SELECT *
+                            FROM current_episodic_memories
+                            WHERE episode_id = %s
+                            ORDER BY t_valid DESC, written_at DESC
+                            {limit_clause}
+                        """,
+                        params,
+                    )
+                else:
+                    params = () if limit is None else (limit,)
+                    rows = self._fetch_all(
+                        f"""
+                            SELECT *
+                            FROM current_episodic_memories
+                            ORDER BY t_valid DESC, written_at DESC
+                            {limit_clause}
+                        """,
+                        params,
+                    )
+                self._record_retrieval(
+                    rows,
+                    memory_kind="episodic",
+                    decision_id=decision_id,
+                    reader=reader,
+                    purpose=purpose,
                 )
-            else:
-                params = () if limit is None else (limit,)
-                rows = self._fetch_all(
-                    f"""
-                        SELECT *
-                        FROM current_episodic_memories
-                        ORDER BY t_valid DESC, written_at DESC
-                        {limit_clause}
-                    """,
-                    params,
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
                 )
-            self._record_retrieval(
-                rows,
-                memory_kind="episodic",
-                decision_id=decision_id,
-                reader=reader,
-                purpose=purpose,
-            )
-            return rows
+                return rows
 
     def current_semantic(
         self,
@@ -495,38 +622,56 @@ class MemoryStore:
         if namespace is not None and not namespace.strip():
             raise ProvenanceError("namespace is required")
         limit_clause = " LIMIT %s" if limit is not None else ""
-        with self._conn.transaction():
-            if namespace is not None:
-                params: tuple[Any, ...] = (namespace,) if limit is None else (namespace, limit)
-                rows = self._fetch_all(
-                    f"""
-                        SELECT *
-                        FROM current_semantic_memories
-                        WHERE namespace = %s
-                        ORDER BY t_valid DESC, written_at DESC
-                        {limit_clause}
-                    """,
-                    params,
+        with start_span(
+            "hindsight.memory.current_semantic",
+            {
+                "hindsight.memory.operation": "current",
+                "hindsight.memory.kind": "semantic",
+                "hindsight.memory.namespace": namespace,
+                "hindsight.memory.limit": limit,
+                "hindsight.memory.decision_id": decision_id,
+                "hindsight.memory.reader": reader,
+            },
+        ) as span:
+            with self._conn.transaction():
+                if namespace is not None:
+                    params: tuple[Any, ...] = (namespace,) if limit is None else (namespace, limit)
+                    rows = self._fetch_all(
+                        f"""
+                            SELECT *
+                            FROM current_semantic_memories
+                            WHERE namespace = %s
+                            ORDER BY t_valid DESC, written_at DESC
+                            {limit_clause}
+                        """,
+                        params,
+                    )
+                else:
+                    params = () if limit is None else (limit,)
+                    rows = self._fetch_all(
+                        f"""
+                            SELECT *
+                            FROM current_semantic_memories
+                            ORDER BY t_valid DESC, written_at DESC
+                            {limit_clause}
+                        """,
+                        params,
+                    )
+                self._record_retrieval(
+                    rows,
+                    memory_kind="semantic",
+                    decision_id=decision_id,
+                    reader=reader,
+                    purpose=purpose,
                 )
-            else:
-                params = () if limit is None else (limit,)
-                rows = self._fetch_all(
-                    f"""
-                        SELECT *
-                        FROM current_semantic_memories
-                        ORDER BY t_valid DESC, written_at DESC
-                        {limit_clause}
-                    """,
-                    params,
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
                 )
-            self._record_retrieval(
-                rows,
-                memory_kind="semantic",
-                decision_id=decision_id,
-                reader=reader,
-                purpose=purpose,
-            )
-            return rows
+                return rows
 
     def recall_semantic(
         self,
@@ -544,36 +689,55 @@ class MemoryStore:
             raise RuntimeError("recall_semantic requires an embedding provider")
         if limit < 1:
             raise ValueError("limit must be at least 1")
-        query_vector = vector_literal(
-            self._embedding_provider.embed(query),
-            dimensions=self._embedding_provider.dimensions,
-        )
-        with self._conn.transaction():
-            rows = self._fetch_all(
-                f"""
-                    SELECT
-                        m.*,
-                        e.provider AS embedding_provider,
-                        e.model AS embedding_model,
-                        e.embedded_at,
-                        e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance
-                    FROM current_semantic_memories AS m
-                    JOIN semantic_memory_embeddings AS e
-                        ON e.memory_id = m.id
-                    WHERE m.namespace = %s
-                    ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
-                    LIMIT %s
-                """,
-                (query_vector, namespace, query_vector, limit),
+        with start_span(
+            "hindsight.memory.recall_semantic",
+            {
+                "hindsight.memory.operation": "recall",
+                "hindsight.memory.kind": "semantic",
+                "hindsight.memory.namespace": namespace,
+                "hindsight.memory.limit": limit,
+                "hindsight.memory.decision_id": decision_id,
+                "hindsight.memory.reader": reader,
+                "hindsight.memory.recall_mode": "vector",
+            },
+        ) as span:
+            query_vector = vector_literal(
+                self._embedding_provider.embed(query),
+                dimensions=self._embedding_provider.dimensions,
             )
-            self._record_retrieval(
-                rows,
-                memory_kind="semantic",
-                decision_id=decision_id,
-                reader=reader,
-                purpose=purpose,
-            )
-            return rows
+            with self._conn.transaction():
+                rows = self._fetch_all(
+                    f"""
+                        SELECT
+                            m.*,
+                            e.provider AS embedding_provider,
+                            e.model AS embedding_model,
+                            e.embedded_at,
+                            e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance
+                        FROM current_semantic_memories AS m
+                        JOIN semantic_memory_embeddings AS e
+                            ON e.memory_id = m.id
+                        WHERE m.namespace = %s
+                        ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                        LIMIT %s
+                    """,
+                    (query_vector, namespace, query_vector, limit),
+                )
+                self._record_retrieval(
+                    rows,
+                    memory_kind="semantic",
+                    decision_id=decision_id,
+                    reader=reader,
+                    purpose=purpose,
+                )
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
+                )
+                return rows
 
     def recall_similar_incidents(
         self,
@@ -602,63 +766,83 @@ class MemoryStore:
         if not service_slug or not service_slug.strip():
             raise ProvenanceError("service_slug is required")
 
-        query_vector = vector_literal(
-            self._embedding_provider.embed(query),
-            dimensions=self._embedding_provider.dimensions,
-        )
-        with self._conn.transaction():
-            rows = self._fetch_all(
-                f"""
-                    SELECT
-                        m.id,
-                        m.id AS memory_id,
-                        m.content AS memory_content,
-                        e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance,
-                        i.slug AS incident_slug,
-                        i.title AS incident_title,
-                        i.severity,
-                        s.slug AS service_slug,
-                        s.name AS service_name,
-                        r.slug AS runbook_slug,
-                        r.title AS runbook_title
-                    FROM current_semantic_memories AS m
-                    JOIN semantic_memory_embeddings AS e
-                        ON e.memory_id = m.id
-                    JOIN incident_semantic_memories AS im
-                        ON im.memory_id = m.id
-                    JOIN incidents AS i
-                        ON i.id = im.incident_id
-                    JOIN incident_services AS isvc
-                        ON isvc.incident_id = i.id
-                    JOIN services AS s
-                        ON s.id = isvc.service_id
-                    LEFT JOIN (
+        with start_span(
+            "hindsight.memory.recall_similar_incidents",
+            {
+                "hindsight.memory.operation": "recall",
+                "hindsight.memory.kind": "semantic",
+                "hindsight.memory.namespace": namespace,
+                "hindsight.memory.service_slug": service_slug,
+                "hindsight.memory.limit": limit,
+                "hindsight.memory.decision_id": decision_id,
+                "hindsight.memory.reader": reader,
+                "hindsight.memory.recall_mode": "similar_incidents",
+            },
+        ) as span:
+            query_vector = vector_literal(
+                self._embedding_provider.embed(query),
+                dimensions=self._embedding_provider.dimensions,
+            )
+            with self._conn.transaction():
+                rows = self._fetch_all(
+                    f"""
                         SELECT
-                            ir.incident_id,
-                            r.service_id,
-                            r.slug,
-                            r.title
-                        FROM incident_runbooks AS ir
-                        JOIN runbooks AS r
-                            ON r.id = ir.runbook_id
-                    ) AS r
-                        ON r.incident_id = i.id
-                        AND (r.service_id = s.id OR r.service_id IS NULL)
-                    WHERE m.namespace = %s
-                        AND s.slug = %s
-                    ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
-                    LIMIT %s
-                """,
-                (query_vector, namespace, service_slug, query_vector, limit),
-            )
-            self._record_retrieval(
-                rows,
-                memory_kind="semantic",
-                decision_id=decision_id,
-                reader=reader,
-                purpose=purpose,
-            )
-            return rows
+                            m.id,
+                            m.id AS memory_id,
+                            m.content AS memory_content,
+                            e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance,
+                            i.slug AS incident_slug,
+                            i.title AS incident_title,
+                            i.severity,
+                            s.slug AS service_slug,
+                            s.name AS service_name,
+                            r.slug AS runbook_slug,
+                            r.title AS runbook_title
+                        FROM current_semantic_memories AS m
+                        JOIN semantic_memory_embeddings AS e
+                            ON e.memory_id = m.id
+                        JOIN incident_semantic_memories AS im
+                            ON im.memory_id = m.id
+                        JOIN incidents AS i
+                            ON i.id = im.incident_id
+                        JOIN incident_services AS isvc
+                            ON isvc.incident_id = i.id
+                        JOIN services AS s
+                            ON s.id = isvc.service_id
+                        LEFT JOIN (
+                            SELECT
+                                ir.incident_id,
+                                r.service_id,
+                                r.slug,
+                                r.title
+                            FROM incident_runbooks AS ir
+                            JOIN runbooks AS r
+                                ON r.id = ir.runbook_id
+                        ) AS r
+                            ON r.incident_id = i.id
+                            AND (r.service_id = s.id OR r.service_id IS NULL)
+                        WHERE m.namespace = %s
+                            AND s.slug = %s
+                        ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                        LIMIT %s
+                    """,
+                    (query_vector, namespace, service_slug, query_vector, limit),
+                )
+                self._record_retrieval(
+                    rows,
+                    memory_kind="semantic",
+                    decision_id=decision_id,
+                    reader=reader,
+                    purpose=purpose,
+                )
+                set_span_attributes(
+                    span,
+                    {
+                        "hindsight.memory.count": len(rows),
+                        "hindsight.memory.ids": memory_ids(rows),
+                    },
+                )
+                return rows
 
     def audit_memory(self, *, memory_kind: MemoryKind, memory_id: str) -> dict[str, Any] | None:
         """Return a memory row whether it is current or invalidated."""
@@ -702,22 +886,36 @@ class MemoryStore:
         if not purpose or not purpose.strip():
             raise ProvenanceError("purpose is required")
 
-        def write_read() -> dict[str, Any]:
-            return self._fetch_one(
-                """
-                    INSERT INTO memory_reads (
-                        decision_id, memory_kind, memory_id, reader, purpose
-                    )
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING *
-                """,
-                (decision_id, memory_kind, memory_id, reader, purpose),
-            )
+        with start_span(
+            "hindsight.memory.record_read",
+            {
+                "hindsight.memory.operation": "record_read",
+                "hindsight.memory.kind": memory_kind,
+                "hindsight.memory.id": memory_id,
+                "hindsight.memory.decision_id": decision_id,
+                "hindsight.memory.reader": reader,
+            },
+        ) as span:
 
-        if self._owns_connection and not self._conn.autocommit:
-            with self._conn.transaction():
-                return write_read()
-        return write_read()
+            def write_read() -> dict[str, Any]:
+                return self._fetch_one(
+                    """
+                        INSERT INTO memory_reads (
+                            decision_id, memory_kind, memory_id, reader, purpose
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING *
+                    """,
+                    (decision_id, memory_kind, memory_id, reader, purpose),
+                )
+
+            if self._owns_connection and not self._conn.autocommit:
+                with self._conn.transaction():
+                    row = write_read()
+            else:
+                row = write_read()
+            set_span_attributes(span, {"hindsight.memory.read_id": str(row["id"])})
+            return row
 
     def reads_for_decision(self, *, decision_id: str) -> list[dict[str, Any]]:
         """Return memory reads attached to one agent or human decision."""
