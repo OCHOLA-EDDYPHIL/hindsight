@@ -1,6 +1,7 @@
 """Tests for telemetry ingestion and the incident demo path."""
 
 import os
+from datetime import UTC, datetime
 
 import pytest
 
@@ -23,6 +24,71 @@ def test_demo_checkout_service_emits_metrics_logs_and_signal():
     assert "payment_processor_timeouts_total" in metrics
     assert service.logs[-1]["event"] == "checkout_latency_breach"
     assert service.logs[-1]["retry_fanout"] == 6
+
+
+def test_telemetry_log_excerpts_are_redacted_and_bounded():
+    from hindsight.telemetry import (
+        DemoTelemetrySignal,
+        _memory_content,
+        _sanitize_log_excerpts,
+    )
+
+    signal = DemoTelemetrySignal(
+        signal_id="signal-redaction",
+        service_slug="payments-api",
+        service_name="Payments API",
+        owner_team="revenue-platform",
+        alert_name="checkout-p99-latency",
+        severity="sev2",
+        title="Checkout p99 latency above SLO",
+        summary="checkout latency breached SLO",
+        metric_name="checkout_request_duration_ms_p99",
+        metric_value=2450.0,
+        threshold=2000.0,
+        started_at=datetime.now(UTC),
+        log_excerpts=[
+            {
+                "event": "checkout_latency_breach",
+                "authorization": "Bearer secret",
+                "nested": {"db_url": "postgresql://user:pass@example/db"},
+                "message": "x" * 10_000,
+            }
+            for _ in range(10)
+        ],
+    )
+
+    excerpts = _sanitize_log_excerpts(signal.log_excerpts)
+    content = _memory_content(signal, log_excerpts=excerpts)
+
+    assert len(excerpts) == 5
+    assert "Bearer secret" not in content
+    assert "postgresql://user:pass@example/db" not in content
+    assert "[REDACTED]" in content
+    assert all(len(str(excerpt)) < 2300 for excerpt in excerpts)
+
+
+def test_telemetry_incident_slug_hashes_full_signal_id():
+    from hindsight.telemetry import DemoTelemetrySignal, _incident_slug
+
+    common = {
+        "service_slug": "payments-api",
+        "service_name": "Payments API",
+        "owner_team": "revenue-platform",
+        "alert_name": "checkout-p99-latency",
+        "severity": "sev2",
+        "title": "Checkout p99 latency above SLO",
+        "summary": "checkout latency breached SLO",
+        "metric_name": "checkout_request_duration_ms_p99",
+        "metric_value": 2450.0,
+        "threshold": 2000.0,
+        "started_at": datetime.now(UTC),
+    }
+
+    first = DemoTelemetrySignal(signal_id="signal-aaaaaaaa-one", **common)
+    second = DemoTelemetrySignal(signal_id="signal-aaaaaaaa-two", **common)
+
+    assert _incident_slug(first) != _incident_slug(second)
+    assert not _incident_slug(first).endswith("aaaaaaaa")
 
 
 @requires_db

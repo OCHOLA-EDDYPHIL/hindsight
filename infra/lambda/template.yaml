@@ -12,6 +12,9 @@ Parameters:
   GeminiApiKeyParameterName:
     Type: String
     Default: /hindsight/dev/gemini-api-key
+  FunctionAuthTokenParameterName:
+    Type: String
+    Default: /hindsight/dev/function-url-token
   LlmProvider:
     Type: String
     Default: gemini
@@ -51,6 +54,7 @@ Resources:
         Variables:
           HINDSIGHT_DATABASE_URL_PARAM: !Ref DatabaseUrlParameterName
           HINDSIGHT_GEMINI_API_KEY_PARAM: !Ref GeminiApiKeyParameterName
+          HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM: !Ref FunctionAuthTokenParameterName
           LLM_PROVIDER: !Ref LlmProvider
           GEMINI_MODEL: !Ref GeminiModel
           BEDROCK_MODEL: !Ref BedrockModel
@@ -63,11 +67,12 @@ Resources:
               Resource:
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DatabaseUrlParameterName}
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GeminiApiKeyParameterName}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FunctionAuthTokenParameterName}
             - Effect: Allow
               Action:
                 - bedrock:InvokeModel
                 - bedrock:Converse
-              Resource: "*"
+              Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModel}
 
   HindsightAgentLogGroup:
     Type: AWS::Logs::LogGroup

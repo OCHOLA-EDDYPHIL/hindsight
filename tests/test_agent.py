@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -24,6 +25,98 @@ def test_async_sqlalchemy_url_uses_async_psycopg_driver():
     assert _async_sqlalchemy_url("cockroachdb://root@localhost/db") == (
         "cockroachdb+psycopg://root@localhost/db"
     )
+
+
+def test_recall_falls_back_without_vector_store_after_vector_error(monkeypatch):
+    import hindsight.agent as agent
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+
+    calls = []
+
+    class FakeMemoryStore:
+        def __init__(self, *, url, embedding_provider=None):
+            self.embedding_provider = embedding_provider
+            calls.append(embedding_provider is not None)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def recall_similar_incidents(self, **kwargs):
+            raise RuntimeError("semantic_memory_embeddings is missing")
+
+        def recall(self, **kwargs):
+            assert self.embedding_provider is None
+            return [{"id": "memory-1", "content": "fallback memory"}]
+
+    monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
+
+    result = agent._recall_for_state(
+        {
+            "namespace": "incident-test",
+            "service_slug": "payments-api",
+            "user_input": "checkout latency",
+            "decision_id": "agent:test:plan",
+        },
+        db_url="postgresql://db",
+        embedding_provider=DeterministicEmbeddingProvider(),
+    )
+
+    assert calls == [True, False]
+    assert result["recalled_memories"] == [{"id": "memory-1", "content": "fallback memory"}]
+    assert "semantic_memory_embeddings is missing" in result["recall_error"]
+
+
+def test_agent_storage_setup_is_cached(monkeypatch):
+    import hindsight.agent as agent
+
+    calls = {"checkpoint": 0, "chat": 0}
+
+    class FakeSaver:
+        @classmethod
+        def from_conn_string(cls, db_url):
+            assert db_url == "postgresql://db"
+            return cls()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def setup(self):
+            calls["checkpoint"] += 1
+
+    class FakeHistory:
+        def create_table_if_not_exists(self):
+            calls["chat"] += 1
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent, "CockroachDBSaver", FakeSaver)
+    monkeypatch.setattr(agent, "_chat_history", lambda **kwargs: FakeHistory())
+    agent._SETUP_DB_URLS.clear()
+
+    agent._setup_agent_storage_once("postgresql://db")
+    agent._setup_agent_storage_once("postgresql://db")
+
+    assert calls == {"checkpoint": 1, "chat": 1}
+
+
+def test_sync_agent_entrypoint_rejects_running_event_loop():
+    from hindsight.agent import IncidentInput, run_incident_agent
+
+    async def call_sync_helper():
+        with pytest.raises(RuntimeError, match="synchronous helpers"):
+            run_incident_agent(
+                IncidentInput(user_input="latency", incident_id="incident-1"),
+                db_url="postgresql://db",
+            )
+
+    asyncio.run(call_sync_helper())
 
 
 @requires_db
