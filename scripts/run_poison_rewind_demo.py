@@ -20,9 +20,12 @@ from hindsight.demo import (  # noqa: E402
 )
 from hindsight.memory import MemoryStore  # noqa: E402
 from hindsight.mcp_server import inspect_decision_trace  # noqa: E402
+from hindsight.tracing import configure_tracing_from_env  # noqa: E402
 
 
 def main() -> None:
+    configure_tracing_from_env(service_name="hindsight-demo")
+
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command")
 

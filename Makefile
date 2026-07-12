@@ -1,6 +1,7 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
+LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
 
-.PHONY: dev-up dev-down migrate migrate-local test lint lambda-zip mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local cross-episode-demo cross-episode-demo-local memory-dashboard memory-dashboard-local
+.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-zip mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local cross-episode-demo cross-episode-demo-local cross-episode-trace-local memory-dashboard memory-dashboard-local
 
 dev-up:
 	docker compose up -d --wait
@@ -8,7 +9,14 @@ dev-up:
 	@echo "CockroachDB ready: sql at localhost:26257, admin ui at http://localhost:8080"
 
 dev-down:
-	docker compose down
+	docker compose --profile otel down
+
+otel-up:
+	docker compose --profile otel up -d jaeger
+	@echo "Jaeger ready: http://localhost:16686"
+
+otel-down:
+	docker compose --profile otel stop jaeger
 
 migrate:
 	uv run python scripts/migrate.py
@@ -37,11 +45,17 @@ poison-rewind-demo:
 poison-rewind-demo-local:
 	DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python scripts/run_poison_rewind_demo.py all
 
+poison-rewind-trace-local:
+	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_OTEL_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT="$(LOCAL_OTEL_ENDPOINT)" OTEL_EXPORTER_OTLP_INSECURE=true uv run python scripts/run_poison_rewind_demo.py all
+
 cross-episode-demo:
 	uv run python scripts/run_cross_episode_demo.py
 
 cross-episode-demo-local:
 	uv run python scripts/run_cross_episode_demo.py --db-url "$(LOCAL_DATABASE_URL)"
+
+cross-episode-trace-local:
+	HINDSIGHT_OTEL_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT="$(LOCAL_OTEL_ENDPOINT)" OTEL_EXPORTER_OTLP_INSECURE=true uv run python scripts/run_cross_episode_demo.py --db-url "$(LOCAL_DATABASE_URL)"
 
 memory-dashboard:
 	uv run python scripts/run_memory_dashboard.py
