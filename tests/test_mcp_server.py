@@ -78,6 +78,46 @@ def test_mcp_current_beliefs_rejects_blank_semantic_namespace():
         inspect_current_beliefs(namespace="", db_url=database_url())
 
 
+def test_mcp_beliefs_as_of_passes_requested_url_to_memory_store(monkeypatch):
+    import hindsight.mcp_server as mcp_server
+
+    captured: dict[str, str | None] = {}
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            pass
+
+        def commit(self) -> None:
+            pass
+
+    class FakeMemoryStore:
+        def __init__(self, *, conn: FakeConnection, url: str | None = None):
+            captured["url"] = url
+
+        def recall(self, **kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    monkeypatch.setattr(mcp_server, "connect", lambda url: FakeConnection())
+    monkeypatch.setattr(mcp_server, "MemoryStore", FakeMemoryStore)
+    monkeypatch.setattr(
+        mcp_server,
+        "_record_mcp_audit_event",
+        lambda *args, **kwargs: {"id": uuid4()},
+    )
+
+    result = mcp_server.inspect_beliefs_as_of(
+        namespace="incident-test",
+        as_of="2026-07-12T00:00:00+00:00",
+        db_url="postgresql://staging-db",
+    )
+
+    assert captured["url"] == "postgresql://staging-db"
+    assert result["tool"] == "beliefs_as_of"
+
+
 @requires_db
 def test_mcp_provenance_chain_and_audit_log_are_visible():
     from hindsight.db import database_url

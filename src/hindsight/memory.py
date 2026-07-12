@@ -639,7 +639,7 @@ class MemoryStore:
                         ON r.id = ir.runbook_id
                 ) AS r
                     ON r.incident_id = i.id
-                    AND r.service_id = s.id
+                    AND (r.service_id = s.id OR r.service_id IS NULL)
                 WHERE m.namespace = %s
                     AND s.slug = %s
                 ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
@@ -984,10 +984,7 @@ class MemoryStore:
     def _historical_read_url(self) -> str:
         if self._url is not None:
             return self._url
-        try:
-            return database_url()
-        except RuntimeError:
-            return self._conn.info.dsn
+        return self._conn.info.dsn
 
     def _validate_embedding_provider_dimensions(self) -> None:
         if self._embedding_provider is None:
@@ -1004,6 +1001,9 @@ class MemoryStore:
             raise ValueError(f"expected {EMBEDDING_DIMENSIONS} dimensions, got {len(embedding)}")
 
     def _in_savepoint(self, callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        if self._conn.autocommit:
+            return callback()
+
         savepoint = sql.Identifier(f"hindsight_memory_{uuid4().hex}").as_string(self._conn)
         self._conn.execute(f"SAVEPOINT {savepoint}")
         try:

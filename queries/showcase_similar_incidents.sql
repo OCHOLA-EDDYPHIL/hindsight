@@ -31,7 +31,7 @@ LEFT JOIN (
         ON r.id = ir.runbook_id
 ) AS r
     ON r.incident_id = i.id
-    AND r.service_id = s.id
+    AND (r.service_id = s.id OR r.service_id IS NULL)
 WHERE m.namespace = %s
     AND s.slug = %s
 ORDER BY e.embedding <=> %s::VECTOR(1024)
