@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
+from collections.abc import Callable
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from http import HTTPStatus
@@ -35,6 +38,160 @@ class DashboardServer(ThreadingHTTPServer):
         super().__init__(server_address, DashboardRequestHandler)
         self.namespace = namespace
         self.db_url = db_url
+        self._brokers: dict[str, DashboardBroker] = {}
+        self._broker_lock = threading.Lock()
+
+    def broker_for(self, namespace: str) -> "DashboardBroker":
+        with self._broker_lock:
+            broker = self._brokers.get(namespace)
+            if broker is None:
+                broker = DashboardBroker(namespace=namespace, db_url=self.db_url)
+                self._brokers[namespace] = broker
+            return broker
+
+    def server_close(self) -> None:
+        with self._broker_lock:
+            brokers = list(self._brokers.values())
+            self._brokers.clear()
+        for broker in brokers:
+            broker.close()
+        super().server_close()
+
+
+@dataclass(frozen=True)
+class DashboardSubscription:
+    """SSE subscriber registered with a dashboard broker."""
+
+    snapshot: dict[str, Any]
+    events: "queue.Queue[dict[str, Any] | None]"
+
+
+class DashboardBroker:
+    """Share one namespace changefeed and cached snapshot across SSE clients."""
+
+    def __init__(
+        self,
+        *,
+        namespace: str,
+        db_url: str | None = None,
+        snapshot_loader: Callable[..., dict[str, Any]] | None = None,
+        changefeed_loader: Callable[..., Iterator[dict[str, Any]]] | None = None,
+        limit: int = MAX_SNAPSHOT_ROWS,
+    ):
+        self.namespace = namespace
+        self.db_url = db_url
+        self._snapshot_loader = snapshot_loader or memory_snapshot
+        self._changefeed_loader = changefeed_loader or changefeed_events
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._subscribers: list["queue.Queue[dict[str, Any] | None]"] = []
+        self._snapshot: dict[str, Any] | None = None
+        self._thread: threading.Thread | None = None
+        self._startup_error: Exception | None = None
+
+    def subscribe(self, *, timeout: float = 30.0) -> DashboardSubscription:
+        """Return a cached snapshot and an event queue for one SSE client."""
+
+        self.start()
+        if not self._ready.wait(timeout):
+            raise RuntimeError("memory dashboard changefeed did not become ready")
+        if self._startup_error is not None:
+            raise RuntimeError(str(self._startup_error)) from self._startup_error
+        events: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=200)
+        with self._lock:
+            snapshot = dict(self._snapshot or self._load_snapshot())
+            self._subscribers.append(events)
+        return DashboardSubscription(snapshot=snapshot, events=events)
+
+    def unsubscribe(self, subscription: DashboardSubscription) -> None:
+        with self._lock:
+            if subscription.events in self._subscribers:
+                self._subscribers.remove(subscription.events)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"hindsight-dashboard-{self.namespace}",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._lock:
+            subscribers = list(self._subscribers)
+            self._subscribers.clear()
+        for subscriber in subscribers:
+            _put_sse_event(subscriber, None)
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def _run(self) -> None:
+        try:
+            cursor = datetime.now(UTC)
+            with self._lock:
+                self._snapshot = self._load_snapshot()
+            self._ready.set()
+            for event in self._changefeed_loader(
+                namespace=self.namespace,
+                db_url=self.db_url,
+                stop_event=self._stop,
+                cursor=cursor,
+            ):
+                if self._stop.is_set():
+                    break
+                self._apply_event(event)
+                self._publish(event)
+        except Exception as exc:  # pragma: no cover - exercised through broker tests
+            self._startup_error = exc
+            self._ready.set()
+            self._publish({"event": "error", "type": "error", "error": str(exc)})
+
+    def _load_snapshot(self) -> dict[str, Any]:
+        return self._snapshot_loader(
+            namespace=self.namespace,
+            db_url=self.db_url,
+            limit=self._limit,
+        )
+
+    def _apply_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") not in {"memory", "operation"}:
+            return
+        with self._lock:
+            snapshot = self._snapshot or self._load_snapshot()
+            if event["event"] == "memory":
+                snapshot["memories"] = _upsert_recent(
+                    snapshot.get("memories", []),
+                    event["memory"],
+                    sort_key=_memory_event_sort_key,
+                    limit=self._limit,
+                )
+            if event["event"] == "operation":
+                snapshot["operations"] = _upsert_recent(
+                    snapshot.get("operations", []),
+                    event["operation"],
+                    sort_key=_operation_event_sort_key,
+                    limit=self._limit,
+                )
+            snapshot["timeline"] = _timeline(snapshot.get("memories", []), snapshot.get("operations", []))
+            snapshot["generated_at"] = datetime.now(UTC).isoformat()
+            self._snapshot = snapshot
+
+    def _publish(self, event: dict[str, Any]) -> None:
+        stale: list[queue.Queue[dict[str, Any] | None]] = []
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            if not _put_sse_event(subscriber, event):
+                stale.append(subscriber)
+        if stale:
+            with self._lock:
+                self._subscribers = [subscriber for subscriber in self._subscribers if subscriber not in stale]
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -88,6 +245,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def _send_events(self, query: str) -> None:
         params = parse_qs(query)
         namespace = _param(params, "namespace", self.server.namespace)
+        broker = self.server.broker_for(namespace)
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -95,22 +253,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_header("x-accel-buffering", "no")
         self.end_headers()
 
-        stop_event = threading.Event()
+        subscription: DashboardSubscription | None = None
         try:
-            self._write_sse("snapshot", memory_snapshot(namespace=namespace, db_url=self.server.db_url))
-            for event in changefeed_events(
-                namespace=namespace,
-                db_url=self.server.db_url,
-                stop_event=stop_event,
-            ):
+            subscription = broker.subscribe()
+            self._write_sse("snapshot", subscription.snapshot)
+            while True:
+                event = subscription.events.get()
+                if event is None:
+                    break
                 self._write_sse(event["event"], event)
         except (BrokenPipeError, ConnectionResetError):
-            stop_event.set()
+            pass
         except Exception as exc:
             try:
                 self._write_sse("error", {"error": str(exc)})
             except (BrokenPipeError, ConnectionResetError):
-                stop_event.set()
+                pass
+        finally:
+            if subscription is not None:
+                broker.unsubscribe(subscription)
 
     def _write_sse(self, event: str, payload: dict[str, Any]) -> None:
         body = f"event: {event}\ndata: {json.dumps(_jsonable(payload), sort_keys=True)}\n\n"
@@ -155,7 +316,7 @@ def memory_snapshot(
     if timestamp is not None:
         with MemoryStore(url=db_url or database_url()) as store:
             memories = store.recall(namespace=namespace, query="", as_of=timestamp, limit=limit)
-        operations = _memory_operations(namespace=namespace, db_url=db_url, limit=limit)
+        operations = _memory_operations(namespace=namespace, db_url=db_url, limit=limit, as_of=timestamp)
         return {
             "type": "snapshot",
             "mode": "as_of",
@@ -186,22 +347,25 @@ def changefeed_events(
     namespace: str,
     db_url: str | None = None,
     stop_event: threading.Event | None = None,
+    cursor: datetime | None = None,
+    on_ready: Callable[[], None] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield namespace-scoped dashboard events from CockroachDB changefeeds."""
 
     stop_event = stop_event or threading.Event()
+    cursor = cursor or datetime.now(UTC)
     with connect(db_url or database_url()) as conn:
+        conn.autocommit = True
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
+            query = """
                     CREATE CHANGEFEED FOR semantic_memories, memory_operations
-                    WITH updated, resolved = '2s'
+                    WITH updated, resolved = '2s', cursor = %s
                 """
-            )
-            while not stop_event.is_set():
-                row = cur.fetchone()
-                if row is None:
-                    continue
+            if on_ready is not None:
+                on_ready()
+            for row in cur.stream(query, (cursor.isoformat(),)):
+                if stop_event.is_set():
+                    break
                 event = changefeed_row_to_event(row, namespace=namespace)
                 if event is not None:
                     yield event
@@ -222,6 +386,18 @@ def changefeed_row_to_event(row: dict[str, Any], *, namespace: str) -> dict[str,
     value = _decode_json_value(raw.get("value"))
     if not isinstance(value, dict):
         return None
+    updated = raw.get("updated")
+    if value.get("updated") is not None:
+        updated = value["updated"]
+    if value.get("resolved") is not None:
+        return {
+            "event": "resolved",
+            "type": "resolved",
+            "namespace": namespace,
+            "resolved": _jsonable(value["resolved"]),
+        }
+    if isinstance(value.get("after"), dict):
+        value = value["after"]
     if value.get("namespace") != namespace:
         return None
     if table == "semantic_memories":
@@ -229,7 +405,7 @@ def changefeed_row_to_event(row: dict[str, Any], *, namespace: str) -> dict[str,
             "event": "memory",
             "type": "memory",
             "namespace": namespace,
-            "updated": _jsonable(raw.get("updated")),
+            "updated": _jsonable(updated),
             "memory": _normalize_memory(value),
         }
     if table == "memory_operations":
@@ -237,7 +413,7 @@ def changefeed_row_to_event(row: dict[str, Any], *, namespace: str) -> dict[str,
             "event": "operation",
             "type": "operation",
             "namespace": namespace,
-            "updated": _jsonable(raw.get("updated")),
+            "updated": _jsonable(updated),
             "operation": _normalize_operation(value),
         }
     return None
@@ -251,10 +427,17 @@ def _semantic_memories(
             cur.execute(
                 """
                     SELECT *
-                    FROM semantic_memories
-                    WHERE namespace = %s
-                    ORDER BY t_valid ASC, written_at ASC
-                    LIMIT %s
+                    FROM (
+                        SELECT *
+                        FROM semantic_memories
+                        WHERE namespace = %s
+                        ORDER BY
+                            COALESCE(invalidated_at, written_at, t_invalid, t_valid) DESC,
+                            written_at DESC,
+                            id DESC
+                        LIMIT %s
+                    ) AS recent_memories
+                    ORDER BY t_valid ASC, written_at ASC, id ASC
                 """,
                 (namespace, limit),
             )
@@ -262,19 +445,31 @@ def _semantic_memories(
 
 
 def _memory_operations(
-    *, namespace: str, db_url: str | None, limit: int
+    *,
+    namespace: str,
+    db_url: str | None,
+    limit: int,
+    as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
     with connect(db_url or database_url()) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            as_of_filter = "AND created_at <= %s" if as_of is not None else ""
+            params: tuple[Any, ...]
+            params = (namespace, as_of, limit) if as_of is not None else (namespace, limit)
             cur.execute(
-                """
+                f"""
                     SELECT *
-                    FROM memory_operations
-                    WHERE namespace = %s
-                    ORDER BY created_at ASC
-                    LIMIT %s
+                    FROM (
+                        SELECT *
+                        FROM memory_operations
+                        WHERE namespace = %s
+                            {as_of_filter}
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT %s
+                    ) AS recent_operations
+                    ORDER BY created_at ASC, id ASC
                 """,
-                (namespace, limit),
+                params,
             )
             return [dict(row) for row in cur.fetchall()]
 
@@ -324,6 +519,45 @@ def _timeline(memories: list[dict[str, Any]], operations: list[dict[str, Any]]) 
             if row.get(key) is not None:
                 values.add(_jsonable(row[key]))
     return sorted(str(value) for value in values if value is not None)
+
+
+def _upsert_recent(
+    rows: list[dict[str, Any]],
+    row: dict[str, Any],
+    *,
+    sort_key: Callable[[dict[str, Any]], tuple[str, str]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    by_id = {str(item.get("id")): item for item in rows}
+    by_id[str(row.get("id"))] = row
+    sorted_rows = sorted(by_id.values(), key=sort_key)
+    return sorted_rows[-limit:]
+
+
+def _memory_event_sort_key(row: dict[str, Any]) -> tuple[str, str]:
+    timestamp = (
+        row.get("invalidated_at")
+        or row.get("written_at")
+        or row.get("t_invalid")
+        or row.get("t_valid")
+        or ""
+    )
+    return (str(timestamp), str(row.get("id") or ""))
+
+
+def _operation_event_sort_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("created_at") or ""), str(row.get("id") or ""))
+
+
+def _put_sse_event(
+    subscriber: "queue.Queue[dict[str, Any] | None]",
+    event: dict[str, Any] | None,
+) -> bool:
+    try:
+        subscriber.put_nowait(event)
+        return True
+    except queue.Full:
+        return False
 
 
 def _parse_timestamp(value: str | datetime | None) -> datetime | None:
@@ -594,6 +828,9 @@ def dashboard_html(*, default_namespace: str = DEMO_NAMESPACE) -> str:
     const params = new URLSearchParams(window.location.search);
     const namespace = params.get("namespace") || {json.dumps(default_namespace)};
     const state = {{ memories: new Map(), operations: new Map(), timeline: [], asOf: null }};
+    let snapshotAbortController = null;
+    let snapshotRequestSeq = 0;
+    let timelineDebounceId = null;
     const namespaceEl = document.getElementById("namespace");
     const statusEl = document.getElementById("status");
     const memoriesEl = document.getElementById("memories");
@@ -679,24 +916,44 @@ def dashboard_html(*, default_namespace: str = DEMO_NAMESPACE) -> str:
       </article>`;
     }}
 
+    function reportSnapshotError(error) {{
+      if (error.name === "AbortError") return;
+      statusEl.textContent = "Snapshot failed";
+      console.error(error);
+    }}
+
     async function loadSnapshot(asOf = null) {{
+      const requestSeq = ++snapshotRequestSeq;
+      if (snapshotAbortController) snapshotAbortController.abort();
+      snapshotAbortController = new AbortController();
+      const controller = snapshotAbortController;
       const url = new URL("/snapshot", window.location.origin);
       url.searchParams.set("namespace", namespace);
       if (asOf) url.searchParams.set("as_of", asOf);
-      const response = await fetch(url);
+      const response = await fetch(url, {{ signal: controller.signal }});
       if (!response.ok) throw new Error(await response.text());
-      applySnapshot(await response.json());
+      const snapshot = await response.json();
+      if (requestSeq === snapshotRequestSeq) applySnapshot(snapshot);
+      if (snapshotAbortController === controller) snapshotAbortController = null;
     }}
 
-    timelineEl.addEventListener("input", async () => {{
+    function scheduleTimelineSnapshot(asOf) {{
+      clearTimeout(timelineDebounceId);
+      timelineDebounceId = setTimeout(() => {{
+        loadSnapshot(asOf).catch(reportSnapshotError);
+      }}, 150);
+    }}
+
+    timelineEl.addEventListener("input", () => {{
       const selected = state.timeline[Number(timelineEl.value)];
       if (!selected) return;
-      await loadSnapshot(selected);
+      scheduleTimelineSnapshot(selected);
     }});
 
     liveButton.addEventListener("click", async () => {{
+      clearTimeout(timelineDebounceId);
       state.asOf = null;
-      await loadSnapshot();
+      await loadSnapshot().catch(reportSnapshotError);
     }});
 
     const events = new EventSource(`/events?namespace=${{encodeURIComponent(namespace)}}`);
