@@ -21,6 +21,13 @@ def seeded_conn():
     conn = connect()
     try:
         with conn.transaction():
+            conn.execute("DELETE FROM incident_semantic_memories")
+            conn.execute("DELETE FROM incident_runbooks")
+            conn.execute("DELETE FROM incident_events")
+            conn.execute("DELETE FROM incident_services")
+            conn.execute("DELETE FROM runbooks")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM services")
             conn.execute(DEMO_FIXTURE.read_text())
             yield conn
             raise RuntimeError("rollback fixture data")
@@ -132,6 +139,57 @@ def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_
         """,
         (payment_memory["id"], stale_memory["id"], gateway_memory["id"]),
     )
+    seeded_conn.execute(
+        """
+            INSERT INTO incident_services (incident_id, service_id, impact)
+            VALUES (
+                '30000000-0000-0000-0000-000000000001',
+                '10000000-0000-0000-0000-000000000002',
+                'Edge gateway contributed client-facing retries.'
+            )
+            ON CONFLICT (incident_id, service_id) DO UPDATE SET
+                impact = excluded.impact
+        """
+    )
+    seeded_conn.execute(
+        """
+            INSERT INTO runbooks (id, slug, service_id, title, summary, steps)
+            VALUES (
+                '20000000-0000-0000-0000-000000000004',
+                'incident-command-global',
+                NULL,
+                'Incident command checklist',
+                'Coordinate communication and command roles for any incident.',
+                '["Assign incident commander", "Open status channel"]'::JSONB
+            )
+            ON CONFLICT (slug) DO UPDATE SET
+                service_id = excluded.service_id,
+                title = excluded.title,
+                summary = excluded.summary,
+                steps = excluded.steps
+        """
+    )
+    seeded_conn.execute(
+        """
+            INSERT INTO incident_runbooks (incident_id, runbook_id, usage_note, outcome)
+            VALUES
+                (
+                    '30000000-0000-0000-0000-000000000001',
+                    '20000000-0000-0000-0000-000000000002',
+                    'Checked gateway certificates while investigating retries.',
+                    'Gateway checks were not the payments remediation.'
+                ),
+                (
+                    '30000000-0000-0000-0000-000000000001',
+                    '20000000-0000-0000-0000-000000000004',
+                    'Used incident command checklist for cross-team coordination.',
+                    'Command workflow applied to the payments incident.'
+                )
+            ON CONFLICT (incident_id, runbook_id) DO UPDATE SET
+                usage_note = excluded.usage_note,
+                outcome = excluded.outcome
+        """
+    )
     store.invalidate(
         memory_kind="semantic",
         memory_id=str(stale_memory["id"]),
@@ -145,11 +203,14 @@ def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_
         (query_vector, namespace, "payments-api", query_vector, 5),
     ).fetchall()
 
-    assert len(rows) == 1
-    assert rows[0][0] == payment_memory["id"]
-    assert rows[0][3] == "inc-payment-latency-2026-06-14"
-    assert rows[0][6] == "payments-api"
-    assert rows[0][8] == "payments-latency-triage"
+    assert len(rows) == 2
+    assert {row[0] for row in rows} == {payment_memory["id"]}
+    assert {row[3] for row in rows} == {"inc-payment-latency-2026-06-14"}
+    assert {row[6] for row in rows} == {"payments-api"}
+    assert {row[8] for row in rows} == {
+        "incident-command-global",
+        "payments-latency-triage",
+    }
 
     wrapped_rows = store.recall_similar_incidents(
         namespace=namespace,
@@ -158,8 +219,13 @@ def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_
         limit=5,
     )
 
-    assert len(wrapped_rows) == 1
-    assert wrapped_rows[0]["memory_id"] == payment_memory["id"]
-    assert wrapped_rows[0]["incident_slug"] == "inc-payment-latency-2026-06-14"
-    assert wrapped_rows[0]["service_slug"] == "payments-api"
-    assert wrapped_rows[0]["runbook_slug"] == "payments-latency-triage"
+    assert len(wrapped_rows) == 2
+    assert {row["memory_id"] for row in wrapped_rows} == {payment_memory["id"]}
+    assert {row["incident_slug"] for row in wrapped_rows} == {
+        "inc-payment-latency-2026-06-14"
+    }
+    assert {row["service_slug"] for row in wrapped_rows} == {"payments-api"}
+    assert {row["runbook_slug"] for row in wrapped_rows} == {
+        "incident-command-global",
+        "payments-latency-triage",
+    }

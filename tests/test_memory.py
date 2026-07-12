@@ -279,14 +279,184 @@ def test_semantic_write_creates_embedding_row():
 
 
 @requires_db
-def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
+def test_bad_embedding_provider_does_not_leave_semantic_row():
     from hindsight.db import connect
+    from hindsight.memory import MemoryStore, Provenance
+
+    class BadProvider:
+        provider_name = "bad"
+        model_name = "wrong-dimensions"
+        dimensions = 3
+
+        def embed(self, text: str) -> list[float]:
+            return [0.0, 0.0, 0.0]
+
+    conn = connect()
+    namespace = f"incident-{uuid4()}"
+    try:
+        store = MemoryStore(conn, embedding_provider=BadProvider())
+
+        with pytest.raises(ValueError, match="semantic vector store expects 1024 dimensions"):
+            store.write_semantic(
+                namespace=namespace,
+                content="payment timeout in worker",
+                provenance=Provenance(
+                    writer="agent.reflect",
+                    source_ref="incident:bad-vector-write",
+                    justification="Reject bad embedding provider before row insert",
+                ),
+            )
+        conn.commit()
+
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE namespace = %s",
+            (namespace,),
+        ).fetchone() == (0,)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_historical_read_url_uses_caller_connection_when_url_is_not_supplied():
+    from hindsight.memory import MemoryStore
+
+    class FakeInfo:
+        dsn = "caller-supplied-dsn"
+
+    class FakeConnection:
+        info = FakeInfo()
+
+    store = MemoryStore.__new__(MemoryStore)
+    store._url = None
+    store._conn = FakeConnection()
+
+    assert store._historical_read_url() == "caller-supplied-dsn"
+
+
+def test_historical_read_url_prefers_explicit_store_url():
+    from hindsight.memory import MemoryStore
+
+    class FakeInfo:
+        dsn = "caller-supplied-dsn"
+
+    class FakeConnection:
+        info = FakeInfo()
+
+    store = MemoryStore.__new__(MemoryStore)
+    store._url = "explicit-database-url"
+    store._conn = FakeConnection()
+
+    assert store._historical_read_url() == "explicit-database-url"
+
+
+@requires_db
+def test_direct_semantic_write_supports_autocommit_connections():
+    from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
-    conn = connect()
+    conn = connect(database_url())
+    namespace = f"incident-{uuid4()}"
+    conn.autocommit = True
     try:
-        store = MemoryStore(conn, embedding_provider=DeterministicEmbeddingProvider())
+        store = MemoryStore(
+            conn,
+            url=database_url(),
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
+        memory = store.write_semantic(
+            namespace=namespace,
+            content="payment timeout in worker",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:autocommit-vector-write",
+                justification="Direct autocommit semantic write remains supported",
+            ),
+        )
+
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE id = %s",
+            (memory["id"],),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memory_embeddings WHERE memory_id = %s",
+            (memory["id"],),
+        ).fetchone() == (1,)
+    finally:
+        conn.execute("DELETE FROM semantic_memory_embeddings WHERE namespace = %s", (namespace,))
+        conn.execute("DELETE FROM semantic_memories WHERE namespace = %s", (namespace,))
+        conn.close()
+
+
+@requires_db
+def test_current_semantic_rejects_blank_namespace(memory_store):
+    from hindsight.memory import ProvenanceError
+
+    with pytest.raises(ProvenanceError, match="namespace is required"):
+        memory_store.current_semantic(namespace="")
+
+
+@requires_db
+def test_as_of_recall_does_not_commit_caller_transaction():
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore, Provenance
+
+    db_url = database_url()
+    conn = connect(db_url)
+    namespace = f"incident-{uuid4()}"
+    try:
+        store = MemoryStore(conn, url=db_url)
+        baseline = store.write_semantic(
+            namespace=namespace,
+            content="payment latency came from retry fanout",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:baseline",
+                justification="Committed baseline before tentative write",
+            ),
+        )
+        conn.commit()
+        as_of = conn.execute("SELECT now()").fetchone()[0]
+        conn.commit()
+        sleep(0.05)
+
+        tentative = store.write_semantic(
+            namespace=namespace,
+            content="payment latency came from certificate expiry",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:tentative",
+                justification="Tentative write must remain rollbackable after AS OF recall",
+            ),
+        )
+
+        recalled = store.recall(namespace=namespace, query="", as_of=as_of, limit=5)
+
+        assert [row["id"] for row in recalled] == [baseline["id"]]
+        conn.rollback()
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE id = %s",
+            (tentative["id"],),
+        ).fetchone() == (0,)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@requires_db
+def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    db_url = database_url()
+    conn = connect(db_url)
+    try:
+        store = MemoryStore(
+            conn,
+            url=db_url,
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
         namespace = f"incident-{uuid4()}"
         good = store.remember(
             memory_kind="semantic",
@@ -362,6 +532,77 @@ def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
         assert [row["id"] for row in store.recall(namespace=namespace, query="payment")] == [
             good["id"]
         ]
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@requires_db
+def test_rewind_does_not_commit_caller_transaction():
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore, Provenance
+
+    db_url = database_url()
+    conn = connect(db_url)
+    namespace = f"incident-{uuid4()}"
+    try:
+        store = MemoryStore(conn, url=db_url)
+        store.write_semantic(
+            namespace=namespace,
+            content="payment latency came from retry fanout",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:baseline",
+                justification="Known-good baseline before rewind target",
+            ),
+        )
+        conn.commit()
+        rewind_target = conn.execute("SELECT now()").fetchone()[0]
+        conn.commit()
+        sleep(0.05)
+
+        poisoned = store.write_semantic(
+            namespace=namespace,
+            content="payment latency came from certificate expiry",
+            provenance=Provenance(
+                writer="agent.reflect",
+                source_ref="incident:poisoned",
+                justification="Committed bad memory to be invalidated inside caller transaction",
+            ),
+        )
+        conn.commit()
+
+        tentative = store.write_semantic(
+            namespace=namespace,
+            content="rotate certificates to fix payment latency",
+            provenance=Provenance(
+                writer="agent.plan",
+                source_ref="decision:tentative",
+                justification="Tentative derived memory must remain rollbackable after rewind",
+            ),
+        )
+        result = store.rewind(
+            timestamp=rewind_target,
+            namespace=namespace,
+            actor="agent.rewind",
+            reason="Poisoned memory led to the wrong remediation plan",
+        )
+        operation_id = result.operation["id"]
+
+        conn.rollback()
+
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE id = %s",
+            (tentative["id"],),
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT t_invalid FROM semantic_memories WHERE id = %s",
+            (poisoned["id"],),
+        ).fetchone() == (None,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_operations WHERE id = %s",
+            (operation_id,),
+        ).fetchone() == (0,)
     finally:
         conn.rollback()
         conn.close()

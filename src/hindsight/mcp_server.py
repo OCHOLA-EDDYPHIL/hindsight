@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from hindsight.db import connect
+from hindsight.db import connect, database_url
 from hindsight.memory import MemoryKind, MemoryStore
 
 MCP_READER = "mcp.memory_inspector"
@@ -177,8 +177,9 @@ def inspect_beliefs_as_of(
     limit = _validated_limit(limit)
     timestamp = _parse_timestamp(as_of)
     decision_id = _decision_id("beliefs-as-of")
-    with connect(db_url) as conn:
-        store = MemoryStore(conn=conn)
+    resolved_db_url = db_url or database_url()
+    with connect(resolved_db_url) as conn:
+        store = MemoryStore(conn=conn, url=resolved_db_url)
         rows = store.recall(
             namespace=namespace,
             query=query or "",
