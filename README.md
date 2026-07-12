@@ -53,6 +53,22 @@ uv run python scripts/run_poison_rewind_demo.py run --namespace demo:payments --
 uv run python scripts/run_poison_rewind_demo.py diagnose --decision-id agent:demo:payments:poisoned:plan
 ```
 
+## Cross-episode learning demo
+
+The repeat-incident demo shows Hindsight consolidating a resolved episode into a reusable lesson, then resolving a similar incident in fewer steps:
+
+```bash
+make cross-episode-demo-local
+```
+
+Run it with the live dashboard open on the printed namespace to watch the consolidated lesson appear as semantic memory:
+
+```bash
+make memory-dashboard-local
+```
+
+The demo output compares episode one and episode two with a deterministic steps-to-resolution metric and includes the consolidated memory recalled by episode two.
+
 ## Live memory dashboard
 
 The demo dashboard shows semantic memories and rewind operations for one namespace as they change:

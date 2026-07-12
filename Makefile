@@ -1,6 +1,6 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
 
-.PHONY: dev-up dev-down migrate migrate-local test lint lambda-zip mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local memory-dashboard memory-dashboard-local
+.PHONY: dev-up dev-down migrate migrate-local test lint lambda-zip mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local cross-episode-demo cross-episode-demo-local memory-dashboard memory-dashboard-local
 
 dev-up:
 	docker compose up -d --wait
@@ -36,6 +36,12 @@ poison-rewind-demo:
 
 poison-rewind-demo-local:
 	DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python scripts/run_poison_rewind_demo.py all
+
+cross-episode-demo:
+	uv run python scripts/run_cross_episode_demo.py
+
+cross-episode-demo-local:
+	uv run python scripts/run_cross_episode_demo.py --db-url "$(LOCAL_DATABASE_URL)"
 
 memory-dashboard:
 	uv run python scripts/run_memory_dashboard.py
