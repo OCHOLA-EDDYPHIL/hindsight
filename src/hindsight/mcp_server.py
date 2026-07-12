@@ -20,6 +20,7 @@ MCP_ACTOR_ENV = "HINDSIGHT_MCP_ACTOR"
 CURRENT_BELIEFS_PURPOSE = "Inspect current Hindsight memory through MCP"
 BELIEFS_AS_OF_PURPOSE = "Inspect Hindsight belief state at a timestamp through MCP"
 PROVENANCE_CHAIN_PURPOSE = "Inspect Hindsight memory provenance through MCP"
+DECISION_TRACE_PURPOSE = "Inspect one decision's memory provenance through MCP"
 MCP_AUDIT_LOG_PURPOSE = "Inspect recent Hindsight MCP audit events"
 MAX_LIMIT = 100
 
@@ -83,6 +84,21 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
             memory_kind=memory_kind,
             actor=_mcp_actor(),
             purpose=PROVENANCE_CHAIN_PURPOSE,
+            db_url=db_url,
+        )
+
+    @server.tool()
+    def decision_trace(
+        decision_id: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return every memory read by one decision with provenance."""
+
+        return inspect_decision_trace(
+            decision_id=decision_id,
+            limit=limit,
+            actor=_mcp_actor(),
+            purpose=DECISION_TRACE_PURPOSE,
             db_url=db_url,
         )
 
@@ -264,6 +280,72 @@ def inspect_provenance_chain(
         "memory": _jsonable(memory),
         "provenance": _jsonable(provenance),
         "reads": _jsonable(downstream_reads),
+    }
+
+
+def inspect_decision_trace(
+    *,
+    decision_id: str,
+    limit: int = 20,
+    actor: str = MCP_READER,
+    purpose: str = "Inspect one decision's memory provenance through MCP",
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Return a decision-to-memory provenance chain in one audited view."""
+
+    if not decision_id or not decision_id.strip():
+        raise ValueError("decision_id is required")
+    limit = _validated_limit(limit)
+    inspection_decision_id = _decision_id("decision-trace")
+    with connect(db_url) as conn:
+        store = MemoryStore(conn=conn)
+        reads = store.reads_for_decision(decision_id=decision_id)[:limit]
+        memories = []
+        for read in reads:
+            memory_kind = read["memory_kind"]
+            memory_id = str(read["memory_id"])
+            memory = store.audit_memory(memory_kind=memory_kind, memory_id=memory_id)
+            provenance = store.provenance_for_memory(
+                memory_kind=memory_kind,
+                memory_id=memory_id,
+            )
+            store.record_read(
+                decision_id=inspection_decision_id,
+                memory_kind=memory_kind,
+                memory_id=memory_id,
+                reader=actor,
+                purpose=purpose,
+            )
+            memories.append(
+                {
+                    "read": read,
+                    "memory": memory,
+                    "provenance": provenance,
+                    "status": "invalidated"
+                    if provenance and provenance.get("invalidated_at") is not None
+                    else "current",
+                }
+            )
+        audit_event = _record_mcp_audit_event(
+            conn,
+            tool_name="decision_trace",
+            actor=actor,
+            purpose=purpose,
+            arguments={
+                "decision_id": decision_id,
+                "limit": limit,
+                "inspection_decision_id": inspection_decision_id,
+            },
+            result_count=len(memories),
+        )
+        conn.commit()
+    return {
+        "tool": "decision_trace",
+        "decision_id": decision_id,
+        "inspection_decision_id": inspection_decision_id,
+        "audit_event_id": str(audit_event["id"]),
+        "count": len(memories),
+        "memories": _jsonable(memories),
     }
 
 

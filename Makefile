@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down migrate test lint lambda-zip mcp-server telemetry-demo
+.PHONY: dev-up dev-down migrate test lint lambda-zip mcp-server telemetry-demo poison-rewind-demo
 
 dev-up:
 	docker compose up -d --wait
@@ -24,3 +24,6 @@ mcp-server:
 
 telemetry-demo:
 	uv run python scripts/run_telemetry_demo.py
+
+poison-rewind-demo:
+	uv run python scripts/run_poison_rewind_demo.py all

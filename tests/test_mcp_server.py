@@ -22,6 +22,63 @@ def test_create_mcp_server_registers_tools():
 
 
 @requires_db
+def test_mcp_decision_trace_shows_memory_provenance_in_one_view():
+    from hindsight.db import connect, database_url
+    from hindsight.mcp_server import inspect_decision_trace
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"mcp-decision-trace-{uuid4()}"
+    decision_id = f"agent:{uuid4()}:plan"
+    with MemoryStore(url=database_url()) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="rotate certificates to repair checkout latency",
+            provenance=Provenance(
+                writer="demo.poison",
+                source_ref="demo:simulated-memory-poisoning",
+                justification="Seed poisoned memory for trace inspection",
+            ),
+        )
+        store.record_read(
+            decision_id=decision_id,
+            memory_kind="semantic",
+            memory_id=str(memory["id"]),
+            reader="agent.recall",
+            purpose="retrieve semantic incident context",
+        )
+
+    result = inspect_decision_trace(
+        decision_id=decision_id,
+        actor="pytest.mcp",
+        purpose="verify one-view decision trace",
+        db_url=database_url(),
+    )
+
+    assert result["tool"] == "decision_trace"
+    assert result["decision_id"] == decision_id
+    assert result["count"] == 1
+    traced = result["memories"][0]
+    assert traced["read"]["reader"] == "agent.recall"
+    assert traced["memory"]["id"] == str(memory["id"])
+    assert traced["provenance"]["writer"] == "demo.poison"
+    assert traced["provenance"]["source_ref"] == "demo:simulated-memory-poisoning"
+    assert traced["status"] == "current"
+
+    with connect(database_url()) as conn:
+        audit = conn.execute(
+            """
+                SELECT tool_name, actor, result_count
+                FROM mcp_audit_events
+                WHERE id = %s
+            """,
+            (result["audit_event_id"],),
+        ).fetchone()
+
+    assert audit == ("decision_trace", "pytest.mcp", 1)
+
+
+@requires_db
 def test_mcp_current_beliefs_records_memory_and_tool_audit():
     from hindsight.db import connect, database_url
     from hindsight.mcp_server import inspect_current_beliefs
