@@ -35,6 +35,24 @@ uv run python scripts/run_telemetry_demo.py
 
 The demo service emits Prometheus-style checkout metrics and structured JSON log events. Its retry-fanout failure produces a webhook-equivalent telemetry signal, opens an `incidents` row, writes an `incident_events` telemetry alert, stores the metric/log excerpt as semantic memory with `telemetry.ingest` provenance, and then runs the incident agent against that namespace.
 
+## Poison and rewind demo
+
+The signature memory demo is also scriptable:
+
+```bash
+uv run python scripts/run_poison_rewind_demo.py all
+```
+
+The sequence seeds a known-good payment-latency memory, runs the agent cleanly, inserts a plausible poisoned memory with provenance, shows the agent make the wrong recommendation, traces the bad decision back to the memory it recalled, rewinds the namespace in one audited transaction, and reruns the agent to produce the corrected recommendation.
+
+For rehearsals, the same script exposes smaller steps:
+
+```bash
+uv run python scripts/run_poison_rewind_demo.py poison --namespace demo:payments
+uv run python scripts/run_poison_rewind_demo.py run --namespace demo:payments --label poisoned
+uv run python scripts/run_poison_rewind_demo.py diagnose --decision-id agent:demo:payments:poisoned:plan
+```
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).

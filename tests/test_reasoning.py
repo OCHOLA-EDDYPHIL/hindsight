@@ -18,6 +18,23 @@ def test_deterministic_reasoning_provider_returns_stable_response():
     assert response.usage["prompt_characters"] == len("what happened?")
 
 
+def test_memory_biased_demo_reasoning_changes_recommendation_from_prompt():
+    from hindsight.demo import BAD_RECOMMENDATION, GOOD_RECOMMENDATION, MemoryBiasedDemoReasoningProvider
+    from hindsight.reasoning import ReasoningRequest
+
+    provider = MemoryBiasedDemoReasoningProvider()
+
+    clean = provider.generate(ReasoningRequest(prompt="Recalled memories:\nretry fanout"))
+    poisoned = provider.generate(
+        ReasoningRequest(prompt="Recalled memories:\nPoisoned memory: certificate material")
+    )
+
+    assert clean.text == GOOD_RECOMMENDATION
+    assert clean.usage["poisoned_memory_seen"] is False
+    assert poisoned.text == BAD_RECOMMENDATION
+    assert poisoned.usage["poisoned_memory_seen"] is True
+
+
 def test_provider_from_env_defaults_to_gemini_and_requires_key():
     from hindsight.reasoning import ReasoningProviderError, reasoning_provider_from_env
 
