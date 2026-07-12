@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import queue
 import threading
 import time
@@ -14,7 +16,7 @@ from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 from uuid import UUID
 
 from psycopg.rows import dict_row
@@ -22,10 +24,13 @@ from psycopg.rows import dict_row
 from hindsight.db import connect, database_url
 from hindsight.demo import DEMO_NAMESPACE
 from hindsight.memory import MemoryStore
+from hindsight.security import safe_error_detail
 
 MAX_SNAPSHOT_ROWS = 100
 HISTORICAL_SNAPSHOT_TTL_SECONDS = 3.0
 BROKER_IDLE_TIMEOUT_SECONDS = 90.0
+DASHBOARD_AUTH_TOKEN_ENV = "HINDSIGHT_DASHBOARD_AUTH_TOKEN"
+DASHBOARD_AUTH_COOKIE = "hindsight_dashboard_token"
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -37,12 +42,14 @@ class DashboardServer(ThreadingHTTPServer):
         *,
         namespace: str,
         db_url: str | None = None,
+        auth_token: str | None = None,
         historical_snapshot_ttl: float = HISTORICAL_SNAPSHOT_TTL_SECONDS,
         broker_idle_timeout: float = BROKER_IDLE_TIMEOUT_SECONDS,
     ):
         super().__init__(server_address, DashboardRequestHandler)
         self.namespace = namespace
         self.db_url = db_url
+        self.auth_token = _optional_token(auth_token or os.environ.get(DASHBOARD_AUTH_TOKEN_ENV))
         self.historical_snapshot_ttl = historical_snapshot_ttl
         self.broker_idle_timeout = broker_idle_timeout
         self._brokers: dict[str, DashboardBroker] = {}
@@ -254,7 +261,7 @@ class DashboardBroker:
         except Exception as exc:  # pragma: no cover - exercised through broker tests
             self._startup_error = exc
             self._ready.set()
-            self._publish({"event": "error", "type": "error", "error": str(exc)})
+            self._publish({"event": "error", "type": "error", "error": safe_error_detail(exc)})
 
     def _load_snapshot(self) -> dict[str, Any]:
         return self._snapshot_loader(
@@ -315,6 +322,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        if parsed.path == "/" and self._query_token_valid(params):
+            self._send_auth_cookie_redirect(parsed)
+            return
+        if not self._authorized(params):
+            self._send_unauthorized()
+            return
         if parsed.path == "/":
             self._send_html(dashboard_html(default_namespace=self.server.namespace))
             return
@@ -337,6 +351,40 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_redirect(self, location: str, *, cookie_token: str | None = None) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("location", location)
+        if cookie_token is not None:
+            self.send_header(
+                "set-cookie",
+                (
+                    f"{DASHBOARD_AUTH_COOKIE}={quote(cookie_token, safe='')}; "
+                    "Path=/; HttpOnly; SameSite=Lax"
+                ),
+            )
+        self.send_header("content-length", "0")
+        self.end_headers()
+
+    def _send_auth_cookie_redirect(self, parsed: Any) -> None:
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        clean_pairs = [
+            (name, value)
+            for name, values in params.items()
+            if name != "token"
+            for value in values
+        ]
+        location = urlunparse(("", "", parsed.path or "/", "", urlencode(clean_pairs), ""))
+        self._send_redirect(location or "/", cookie_token=self.server.auth_token)
+
+    def _send_unauthorized(self) -> None:
+        payload = b"missing or invalid dashboard token\n"
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("content-type", "text/plain; charset=utf-8")
+        self.send_header("www-authenticate", 'Bearer realm="hindsight-dashboard"')
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(_jsonable(payload), sort_keys=True).encode("utf-8")
         self.send_response(status)
@@ -355,7 +403,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             else:
                 snapshot = self.server.current_snapshot(namespace=namespace)
         except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            self._send_json({"error": safe_error_detail(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         self._send_json(snapshot)
 
@@ -383,7 +431,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             pass
         except Exception as exc:
             try:
-                self._write_sse("error", {"error": str(exc)})
+                self._write_sse("error", {"error": safe_error_detail(exc)})
             except (BrokenPipeError, ConnectionResetError):
                 pass
         finally:
@@ -395,6 +443,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body.encode("utf-8"))
         self.wfile.flush()
 
+    def _authorized(self, params: dict[str, list[str]]) -> bool:
+        expected = self.server.auth_token
+        if expected is None:
+            return True
+        supplied = (
+            _bearer_token(self.headers.get("authorization"))
+            or _cookie_token(self.headers.get("cookie"))
+            or _param(params, "token", None)
+        )
+        return supplied is not None and hmac.compare_digest(supplied, expected)
+
+    def _query_token_valid(self, params: dict[str, list[str]]) -> bool:
+        expected = self.server.auth_token
+        supplied = _param(params, "token", None)
+        return expected is not None and supplied is not None and hmac.compare_digest(supplied, expected)
+
 
 def run_dashboard_server(
     *,
@@ -402,12 +466,15 @@ def run_dashboard_server(
     port: int = 8765,
     namespace: str = DEMO_NAMESPACE,
     db_url: str | None = None,
+    auth_token: str | None = None,
 ) -> None:
     """Run the dashboard HTTP server until interrupted."""
 
-    server = DashboardServer((host, port), namespace=namespace, db_url=db_url)
+    server = DashboardServer((host, port), namespace=namespace, db_url=db_url, auth_token=auth_token)
     actual_host, actual_port = server.server_address
     print(f"Hindsight memory dashboard: http://{actual_host}:{actual_port}/?namespace={namespace}")
+    if server.auth_token is not None:
+        print("Dashboard authentication enabled. Visit once with ?token=<token> to set a cookie.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -715,6 +782,32 @@ def _param(params: dict[str, list[str]], name: str, default: str | None) -> str 
         return default
     value = values[0].strip()
     return value or default
+
+
+def _bearer_token(value: str | None) -> str | None:
+    if not value:
+        return None
+    scheme, _, token = value.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def _cookie_token(value: str | None) -> str | None:
+    if not value:
+        return None
+    for part in value.split(";"):
+        name, _, raw = part.strip().partition("=")
+        if name == DASHBOARD_AUTH_COOKIE and raw:
+            return unquote(raw)
+    return None
+
+
+def _optional_token(value: str | None) -> str | None:
+    if value is None:
+        return None
+    token = value.strip()
+    return token or None
 
 
 def _jsonable(value: Any) -> Any:

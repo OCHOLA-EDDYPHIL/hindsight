@@ -182,6 +182,31 @@ def test_provider_from_env_supports_bedrock(monkeypatch):
     assert provider.model_name == "bedrock-env"
 
 
+def test_bedrock_provider_configures_bounded_boto_client(monkeypatch):
+    import hindsight.reasoning as reasoning
+
+    calls = []
+
+    def fake_client(service_name, **kwargs):
+        calls.append((service_name, kwargs))
+        return object()
+
+    monkeypatch.setattr(reasoning, "boto3", None, raising=False)
+    monkeypatch.setattr("boto3.client", fake_client)
+
+    provider = reasoning.BedrockReasoningProvider(
+        model_name="bedrock-test",
+        region_name="us-east-1",
+    )
+
+    assert provider.model_name == "bedrock-test"
+    service_name, kwargs = calls[0]
+    assert service_name == "bedrock-runtime"
+    assert kwargs["region_name"] == "us-east-1"
+    assert kwargs["config"].connect_timeout == 3
+    assert kwargs["config"].read_timeout == 20
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVE_GEMINI_REASONING") != "1",
     reason="live Gemini reasoning invocation is opt-in",

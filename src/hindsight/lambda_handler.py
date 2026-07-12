@@ -7,7 +7,6 @@ import binascii
 import hmac
 import json
 import os
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -15,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import boto3
 
+from hindsight.aws import aws_client_config
 from hindsight.agent import (
     IncidentAgentResult,
     IncidentInput,
@@ -23,6 +23,7 @@ from hindsight.agent import (
 )
 from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
+from hindsight.security import safe_error_detail
 from hindsight.tracing import configure_tracing_from_env
 
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
@@ -127,7 +128,7 @@ def function_auth_token(
 
     client = ssm_client
     if client is None and env.get(FUNCTION_AUTH_TOKEN_PARAM_ENV):
-        client = boto3.client("ssm", region_name=env.get("AWS_REGION"))
+        client = _ssm_client(env)
     token = _secret_value(
         env=env,
         client=client,
@@ -154,7 +155,7 @@ def runtime_settings(
 
     client = ssm_client
     if client is None and _needs_ssm(env):
-        client = boto3.client("ssm", region_name=env.get("AWS_REGION"))
+        client = _ssm_client(env)
     database_url = _database_url_for_lambda(
         _secret_value(
             env=env,
@@ -295,7 +296,7 @@ def _error_response(
             "elapsed_ms": elapsed_ms,
             "cold_start": cold_start,
             "error_type": type(exc).__name__ if exc else "ValueError",
-            "error_detail": _safe_error_detail(exc),
+            "error_detail": safe_error_detail(exc),
         }
     )
     return {
@@ -535,19 +536,6 @@ def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 
 
-def _safe_error_detail(exc: Exception | None) -> str | None:
-    if exc is None:
-        return None
-    detail = str(exc).replace("\n", " ")
-    detail = re.sub(r"(postgres(?:ql)?://[^:\s/]+:)[^@\s/]+@", r"\1***@", detail)
-    detail = re.sub(
-        r"(?i)\b(password|token|secret|api[_-]?key)=([^&\s]+)",
-        r"\1=***",
-        detail,
-    )
-    return detail[:500]
-
-
 def _database_url_for_lambda(url: str) -> str:
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -556,3 +544,11 @@ def _database_url_for_lambda(url: str) -> str:
 
         query["sslrootcert"] = certifi.where()
     return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _ssm_client(env: Mapping[str, str]) -> Any:
+    return boto3.client(
+        "ssm",
+        region_name=env.get("AWS_REGION"),
+        config=aws_client_config(read_timeout=10),
+    )

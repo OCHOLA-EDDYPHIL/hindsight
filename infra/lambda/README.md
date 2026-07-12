@@ -33,3 +33,7 @@ sam deploy \
 The stack output `HindsightAgentFunctionUrl` is the demo endpoint. The handler exposes
 `POST /incident` to start a thread and `POST /incident/resume` to continue an interrupted
 thread. Calls must include `Authorization: Bearer <demo-token>`.
+
+The Function URL uses app-layer bearer authentication so the same endpoint works for
+browser-free demo scripts. Database URLs, model keys, and the function token should be
+stored as SSM SecureString parameters for deployed environments.
