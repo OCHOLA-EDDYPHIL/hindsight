@@ -58,16 +58,20 @@ uv run python scripts/run_poison_rewind_demo.py diagnose --decision-id agent:dem
 The demo dashboard shows semantic memories and rewind operations for one namespace as they change:
 
 ```bash
-uv run python scripts/run_memory_dashboard.py --namespace demo:payments
+make dev-up
+make migrate-local
+make memory-dashboard-local
 ```
 
-Open the printed local URL, then run the poison/rewind sequence against the same namespace:
+Open the printed local URL, then run the poison/rewind sequence against the same local database and namespace:
 
 ```bash
-uv run python scripts/run_poison_rewind_demo.py all --namespace demo:payments
+make poison-rewind-demo-local
 ```
 
 The page receives memory and rewind events through a CockroachDB changefeed-backed Server-Sent Events stream. Invalidated memories remain visible with strikethrough styling, and the timeline scrubber can replay belief state at earlier timestamps.
+
+For final demo checks against CockroachDB Cloud, point `DATABASE_URL` or `--db-url` at the Cloud cluster explicitly. Local CockroachDB is the default rehearsal target.
 
 ## License
 

@@ -17,9 +17,15 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--namespace", default=DEMO_NAMESPACE)
+    parser.add_argument("--db-url", default=None)
     args = parser.parse_args()
 
-    run_dashboard_server(host=args.host, port=args.port, namespace=args.namespace)
+    run_dashboard_server(
+        host=args.host,
+        port=args.port,
+        namespace=args.namespace,
+        db_url=args.db_url,
+    )
 
 
 if __name__ == "__main__":

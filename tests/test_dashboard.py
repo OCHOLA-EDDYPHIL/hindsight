@@ -201,9 +201,10 @@ def test_dashboard_broker_shares_one_changefeed_and_caches_events():
     import hindsight.dashboard as dashboard
 
     memory_id = str(uuid4())
+    cursor = datetime(2026, 7, 12, 14, 0, tzinfo=UTC)
     started = Event()
     continue_feed = Event()
-    calls = {"snapshots": 0, "changefeeds": 0}
+    calls = {"snapshots": 0, "changefeeds": 0, "cursors": 0}
 
     def snapshot_loader(**kwargs):
         calls["snapshots"] += 1
@@ -220,7 +221,7 @@ def test_dashboard_broker_shares_one_changefeed_and_caches_events():
 
     def changefeed_loader(**kwargs):
         calls["changefeeds"] += 1
-        assert kwargs["cursor"].tzinfo is not None
+        assert kwargs["cursor"] == cursor
         started.set()
         continue_feed.wait(timeout=2)
         yield {
@@ -245,17 +246,23 @@ def test_dashboard_broker_shares_one_changefeed_and_caches_events():
             },
         }
 
+    def cursor_provider(**kwargs):
+        calls["cursors"] += 1
+        assert kwargs["db_url"] is None
+        return cursor
+
     broker = dashboard.DashboardBroker(
         namespace="demo:payments",
         snapshot_loader=snapshot_loader,
         changefeed_loader=changefeed_loader,
+        cursor_provider=cursor_provider,
     )
     try:
         first = broker.subscribe()
         second = broker.subscribe()
 
         assert started.is_set()
-        assert calls == {"snapshots": 1, "changefeeds": 1}
+        assert calls == {"snapshots": 1, "changefeeds": 1, "cursors": 1}
         assert first.snapshot["memories"] == []
         assert second.snapshot["memories"] == []
 
@@ -270,10 +277,263 @@ def test_dashboard_broker_shares_one_changefeed_and_caches_events():
 
         late = broker.subscribe()
 
-        assert calls == {"snapshots": 1, "changefeeds": 1}
+        assert calls == {"snapshots": 1, "changefeeds": 1, "cursors": 1}
         assert late.snapshot["memories"][0]["id"] == memory_id
     finally:
         broker.close()
+
+
+def test_dashboard_broker_current_snapshot_reuses_warm_cache():
+    import hindsight.dashboard as dashboard
+
+    calls = {"snapshots": 0, "changefeeds": 0, "cursors": 0}
+
+    def snapshot_loader(**kwargs):
+        calls["snapshots"] += 1
+        return {
+            "type": "snapshot",
+            "mode": "current",
+            "namespace": kwargs["namespace"],
+            "as_of": None,
+            "memories": [
+                {
+                    "id": "memory-1",
+                    "namespace": kwargs["namespace"],
+                    "content": "cached",
+                    "status": "current",
+                }
+            ],
+            "operations": [],
+            "timeline": [],
+            "generated_at": "2026-07-12T14:00:00+00:00",
+        }
+
+    def changefeed_loader(**kwargs):
+        calls["changefeeds"] += 1
+        return iter(())
+
+    def cursor_provider(**kwargs):
+        calls["cursors"] += 1
+        return datetime(2026, 7, 12, 14, 0, tzinfo=UTC)
+
+    broker = dashboard.DashboardBroker(
+        namespace="demo:payments",
+        snapshot_loader=snapshot_loader,
+        changefeed_loader=changefeed_loader,
+        cursor_provider=cursor_provider,
+    )
+    try:
+        first = broker.current_snapshot()
+        second = broker.current_snapshot()
+
+        assert first["memories"][0]["content"] == "cached"
+        assert second["memories"][0]["content"] == "cached"
+        assert calls == {"snapshots": 1, "changefeeds": 1, "cursors": 1}
+    finally:
+        broker.close()
+
+
+def test_dashboard_server_current_snapshot_reuses_one_namespace_broker(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    created = []
+
+    class FakeBroker:
+        def __init__(self, *, namespace, db_url):
+            self.namespace = namespace
+            self.db_url = db_url
+            self.closed = False
+            created.append(self)
+
+        def current_snapshot(self, *, limit):
+            return {
+                "type": "snapshot",
+                "mode": "current",
+                "namespace": self.namespace,
+                "as_of": None,
+                "memories": [],
+                "operations": [],
+                "timeline": [],
+                "generated_at": "2026-07-12T14:00:00+00:00",
+            }
+
+        def is_idle_for(self, idle_timeout):
+            return False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(dashboard, "DashboardBroker", FakeBroker)
+
+    server = dashboard.DashboardServer(("127.0.0.1", 0), namespace="demo:payments")
+    try:
+        server.current_snapshot(namespace="demo:payments")
+        server.current_snapshot(namespace="demo:payments")
+
+        assert len(created) == 1
+        assert not created[0].closed
+    finally:
+        server.server_close()
+
+
+def test_dashboard_server_historical_snapshot_uses_short_ttl_cache(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    calls = []
+
+    def snapshot_loader(**kwargs):
+        calls.append(kwargs)
+        return {
+            "type": "snapshot",
+            "mode": "as_of",
+            "namespace": kwargs["namespace"],
+            "as_of": kwargs["as_of"].isoformat(),
+            "memories": [],
+            "operations": [],
+            "timeline": [],
+            "generated_at": "2026-07-12T14:00:00+00:00",
+        }
+
+    monkeypatch.setattr(dashboard, "memory_snapshot", snapshot_loader)
+
+    server = dashboard.DashboardServer(
+        ("127.0.0.1", 0),
+        namespace="demo:payments",
+        historical_snapshot_ttl=60.0,
+    )
+    try:
+        first = server.historical_snapshot(
+            namespace="demo:payments",
+            as_of="2026-07-12T14:00:00+00:00",
+        )
+        second = server.historical_snapshot(
+            namespace="demo:payments",
+            as_of="2026-07-12T14:00:00+00:00",
+        )
+
+        assert first is second
+        assert len(calls) == 1
+    finally:
+        server.server_close()
+
+
+def test_dashboard_server_historical_snapshot_expires_ttl_cache(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    now = {"value": 100.0}
+    calls = []
+
+    def monotonic():
+        return now["value"]
+
+    def snapshot_loader(**kwargs):
+        calls.append(kwargs)
+        return {
+            "type": "snapshot",
+            "mode": "as_of",
+            "namespace": kwargs["namespace"],
+            "as_of": kwargs["as_of"].isoformat(),
+            "memories": [],
+            "operations": [],
+            "timeline": [],
+            "generated_at": "2026-07-12T14:00:00+00:00",
+        }
+
+    monkeypatch.setattr(dashboard.time, "monotonic", monotonic)
+    monkeypatch.setattr(dashboard, "memory_snapshot", snapshot_loader)
+
+    server = dashboard.DashboardServer(
+        ("127.0.0.1", 0),
+        namespace="demo:payments",
+        historical_snapshot_ttl=3.0,
+    )
+    try:
+        server.historical_snapshot(
+            namespace="demo:payments",
+            as_of="2026-07-12T14:00:00+00:00",
+        )
+        now["value"] = 104.0
+        server.historical_snapshot(
+            namespace="demo:payments",
+            as_of="2026-07-12T14:00:00+00:00",
+        )
+
+        assert len(calls) == 2
+    finally:
+        server.server_close()
+
+
+def test_dashboard_server_idle_cleanup_closes_broker_and_new_request_creates_new(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    created = []
+
+    class FakeBroker:
+        def __init__(self, *, namespace, db_url):
+            self.namespace = namespace
+            self.db_url = db_url
+            self.closed = False
+            self.idle = False
+            created.append(self)
+
+        def is_idle_for(self, idle_timeout):
+            return self.idle
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(dashboard, "DashboardBroker", FakeBroker)
+
+    server = dashboard.DashboardServer(
+        ("127.0.0.1", 0),
+        namespace="demo:payments",
+        broker_idle_timeout=1.0,
+    )
+    try:
+        first = server.broker_for("demo:payments")
+        first.idle = True
+        second = server.broker_for("demo:payments")
+
+        assert first.closed
+        assert second is not first
+        assert len(created) == 2
+    finally:
+        server.server_close()
+
+
+def test_changefeed_cursor_reads_timestamp_from_database(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    timestamp = datetime(2026, 7, 12, 14, 0, tzinfo=UTC)
+    executed = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def execute(self, query):
+            executed.append(query)
+
+        def fetchone(self):
+            return (timestamp,)
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def cursor(self):
+            return FakeCursor()
+
+    monkeypatch.setattr(dashboard, "connect", lambda url: FakeConnection())
+
+    assert dashboard.changefeed_cursor(db_url="postgresql://db") == timestamp
+    assert executed == ["SELECT now()"]
 
 
 def test_changefeed_events_uses_autocommit_cursor_now_and_ready_callback(monkeypatch):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from hindsight.demo import DEMO_NAMESPACE
 from hindsight.memory import MemoryStore
 
 MAX_SNAPSHOT_ROWS = 100
+HISTORICAL_SNAPSHOT_TTL_SECONDS = 3.0
+BROKER_IDLE_TIMEOUT_SECONDS = 90.0
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -34,20 +37,85 @@ class DashboardServer(ThreadingHTTPServer):
         *,
         namespace: str,
         db_url: str | None = None,
+        historical_snapshot_ttl: float = HISTORICAL_SNAPSHOT_TTL_SECONDS,
+        broker_idle_timeout: float = BROKER_IDLE_TIMEOUT_SECONDS,
     ):
         super().__init__(server_address, DashboardRequestHandler)
         self.namespace = namespace
         self.db_url = db_url
+        self.historical_snapshot_ttl = historical_snapshot_ttl
+        self.broker_idle_timeout = broker_idle_timeout
         self._brokers: dict[str, DashboardBroker] = {}
         self._broker_lock = threading.Lock()
+        self._historical_cache: dict[tuple[str, str, int], tuple[float, dict[str, Any]]] = {}
+        self._historical_cache_lock = threading.Lock()
 
     def broker_for(self, namespace: str) -> "DashboardBroker":
         with self._broker_lock:
+            self._cleanup_idle_brokers_locked()
             broker = self._brokers.get(namespace)
             if broker is None:
                 broker = DashboardBroker(namespace=namespace, db_url=self.db_url)
                 self._brokers[namespace] = broker
             return broker
+
+    def current_snapshot(self, *, namespace: str, limit: int = MAX_SNAPSHOT_ROWS) -> dict[str, Any]:
+        return self.broker_for(namespace).current_snapshot(limit=limit)
+
+    def historical_snapshot(
+        self,
+        *,
+        namespace: str,
+        as_of: str,
+        limit: int = MAX_SNAPSHOT_ROWS,
+    ) -> dict[str, Any]:
+        self.cleanup_idle_brokers()
+        timestamp = _parse_timestamp(as_of)
+        if timestamp is None:
+            raise ValueError("as_of is required")
+        cache_key = (namespace, timestamp.isoformat(), limit)
+        now = time.monotonic()
+        with self._historical_cache_lock:
+            cached = self._historical_cache.get(cache_key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+
+        snapshot = memory_snapshot(
+            namespace=namespace,
+            as_of=timestamp,
+            db_url=self.db_url,
+            limit=limit,
+        )
+        expires_at = time.monotonic() + self.historical_snapshot_ttl
+        with self._historical_cache_lock:
+            self._historical_cache[cache_key] = (expires_at, snapshot)
+        return snapshot
+
+    def cleanup_idle_brokers(self) -> None:
+        with self._broker_lock:
+            self._cleanup_idle_brokers_locked()
+
+    def release_subscription(
+        self,
+        *,
+        namespace: str,
+        subscription: "DashboardSubscription",
+    ) -> None:
+        with self._broker_lock:
+            broker = self._brokers.get(namespace)
+        if broker is not None:
+            broker.unsubscribe(subscription)
+        self.cleanup_idle_brokers()
+
+    def _cleanup_idle_brokers_locked(self) -> None:
+        idle_namespaces = [
+            namespace
+            for namespace, broker in self._brokers.items()
+            if broker.is_idle_for(self.broker_idle_timeout)
+        ]
+        for namespace in idle_namespaces:
+            broker = self._brokers.pop(namespace)
+            broker.close()
 
     def server_close(self) -> None:
         with self._broker_lock:
@@ -76,13 +144,17 @@ class DashboardBroker:
         db_url: str | None = None,
         snapshot_loader: Callable[..., dict[str, Any]] | None = None,
         changefeed_loader: Callable[..., Iterator[dict[str, Any]]] | None = None,
+        cursor_provider: Callable[..., datetime] | None = None,
         limit: int = MAX_SNAPSHOT_ROWS,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.namespace = namespace
         self.db_url = db_url
         self._snapshot_loader = snapshot_loader or memory_snapshot
         self._changefeed_loader = changefeed_loader or changefeed_events
+        self._cursor_provider = cursor_provider or changefeed_cursor
         self._limit = limit
+        self._clock = clock
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop = threading.Event()
@@ -90,30 +162,59 @@ class DashboardBroker:
         self._snapshot: dict[str, Any] | None = None
         self._thread: threading.Thread | None = None
         self._startup_error: Exception | None = None
+        self._last_used_at = self._clock()
+        self._closed = False
 
     def subscribe(self, *, timeout: float = 30.0) -> DashboardSubscription:
         """Return a cached snapshot and an event queue for one SSE client."""
 
-        self.start()
-        if not self._ready.wait(timeout):
-            raise RuntimeError("memory dashboard changefeed did not become ready")
-        if self._startup_error is not None:
-            raise RuntimeError(str(self._startup_error)) from self._startup_error
+        self._ensure_ready(timeout=timeout)
         events: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=200)
         with self._lock:
-            snapshot = dict(self._snapshot or self._load_snapshot())
+            self._last_used_at = self._clock()
+            snapshot = self._snapshot_copy()
             self._subscribers.append(events)
         return DashboardSubscription(snapshot=snapshot, events=events)
+
+    def current_snapshot(
+        self,
+        *,
+        limit: int = MAX_SNAPSHOT_ROWS,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Return the cached current snapshot, starting the broker if needed."""
+
+        if limit != self._limit:
+            return self._snapshot_loader(
+                namespace=self.namespace,
+                db_url=self.db_url,
+                limit=limit,
+            )
+        self._ensure_ready(timeout=timeout)
+        with self._lock:
+            self._last_used_at = self._clock()
+            return self._snapshot_copy()
 
     def unsubscribe(self, subscription: DashboardSubscription) -> None:
         with self._lock:
             if subscription.events in self._subscribers:
                 self._subscribers.remove(subscription.events)
+            self._last_used_at = self._clock()
+
+    def is_idle_for(self, idle_timeout: float) -> bool:
+        with self._lock:
+            return (
+                not self._closed
+                and not self._subscribers
+                and self._clock() - self._last_used_at >= idle_timeout
+            )
 
     def start(self) -> None:
         with self._lock:
             if self._thread is not None:
                 return
+            if self._closed:
+                raise RuntimeError("dashboard broker is closed")
             self._thread = threading.Thread(
                 target=self._run,
                 name=f"hindsight-dashboard-{self.namespace}",
@@ -124,6 +225,8 @@ class DashboardBroker:
     def close(self) -> None:
         self._stop.set()
         with self._lock:
+            self._closed = True
+            self._last_used_at = self._clock()
             subscribers = list(self._subscribers)
             self._subscribers.clear()
         for subscriber in subscribers:
@@ -133,9 +236,10 @@ class DashboardBroker:
 
     def _run(self) -> None:
         try:
-            cursor = datetime.now(UTC)
+            cursor = self._cursor_provider(db_url=self.db_url)
             with self._lock:
                 self._snapshot = self._load_snapshot()
+                self._last_used_at = self._clock()
             self._ready.set()
             for event in self._changefeed_loader(
                 namespace=self.namespace,
@@ -181,6 +285,16 @@ class DashboardBroker:
             snapshot["timeline"] = _timeline(snapshot.get("memories", []), snapshot.get("operations", []))
             snapshot["generated_at"] = datetime.now(UTC).isoformat()
             self._snapshot = snapshot
+
+    def _ensure_ready(self, *, timeout: float) -> None:
+        self.start()
+        if not self._ready.wait(timeout):
+            raise RuntimeError("memory dashboard changefeed did not become ready")
+        if self._startup_error is not None:
+            raise RuntimeError(str(self._startup_error)) from self._startup_error
+
+    def _snapshot_copy(self) -> dict[str, Any]:
+        return json.loads(json.dumps(_jsonable(self._snapshot or self._load_snapshot())))
 
     def _publish(self, event: dict[str, Any]) -> None:
         stale: list[queue.Queue[dict[str, Any] | None]] = []
@@ -236,7 +350,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         namespace = _param(params, "namespace", self.server.namespace)
         as_of = _param(params, "as_of", None)
         try:
-            snapshot = memory_snapshot(namespace=namespace, as_of=as_of, db_url=self.server.db_url)
+            if as_of:
+                snapshot = self.server.historical_snapshot(namespace=namespace, as_of=as_of)
+            else:
+                snapshot = self.server.current_snapshot(namespace=namespace)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -271,7 +388,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 pass
         finally:
             if subscription is not None:
-                broker.unsubscribe(subscription)
+                self.server.release_subscription(namespace=namespace, subscription=subscription)
 
     def _write_sse(self, event: str, payload: dict[str, Any]) -> None:
         body = f"event: {event}\ndata: {json.dumps(_jsonable(payload), sort_keys=True)}\n\n"
@@ -353,7 +470,7 @@ def changefeed_events(
     """Yield namespace-scoped dashboard events from CockroachDB changefeeds."""
 
     stop_event = stop_event or threading.Event()
-    cursor = cursor or datetime.now(UTC)
+    cursor = cursor or changefeed_cursor(db_url=db_url)
     with connect(db_url or database_url()) as conn:
         conn.autocommit = True
         with conn.cursor(row_factory=dict_row) as cur:
@@ -369,6 +486,19 @@ def changefeed_events(
                 event = changefeed_row_to_event(row, namespace=namespace)
                 if event is not None:
                     yield event
+
+
+def changefeed_cursor(*, db_url: str | None = None) -> datetime:
+    """Return a CockroachDB-derived timestamp for changefeed cursor startup."""
+
+    with connect(db_url or database_url()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT now()")
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("failed to fetch changefeed cursor timestamp")
+            timestamp = row[0]
+    return timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
 
 
 def changefeed_row_to_event(row: dict[str, Any], *, namespace: str) -> dict[str, Any] | None:

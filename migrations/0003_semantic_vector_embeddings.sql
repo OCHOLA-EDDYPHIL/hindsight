@@ -9,8 +9,8 @@ CREATE TABLE IF NOT EXISTS semantic_memory_embeddings (
     CONSTRAINT semantic_embedding_dimensions CHECK (dimensions = 1024)
 );
 
-CREATE VECTOR INDEX semantic_memory_embeddings_namespace_embedding_idx
-    ON semantic_memory_embeddings (namespace, embedding vector_cosine_ops);
+CREATE VECTOR INDEX IF NOT EXISTS semantic_memory_embeddings_namespace_embedding_idx
+    ON semantic_memory_embeddings (embedding);
 
 CREATE INDEX IF NOT EXISTS semantic_memory_embeddings_namespace_idx
     ON semantic_memory_embeddings (namespace, embedded_at DESC);
