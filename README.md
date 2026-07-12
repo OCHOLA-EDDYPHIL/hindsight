@@ -53,6 +53,22 @@ uv run python scripts/run_poison_rewind_demo.py run --namespace demo:payments --
 uv run python scripts/run_poison_rewind_demo.py diagnose --decision-id agent:demo:payments:poisoned:plan
 ```
 
+## Live memory dashboard
+
+The demo dashboard shows semantic memories and rewind operations for one namespace as they change:
+
+```bash
+uv run python scripts/run_memory_dashboard.py --namespace demo:payments
+```
+
+Open the printed local URL, then run the poison/rewind sequence against the same namespace:
+
+```bash
+uv run python scripts/run_poison_rewind_demo.py all --namespace demo:payments
+```
+
+The page receives memory and rewind events through a CockroachDB changefeed-backed Server-Sent Events stream. Invalidated memories remain visible with strikethrough styling, and the timeline scrubber can replay belief state at earlier timestamps.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
