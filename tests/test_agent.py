@@ -119,6 +119,100 @@ def test_sync_agent_entrypoint_rejects_running_event_loop():
     asyncio.run(call_sync_helper())
 
 
+def test_async_run_incident_agent_wraps_sync_graph(monkeypatch):
+    import hindsight.agent as agent
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.reasoning import DeterministicReasoningProvider
+
+    calls = []
+    reasoning_provider = DeterministicReasoningProvider(response_text="plan")
+    embedding_provider = DeterministicEmbeddingProvider()
+
+    def fake_invoke_graph(input_or_command, **kwargs):
+        calls.append((input_or_command, kwargs))
+        return {
+            "plan": "check dependencies",
+            "proposed_action": "review rollback",
+            "reflected_memory": {"id": "memory-1"},
+        }
+
+    monkeypatch.setattr(agent, "_invoke_graph", fake_invoke_graph)
+
+    async def call_async_helper():
+        return await agent.run_incident_agent_async(
+            agent.IncidentInput(
+                user_input="latency",
+                incident_id="incident-1",
+                namespace="namespace-1",
+            ),
+            thread_id="thread-1",
+            pause_before_act=True,
+            db_url="postgresql://db",
+            reasoning_provider=reasoning_provider,
+            embedding_provider=embedding_provider,
+        )
+
+    result = asyncio.run(call_async_helper())
+
+    assert result.thread_id == "thread-1"
+    assert result.plan == "check dependencies"
+    assert result.reflected_memory_id == "memory-1"
+    state, kwargs = calls[0]
+    assert state["thread_id"] == "thread-1"
+    assert state["incident_id"] == "incident-1"
+    assert state["namespace"] == "namespace-1"
+    assert state["pause_before_act"] is True
+    assert kwargs == {
+        "thread_id": "thread-1",
+        "db_url": "postgresql://db",
+        "reasoning_provider": reasoning_provider,
+        "embedding_provider": embedding_provider,
+    }
+
+
+def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
+    import hindsight.agent as agent
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.reasoning import DeterministicReasoningProvider
+
+    calls = []
+    reasoning_provider = DeterministicReasoningProvider(response_text="plan")
+    embedding_provider = DeterministicEmbeddingProvider()
+
+    def fake_invoke_graph(input_or_command, **kwargs):
+        calls.append((input_or_command, kwargs))
+        return {
+            "action_approved": False,
+            "proposed_action": "hold change",
+            "reflected_memory": {"id": "memory-2"},
+        }
+
+    monkeypatch.setattr(agent, "_invoke_graph", fake_invoke_graph)
+
+    async def call_async_helper():
+        return await agent.resume_incident_agent_async(
+            thread_id="thread-2",
+            approved=False,
+            db_url="postgresql://db",
+            reasoning_provider=reasoning_provider,
+            embedding_provider=embedding_provider,
+        )
+
+    result = asyncio.run(call_async_helper())
+
+    assert result.thread_id == "thread-2"
+    assert result.proposed_action == "hold change"
+    assert result.reflected_memory_id == "memory-2"
+    command, kwargs = calls[0]
+    assert command.resume is False
+    assert kwargs == {
+        "thread_id": "thread-2",
+        "db_url": "postgresql://db",
+        "reasoning_provider": reasoning_provider,
+        "embedding_provider": embedding_provider,
+    }
+
+
 @requires_db
 def test_incident_graph_checkpoints_and_reflects_to_memory():
     from hindsight.agent import IncidentInput, run_incident_agent

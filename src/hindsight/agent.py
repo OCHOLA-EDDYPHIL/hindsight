@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, NotRequired, TypedDict
 from uuid import uuid4
 
@@ -105,6 +106,30 @@ def run_incident_agent(
     return _agent_result(resolved_thread_id, state)
 
 
+async def run_incident_agent_async(
+    incident: IncidentInput,
+    *,
+    thread_id: str | None = None,
+    pause_before_act: bool = False,
+    db_url: str | None = None,
+    reasoning_provider: ReasoningProvider | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> IncidentAgentResult:
+    """Async-safe wrapper for starting or continuing an incident thread."""
+
+    return await asyncio.to_thread(
+        partial(
+            run_incident_agent,
+            incident,
+            thread_id=thread_id,
+            pause_before_act=pause_before_act,
+            db_url=db_url,
+            reasoning_provider=reasoning_provider,
+            embedding_provider=embedding_provider,
+        )
+    )
+
+
 def resume_incident_agent(
     *,
     thread_id: str,
@@ -124,6 +149,28 @@ def resume_incident_agent(
         embedding_provider=embedding_provider,
     )
     return _agent_result(thread_id, state)
+
+
+async def resume_incident_agent_async(
+    *,
+    thread_id: str,
+    approved: bool = True,
+    db_url: str | None = None,
+    reasoning_provider: ReasoningProvider | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> IncidentAgentResult:
+    """Async-safe wrapper for resuming an interrupted incident thread."""
+
+    return await asyncio.to_thread(
+        partial(
+            resume_incident_agent,
+            thread_id=thread_id,
+            approved=approved,
+            db_url=db_url,
+            reasoning_provider=reasoning_provider,
+            embedding_provider=embedding_provider,
+        )
+    )
 
 
 def build_incident_graph(
