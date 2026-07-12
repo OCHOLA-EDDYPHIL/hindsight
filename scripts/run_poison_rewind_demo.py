@@ -49,8 +49,9 @@ def main() -> None:
     rewind_cmd.add_argument("--timestamp", required=True)
     rewind_cmd.add_argument("--reason", default="Operator requested demo rewind")
 
+    parser.set_defaults(command="all", namespace=DEMO_NAMESPACE, keep_existing=False)
     args = parser.parse_args()
-    command = args.command or "all"
+    command = args.command
 
     if command == "all":
         result = run_poison_rewind_demo(
