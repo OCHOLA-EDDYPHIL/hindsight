@@ -701,16 +701,23 @@ class MemoryStore:
             raise ProvenanceError("reader is required")
         if not purpose or not purpose.strip():
             raise ProvenanceError("purpose is required")
-        return self._fetch_one(
-            """
-                INSERT INTO memory_reads (
-                    decision_id, memory_kind, memory_id, reader, purpose
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING *
-            """,
-            (decision_id, memory_kind, memory_id, reader, purpose),
-        )
+
+        def write_read() -> dict[str, Any]:
+            return self._fetch_one(
+                """
+                    INSERT INTO memory_reads (
+                        decision_id, memory_kind, memory_id, reader, purpose
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING *
+                """,
+                (decision_id, memory_kind, memory_id, reader, purpose),
+            )
+
+        if self._owns_connection and not self._conn.autocommit:
+            with self._conn.transaction():
+                return write_read()
+        return write_read()
 
     def reads_for_decision(self, *, decision_id: str) -> list[dict[str, Any]]:
         """Return memory reads attached to one agent or human decision."""
