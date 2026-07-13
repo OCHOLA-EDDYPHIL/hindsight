@@ -1,0 +1,664 @@
+locals {
+  name = "${var.project_name}-${var.stage}"
+
+  api_zip      = var.api_zip_path != null ? abspath(var.api_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-api.zip")
+  worker_zip   = var.worker_zip_path != null ? abspath(var.worker_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip")
+  realtime_zip = var.realtime_zip_path != null ? abspath(var.realtime_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-realtime.zip")
+  web_root     = abspath("${path.module}/../../../src/hindsight/web")
+
+  lambda_artifacts = {
+    api      = local.api_zip
+    worker   = local.worker_zip
+    realtime = local.realtime_zip
+  }
+
+  parameter_arns = {
+    database   = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.database_url_parameter_name}"
+    gemini     = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_key_parameter_name}"
+    operator   = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.operator_token_parameter_name}"
+    changefeed = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.changefeed_token_parameter_name}"
+  }
+
+  content_types = {
+    ".css"  = "text/css; charset=utf-8"
+    ".html" = "text/html; charset=utf-8"
+    ".js"   = "text/javascript; charset=utf-8"
+    ".svg"  = "image/svg+xml"
+  }
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket        = "${local.name}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-artifacts"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_versioning" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  bucket                  = aws_s3_bucket.artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_object" "lambda_artifact" {
+  for_each = local.lambda_artifacts
+
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "lambda/${each.key}.zip"
+  source      = each.value
+  source_hash = try(filebase64sha256(each.value), "artifact-not-built")
+}
+
+resource "aws_s3_bucket" "ui" {
+  bucket        = "${local.name}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-ui"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "ui" {
+  bucket = aws_s3_bucket.ui.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "ui" {
+  bucket                  = aws_s3_bucket.ui.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_object" "ui_asset" {
+  for_each = {
+    for file in fileset(local.web_root, "**") : file => file
+    if file != "config.js"
+  }
+
+  bucket        = aws_s3_bucket.ui.id
+  key           = each.key
+  source        = "${local.web_root}/${each.value}"
+  etag          = filemd5("${local.web_root}/${each.value}")
+  content_type  = lookup(local.content_types, regex("(\\.[^.]+)$", each.value)[0], "application/octet-stream")
+  cache_control = each.key == "index.html" ? "no-cache" : "public, max-age=31536000, immutable"
+}
+
+resource "aws_s3_object" "ui_config" {
+  bucket        = aws_s3_bucket.ui.id
+  key           = "config.js"
+  content_type  = "text/javascript; charset=utf-8"
+  cache_control = "no-cache"
+  content = <<-JS
+    window.HINDSIGHT_CONFIG = ${jsonencode({
+  apiBase          = "/v1"
+  snapshotBase     = null
+  eventsBase       = null
+  websocketUrl     = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "https://", "wss://")}/${aws_apigatewayv2_stage.websocket.name}"
+  defaultNamespace = "demo:payments-poison-rewind"
+  pollIntervalMs   = 4000
+})};
+  JS
+}
+
+resource "aws_sqs_queue" "run_dlq" {
+  name                      = "${local.name}-run-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+}
+
+resource "aws_sqs_queue" "runs" {
+  name                       = "${local.name}-runs"
+  visibility_timeout_seconds = 360
+  message_retention_seconds  = 86400
+  receive_wait_time_seconds  = 10
+  sqs_managed_sse_enabled    = true
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.run_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
+resource "aws_dynamodb_table" "connections" {
+  name         = "${local.name}-websocket-connections"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "connection_id"
+
+  attribute {
+    name = "connection_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption { enabled = true }
+}
+
+data "aws_iam_policy_document" "lambda_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "api" {
+  name               = "${local.name}-api"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role" "worker" {
+  name               = "${local.name}-worker"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role" "websocket" {
+  name               = "${local.name}-websocket"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role" "changefeed" {
+  name               = "${local.name}-changefeed"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "basic_logs" {
+  for_each = {
+    api        = aws_iam_role.api.name
+    worker     = aws_iam_role.worker.name
+    websocket  = aws_iam_role.websocket.name
+    changefeed = aws_iam_role.changefeed.name
+  }
+
+  role       = each.value
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+data "aws_iam_policy_document" "api" {
+  statement {
+    actions   = ["ssm:GetParameter"]
+    resources = [local.parameter_arns.database, local.parameter_arns.operator]
+  }
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.runs.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "api" {
+  role   = aws_iam_role.api.id
+  policy = data.aws_iam_policy_document.api.json
+}
+
+data "aws_iam_policy_document" "worker" {
+  statement {
+    actions   = ["ssm:GetParameter"]
+    resources = [local.parameter_arns.database, local.parameter_arns.gemini]
+  }
+  statement {
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:GetQueueAttributes"
+    ]
+    resources = [aws_sqs_queue.runs.arn]
+  }
+  statement {
+    actions = ["bedrock:InvokeModel", "bedrock:Converse"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model}"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "worker" {
+  role   = aws_iam_role.worker.id
+  policy = data.aws_iam_policy_document.worker.json
+}
+
+data "aws_iam_policy_document" "websocket" {
+  statement {
+    actions   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+    resources = [aws_dynamodb_table.connections.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "websocket" {
+  role   = aws_iam_role.websocket.id
+  policy = data.aws_iam_policy_document.websocket.json
+}
+
+data "aws_iam_policy_document" "changefeed" {
+  statement {
+    actions   = ["ssm:GetParameter"]
+    resources = [local.parameter_arns.changefeed]
+  }
+  statement {
+    actions   = ["dynamodb:Scan", "dynamodb:DeleteItem"]
+    resources = [aws_dynamodb_table.connections.arn]
+  }
+  statement {
+    actions   = ["execute-api:ManageConnections"]
+    resources = ["${aws_apigatewayv2_api.websocket.execution_arn}/${var.stage}/POST/@connections/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "changefeed" {
+  role   = aws_iam_role.changefeed.id
+  policy = data.aws_iam_policy_document.changefeed.json
+}
+
+resource "aws_lambda_function" "api" {
+  function_name = "${local.name}-api"
+  role          = aws_iam_role.api.arn
+  runtime       = "python3.12"
+  handler       = "hindsight.api.handler"
+  memory_size   = 512
+  timeout       = 30
+  architectures = ["x86_64"]
+
+  s3_bucket        = aws_s3_bucket.artifacts.id
+  s3_key           = aws_s3_object.lambda_artifact["api"].key
+  source_code_hash = try(filebase64sha256(local.api_zip), null)
+
+  reserved_concurrent_executions = 5
+
+  environment {
+    variables = {
+      HINDSIGHT_DATABASE_URL_PARAM        = var.database_url_parameter_name
+      HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM = var.operator_token_parameter_name
+      HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
+      HINDSIGHT_SECURE_COOKIES            = "1"
+    }
+  }
+}
+
+resource "aws_lambda_function" "worker" {
+  function_name = "${local.name}-worker"
+  role          = aws_iam_role.worker.arn
+  runtime       = "python3.12"
+  handler       = "hindsight.worker.handler"
+  memory_size   = 1024
+  timeout       = 180
+  architectures = ["x86_64"]
+
+  s3_bucket        = aws_s3_bucket.artifacts.id
+  s3_key           = aws_s3_object.lambda_artifact["worker"].key
+  source_code_hash = try(filebase64sha256(local.worker_zip), null)
+
+  reserved_concurrent_executions = 2
+
+  environment {
+    variables = {
+      HINDSIGHT_DATABASE_URL_PARAM   = var.database_url_parameter_name
+      HINDSIGHT_GEMINI_API_KEY_PARAM = var.gemini_api_key_parameter_name
+      HINDSIGHT_WORKER_MAX_RECEIVES  = "3"
+      LLM_PROVIDER                   = var.llm_provider
+      GEMINI_MODEL                   = var.gemini_model
+      BEDROCK_MODEL                  = var.bedrock_model
+      REASONING_MAX_ATTEMPTS         = tostring(var.reasoning_max_attempts)
+    }
+  }
+}
+
+resource "aws_lambda_function" "websocket" {
+  function_name = "${local.name}-websocket"
+  role          = aws_iam_role.websocket.arn
+  runtime       = "python3.12"
+  handler       = "hindsight.realtime.websocket_handler"
+  memory_size   = 256
+  timeout       = 10
+
+  s3_bucket        = aws_s3_bucket.artifacts.id
+  s3_key           = aws_s3_object.lambda_artifact["realtime"].key
+  source_code_hash = try(filebase64sha256(local.realtime_zip), null)
+
+  reserved_concurrent_executions = 5
+
+  environment {
+    variables = {
+      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE = aws_dynamodb_table.connections.name
+    }
+  }
+}
+
+resource "aws_lambda_function" "changefeed" {
+  function_name = "${local.name}-changefeed"
+  role          = aws_iam_role.changefeed.arn
+  runtime       = "python3.12"
+  handler       = "hindsight.realtime.changefeed_handler"
+  memory_size   = 256
+  timeout       = 30
+
+  s3_bucket        = aws_s3_bucket.artifacts.id
+  s3_key           = aws_s3_object.lambda_artifact["realtime"].key
+  source_code_hash = try(filebase64sha256(local.realtime_zip), null)
+
+  reserved_concurrent_executions = 5
+
+  environment {
+    variables = {
+      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE    = aws_dynamodb_table.connections.name
+      HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT = "https://${aws_apigatewayv2_api.websocket.id}.execute-api.${var.aws_region}.amazonaws.com/${var.stage}"
+      HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM   = var.changefeed_token_parameter_name
+    }
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "worker" {
+  event_source_arn        = aws_sqs_queue.runs.arn
+  function_name           = aws_lambda_function.worker.arn
+  batch_size              = 5
+  function_response_types = ["ReportBatchItemFailures"]
+}
+
+resource "aws_apigatewayv2_api" "http" {
+  name          = "${local.name}-http"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_integration" "api" {
+  api_id                 = aws_apigatewayv2_api.http.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.api.invoke_arn
+  payload_format_version = "2.0"
+  timeout_milliseconds   = 30000
+}
+
+resource "aws_apigatewayv2_integration" "changefeed" {
+  api_id                 = aws_apigatewayv2_api.http.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.changefeed.invoke_arn
+  payload_format_version = "2.0"
+  timeout_milliseconds   = 30000
+}
+
+resource "aws_apigatewayv2_route" "api_root" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "ANY /v1"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_apigatewayv2_route" "api_proxy" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "ANY /v1/{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_apigatewayv2_route" "changefeed" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "POST /internal/changefeed"
+  target    = "integrations/${aws_apigatewayv2_integration.changefeed.id}"
+}
+
+resource "aws_cloudwatch_log_group" "http_access" {
+  name              = "/aws/apigateway/${local.name}-http"
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_apigatewayv2_stage" "http" {
+  api_id      = aws_apigatewayv2_api.http.id
+  name        = "$default"
+  auto_deploy = true
+
+  default_route_settings {
+    throttling_burst_limit = 20
+    throttling_rate_limit  = 10
+  }
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.http_access.arn
+    format = jsonencode({
+      requestId        = "$context.requestId"
+      routeKey         = "$context.routeKey"
+      status           = "$context.status"
+      responseLength   = "$context.responseLength"
+      integrationError = "$context.integrationErrorMessage"
+    })
+  }
+}
+
+resource "aws_lambda_permission" "http_api" {
+  statement_id  = "AllowHttpApi"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/*/v1*"
+}
+
+resource "aws_lambda_permission" "http_changefeed" {
+  statement_id  = "AllowChangefeedRoute"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.changefeed.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/POST/internal/changefeed"
+}
+
+resource "aws_apigatewayv2_api" "websocket" {
+  name                       = "${local.name}-websocket"
+  protocol_type              = "WEBSOCKET"
+  route_selection_expression = "$request.body.type"
+}
+
+resource "aws_apigatewayv2_integration" "websocket" {
+  api_id             = aws_apigatewayv2_api.websocket.id
+  integration_type   = "AWS_PROXY"
+  integration_method = "POST"
+  integration_uri    = aws_lambda_function.websocket.invoke_arn
+}
+
+resource "aws_apigatewayv2_route" "websocket" {
+  for_each = toset(["$connect", "$disconnect", "$default", "subscribe", "unsubscribe", "ping"])
+
+  api_id    = aws_apigatewayv2_api.websocket.id
+  route_key = each.value
+  target    = "integrations/${aws_apigatewayv2_integration.websocket.id}"
+}
+
+resource "aws_cloudwatch_log_group" "websocket_access" {
+  name              = "/aws/apigateway/${local.name}-websocket"
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_apigatewayv2_stage" "websocket" {
+  api_id      = aws_apigatewayv2_api.websocket.id
+  name        = var.stage
+  auto_deploy = true
+
+  default_route_settings {
+    throttling_burst_limit = 30
+    throttling_rate_limit  = 15
+  }
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.websocket_access.arn
+    format = jsonencode({
+      requestId    = "$context.requestId"
+      routeKey     = "$context.routeKey"
+      status       = "$context.status"
+      connectionId = "$context.connectionId"
+    })
+  }
+}
+
+resource "aws_lambda_permission" "websocket" {
+  statement_id  = "AllowWebSocketApi"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.websocket.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.websocket.execution_arn}/*"
+}
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  for_each = {
+    api        = aws_lambda_function.api.function_name
+    worker     = aws_lambda_function.worker.function_name
+    websocket  = aws_lambda_function.websocket.function_name
+    changefeed = aws_lambda_function.changefeed.function_name
+  }
+
+  name              = "/aws/lambda/${each.value}"
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_cloudfront_origin_access_control" "ui" {
+  name                              = "${local.name}-ui"
+  description                       = "Private Hindsight UI bucket"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "ui" {
+  enabled             = true
+  is_ipv6_enabled     = true
+  default_root_object = "index.html"
+  price_class         = "PriceClass_100"
+  aliases             = var.domain_name != null ? [var.domain_name] : []
+
+  origin {
+    domain_name              = aws_s3_bucket.ui.bucket_regional_domain_name
+    origin_id                = "ui-s3"
+    origin_access_control_id = aws_cloudfront_origin_access_control.ui.id
+  }
+
+  origin {
+    domain_name = replace(aws_apigatewayv2_api.http.api_endpoint, "https://", "")
+    origin_id   = "http-api"
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "ui-s3"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD", "OPTIONS"]
+    compress               = true
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+    min_ttl     = 0
+    default_ttl = 300
+    max_ttl     = 31536000
+  }
+
+  ordered_cache_behavior {
+    path_pattern             = "/v1/*"
+    target_origin_id         = "http-api"
+    viewer_protocol_policy   = "https-only"
+    allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods           = ["GET", "HEAD", "OPTIONS"]
+    compress                 = true
+    cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
+    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer_except_host.id
+  }
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = var.domain_name == null
+    acm_certificate_arn            = var.domain_name != null ? var.acm_certificate_arn : null
+    ssl_support_method             = var.domain_name != null ? "sni-only" : null
+    minimum_protocol_version       = var.domain_name != null ? "TLSv1.2_2021" : "TLSv1"
+  }
+}
+
+data "aws_iam_policy_document" "ui_bucket" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.ui.arn}/*"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.ui.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "ui" {
+  bucket = aws_s3_bucket.ui.id
+  policy = data.aws_iam_policy_document.ui_bucket.json
+}
+
+resource "aws_route53_record" "ui" {
+  count = var.domain_name != null && var.route53_zone_id != null ? 1 : 0
+
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "A"
+  alias {
+    name                   = aws_cloudfront_distribution.ui.domain_name
+    zone_id                = aws_cloudfront_distribution.ui.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  for_each = {
+    api        = aws_lambda_function.api.function_name
+    worker     = aws_lambda_function.worker.function_name
+    websocket  = aws_lambda_function.websocket.function_name
+    changefeed = aws_lambda_function.changefeed.function_name
+  }
+
+  alarm_name          = "${each.value}-errors"
+  alarm_description   = "${each.value} emitted an unhandled error"
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = var.alarm_actions
+  dimensions          = { FunctionName = each.value }
+}
+
+resource "aws_cloudwatch_metric_alarm" "run_dlq" {
+  alarm_name          = "${local.name}-run-dlq-not-empty"
+  alarm_description   = "An agent run exhausted its bounded retries"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = var.alarm_actions
+  dimensions          = { QueueName = aws_sqs_queue.run_dlq.name }
+}

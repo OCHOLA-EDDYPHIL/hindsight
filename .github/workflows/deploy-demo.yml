@@ -1,0 +1,119 @@
+name: deploy demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Plan only or apply after protected approval
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: hindsight-demo-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_stage: demo
+  TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_database_url_parameter_name: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  TF_VAR_gemini_api_key_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEY_PARAM || '/hindsight/demo/gemini-api-key' }}
+  TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+  TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.plan-name.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: uv sync --frozen
+      - run: uv run python scripts/build_lambda_artifacts.py
+      - name: Initialize remote state
+        run: >-
+          terraform -chdir=infra/terraform/app init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=hindsight/demo/terraform.tfstate"
+          -backend-config="region=${{ env.AWS_REGION }}"
+          -backend-config="encrypt=true"
+          -backend-config="use_lockfile=true"
+      - name: Create deployment plan
+        run: terraform -chdir=infra/terraform/app plan -input=false -out="$GITHUB_WORKSPACE/build/demo.tfplan"
+      - id: plan-name
+        run: echo "name=demo-plan-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plan-name.outputs.name }}
+          path: build/demo.tfplan
+          retention-days: 2
+
+  apply:
+    if: inputs.operation == 'apply'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: uv sync --frozen
+      - run: uv run python scripts/build_lambda_artifacts.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.artifact-name }}
+          path: build
+      - name: Initialize remote state
+        run: >-
+          terraform -chdir=infra/terraform/app init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=hindsight/demo/terraform.tfstate"
+          -backend-config="region=${{ env.AWS_REGION }}"
+          -backend-config="encrypt=true"
+          -backend-config="use_lockfile=true"
+      - run: terraform -chdir=infra/terraform/app apply -input=false -auto-approve "$GITHUB_WORKSPACE/build/demo.tfplan"
+      - name: Apply database migrations and changefeed
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$TF_VAR_changefeed_token_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          CHANGEFEED_WEBHOOK_URL="$(terraform -chdir=infra/terraform/app output -raw changefeed_webhook_url)"
+          echo "::add-mask::$DATABASE_URL"
+          echo "::add-mask::$CHANGEFEED_TOKEN"
+          export DATABASE_URL
+          export HINDSIGHT_CHANGEFEED_AUTH_TOKEN="$CHANGEFEED_TOKEN"
+          export HINDSIGHT_CHANGEFEED_WEBHOOK_URL="$CHANGEFEED_WEBHOOK_URL"
+          uv run python scripts/migrate.py
+          uv run python scripts/configure_changefeed.py apply
+      - name: Smoke test deployed product
+        shell: bash
+        run: |
+          UI_URL="$(terraform -chdir=infra/terraform/app output -raw ui_url)"
+          for _ in {1..12}; do
+            if curl --fail --silent --show-error "$UI_URL/v1/health/ready"; then
+              echo "ui_url=$UI_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1

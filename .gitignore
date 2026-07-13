@@ -19,6 +19,18 @@ build/
 output/
 *.log
 
+# Terraform local state and provider cache
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
 # OS / editor noise
 .DS_Store
 .idea/

@@ -14,3 +14,12 @@ jobs:
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - run: node --input-type=module --check < src/hindsight/web/app.js
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive infra/terraform
+      - run: terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform/bootstrap validate
+      - run: terraform -chdir=infra/terraform/bootstrap test
+      - run: terraform -chdir=infra/terraform/app init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform/app validate
+      - run: terraform -chdir=infra/terraform/app test

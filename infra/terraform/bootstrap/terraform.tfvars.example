@@ -1,0 +1,10 @@
+aws_region        = "us-east-1"
+github_repository = "OCHOLA-EDDYPHIL/hindsight"
+github_subjects = [
+  "repo:OCHOLA-EDDYPHIL/hindsight:ref:refs/heads/main",
+  "repo:OCHOLA-EDDYPHIL/hindsight:environment:demo",
+]
+
+# If the account already has GitHub's OIDC provider:
+# create_github_oidc_provider       = false
+# existing_github_oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
