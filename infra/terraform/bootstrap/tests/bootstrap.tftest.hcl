@@ -19,18 +19,52 @@ mock_provider "aws" {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
     }
   }
+
+  mock_data "aws_s3_bucket" {
+    defaults = {
+      id  = "existing-state-bucket"
+      arn = "arn:aws:s3:::existing-state-bucket"
+    }
+  }
+
+  mock_resource "aws_acm_certificate" {
+    defaults = {
+      arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
+      domain_validation_options = [
+        {
+          domain_name           = "hindsight.example.com"
+          resource_record_name  = "_validation.hindsight.example.com"
+          resource_record_type  = "CNAME"
+          resource_record_value = "_validation.acm-validations.aws"
+        }
+      ]
+    }
+  }
 }
+
+mock_provider "cloudflare" {}
 
 run "isolated_bootstrap" {
   command = plan
 
+  variables {
+    state_bucket_name  = "existing-state-bucket"
+    cloudflare_zone_id = "00000000000000000000000000000000"
+    domain_name        = "hindsight.example.com"
+  }
+
   assert {
-    condition     = aws_s3_bucket.state.bucket == "hindsight-terraform-123456789012-us-east-1"
-    error_message = "Bootstrap state must use an account-scoped bucket."
+    condition     = data.aws_s3_bucket.state.id == "existing-state-bucket"
+    error_message = "Bootstrap must reuse the configured state bucket."
   }
 
   assert {
     condition     = aws_iam_role.github_deploy.name == "hindsight-github-deploy"
     error_message = "The GitHub OIDC deployment role must remain stable."
+  }
+
+  assert {
+    condition     = toset(var.github_subjects) == toset(["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"])
+    error_message = "OIDC trust must remain scoped to the demo environment."
   }
 }

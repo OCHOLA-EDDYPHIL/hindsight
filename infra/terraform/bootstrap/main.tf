@@ -1,38 +1,11 @@
 locals {
-  state_bucket = var.state_bucket_name != null ? var.state_bucket_name : "hindsight-terraform-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
-  oidc_arn     = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_github_oidc_provider_arn
+  state_bucket_arn = data.aws_s3_bucket.state.arn
+  oidc_arn         = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_github_oidc_provider_arn
+  parameter_arn    = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/*"
 }
 
-resource "aws_s3_bucket" "state" {
-  bucket = local.state_bucket
-
-  lifecycle {
-    prevent_destroy = true
-  }
-}
-
-resource "aws_s3_bucket_versioning" "state" {
-  bucket = aws_s3_bucket.state.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
-  bucket = aws_s3_bucket.state.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "state" {
-  bucket                  = aws_s3_bucket.state.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+data "aws_s3_bucket" "state" {
+  bucket = var.state_bucket_name
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
@@ -41,6 +14,34 @@ resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
+resource "aws_acm_certificate" "demo" {
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_dns_record" "acm_validation" {
+  for_each = {
+    (var.domain_name) = one(aws_acm_certificate.demo.domain_validation_options)
+  }
+
+  zone_id = var.cloudflare_zone_id
+  name    = each.value.resource_record_name
+  content = each.value.resource_record_value
+  type    = each.value.resource_record_type
+  ttl     = 1
+  proxied = false
+  comment = "ACM validation for Hindsight"
+}
+
+resource "aws_acm_certificate_validation" "demo" {
+  certificate_arn         = aws_acm_certificate.demo.arn
+  validation_record_fqdns = [for record in cloudflare_dns_record.acm_validation : record.name]
 }
 
 data "aws_iam_policy_document" "github_assume" {
@@ -56,7 +57,7 @@ data "aws_iam_policy_document" "github_assume" {
       values   = ["sts.amazonaws.com"]
     }
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
       values   = var.github_subjects
     }
@@ -71,34 +72,148 @@ resource "aws_iam_role" "github_deploy" {
 
 data "aws_iam_policy_document" "github_deploy" {
   statement {
-    sid = "TerraformState"
+    sid       = "TerraformStateBucketMetadata"
+    actions   = ["s3:GetBucketLocation", "s3:GetBucketVersioning"]
+    resources = [local.state_bucket_arn]
+  }
+
+  statement {
+    sid       = "TerraformStateList"
+    actions   = ["s3:ListBucket"]
+    resources = [local.state_bucket_arn]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = [var.application_state_key, "${var.application_state_key}.*"]
+    }
+  }
+
+  statement {
+    sid = "TerraformStateObject"
     actions = [
-      "s3:ListBucket",
+      "s3:DeleteObject",
       "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject"
+      "s3:PutObject"
     ]
-    resources = [aws_s3_bucket.state.arn, "${aws_s3_bucket.state.arn}/*"]
+    resources = [
+      "${local.state_bucket_arn}/${var.application_state_key}",
+      "${local.state_bucket_arn}/${var.application_state_key}.*"
+    ]
+  }
+
+  statement {
+    sid       = "CertificateReadiness"
+    actions   = ["acm:DescribeCertificate"]
+    resources = [aws_acm_certificate.demo.arn]
+  }
+
+  statement {
+    sid       = "ParameterReadiness"
+    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = [local.parameter_arn]
   }
 
   statement {
     sid = "ApplicationLifecycle"
     actions = [
-      "apigateway:*",
-      "cloudfront:*",
-      "cloudwatch:*",
-      "dynamodb:*",
-      "lambda:*",
-      "logs:*",
-      "route53:ChangeResourceRecordSets",
-      "route53:GetHostedZone",
-      "route53:ListResourceRecordSets",
-      "s3:*",
-      "sqs:*",
-      "ssm:GetParameter",
-      "sts:GetCallerIdentity",
-      "acm:DescribeCertificate",
-      "acm:ListCertificates"
+      "apigateway:DELETE",
+      "apigateway:GET",
+      "apigateway:PATCH",
+      "apigateway:POST",
+      "apigateway:PUT",
+      "cloudfront:CreateDistribution",
+      "cloudfront:CreateInvalidation",
+      "cloudfront:DeleteDistribution",
+      "cloudfront:GetCachePolicy",
+      "cloudfront:GetDistribution",
+      "cloudfront:GetDistributionConfig",
+      "cloudfront:GetInvalidation",
+      "cloudfront:GetOriginAccessControl",
+      "cloudfront:GetOriginAccessControlConfig",
+      "cloudfront:GetOriginRequestPolicy",
+      "cloudfront:ListCachePolicies",
+      "cloudfront:ListDistributions",
+      "cloudfront:ListOriginAccessControls",
+      "cloudfront:ListOriginRequestPolicies",
+      "cloudfront:ListTagsForResource",
+      "cloudfront:TagResource",
+      "cloudfront:UntagResource",
+      "cloudfront:UpdateDistribution",
+      "cloudfront:CreateOriginAccessControl",
+      "cloudfront:DeleteOriginAccessControl",
+      "cloudfront:UpdateOriginAccessControl",
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:PutMetricAlarm",
+      "dynamodb:CreateTable",
+      "dynamodb:BatchGetItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:DeleteTable",
+      "dynamodb:DescribeContinuousBackups",
+      "dynamodb:DescribeTable",
+      "dynamodb:DescribeTimeToLive",
+      "dynamodb:GetItem",
+      "dynamodb:ListTagsOfResource",
+      "dynamodb:PutItem",
+      "dynamodb:TagResource",
+      "dynamodb:UntagResource",
+      "dynamodb:UpdateContinuousBackups",
+      "dynamodb:UpdateItem",
+      "dynamodb:UpdateTable",
+      "dynamodb:UpdateTimeToLive",
+      "lambda:AddPermission",
+      "lambda:CreateEventSourceMapping",
+      "lambda:CreateFunction",
+      "lambda:DeleteEventSourceMapping",
+      "lambda:DeleteFunction",
+      "lambda:GetEventSourceMapping",
+      "lambda:GetFunction",
+      "lambda:GetFunctionCodeSigningConfig",
+      "lambda:GetPolicy",
+      "lambda:ListTags",
+      "lambda:RemovePermission",
+      "lambda:TagResource",
+      "lambda:UntagResource",
+      "lambda:UpdateEventSourceMapping",
+      "lambda:UpdateFunctionCode",
+      "lambda:UpdateFunctionConfiguration",
+      "logs:CreateLogGroup",
+      "logs:DeleteLogGroup",
+      "logs:DescribeLogGroups",
+      "logs:ListTagsForResource",
+      "logs:PutRetentionPolicy",
+      "logs:TagResource",
+      "logs:UntagResource",
+      "s3:CreateBucket",
+      "s3:DeleteBucket",
+      "s3:DeleteBucketPolicy",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:GetBucketLocation",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketPublicAccessBlock",
+      "s3:GetBucketTagging",
+      "s3:GetBucketVersioning",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+      "s3:PutBucketPolicy",
+      "s3:PutBucketPublicAccessBlock",
+      "s3:PutBucketTagging",
+      "s3:PutBucketVersioning",
+      "s3:PutEncryptionConfiguration",
+      "s3:PutObject",
+      "sqs:CreateQueue",
+      "sqs:DeleteQueue",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+      "sqs:ListQueueTags",
+      "sqs:ListQueues",
+      "sqs:SetQueueAttributes",
+      "sqs:TagQueue",
+      "sqs:UntagQueue",
+      "sts:GetCallerIdentity"
     ]
     resources = ["*"]
   }
@@ -106,22 +221,22 @@ data "aws_iam_policy_document" "github_deploy" {
   statement {
     sid = "ApplicationIam"
     actions = [
+      "iam:AttachRolePolicy",
       "iam:CreateRole",
       "iam:DeleteRole",
-      "iam:GetRole",
-      "iam:PassRole",
-      "iam:TagRole",
-      "iam:UntagRole",
-      "iam:ListRolePolicies",
-      "iam:ListAttachedRolePolicies",
-      "iam:PutRolePolicy",
-      "iam:GetRolePolicy",
       "iam:DeleteRolePolicy",
-      "iam:AttachRolePolicy",
-      "iam:DetachRolePolicy"
+      "iam:DetachRolePolicy",
+      "iam:GetRole",
+      "iam:GetRolePolicy",
+      "iam:ListAttachedRolePolicies",
+      "iam:ListRolePolicies",
+      "iam:PassRole",
+      "iam:PutRolePolicy",
+      "iam:TagRole",
+      "iam:UntagRole"
     ]
     resources = [
-      "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-*"
+      "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-${var.stage}-*"
     ]
   }
 }

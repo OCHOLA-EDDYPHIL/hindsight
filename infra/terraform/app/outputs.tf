@@ -25,3 +25,11 @@ output "artifact_bucket" {
 output "ui_bucket" {
   value = aws_s3_bucket.ui.id
 }
+
+output "cloudfront_distribution_id" {
+  value = aws_cloudfront_distribution.ui.id
+}
+
+output "gemini_key_health_table" {
+  value = aws_dynamodb_table.gemini_key_health.name
+}

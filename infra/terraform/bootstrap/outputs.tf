@@ -1,5 +1,5 @@
 output "state_bucket" {
-  value = aws_s3_bucket.state.id
+  value = data.aws_s3_bucket.state.id
 }
 
 output "github_deploy_role_arn" {
@@ -8,10 +8,22 @@ output "github_deploy_role_arn" {
 
 output "backend_config" {
   value = {
-    bucket       = aws_s3_bucket.state.id
-    key          = "hindsight/demo/terraform.tfstate"
+    bucket       = data.aws_s3_bucket.state.id
+    key          = var.application_state_key
     region       = var.aws_region
     use_lockfile = true
     encrypt      = true
   }
+}
+
+output "acm_certificate_arn" {
+  value = aws_acm_certificate_validation.demo.certificate_arn
+}
+
+output "domain_name" {
+  value = var.domain_name
+}
+
+output "cloudflare_zone_id" {
+  value = var.cloudflare_zone_id
 }

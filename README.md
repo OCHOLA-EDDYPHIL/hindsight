@@ -141,11 +141,11 @@ uv run python scripts/reembed_memories.py
 
 ## AWS deployment lifecycle
 
-Terraform owns the complete ephemeral AWS application: private S3 UI hosting through CloudFront, API Gateway HTTP and WebSocket APIs, split Lambda artifacts, SQS with a dead-letter queue, the expiring connection registry, IAM, logs, throttles, and alarms. CockroachDB Cloud, SecureString values, and the Terraform bootstrap state are intentionally external to routine teardown.
+Terraform owns the complete ephemeral AWS application: private S3 UI hosting through CloudFront, API Gateway HTTP and WebSocket APIs, split Lambda artifacts, SQS with a dead-letter queue, expiring WebSocket and Gemini-cooldown registries, IAM, logs, throttles, alarms, and the DNS-only Cloudflare alias. CockroachDB Cloud, SecureString values, ACM validation, deployment IAM, and Terraform bootstrap state are intentionally external to routine teardown.
 
-Bootstrap the remote state bucket and GitHub OIDC role once from `infra/terraform/bootstrap`. The `deploy demo` workflow can then produce a plan or apply it through the protected `demo` environment. The `destroy demo` workflow requires the exact `destroy-demo` confirmation, pauses CockroachDB delivery first, and removes only the application stack.
+Bootstrap the deployment role and custom-domain certificate once from `infra/terraform/bootstrap`, reusing an existing state bucket and GitHub OIDC provider. The `deploy demo` workflow can then produce a plan or apply it through the protected `demo` environment. Apply checks SSM, ACM, Cloudflare, and CockroachDB before creating resources. The `destroy demo` workflow requires the exact `destroy-demo` confirmation, pauses CockroachDB delivery first, and removes only the application stack.
 
-Required GitHub repository variables are `AWS_DEPLOY_ROLE_ARN`, `TF_STATE_BUCKET`, and optionally `AWS_REGION` plus SSM parameter-name overrides. No long-lived AWS access keys are stored in GitHub.
+Required GitHub repository variables are `AWS_DEPLOY_ROLE_ARN`, `TF_STATE_BUCKET`, `HINDSIGHT_ACM_CERTIFICATE_ARN`, `HINDSIGHT_DOMAIN_NAME`, and `CLOUDFLARE_ZONE_ID`, plus optional region and SSM parameter-name overrides. `CLOUDFLARE_API_TOKEN` is a zone-scoped `demo` environment secret. No long-lived AWS access keys are stored in GitHub.
 
 ## OpenTelemetry memory traces
 
