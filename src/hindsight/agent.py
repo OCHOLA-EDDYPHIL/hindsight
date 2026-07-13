@@ -284,6 +284,7 @@ def build_incident_graph(
                     ),
                     prompt=_plan_prompt(state),
                     max_output_tokens=512,
+                    routing_key=state["decision_id"],
                 )
             )
             set_span_attributes(

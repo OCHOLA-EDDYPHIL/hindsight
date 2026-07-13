@@ -85,6 +85,27 @@ def test_gemini_provider_uses_injected_client_without_network():
     assert calls[0]["config"]["max_output_tokens"] == 64
 
 
+def test_gemini_provider_reports_pool_slot_without_key_material():
+    from hindsight.gemini import GeminiCredential, GeminiCredentialPool
+    from hindsight.reasoning import GeminiReasoningProvider, ReasoningRequest
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return SimpleNamespace(text="recovered", usage_metadata={"prompt_token_count": 3})
+
+    pool = GeminiCredentialPool(
+        [GeminiCredential("project-a", "sensitive-key")],
+        client_factory=lambda key: SimpleNamespace(models=FakeModels()),
+    )
+    provider = GeminiReasoningProvider(model_name="gemini-test", credential_pool=pool)
+
+    response = provider.generate(ReasoningRequest(prompt="triage", routing_key="run-1"))
+
+    assert response.usage["gemini_key_slot"] == "project-a"
+    assert response.usage["provider_attempts"] == 1
+    assert "sensitive-key" not in str(response.usage)
+
+
 def test_bedrock_provider_uses_injected_client_without_network():
     from hindsight.reasoning import BedrockReasoningProvider, ReasoningRequest
 

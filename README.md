@@ -128,6 +128,17 @@ make changefeed-pause
 
 `changefeed-apply` is idempotent for the same endpoint and token. Teardown pauses the feed before removing the AWS webhook so CockroachDB does not retry a dead sink.
 
+## Gemini reasoning and embeddings
+
+The hosted worker uses one SSM-backed Gemini key pool for reasoning and 1,024-dimensional `gemini-embedding-2` vectors. Keys may belong to separate Google projects. Rate limits and transient failures move only the affected slot into a DynamoDB-coordinated cooldown; request errors do not trigger rotation, and telemetry records slot IDs rather than credentials.
+
+Local runs can set `GEMINI_API_KEY` plus numbered keys such as `GEMINI_API_KEY_1`. Production stores the versioned pool document in `/hindsight/demo/gemini-api-keys`. When the embedding model changes, rebuild derivative vectors without changing memory provenance:
+
+```bash
+uv run python scripts/reembed_memories.py --dry-run
+uv run python scripts/reembed_memories.py
+```
+
 ## AWS deployment lifecycle
 
 Terraform owns the complete ephemeral AWS application: private S3 UI hosting through CloudFront, API Gateway HTTP and WebSocket APIs, split Lambda artifacts, SQS with a dead-letter queue, the expiring connection registry, IAM, logs, throttles, and alarms. CockroachDB Cloud, SecureString values, and the Terraform bootstrap state are intentionally external to routine teardown.

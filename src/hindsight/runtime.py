@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -13,10 +15,13 @@ from hindsight.aws import aws_client_config
 
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
 GEMINI_API_KEY_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEY_PARAM"
+GEMINI_API_KEYS_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEYS_PARAM"
 FUNCTION_AUTH_TOKEN_PARAM_ENV = "HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM"
 FUNCTION_AUTH_TOKEN_ENV = "HINDSIGHT_FUNCTION_AUTH_TOKEN"
 REASONING_MAX_ATTEMPTS_ENV = "REASONING_MAX_ATTEMPTS"
+SETTINGS_CACHE_TTL_ENV = "HINDSIGHT_SETTINGS_CACHE_TTL_SECONDS"
 _SETTINGS_CACHE: RuntimeSettings | None = None
+_SETTINGS_CACHE_AT: float | None = None
 _AUTH_TOKEN_CACHE: str | None = None
 
 
@@ -57,9 +62,19 @@ def runtime_settings(
     ssm_client: Any | None = None,
     use_cache: bool = True,
 ) -> RuntimeSettings:
-    global _SETTINGS_CACHE
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_AT
     env = os.environ if environ is None else environ
-    if use_cache and environ is None and ssm_client is None and _SETTINGS_CACHE is not None:
+    cache_ttl = _int_env(env, SETTINGS_CACHE_TTL_ENV, default=300)
+    cache_current = (
+        _SETTINGS_CACHE_AT is not None and time.monotonic() - _SETTINGS_CACHE_AT < cache_ttl
+    )
+    if (
+        use_cache
+        and environ is None
+        and ssm_client is None
+        and _SETTINGS_CACHE is not None
+        and cache_current
+    ):
         return _SETTINGS_CACHE
     client = ssm_client
     if client is None and _needs_ssm(env):
@@ -75,19 +90,51 @@ def runtime_settings(
     provider_env = {
         "LLM_PROVIDER": env.get("LLM_PROVIDER", "gemini"),
         "GEMINI_MODEL": env.get("GEMINI_MODEL", ""),
+        "GEMINI_EMBEDDING_MODEL": env.get("GEMINI_EMBEDDING_MODEL", ""),
+        "EMBEDDING_PROVIDER": env.get("EMBEDDING_PROVIDER", "deterministic"),
+        "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE": env.get(
+            "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE", ""
+        ),
         "BEDROCK_MODEL": env.get("BEDROCK_MODEL", ""),
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }
-    if provider_env["LLM_PROVIDER"].strip().lower() == "gemini":
-        gemini_key = _optional_secret_value(
+    needs_gemini = any(
+        provider_env[name].strip().lower() == "gemini"
+        for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
+    )
+    if needs_gemini:
+        gemini_keys = _optional_secret_value(
             env=env,
             client=client,
-            param_env=GEMINI_API_KEY_PARAM_ENV,
-            fallback_env="GEMINI_API_KEY",
+            param_env=GEMINI_API_KEYS_PARAM_ENV,
+            fallback_env="GEMINI_API_KEYS",
         )
-        if gemini_key:
-            provider_env["GEMINI_API_KEY"] = gemini_key
+        if not gemini_keys and not _running_in_lambda(env):
+            local_keys = [
+                env[name]
+                for name in ("GEMINI_API_KEY", *(f"GEMINI_API_KEY_{i}" for i in range(1, 20)))
+                if env.get(name)
+            ]
+            if local_keys:
+                gemini_keys = json.dumps(
+                    {
+                        "version": 1,
+                        "keys": [
+                            {"id": f"gemini-{index + 1}", "api_key": key}
+                            for index, key in enumerate(local_keys)
+                        ],
+                    }
+                )
+        if not gemini_keys:
+            gemini_keys = _optional_secret_value(
+                env=env,
+                client=client,
+                param_env=GEMINI_API_KEY_PARAM_ENV,
+                fallback_env="GEMINI_API_KEY",
+            )
+        if gemini_keys:
+            provider_env["GEMINI_API_KEYS"] = gemini_keys
     settings = RuntimeSettings(
         database_url=database_url,
         provider_env=provider_env,
@@ -95,7 +142,16 @@ def runtime_settings(
     )
     if use_cache and environ is None and ssm_client is None:
         _SETTINGS_CACHE = settings
+        _SETTINGS_CACHE_AT = time.monotonic()
     return settings
+
+
+def invalidate_runtime_settings_cache() -> None:
+    """Force the next invocation to reload mutable SSM-backed settings."""
+
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_AT
+    _SETTINGS_CACHE = None
+    _SETTINGS_CACHE_AT = None
 
 
 def _secret_value(
@@ -141,6 +197,7 @@ def _running_in_lambda(env: Mapping[str, str]) -> bool:
 def _needs_ssm(env: Mapping[str, str]) -> bool:
     return bool(
         env.get(DATABASE_URL_PARAM_ENV)
+        or env.get(GEMINI_API_KEYS_PARAM_ENV)
         or env.get(GEMINI_API_KEY_PARAM_ENV)
         or _running_in_lambda(env)
     )

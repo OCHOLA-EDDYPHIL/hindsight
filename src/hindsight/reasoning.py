@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
 from hindsight.aws import aws_client_config
+from hindsight.gemini import GeminiCredentialPool, gemini_pool_from_env
 
 DEFAULT_LLM_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -32,6 +33,7 @@ class ReasoningRequest:
     system: str | None = None
     temperature: float = 0.2
     max_output_tokens: int | None = None
+    routing_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,8 +88,11 @@ class GeminiReasoningProvider:
         api_key: str | None = None,
         model_name: str = DEFAULT_GEMINI_MODEL,
         client: Any | None = None,
+        credential_pool: GeminiCredentialPool | None = None,
     ):
-        if client is None:
+        if client is not None and credential_pool is not None:
+            raise ValueError("client and credential_pool are mutually exclusive")
+        if client is None and credential_pool is None:
             api_key = api_key or os.environ.get("GEMINI_API_KEY")
             if not api_key:
                 raise ReasoningProviderError("GEMINI_API_KEY is required for Gemini")
@@ -96,6 +101,7 @@ class GeminiReasoningProvider:
             client = genai.Client(api_key=api_key)
         self.model_name = model_name
         self._client = client
+        self._credential_pool = credential_pool
 
     def generate(self, request: ReasoningRequest) -> ReasoningResponse:
         contents = request.prompt
@@ -104,22 +110,39 @@ class GeminiReasoningProvider:
         config: dict[str, Any] = {"temperature": request.temperature}
         if request.max_output_tokens is not None:
             config["max_output_tokens"] = request.max_output_tokens
-        try:
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=config,
+        def invoke(client: Any) -> Any:
+            return client.models.generate_content(
+                model=self.model_name, contents=contents, config=config
             )
+
+        pool_execution = None
+        try:
+            if self._credential_pool is not None:
+                pool_execution = self._credential_pool.execute(
+                    invoke,
+                    routing_key=request.routing_key or request.prompt,
+                )
+                response = pool_execution.value
+            else:
+                response = invoke(self._client)
         except Exception as exc:  # pragma: no cover - provider SDK details vary.
             raise ReasoningProviderError(f"Gemini generation failed: {exc}") from exc
         text = getattr(response, "text", None)
         if not text:
             raise ReasoningProviderError("Gemini returned an empty response")
+        usage = _usage_dict(getattr(response, "usage_metadata", None))
+        if pool_execution is not None:
+            usage.update(
+                {
+                    "gemini_key_slot": pool_execution.slot_id,
+                    "provider_attempts": pool_execution.attempts,
+                }
+            )
         return ReasoningResponse(
             text=text,
             provider=self.provider_name,
             model=self.model_name,
-            usage=_usage_dict(getattr(response, "usage_metadata", None)),
+            usage=usage,
         )
 
 
@@ -218,6 +241,8 @@ class RetryingReasoningProvider:
 
 def reasoning_provider_from_env(
     environ: Mapping[str, str] | None = None,
+    *,
+    gemini_pool: GeminiCredentialPool | None = None,
 ) -> ReasoningProvider:
     """Build the configured reasoning provider from environment values."""
 
@@ -226,11 +251,13 @@ def reasoning_provider_from_env(
     if provider == "deterministic":
         return DeterministicReasoningProvider()
     if provider == "gemini":
-        if environ is not None and not env.get("GEMINI_API_KEY"):
-            raise ReasoningProviderError("GEMINI_API_KEY is required for Gemini")
+        try:
+            pool = gemini_pool or gemini_pool_from_env(env)
+        except Exception as exc:
+            raise ReasoningProviderError(str(exc)) from exc
         return GeminiReasoningProvider(
-            api_key=env.get("GEMINI_API_KEY"),
             model_name=(env.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip(),
+            credential_pool=pool,
         )
     if provider == "bedrock":
         return BedrockReasoningProvider(

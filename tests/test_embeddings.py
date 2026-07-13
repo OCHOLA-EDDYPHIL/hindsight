@@ -1,8 +1,35 @@
 """Embedding provider tests."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
+
+
+def test_gemini_embedding_provider_requests_1024_dimensions():
+    from hindsight.embeddings import EMBEDDING_DIMENSIONS, GeminiEmbeddingProvider
+    from hindsight.gemini import PoolExecution
+
+    calls = []
+
+    class FakePool:
+        def execute(self, operation, *, routing_key):
+            class Models:
+                def embed_content(self, **kwargs):
+                    calls.append(kwargs)
+                    return SimpleNamespace(
+                        embeddings=[SimpleNamespace(values=[0.25] * EMBEDDING_DIMENSIONS)]
+                    )
+
+            value = operation(SimpleNamespace(models=Models()))
+            return PoolExecution(value=value, slot_id="slot-a", attempts=1)
+
+    provider = GeminiEmbeddingProvider(credential_pool=FakePool())
+    vector = provider.embed("payment timeout")
+
+    assert len(vector) == EMBEDDING_DIMENSIONS
+    assert calls[0]["model"] == "gemini-embedding-2"
+    assert calls[0]["config"]["output_dimensionality"] == EMBEDDING_DIMENSIONS
 
 
 def test_deterministic_embedding_provider_is_stable():
