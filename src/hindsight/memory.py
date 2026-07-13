@@ -782,10 +782,21 @@ class MemoryStore:
                         JOIN semantic_memory_embeddings AS e
                             ON e.memory_id = m.id
                         WHERE m.namespace = %s
+                            AND e.provider = %s
+                            AND e.model = %s
+                            AND e.dimensions = %s
                         ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
                         LIMIT %s
                     """,
-                    (query_vector, namespace, query_vector, limit),
+                    (
+                        query_vector,
+                        namespace,
+                        self._embedding_provider.provider_name,
+                        self._embedding_provider.model_name,
+                        self._embedding_provider.dimensions,
+                        query_vector,
+                        limit,
+                    ),
                 )
                 self._record_retrieval(
                     rows,
@@ -887,10 +898,22 @@ class MemoryStore:
                             AND (r.service_id = s.id OR r.service_id IS NULL)
                         WHERE m.namespace = %s
                             AND s.slug = %s
+                            AND e.provider = %s
+                            AND e.model = %s
+                            AND e.dimensions = %s
                         ORDER BY e.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
                         LIMIT %s
                     """,
-                    (query_vector, namespace, service_slug, query_vector, limit),
+                    (
+                        query_vector,
+                        namespace,
+                        service_slug,
+                        self._embedding_provider.provider_name,
+                        self._embedding_provider.model_name,
+                        self._embedding_provider.dimensions,
+                        query_vector,
+                        limit,
+                    ),
                 )
                 self._record_retrieval(
                     rows,

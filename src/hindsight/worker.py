@@ -7,9 +7,10 @@ import os
 from typing import Any
 
 from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
-from hindsight.embeddings import DeterministicEmbeddingProvider
+from hindsight.embeddings import embedding_provider_from_env
+from hindsight.gemini import GeminiPoolExhaustedError, gemini_pool_from_env
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
-from hindsight.runtime import runtime_settings
+from hindsight.runtime import invalidate_runtime_settings_cache, runtime_settings
 from hindsight.runs import claim_run, fail_run, get_run, transition_run
 from hindsight.security import safe_error_detail
 from hindsight.tracing import configure_tracing_from_env
@@ -54,9 +55,24 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
         return get_run(run_id=run_id)
 
     settings = runtime_settings()
-    provider = retrying_reasoning_provider(
-        reasoning_provider_from_env(settings.provider_env),
-        max_attempts=settings.reasoning_max_attempts,
+    uses_gemini = any(
+        settings.provider_env.get(name, "").strip().lower() == "gemini"
+        for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
+    )
+    gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
+    provider = (
+        reasoning_provider_from_env(settings.provider_env, gemini_pool=gemini_pool)
+        if gemini_pool is not None
+        else reasoning_provider_from_env(settings.provider_env)
+    )
+    if provider.provider_name != "gemini":
+        provider = retrying_reasoning_provider(
+            provider,
+            max_attempts=settings.reasoning_max_attempts,
+        )
+    embedding_provider = embedding_provider_from_env(
+        settings.provider_env,
+        gemini_pool=gemini_pool,
     )
 
     def progress(phase: str, status: str, state: dict[str, Any]) -> None:
@@ -115,7 +131,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
                 pause_before_act=True,
                 db_url=settings.database_url,
                 reasoning_provider=provider,
-                embedding_provider=DeterministicEmbeddingProvider(),
+                embedding_provider=embedding_provider,
                 progress_callback=progress,
             )
         else:
@@ -124,10 +140,12 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
                 approved=bool(message.get("approved")),
                 db_url=settings.database_url,
                 reasoning_provider=provider,
-                embedding_provider=DeterministicEmbeddingProvider(),
+                embedding_provider=embedding_provider,
                 progress_callback=progress,
             )
     except Exception as exc:
+        if _caused_by_pool_exhaustion(exc):
+            invalidate_runtime_settings_cache()
         max_receives = max(1, int(os.environ.get(WORKER_MAX_RECEIVES_ENV, "3")))
         if attempt < max_receives:
             transition_run(
@@ -194,3 +212,12 @@ def _phase_summary(phase: str, status: str) -> str:
         "reflection": "Outcome reflected into long-term memory",
     }
     return summaries.get(phase, f"Agent run entered {status.replace('_', ' ')}")
+
+
+def _caused_by_pool_exhaustion(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, GeminiPoolExhaustedError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False

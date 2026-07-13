@@ -12,13 +12,15 @@ import math
 import os
 import re
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Any, Mapping, Protocol
 
 from hindsight.aws import aws_client_config
+from hindsight.gemini import GeminiCredentialPool, gemini_pool_from_env
 
 EMBEDDING_DIMENSIONS = 1024
 BEDROCK_TITAN_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 LIVE_BEDROCK_EMBEDDINGS_FLAG = "RUN_LIVE_BEDROCK_EMBEDDINGS"
+DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-2"
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -68,6 +70,47 @@ class DeterministicEmbeddingProvider:
         return [value / norm for value in vector]
 
 
+class GeminiEmbeddingProvider:
+    """Gemini Developer API embeddings routed through the shared key pool."""
+
+    provider_name = "gemini"
+
+    def __init__(
+        self,
+        *,
+        credential_pool: GeminiCredentialPool,
+        model_name: str = DEFAULT_GEMINI_EMBEDDING_MODEL,
+        dimensions: int = EMBEDDING_DIMENSIONS,
+    ):
+        self.model_name = model_name
+        self.dimensions = dimensions
+        self._credential_pool = credential_pool
+
+    def embed(self, text: str) -> list[float]:
+        def invoke(client: Any) -> Any:
+            return client.models.embed_content(
+                model=self.model_name,
+                contents=text,
+                config={"output_dimensionality": self.dimensions},
+            )
+
+        execution = self._credential_pool.execute(invoke, routing_key=text)
+        embeddings = getattr(execution.value, "embeddings", None) or []
+        if not embeddings:
+            raise RuntimeError("Gemini returned no embedding")
+        values = getattr(embeddings[0], "values", None)
+        if values is None and isinstance(embeddings[0], dict):
+            values = embeddings[0].get("values")
+        if values is None:
+            raise RuntimeError("Gemini returned an embedding without values")
+        vector = [float(value) for value in values]
+        if len(vector) != self.dimensions:
+            raise ValueError(
+                f"Gemini returned {len(vector)} dimensions, expected {self.dimensions}"
+            )
+        return vector
+
+
 class BedrockTitanEmbeddingProvider:
     """Amazon Bedrock Titan Text Embeddings V2 provider."""
 
@@ -115,3 +158,30 @@ class BedrockTitanEmbeddingProvider:
                 f"Bedrock returned {len(embedding)} dimensions, expected {self.dimensions}"
             )
         return [float(value) for value in embedding]
+
+
+def embedding_provider_from_env(
+    environ: Mapping[str, str] | None = None,
+    *,
+    gemini_pool: GeminiCredentialPool | None = None,
+) -> EmbeddingProvider:
+    """Build the configured embedding provider without enabling live calls implicitly."""
+
+    env = os.environ if environ is None else environ
+    provider = (env.get("EMBEDDING_PROVIDER") or "deterministic").strip().lower()
+    if provider == "deterministic":
+        return DeterministicEmbeddingProvider()
+    if provider == "gemini":
+        pool = gemini_pool or gemini_pool_from_env(env)
+        return GeminiEmbeddingProvider(
+            credential_pool=pool,
+            model_name=(
+                env.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
+            ).strip(),
+        )
+    if provider == "bedrock":
+        return BedrockTitanEmbeddingProvider(
+            model_id=(env.get("BEDROCK_EMBEDDING_MODEL") or BEDROCK_TITAN_EMBED_MODEL).strip(),
+            region_name=env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION"),
+        )
+    raise ValueError(f"Unsupported EMBEDDING_PROVIDER: {provider}")
