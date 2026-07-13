@@ -1,7 +1,7 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
 LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
 
-.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-zip lambda-artifacts mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local cross-episode-demo cross-episode-demo-local cross-episode-trace-local memory-dashboard memory-dashboard-local product-api-local changefeed-apply changefeed-pause changefeed-status
+.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local cross-episode-demo cross-episode-demo-local cross-episode-trace-local memory-dashboard memory-dashboard-local product-api-local changefeed-apply changefeed-pause changefeed-status
 
 dev-up:
 	docker compose up -d --wait
@@ -29,9 +29,6 @@ test:
 
 lint:
 	uv run ruff check .
-
-lambda-zip:
-	uv run python scripts/build_lambda_zip.py
 
 lambda-artifacts:
 	uv run python scripts/build_lambda_artifacts.py

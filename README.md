@@ -128,6 +128,14 @@ make changefeed-pause
 
 `changefeed-apply` is idempotent for the same endpoint and token. Teardown pauses the feed before removing the AWS webhook so CockroachDB does not retry a dead sink.
 
+## AWS deployment lifecycle
+
+Terraform owns the complete ephemeral AWS application: private S3 UI hosting through CloudFront, API Gateway HTTP and WebSocket APIs, split Lambda artifacts, SQS with a dead-letter queue, the expiring connection registry, IAM, logs, throttles, and alarms. CockroachDB Cloud, SecureString values, and the Terraform bootstrap state are intentionally external to routine teardown.
+
+Bootstrap the remote state bucket and GitHub OIDC role once from `infra/terraform/bootstrap`. The `deploy demo` workflow can then produce a plan or apply it through the protected `demo` environment. The `destroy demo` workflow requires the exact `destroy-demo` confirmation, pauses CockroachDB delivery first, and removes only the application stack.
+
+Required GitHub repository variables are `AWS_DEPLOY_ROLE_ARN`, `TF_STATE_BUCKET`, and optionally `AWS_REGION` plus SSM parameter-name overrides. No long-lived AWS access keys are stored in GitHub.
+
 ## OpenTelemetry memory traces
 
 The memory layer emits safe OpenTelemetry spans for reads, writes, invalidations, rewinds, and agent recall/reasoning/reflection boundaries. Spans include namespaces, memory IDs, counts, decision IDs, and writer names, but do not record raw memory content, prompts, recall queries, DB URLs, secrets, or operator-entered reasons.

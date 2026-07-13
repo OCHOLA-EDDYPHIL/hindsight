@@ -1,0 +1,64 @@
+name: destroy demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type destroy-demo to remove ephemeral AWS application resources
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: hindsight-demo-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_stage: demo
+  TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_database_url_parameter_name: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  TF_VAR_gemini_api_key_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEY_PARAM || '/hindsight/demo/gemini-api-key' }}
+  TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+  TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+
+jobs:
+  destroy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: demo
+    steps:
+      - name: Confirm destructive operation
+        if: inputs.confirmation != 'destroy-demo'
+        run: exit 1
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: uv sync --frozen
+      - run: uv run python scripts/build_lambda_artifacts.py
+      - name: Initialize remote state
+        run: >-
+          terraform -chdir=infra/terraform/app init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=hindsight/demo/terraform.tfstate"
+          -backend-config="region=${{ env.AWS_REGION }}"
+          -backend-config="encrypt=true"
+          -backend-config="use_lockfile=true"
+      - name: Pause CockroachDB delivery before endpoint removal
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          uv run python scripts/configure_changefeed.py pause
+      - run: terraform -chdir=infra/terraform/app plan -destroy -input=false -out="$GITHUB_WORKSPACE/build/destroy.tfplan"
+      - run: terraform -chdir=infra/terraform/app apply -input=false -auto-approve "$GITHUB_WORKSPACE/build/destroy.tfplan"
+      - run: echo "Ephemeral AWS application resources were removed. CockroachDB, SSM values, and bootstrap state remain." >> "$GITHUB_STEP_SUMMARY"
