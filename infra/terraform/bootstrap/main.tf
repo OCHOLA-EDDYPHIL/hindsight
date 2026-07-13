@@ -27,17 +27,13 @@ resource "aws_acm_certificate" "demo" {
 
 resource "cloudflare_dns_record" "acm_validation" {
   for_each = {
-    for option in aws_acm_certificate.demo.domain_validation_options : option.domain_name => {
-      name    = option.resource_record_name
-      content = option.resource_record_value
-      type    = option.resource_record_type
-    }
+    (var.domain_name) = one(aws_acm_certificate.demo.domain_validation_options)
   }
 
   zone_id = var.cloudflare_zone_id
-  name    = each.value.name
-  content = each.value.content
-  type    = each.value.type
+  name    = each.value.resource_record_name
+  content = each.value.resource_record_value
+  type    = each.value.resource_record_type
   ttl     = 1
   proxied = false
   comment = "ACM validation for Hindsight"
