@@ -12,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
+from hindsight.aws import aws_client_config
+
 DEFAULT_LLM_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_BEDROCK_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
@@ -136,7 +138,11 @@ class BedrockReasoningProvider:
         if client is None:
             import boto3
 
-            client = boto3.client("bedrock-runtime", region_name=region_name)
+            client = boto3.client(
+                "bedrock-runtime",
+                region_name=region_name,
+                config=aws_client_config(),
+            )
         self.model_name = model_name
         self._client = client
 

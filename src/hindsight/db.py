@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
+DEFAULT_APPLICATION_NAME = "hindsight"
+
 
 def database_url() -> str:
     url = os.environ.get("DATABASE_URL")
@@ -23,5 +26,16 @@ def database_url() -> str:
     return url
 
 
-def connect(url: str | None = None) -> psycopg.Connection:
-    return psycopg.connect(url or database_url())
+def connect(
+    url: str | None = None,
+    *,
+    connect_timeout: int = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    application_name: str = DEFAULT_APPLICATION_NAME,
+) -> psycopg.Connection:
+    """Open a CockroachDB connection with bounded startup behavior."""
+
+    return psycopg.connect(
+        url or database_url(),
+        connect_timeout=connect_timeout,
+        application_name=application_name,
+    )

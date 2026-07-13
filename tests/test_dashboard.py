@@ -1,5 +1,8 @@
 """Tests for the live memory dashboard helpers."""
 
+import http.client
+import json
+import threading
 from datetime import UTC, datetime
 from threading import Event
 from uuid import uuid4
@@ -417,6 +420,66 @@ def test_dashboard_server_historical_snapshot_uses_short_ttl_cache(monkeypatch):
         server.server_close()
 
 
+def test_dashboard_server_authenticates_page_snapshot_and_events(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    monkeypatch.delenv("HINDSIGHT_DASHBOARD_AUTH_TOKEN", raising=False)
+    server = dashboard.DashboardServer(
+        ("127.0.0.1", 0),
+        namespace="demo:payments",
+        auth_token="secret-token",
+    )
+    server.current_snapshot = lambda *, namespace: {
+        "type": "snapshot",
+        "mode": "current",
+        "namespace": namespace,
+        "as_of": None,
+        "memories": [],
+        "operations": [],
+        "timeline": [],
+        "generated_at": "2026-07-12T14:00:00+00:00",
+    }
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+
+    try:
+        missing = _http_get(host, port, "/snapshot?namespace=demo:payments")
+        assert missing.status == 401
+
+        wrong_events = _http_get(host, port, "/events?namespace=demo:payments")
+        assert wrong_events.status == 401
+
+        redirected = _http_get(host, port, "/?namespace=demo:payments&token=secret-token")
+        assert redirected.status == 303
+        assert redirected.getheader("location") == "/?namespace=demo%3Apayments"
+        cookie = redirected.getheader("set-cookie")
+        assert cookie is not None
+        assert dashboard.DASHBOARD_AUTH_COOKIE in cookie
+        assert "secret-token" not in redirected.getheader("location")
+
+        cookie_snapshot = _http_get(
+            host,
+            port,
+            "/snapshot?namespace=demo:payments",
+            headers={"cookie": cookie},
+        )
+        assert cookie_snapshot.status == 200
+        assert json.loads(cookie_snapshot.read().decode("utf-8"))["namespace"] == "demo:payments"
+
+        bearer_snapshot = _http_get(
+            host,
+            port,
+            "/snapshot?namespace=demo:payments",
+            headers={"authorization": "Bearer secret-token"},
+        )
+        assert bearer_snapshot.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_dashboard_server_historical_snapshot_expires_ttl_cache(monkeypatch):
     import hindsight.dashboard as dashboard
 
@@ -661,3 +724,15 @@ def test_dashboard_html_contains_sse_and_timeline_surface():
     assert "Rewinds" in html
     assert "AbortController" in html
     assert "setTimeout" in html
+
+
+def _http_get(
+    host: str,
+    port: int,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> http.client.HTTPResponse:
+    conn = http.client.HTTPConnection(host, port, timeout=2)
+    conn.request("GET", path, headers=headers or {})
+    return conn.getresponse()

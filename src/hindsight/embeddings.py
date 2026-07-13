@@ -14,6 +14,8 @@ import re
 from collections.abc import Sequence
 from typing import Protocol
 
+from hindsight.aws import aws_client_config
+
 EMBEDDING_DIMENSIONS = 1024
 BEDROCK_TITAN_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 LIVE_BEDROCK_EMBEDDINGS_FLAG = "RUN_LIVE_BEDROCK_EMBEDDINGS"
@@ -86,7 +88,11 @@ class BedrockTitanEmbeddingProvider:
 
         self.model_name = model_id
         self.dimensions = dimensions
-        self._client = boto3.client("bedrock-runtime", region_name=region_name)
+        self._client = boto3.client(
+            "bedrock-runtime",
+            region_name=region_name,
+            config=aws_client_config(),
+        )
 
     def embed(self, text: str) -> list[float]:
         body = json.dumps(

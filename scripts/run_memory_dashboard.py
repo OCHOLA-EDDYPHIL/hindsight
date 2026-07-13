@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 
@@ -18,6 +19,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--namespace", default=DEMO_NAMESPACE)
     parser.add_argument("--db-url", default=None)
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("HINDSIGHT_DASHBOARD_AUTH_TOKEN"),
+        help="Bearer token for the dashboard; defaults to HINDSIGHT_DASHBOARD_AUTH_TOKEN.",
+    )
     args = parser.parse_args()
 
     run_dashboard_server(
@@ -25,6 +31,7 @@ def main() -> None:
         port=args.port,
         namespace=args.namespace,
         db_url=args.db_url,
+        auth_token=args.auth_token,
     )
 
 

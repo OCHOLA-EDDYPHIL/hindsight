@@ -447,9 +447,9 @@ def test_runtime_settings_adds_certifi_root_for_verify_full_database_url():
 
 
 def test_safe_error_detail_redacts_connection_secrets():
-    from hindsight.lambda_handler import _safe_error_detail
+    from hindsight.security import safe_error_detail
 
-    detail = _safe_error_detail(
+    detail = safe_error_detail(
         RuntimeError(
             "failed postgresql://user:supersecret@example.com/db?sslmode=verify-full "
             "password=hidden token=opaque api_key=abc123"
@@ -462,3 +462,24 @@ def test_safe_error_detail_redacts_connection_secrets():
     assert "opaque" not in detail
     assert "abc123" not in detail
     assert "postgresql://user:***@example.com/db" in detail
+
+
+def test_lambda_ssm_client_uses_bounded_boto_config(monkeypatch):
+    import hindsight.lambda_handler as lambda_handler
+
+    calls = []
+
+    def fake_client(service_name, **kwargs):
+        calls.append((service_name, kwargs))
+        return object()
+
+    monkeypatch.setattr(lambda_handler.boto3, "client", fake_client)
+
+    client = lambda_handler._ssm_client({"AWS_REGION": "us-east-1"})
+
+    assert client is not None
+    service_name, kwargs = calls[0]
+    assert service_name == "ssm"
+    assert kwargs["region_name"] == "us-east-1"
+    assert kwargs["config"].connect_timeout == 3
+    assert kwargs["config"].read_timeout == 10
