@@ -21,16 +21,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hindsight.dashboard import memory_snapshot
 from hindsight.db import connect
-from hindsight.demo import (
+from hindsight.demo_state import (
     DEMO_NAMESPACE,
     ensure_poison_rewind_incident,
     poison_demo_memory,
-    reset_poison_rewind_demo,
+    reset_poison_rewind_state,
     seed_good_demo_memory,
 )
-from hindsight.lambda_handler import function_auth_token, runtime_settings
 from hindsight.memory import MemoryStore
 from hindsight.queueing import RunQueueUnavailableError, enqueue_run
+from hindsight.runtime import function_auth_token, runtime_settings
 from hindsight.runs import (
     RunConflictError,
     RunNotFoundError,
@@ -326,7 +326,7 @@ def rewind_execute(namespace: str, payload: RewindRequest) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
-    reset_poison_rewind_demo(namespace=payload.namespace)
+    reset_poison_rewind_state(namespace=payload.namespace)
     incident = ensure_poison_rewind_incident()
     memory = seed_good_demo_memory(namespace=payload.namespace)
     return {

@@ -116,6 +116,18 @@ The versioned API and interactive OpenAPI document are available under `/v1` and
 
 Run creation accepts an `Idempotency-Key` header and returns `202 Accepted`. The client follows the resulting run resource until it reaches `awaiting_approval`, `completed`, `rejected`, or `failed`.
 
+In the deployed product, CockroachDB sends changes from `semantic_memories`, `memory_operations`, `agent_runs`, and `agent_run_events` to an authenticated webhook. Lightweight Lambda handlers fan one versioned event envelope out through API Gateway WebSockets. DynamoDB contains only expiring connection subscriptions; durable run and memory state never leaves CockroachDB.
+
+Deployment automation manages the changefeed lifecycle separately from schema migrations:
+
+```bash
+make changefeed-apply
+make changefeed-status
+make changefeed-pause
+```
+
+`changefeed-apply` is idempotent for the same endpoint and token. Teardown pauses the feed before removing the AWS webhook so CockroachDB does not retry a dead sink.
+
 ## OpenTelemetry memory traces
 
 The memory layer emits safe OpenTelemetry spans for reads, writes, invalidations, rewinds, and agent recall/reasoning/reflection boundaries. Spans include namespaces, memory IDs, counts, decision IDs, and writer names, but do not record raw memory content, prompts, recall queries, DB URLs, secrets, or operator-entered reasons.

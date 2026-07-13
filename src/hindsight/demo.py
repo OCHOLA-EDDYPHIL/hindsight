@@ -9,20 +9,21 @@ from typing import Any
 from uuid import uuid4
 
 from hindsight.db import connect, database_url
+from hindsight.demo_state import (
+    DEMO_INCIDENT_ID,
+    DEMO_INPUT,
+    DEMO_NAMESPACE,
+    DEMO_SERVICE_SLUG,
+    DEMO_TITLE,
+    GOOD_MEMORY_CONTENT,
+    POISONED_MEMORY_CONTENT,
+)
 from hindsight.embeddings import DeterministicEmbeddingProvider
 from hindsight.mcp_server import inspect_decision_trace
 from hindsight.memory import MemoryStore, Provenance, RewindResult
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
-DEMO_NAMESPACE = "demo:payments-poison-rewind"
-DEMO_INCIDENT_ID = "demo-payments-checkout-latency"
-DEMO_SERVICE_SLUG = "payments-api"
-DEMO_TITLE = "Checkout p99 latency above SLO"
-DEMO_INPUT = (
-    "payments-api checkout p99 latency breached the 2s SLO while processor "
-    "timeouts and retry fanout rose together."
-)
 GOOD_RECOMMENDATION = (
     "Suspected cause: retry fanout is amplifying downstream payment processor "
     "timeouts. Check processor timeout rate and queue depth, then throttle retry "
@@ -31,16 +32,6 @@ GOOD_RECOMMENDATION = (
 BAD_RECOMMENDATION = (
     "Suspected cause: stale edge certificate material is breaking checkout. "
     "Rotate the edge certificate bundle and reload gateway configuration."
-)
-GOOD_MEMORY_CONTENT = (
-    "Prior payments-api incident: checkout p99 latency rose when payment processor "
-    "timeouts triggered retry fanout. The safe fix was to throttle retry fanout, "
-    "watch queue depth, and avoid scaling workers until the processor recovered."
-)
-POISONED_MEMORY_CONTENT = (
-    "Poisoned memory: payments-api checkout latency was caused by stale edge "
-    "certificate material. The recommended fix is to rotate certificates and "
-    "reload edge gateway configuration."
 )
 REWIND_REASON = "Poisoned memory led to a wrong certificate-rotation recommendation"
 

@@ -22,7 +22,7 @@ from uuid import UUID
 from psycopg.rows import dict_row
 
 from hindsight.db import connect, database_url
-from hindsight.demo import DEMO_NAMESPACE
+from hindsight.demo_state import DEMO_NAMESPACE
 from hindsight.memory import MemoryStore
 from hindsight.security import safe_error_detail
 

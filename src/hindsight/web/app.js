@@ -14,6 +14,7 @@ const state = {
   memoryDetail: null,
   rewindPreview: null,
   rewindAnchor: null,
+  socket: null,
   snapshotRequest: 0,
   runPoll: null
 };
@@ -198,6 +199,7 @@ function renderRun() {
 async function loadRun(runId, {poll = false} = {}) {
   try {
     state.run = await request(`/runs/${encodeURIComponent(runId)}`);
+    subscribeSocket();
     renderRun();
     if (state.run.decision_id) await loadInfluence(state.run.decision_id);
     if (poll && !["completed", "rejected", "failed", "awaiting_approval"].includes(state.run.status)) {
@@ -485,16 +487,27 @@ function connectSse() {
 
 function connectWebSocket() {
   const socket = new WebSocket(config.websocketUrl);
+  state.socket = socket;
   socket.addEventListener("open", () => {
     setConnection("Live", "live");
-    socket.send(JSON.stringify({type: "subscribe", namespace: state.namespace, run_id: state.run?.id || null}));
+    subscribeSocket();
   });
   socket.addEventListener("message", (event) => handleLiveEvent(JSON.parse(event.data)));
   socket.addEventListener("close", () => {
     setConnection("Reconnecting", "error");
+    if (state.socket === socket) state.socket = null;
     setTimeout(connectWebSocket, 1600);
   });
   socket.addEventListener("error", () => socket.close());
+}
+
+function subscribeSocket() {
+  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  state.socket.send(JSON.stringify({
+    type: "subscribe",
+    namespace: state.namespace,
+    run_id: state.run?.id || null
+  }));
 }
 
 function handleLiveEvent(payload) {

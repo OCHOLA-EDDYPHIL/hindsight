@@ -1,7 +1,7 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
 LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
 
-.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-zip mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local cross-episode-demo cross-episode-demo-local cross-episode-trace-local memory-dashboard memory-dashboard-local product-api-local
+.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-zip lambda-artifacts mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local cross-episode-demo cross-episode-demo-local cross-episode-trace-local memory-dashboard memory-dashboard-local product-api-local changefeed-apply changefeed-pause changefeed-status
 
 dev-up:
 	docker compose up -d --wait
@@ -32,6 +32,9 @@ lint:
 
 lambda-zip:
 	uv run python scripts/build_lambda_zip.py
+
+lambda-artifacts:
+	uv run python scripts/build_lambda_artifacts.py
 
 mcp-server:
 	uv run python scripts/run_mcp_server.py
@@ -65,3 +68,12 @@ memory-dashboard-local:
 
 product-api-local:
 	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_DATABASE_URL_PARAM="" HINDSIGHT_GEMINI_API_KEY_PARAM="" HINDSIGHT_INLINE_WORKER=1 HINDSIGHT_SECURE_COOKIES=0 uv run uvicorn hindsight.api:app --reload --host 127.0.0.1 --port 8766
+
+changefeed-apply:
+	uv run python scripts/configure_changefeed.py apply
+
+changefeed-pause:
+	uv run python scripts/configure_changefeed.py pause
+
+changefeed-status:
+	uv run python scripts/configure_changefeed.py status
