@@ -91,6 +91,31 @@ Set `HINDSIGHT_DASHBOARD_AUTH_TOKEN` or pass `--auth-token` to require dashboard
 
 For final demo checks against CockroachDB Cloud, point `DATABASE_URL` or `--db-url` at the Cloud cluster explicitly. Local CockroachDB is the default rehearsal target.
 
+## Incident cockpit and product API
+
+The enhanced dashboard adds the incident workflow around the live memory view: agent run phases, plans and approvals, exact decision-to-memory influence, provenance details, and a guarded rewind preview. Read-only inspection stays public; model calls and memory mutations require the shared operator token.
+
+Run the complete local product surface with an inline background worker:
+
+```bash
+make dev-up
+make migrate-local
+HINDSIGHT_FUNCTION_AUTH_TOKEN=local-demo LLM_PROVIDER=deterministic make product-api-local
+```
+
+Open `http://127.0.0.1:8766`. The hosted runtime replaces the inline worker with SQS, while CockroachDB remains the durable source of run state and ordered phase events.
+
+The versioned API and interactive OpenAPI document are available under `/v1` and `/v1/docs`. Its primary resources are:
+
+- incidents and asynchronous agent runs;
+- approval/resume of interrupted runs;
+- current or historical belief state;
+- memory provenance and decision influence;
+- rewind preview and guarded execution;
+- operator-only signature-demo controls.
+
+Run creation accepts an `Idempotency-Key` header and returns `202 Accepted`. The client follows the resulting run resource until it reaches `awaiting_approval`, `completed`, `rejected`, or `failed`.
+
 ## OpenTelemetry memory traces
 
 The memory layer emits safe OpenTelemetry spans for reads, writes, invalidations, rewinds, and agent recall/reasoning/reflection boundaries. Spans include namespaces, memory IDs, counts, decision IDs, and writer names, but do not record raw memory content, prompts, recall queries, DB URLs, secrets, or operator-entered reasons.

@@ -162,11 +162,14 @@ def test_async_run_incident_agent_wraps_sync_graph(monkeypatch):
     assert state["incident_id"] == "incident-1"
     assert state["namespace"] == "namespace-1"
     assert state["pause_before_act"] is True
+    assert state["run_id"]
+    assert state["decision_id"] == f"agent:{state['run_id']}:plan"
     assert kwargs == {
         "thread_id": "thread-1",
         "db_url": "postgresql://db",
         "reasoning_provider": reasoning_provider,
         "embedding_provider": embedding_provider,
+        "progress_callback": None,
     }
 
 
@@ -210,6 +213,7 @@ def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
         "db_url": "postgresql://db",
         "reasoning_provider": reasoning_provider,
         "embedding_provider": embedding_provider,
+        "progress_callback": None,
     }
 
 

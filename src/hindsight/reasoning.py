@@ -226,6 +226,8 @@ def reasoning_provider_from_env(
     if provider == "deterministic":
         return DeterministicReasoningProvider()
     if provider == "gemini":
+        if environ is not None and not env.get("GEMINI_API_KEY"):
+            raise ReasoningProviderError("GEMINI_API_KEY is required for Gemini")
         return GeminiReasoningProvider(
             api_key=env.get("GEMINI_API_KEY"),
             model_name=(env.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip(),

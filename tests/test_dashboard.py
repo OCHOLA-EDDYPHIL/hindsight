@@ -718,11 +718,12 @@ def test_dashboard_html_contains_sse_and_timeline_surface():
 
     assert "Memory Dashboard" in html
     assert "new EventSource" in html
-    assert "/events?namespace=" in html
+    assert '"eventsBase": "/events"' in html
     assert 'id="timeline"' in html
     assert "Current Beliefs" in html
-    assert "Rewinds" in html
-    assert "AbortController" in html
+    assert "Decision influence" in html
+    assert "Rewind belief state" in html
+    assert "Inject poison" in html
     assert "setTimeout" in html
 
 

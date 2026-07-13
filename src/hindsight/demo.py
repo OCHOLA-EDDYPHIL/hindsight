@@ -118,18 +118,7 @@ def run_poison_rewind_demo(
         if not keep_existing:
             reset_poison_rewind_demo(namespace=namespace, db_url=resolved_db_url)
 
-        with MemoryStore(url=resolved_db_url, embedding_provider=embedding_provider) as store:
-            store.remember(
-                memory_kind="semantic",
-                namespace=namespace,
-                content=GOOD_MEMORY_CONTENT,
-                provenance=Provenance(
-                    writer="demo.seed",
-                    source_ref="demo:known-good-payment-incident",
-                    justification="Seed known-good payment latency resolution before poisoning",
-                ),
-                metadata={"demo": "poison-rewind", "role": "known-good"},
-            )
+        seed_good_demo_memory(namespace=namespace, db_url=resolved_db_url)
 
         clean_run = run_demo_agent_turn(
             label="clean",
@@ -197,6 +186,7 @@ def reset_poison_rewind_demo(*, namespace: str = DEMO_NAMESPACE, db_url: str | N
 
     resolved_db_url = db_url or database_url()
     with connect(resolved_db_url) as conn:
+        conn.execute("DELETE FROM agent_runs WHERE namespace = %s", (namespace,))
         conn.execute(
             """
                 DELETE FROM memory_reads
@@ -213,6 +203,93 @@ def reset_poison_rewind_demo(*, namespace: str = DEMO_NAMESPACE, db_url: str | N
         conn.execute("DELETE FROM semantic_memory_embeddings WHERE namespace = %s", (namespace,))
         conn.execute("DELETE FROM semantic_memories WHERE namespace = %s", (namespace,))
         conn.commit()
+
+
+def seed_good_demo_memory(
+    *,
+    namespace: str = DEMO_NAMESPACE,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Seed the known-good memory used at the start of the signature demo."""
+
+    with MemoryStore(
+        url=db_url or database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ) as store:
+        return store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content=GOOD_MEMORY_CONTENT,
+            provenance=Provenance(
+                writer="demo.seed",
+                source_ref="demo:known-good-payment-incident",
+                justification="Seed known-good payment latency resolution before poisoning",
+            ),
+            metadata={"demo": "poison-rewind", "role": "known-good"},
+        )
+
+
+def ensure_poison_rewind_incident(*, db_url: str | None = None) -> dict[str, Any]:
+    """Create or refresh the product-facing incident used by the signature demo."""
+
+    with connect(db_url or database_url()) as conn:
+        with conn.transaction():
+            service = conn.execute(
+                """
+                    INSERT INTO services (id, slug, name, owner_team, tier)
+                    VALUES (
+                        '10000000-0000-0000-0000-000000000001',
+                        %s,
+                        'Payments API',
+                        'revenue-platform',
+                        'critical'
+                    )
+                    ON CONFLICT (slug) DO UPDATE SET name = excluded.name
+                    RETURNING id
+                """,
+                (DEMO_SERVICE_SLUG,),
+            ).fetchone()
+            incident = conn.execute(
+                """
+                    INSERT INTO incidents (
+                        id, slug, title, severity, status, started_at, summary
+                    )
+                    VALUES (
+                        '40000000-0000-0000-0000-000000000001',
+                        %s,
+                        %s,
+                        'sev2',
+                        'open',
+                        now(),
+                        %s
+                    )
+                    ON CONFLICT (slug) DO UPDATE SET
+                        title = excluded.title,
+                        severity = excluded.severity,
+                        status = excluded.status,
+                        started_at = excluded.started_at,
+                        resolved_at = NULL,
+                        summary = excluded.summary,
+                        root_cause = NULL
+                    RETURNING *
+                """,
+                (DEMO_INCIDENT_ID, DEMO_TITLE, DEMO_INPUT),
+            ).fetchone()
+            conn.execute(
+                """
+                    INSERT INTO incident_services (incident_id, service_id, impact)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (incident_id, service_id) DO UPDATE SET impact = excluded.impact
+                """,
+                (incident[0], service[0], DEMO_INPUT),
+            )
+        return {
+            "id": str(incident[0]),
+            "slug": incident[1],
+            "title": incident[2],
+            "severity": incident[3],
+            "status": incident[4],
+        }
 
 
 def poison_demo_memory(

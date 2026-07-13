@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from functools import partial
+from collections.abc import Callable
 from typing import Any, NotRequired, TypedDict
 from uuid import uuid4
 
@@ -50,6 +51,7 @@ class IncidentAgentResult:
 
 
 class IncidentAgentState(TypedDict, total=False):
+    run_id: str
     thread_id: str
     incident_id: str
     namespace: str
@@ -71,21 +73,29 @@ class IncidentAgentState(TypedDict, total=False):
     reflected_memory: dict[str, Any]
 
 
+ProgressCallback = Callable[[str, str, dict[str, Any]], None]
+
+
 def run_incident_agent(
     incident: IncidentInput,
     *,
     thread_id: str | None = None,
+    run_id: str | None = None,
+    decision_id: str | None = None,
     pause_before_act: bool = False,
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Start or continue an incident thread with a new user incident turn."""
 
     _ensure_sync_entrypoint()
     resolved_thread_id = thread_id or incident.incident_id or f"incident-{uuid4()}"
+    resolved_run_id = run_id or str(uuid4())
     namespace = incident.namespace or incident.incident_id
     initial_state: IncidentAgentState = {
+        "run_id": resolved_run_id,
         "thread_id": resolved_thread_id,
         "incident_id": incident.incident_id,
         "namespace": namespace,
@@ -95,7 +105,7 @@ def run_incident_agent(
         "user_input": incident.user_input,
         "metadata": dict(incident.metadata),
         "pause_before_act": pause_before_act,
-        "decision_id": f"agent:{resolved_thread_id}:plan",
+        "decision_id": decision_id or f"agent:{resolved_run_id}:plan",
     }
     state = _invoke_graph(
         initial_state,
@@ -103,6 +113,7 @@ def run_incident_agent(
         db_url=db_url,
         reasoning_provider=reasoning_provider,
         embedding_provider=embedding_provider,
+        progress_callback=progress_callback,
     )
     return _agent_result(resolved_thread_id, state)
 
@@ -111,10 +122,13 @@ async def run_incident_agent_async(
     incident: IncidentInput,
     *,
     thread_id: str | None = None,
+    run_id: str | None = None,
+    decision_id: str | None = None,
     pause_before_act: bool = False,
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Async-safe wrapper for starting or continuing an incident thread."""
 
@@ -123,10 +137,13 @@ async def run_incident_agent_async(
             run_incident_agent,
             incident,
             thread_id=thread_id,
+            run_id=run_id,
+            decision_id=decision_id,
             pause_before_act=pause_before_act,
             db_url=db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
+            progress_callback=progress_callback,
         )
     )
 
@@ -138,6 +155,7 @@ def resume_incident_agent(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Resume an interrupted incident thread in a fresh graph context."""
 
@@ -148,6 +166,7 @@ def resume_incident_agent(
         db_url=db_url,
         reasoning_provider=reasoning_provider,
         embedding_provider=embedding_provider,
+        progress_callback=progress_callback,
     )
     return _agent_result(thread_id, state)
 
@@ -159,6 +178,7 @@ async def resume_incident_agent_async(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Async-safe wrapper for resuming an interrupted incident thread."""
 
@@ -170,6 +190,7 @@ async def resume_incident_agent_async(
             db_url=db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
+            progress_callback=progress_callback,
         )
     )
 
@@ -179,6 +200,7 @@ def build_incident_graph(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    progress_callback: ProgressCallback | None = None,
 ):
     """Build the incident graph; compile it with a checkpointer before use."""
 
@@ -206,10 +228,12 @@ def build_incident_graph(
             "summary": state["user_input"].strip(),
             "prior_chat_messages": len(previous_messages),
         }
-        return {
+        update = {
             "triage": triaged,
             "chat_messages": messages_to_dict(current_messages),
         }
+        _report_progress(progress_callback, "triage", "triaging", state, update)
+        return update
 
     def recall(state: IncidentAgentState) -> dict[str, Any]:
         with start_span(
@@ -235,6 +259,7 @@ def build_incident_graph(
                     "hindsight.agent.recall_error": bool(update.get("recall_error")),
                 },
             )
+            _report_progress(progress_callback, "recall", "recalling", state, update)
             return update
 
     def plan(state: IncidentAgentState) -> dict[str, Any]:
@@ -272,7 +297,7 @@ def build_incident_graph(
                     ),
                 },
             )
-        return {
+        update = {
             "plan": response.text,
             "reasoning": {
                 "provider": response.provider,
@@ -280,11 +305,20 @@ def build_incident_graph(
                 "usage": dict(response.usage),
             },
         }
+        _report_progress(progress_callback, "plan", "planning", state, update)
+        return update
 
     def act(state: IncidentAgentState) -> dict[str, Any]:
         proposed_action = _proposed_action(state)
         approved = True
         if state.get("pause_before_act"):
+            _report_progress(
+                progress_callback,
+                "approval",
+                "awaiting_approval",
+                state,
+                {"proposed_action": proposed_action},
+            )
             approved = bool(
                 interrupt(
                     {
@@ -294,10 +328,12 @@ def build_incident_graph(
                     }
                 )
             )
-        return {
+        update = {
             "proposed_action": proposed_action,
             "action_approved": approved,
         }
+        _report_progress(progress_callback, "action", "reflecting", state, update)
+        return update
 
     def reflect(state: IncidentAgentState) -> dict[str, Any]:
         with start_span(
@@ -344,7 +380,9 @@ def build_incident_graph(
             finally:
                 history.close()
             set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
-            return {"reflected_memory": _jsonable_row(memory)}
+            update = {"reflected_memory": _jsonable_row(memory)}
+            _report_progress(progress_callback, "reflection", "reflecting", state, update)
+            return update
 
     builder = StateGraph(IncidentAgentState)
     builder.add_node("triage", triage)
@@ -436,6 +474,7 @@ def _invoke_graph(
     db_url: str | None,
     reasoning_provider: ReasoningProvider | None,
     embedding_provider: EmbeddingProvider | None,
+    progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     resolved_db_url = db_url or database_url()
     _setup_agent_storage_once(resolved_db_url)
@@ -444,6 +483,7 @@ def _invoke_graph(
             db_url=resolved_db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
+            progress_callback=progress_callback,
         ).compile(checkpointer=checkpointer)
         return graph.invoke(
             input_or_command,
@@ -466,6 +506,17 @@ def _append_error(existing: str | None, new_error: str) -> str:
     if existing:
         return f"{existing}; {new_error}"
     return new_error
+
+
+def _report_progress(
+    callback: ProgressCallback | None,
+    phase: str,
+    status: str,
+    state: IncidentAgentState,
+    update: dict[str, Any],
+) -> None:
+    if callback is not None:
+        callback(phase, status, {**state, **update})
 
 
 def _chat_history(*, thread_id: str, db_url: str) -> CockroachDBChatMessageHistory:
