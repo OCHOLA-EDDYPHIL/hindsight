@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Inspect how Hindsight recalls, uses, and rewinds incident-response memory.">
+  <meta name="theme-color" content="#111614">
+  <title>Hindsight · Incident memory cockpit</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/config.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to incident workspace</a>
+  <div class="ambient" aria-hidden="true"></div>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="Hindsight home">
+      <span class="brand-mark" aria-hidden="true">H</span>
+      <span>
+        <strong>Hindsight</strong>
+        <small>rewindable incident memory</small>
+      </span>
+    </a>
+    <div class="header-state">
+      <span class="connection" id="connection"><i></i><span>Connecting</span></span>
+      <button class="operator-state" id="operatorButton" type="button" aria-expanded="false">
+        <span id="operatorLabel">Read-only</span>
+        <span aria-hidden="true">⌁</span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="incident-band" aria-labelledby="incidentHeading">
+      <div class="incident-copy">
+        <span class="eyebrow">Active incident</span>
+        <h1 id="incidentHeading">Memory Dashboard</h1>
+        <p id="incidentSummary">Watch a decision change when its memory changes.</p>
+      </div>
+      <dl class="incident-facts">
+        <div><dt>Severity</dt><dd id="incidentSeverity">—</dd></div>
+        <div><dt>Service</dt><dd id="incidentService">—</dd></div>
+        <div><dt>Namespace</dt><dd id="namespace">—</dd></div>
+        <div><dt>Run</dt><dd id="runStatus">No run</dd></div>
+      </dl>
+    </section>
+
+    <section class="operator-panel" id="operatorPanel" hidden aria-label="Operator access">
+      <form id="operatorForm">
+        <label for="operatorToken">Operator passcode</label>
+        <input id="operatorToken" name="token" type="password" autocomplete="current-password" required>
+        <button class="button primary" type="submit">Unlock controls</button>
+        <button class="text-button" id="lockButton" type="button" hidden>Return to read-only</button>
+      </form>
+      <p>Viewing stays public. Model calls and memory changes require operator access.</p>
+    </section>
+
+    <section class="command-deck" aria-label="Incident and demo controls">
+      <div class="field incident-picker">
+        <label for="incidentSelect">Incident</label>
+        <select id="incidentSelect"><option value="">Loading incidents…</option></select>
+      </div>
+      <div class="field report-field">
+        <label for="incidentInput">Current report</label>
+        <textarea id="incidentInput" rows="2">payments-api checkout p99 latency breached the 2s SLO while processor timeouts and retry fanout rose together.</textarea>
+      </div>
+      <div class="command-actions">
+        <button class="button quiet" id="resetDemo" type="button" data-operator>Reset</button>
+        <button class="button danger" id="poisonDemo" type="button" data-operator>Inject poison</button>
+        <button class="button primary" id="startRun" type="button" data-operator>Analyze incident</button>
+      </div>
+      <details class="new-incident" data-operator>
+        <summary>Create incident</summary>
+        <form id="incidentForm">
+          <input name="slug" placeholder="incident-slug" required pattern="[a-z0-9][a-z0-9:-]*">
+          <input name="title" placeholder="Incident title" required>
+          <select name="severity"><option>sev1</option><option selected>sev2</option><option>sev3</option></select>
+          <input name="service_slug" placeholder="service slug">
+          <textarea name="summary" placeholder="What is happening?" required></textarea>
+          <button class="button quiet" type="submit">Create</button>
+        </form>
+      </details>
+    </section>
+
+    <section class="run-strip" aria-label="Agent run phases">
+      <ol id="phaseRail">
+        <li data-phase="triage"><span>01</span>Triage</li>
+        <li data-phase="recall"><span>02</span>Recall</li>
+        <li data-phase="plan"><span>03</span>Plan</li>
+        <li data-phase="approval"><span>04</span>Review</li>
+        <li data-phase="reflection"><span>05</span>Reflect</li>
+      </ol>
+      <div class="approval-actions" id="approvalActions" hidden>
+        <button class="button quiet" id="rejectRun" type="button" data-operator>Reject</button>
+        <button class="button primary" id="approveRun" type="button" data-operator>Approve recommendation</button>
+      </div>
+    </section>
+
+    <section class="timeline-toolbar" aria-label="Belief history">
+      <div>
+        <label for="timeline">Belief state</label>
+        <input id="timeline" type="range" min="0" max="0" value="0" disabled>
+        <output id="timeLabel" for="timeline">Live belief state</output>
+      </div>
+      <button class="text-button" id="liveButton" type="button">Return to live</button>
+    </section>
+
+    <div class="workspace">
+      <section class="beliefs-pane" aria-labelledby="beliefTitle">
+        <header class="pane-header">
+          <div>
+            <span class="eyebrow">CockroachDB belief state</span>
+            <h2 id="beliefTitle">Current Beliefs</h2>
+          </div>
+          <span class="count" id="memoryCount">0</span>
+        </header>
+        <div class="memory-list" id="memories" aria-live="polite">
+          <div class="skeleton"></div><div class="skeleton short"></div>
+        </div>
+      </section>
+
+      <aside class="influence-pane" aria-labelledby="influenceTitle">
+        <header class="pane-header">
+          <div>
+            <span class="eyebrow">Why this plan?</span>
+            <h2 id="influenceTitle">Decision influence</h2>
+          </div>
+          <span class="count" id="influenceCount">0 reads</span>
+        </header>
+        <section class="plan-block" id="planBlock">
+          <span class="plan-label">Agent plan</span>
+          <p id="planText">Select a completed run to trace its reasoning back to memory.</p>
+          <p class="proposed-action" id="proposedAction"></p>
+        </section>
+        <div class="influence-list" id="influenceList"></div>
+
+        <section class="rewind-workspace" aria-labelledby="rewindTitle">
+          <div class="rewind-heading">
+            <div>
+              <span class="eyebrow">Audited correction</span>
+              <h3 id="rewindTitle">Rewind belief state</h3>
+            </div>
+            <span class="count" id="operationCount">0 rewinds</span>
+          </div>
+          <label for="rewindTimestamp">Restore beliefs as of</label>
+          <input id="rewindTimestamp" type="datetime-local" step="1">
+          <label for="rewindReason">Reason</label>
+          <input id="rewindReason" value="Poisoned memory led to an unsafe recommendation">
+          <div class="rewind-actions">
+            <button class="button quiet" id="previewRewind" type="button">Preview</button>
+            <button class="button danger" id="executeRewind" type="button" data-operator disabled>Execute rewind</button>
+          </div>
+          <div class="rewind-preview" id="rewindPreview">Choose a point on the belief timeline to preview its impact.</div>
+          <div class="operation-list" id="operations"></div>
+        </section>
+      </aside>
+    </div>
+
+    <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+  </main>
+
+  <footer>
+    <p>Memory is infrastructure. Every recommendation should be explainable and reversible.</p>
+    <a href="/v1/docs">API</a>
+    <a href="https://github.com/OCHOLA-EDDYPHIL/hindsight">Source</a>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

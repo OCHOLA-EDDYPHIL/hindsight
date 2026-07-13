@@ -7,6 +7,8 @@ agent believed before a correction or rewind.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -60,6 +62,17 @@ class RewindResult:
     """The audited result of restoring memory to an earlier belief state."""
 
     operation: dict[str, Any]
+    restored_memories: list[dict[str, Any]]
+    invalidated_memories: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class RewindPreview:
+    """A non-mutating, concurrency-checkable rewind impact preview."""
+
+    target_timestamp: datetime
+    namespace: str | None
+    state_hash: str
     restored_memories: list[dict[str, Any]]
     invalidated_memories: list[dict[str, Any]]
 
@@ -518,6 +531,57 @@ class MemoryStore:
                 restored_memories=restored,
                 invalidated_memories=invalidated_rows,
             )
+
+    def preview_rewind(
+        self,
+        *,
+        timestamp: datetime,
+        namespace: str | None = None,
+    ) -> RewindPreview:
+        """Return the exact current candidates and historical beliefs without mutation."""
+
+        restored = self._semantic_beliefs_as_of(
+            namespace=namespace,
+            as_of=timestamp,
+            limit=None,
+            query=None,
+        )
+        invalidated = self._semantic_rewind_candidates(
+            timestamp=timestamp,
+            namespace=namespace,
+        )
+        invalidated_by_id = {str(row["id"]): row for row in invalidated}
+        pending_ids = set(invalidated_by_id)
+        while pending_ids:
+            derived = self._derived_semantic_memories(
+                memory_ids=sorted(pending_ids),
+                namespace=namespace,
+            )
+            next_ids = {
+                str(row["id"])
+                for row in derived
+                if str(row["id"]) not in invalidated_by_id
+            }
+            for row in derived:
+                invalidated_by_id.setdefault(str(row["id"]), row)
+            pending_ids = next_ids
+        invalidated_rows = [invalidated_by_id[key] for key in sorted(invalidated_by_id)]
+        state_payload = {
+            "namespace": namespace,
+            "target_timestamp": timestamp.isoformat(),
+            "restored_memory_ids": sorted(str(row["id"]) for row in restored),
+            "invalidated_memory_ids": sorted(str(row["id"]) for row in invalidated_rows),
+        }
+        state_hash = hashlib.sha256(
+            json.dumps(state_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return RewindPreview(
+            target_timestamp=timestamp,
+            namespace=namespace,
+            state_hash=state_hash,
+            restored_memories=restored,
+            invalidated_memories=invalidated_rows,
+        )
 
     def _invalidate_one(
         self,
