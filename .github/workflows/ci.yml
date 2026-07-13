@@ -22,6 +22,8 @@ jobs:
             docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1' && break
             sleep 1
           done
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
           uv run python scripts/migrate.py
       - run: uv run ruff check .
       - run: uv run pytest -q
