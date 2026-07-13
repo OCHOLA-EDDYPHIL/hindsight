@@ -96,29 +96,25 @@ def test_run_creation_returns_accepted_and_enqueues_once(monkeypatch):
 def test_rewind_execute_rejects_stale_preview(monkeypatch):
     import hindsight.api as api
 
-    class FakeStore:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc_info):
-            pass
-
-        def preview_rewind(self, **kwargs):
-            return type("Preview", (), {"state_hash": "a" * 64})()
-
     monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
-    monkeypatch.setattr(api, "MemoryStore", FakeStore)
+    monkeypatch.setattr(
+        api,
+        "enqueue_operation",
+        lambda **kwargs: (_ for _ in ()).throw(api.OperationConflictError("stale preview")),
+    )
     client = TestClient(api.app)
 
     response = client.post(
         "/v1/namespaces/demo:payments/rewinds",
-        headers={"Authorization": "Bearer operator-secret"},
+        headers={
+            "Authorization": "Bearer operator-secret",
+            "Idempotency-Key": "rewind-test",
+        },
         json={
-            "target_timestamp": "2026-07-13T10:00:00Z",
-            "reason": "remove poisoned state",
-            "state_hash": "b" * 64,
+            "preview_id": "preview-1",
+            "fingerprint": "b" * 64,
         },
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "belief state changed; preview rewind again"
+    assert response.json()["detail"] == "stale preview"

@@ -96,6 +96,7 @@ def runtime_settings(
             "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE", ""
         ),
         "BEDROCK_MODEL": env.get("BEDROCK_MODEL", ""),
+        "BEDROCK_EMBEDDING_MODEL": env.get("BEDROCK_EMBEDDING_MODEL", ""),
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }

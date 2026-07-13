@@ -148,7 +148,7 @@ def test_memory_snapshot_current_includes_memories_operations_and_timeline(monke
     assert "2026-07-12T14:02:00+00:00" in snapshot["timeline"]
 
 
-def test_memory_snapshot_as_of_uses_memory_store_recall(monkeypatch):
+def test_memory_snapshot_as_of_uses_explicit_historical_listing(monkeypatch):
     import hindsight.dashboard as dashboard
 
     calls = []
@@ -163,8 +163,8 @@ def test_memory_snapshot_as_of_uses_memory_store_recall(monkeypatch):
         def __exit__(self, *exc_info):
             pass
 
-        def recall(self, **kwargs):
-            calls.append(("recall", kwargs))
+        def list_semantic_as_of(self, **kwargs):
+            calls.append(("list_semantic_as_of", kwargs))
             return [
                 {
                     "id": uuid4(),
@@ -196,8 +196,8 @@ def test_memory_snapshot_as_of_uses_memory_store_recall(monkeypatch):
     assert snapshot["memories"][0]["content"] == "as-of memory"
     assert snapshot["operations"] == []
     assert calls[1][1]["namespace"] == "demo:payments"
-    assert calls[1][1]["query"] == ""
-    assert calls[1][1]["as_of"].isoformat() == "2026-07-12T14:00:00+00:00"
+    assert calls[1][1]["system_as_of"].isoformat() == "2026-07-12T14:00:00+00:00"
+    assert calls[1][1]["valid_at"].isoformat() == "2026-07-12T14:00:00+00:00"
 
 
 def test_dashboard_broker_shares_one_changefeed_and_caches_events():

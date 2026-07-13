@@ -53,9 +53,9 @@ uv run python scripts/run_poison_rewind_demo.py run --namespace demo:payments --
 uv run python scripts/run_poison_rewind_demo.py diagnose --decision-id agent:demo:payments:poisoned:plan
 ```
 
-## Cross-episode learning demo
+## Cross-episode mechanism demo
 
-The repeat-incident demo shows Hindsight consolidating a resolved episode into a reusable lesson, then resolving a similar incident in fewer steps:
+The repeat-incident demo illustrates the mechanism: a resolved episode produces an evidence-cited procedural lesson, and a later incident retrieves that lesson. It is intentionally not a benchmark and reports no improvement metric:
 
 ```bash
 make cross-episode-demo-local
@@ -67,7 +67,16 @@ Run it with the live dashboard open on the printed namespace to watch the consol
 make memory-dashboard-local
 ```
 
-The demo output compares episode one and episode two with a deterministic steps-to-resolution metric and includes the consolidated memory recalled by episode two.
+The output includes the typed lesson, its citations and lineage, and the lesson recalled by episode two. Performance claims belong to the separate three-arm benchmark: no lesson, an independently verified gold lesson, and a normally consolidated lesson in an externally scored simulator. Confirmation evidence requires a pilot-derived, hash-pinned power analysis and held-out preregistration.
+
+Run the frozen pilot, then use its experiment ID to preregister and execute held-out confirmation:
+
+```bash
+uv run python scripts/run_learning_benchmark.py pilot
+uv run python scripts/run_learning_benchmark.py confirmation --pilot-experiment-id <id>
+```
+
+`ci-smoke` exercises the same trace and scoring machinery with deterministic fixtures, but the report always marks it ineligible for public performance claims.
 
 ## Live memory dashboard
 
@@ -111,12 +120,12 @@ The versioned API and interactive OpenAPI document are available under `/v1` and
 - approval/resume of interrupted runs;
 - current or historical belief state;
 - memory provenance and decision influence;
-- rewind preview and guarded execution;
+- immutable correction previews and asynchronous rewind, retraction, supersession, and review operations;
 - operator-only signature-demo controls.
 
-Run creation accepts an `Idempotency-Key` header and returns `202 Accepted`. The client follows the resulting run resource until it reaches `awaiting_approval`, `completed`, `rejected`, or `failed`.
+Run creation and governed memory mutations accept an `Idempotency-Key` header and return `202 Accepted`. Mutation workers verify namespace revisions, lineage closure, preview expiry, and embedding generation before committing any effect.
 
-In the deployed product, CockroachDB sends changes from `semantic_memories`, `memory_operations`, `agent_runs`, and `agent_run_events` to an authenticated webhook. Lightweight Lambda handlers fan one versioned event envelope out through API Gateway WebSockets. DynamoDB contains only expiring connection subscriptions; durable run and memory state never leaves CockroachDB.
+In the deployed product, CockroachDB sends incident, governed-memory, operation, and agent-run changes to an authenticated webhook. Full before/after envelopes queue consolidation only for real transitions to `resolved`; the same feed fans versioned state events through API Gateway WebSockets. DynamoDB contains only expiring connection subscriptions; durable run and memory state never leaves CockroachDB.
 
 Deployment automation manages the changefeed lifecycle separately from schema migrations:
 
@@ -128,14 +137,15 @@ make changefeed-pause
 
 `changefeed-apply` is idempotent for the same endpoint and token. Teardown pauses the feed before removing the AWS webhook so CockroachDB does not retry a dead sink.
 
-## Gemini reasoning and embeddings
+## Retrieval and embedding profiles
 
-The hosted worker uses one SSM-backed Gemini key pool for reasoning and 1,024-dimensional `gemini-embedding-2` vectors. Keys may belong to separate Google projects. Rate limits and transient failures move only the affected slot into a DynamoDB-coordinated cooldown; request errors do not trigger rotation, and telemetry records slot IDs rather than credentials.
+Hosted retrieval is strict semantic vector search by default. A miss stays empty; keyword fallback occurs only when a run explicitly selects the degraded `semantic_then_keyword` policy, and every attempt, ordered hit, decision, and profile is audited. The deterministic hashing provider is a lexical-hash test fixture—not a semantic encoder—and hosted activation rejects it.
 
-Local runs can set `GEMINI_API_KEY` plus numbered keys such as `GEMINI_API_KEY_1`. Production stores the versioned pool document in `/hindsight/demo/gemini-api-keys`. When the embedding model changes, rebuild derivative vectors without changing memory provenance:
+The hosted worker uses an SSM-backed Gemini key pool for reasoning and 1,024-dimensional `gemini-embedding-2` vectors, or configured Bedrock models. Local runs can set `GEMINI_API_KEY` plus numbered keys such as `GEMINI_API_KEY_1`.
+
+Embedding spaces are content-addressed profiles. Model rotation builds vectors side-by-side and activation fails until every current trusted memory has coverage, so retrieval never mixes spaces or silently loses rows:
 
 ```bash
-uv run python scripts/reembed_memories.py --dry-run
 uv run python scripts/reembed_memories.py
 ```
 

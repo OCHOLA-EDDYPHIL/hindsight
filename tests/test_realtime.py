@@ -153,6 +153,7 @@ def test_changefeed_handler_authenticates_and_accepts_batch(monkeypatch):
     assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {
         "accepted": 1,
+        "consolidation_jobs_queued": 0,
         "delivered": 2,
         "stale_connections_removed": 0,
     }

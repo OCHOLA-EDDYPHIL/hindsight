@@ -18,8 +18,9 @@ from hindsight.demo import (  # noqa: E402
     run_demo_agent_turn,
     run_poison_rewind_demo,
 )
-from hindsight.memory import MemoryStore  # noqa: E402
+from hindsight.embeddings import embedding_provider_from_env  # noqa: E402
 from hindsight.mcp_server import inspect_decision_trace  # noqa: E402
+from hindsight.operations import enqueue_operation, execute_operation, preview_rewind  # noqa: E402
 from hindsight.tracing import configure_tracing_from_env  # noqa: E402
 
 
@@ -33,7 +34,7 @@ def main() -> None:
     all_cmd.add_argument("--namespace", default=DEMO_NAMESPACE)
     all_cmd.add_argument("--keep-existing", action="store_true")
 
-    reset_cmd = subparsers.add_parser("reset", help="delete prior demo rows for a namespace")
+    reset_cmd = subparsers.add_parser("reset", help="archive a prior demo session")
     reset_cmd.add_argument("--namespace", default=DEMO_NAMESPACE)
 
     poison_cmd = subparsers.add_parser("poison", help="insert the poisoned memory")
@@ -83,13 +84,22 @@ def main() -> None:
         from datetime import datetime
 
         timestamp = datetime.fromisoformat(args.timestamp.replace("Z", "+00:00"))
-        with MemoryStore() as store:
-            result = store.rewind(
-                timestamp=timestamp,
-                namespace=args.namespace,
-                actor="demo.operator",
-                reason=args.reason,
-            )
+        preview = preview_rewind(
+            namespace=args.namespace,
+            target_timestamp=timestamp,
+            actor="demo.operator",
+            reason=args.reason,
+        )
+        operation, _ = enqueue_operation(
+            preview_id=str(preview["id"]),
+            fingerprint=str(preview["fingerprint"]),
+            idempotency_key=f"demo-cli:{preview['id']}",
+        )
+        result = execute_operation(
+            operation_id=str(operation["id"]),
+            embedding_provider=embedding_provider_from_env(),
+            worker_id="demo.cli",
+        )
     else:
         parser.error(f"Unsupported command: {command}")
 

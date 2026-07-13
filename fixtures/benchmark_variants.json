@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "variants": [
+    {
+      "variant_id": "pilot-payments-a",
+      "split": "pilot",
+      "source_summary": "Checkout latency rose as processor timeouts caused retry amplification.",
+      "recurrence_query": "Checkout is slow, processor timeouts are rising, and retries are multiplying.",
+      "root_cause": "Retry amplification overloaded an unhealthy downstream processor.",
+      "resolution_action": "Inspect processor health and throttle retry fanout before changing worker capacity.",
+      "resolution_observation": "Timeout rate and queue depth recovered after retry fanout was throttled.",
+      "gold_lesson": "Inspect downstream processor timeout rate and queue depth, then throttle retry fanout. Do not scale workers while downstream health is unresolved.",
+      "gold_verified_by": "benchmark-reviewer-a"
+    },
+    {
+      "variant_id": "pilot-search-a",
+      "split": "pilot",
+      "source_summary": "Search indexing lag grew when failed shard requests fanned out retries.",
+      "recurrence_query": "Indexing lag and shard timeouts are rising while retry volume multiplies.",
+      "root_cause": "Retry fanout amplified shard timeouts and queue pressure.",
+      "resolution_action": "Inspect shard timeout rate and throttle retry fanout before scaling index workers.",
+      "resolution_observation": "Shard queues recovered after retry fanout was reduced.",
+      "gold_lesson": "Inspect shard timeouts and queue depth, then throttle retry fanout. Avoid scaling index workers until shard health recovers.",
+      "gold_verified_by": "benchmark-reviewer-b"
+    },
+    {
+      "variant_id": "heldout-orders-a",
+      "split": "confirmation",
+      "source_summary": "Order ingestion stalled when database timeouts triggered retry amplification.",
+      "recurrence_query": "Order ingestion is stalling, database timeouts are high, and retries are multiplying.",
+      "root_cause": "Retry fanout overloaded a degraded order database.",
+      "resolution_action": "Inspect database timeout rate and throttle retry fanout before scaling consumers.",
+      "resolution_observation": "The ingestion queue recovered after retry fanout was throttled.",
+      "gold_lesson": "Inspect database timeout rate and queue depth, then throttle retry fanout. Do not scale consumers before database health recovers.",
+      "gold_verified_by": "benchmark-reviewer-c"
+    },
+    {
+      "variant_id": "heldout-notifications-a",
+      "split": "confirmation",
+      "source_summary": "Notification delivery lag rose when provider timeouts multiplied retries.",
+      "recurrence_query": "Delivery lag, provider timeouts, and retry fanout are rising together.",
+      "root_cause": "Retry amplification overloaded the degraded notification provider.",
+      "resolution_action": "Inspect provider timeout rate and throttle retry fanout before scaling senders.",
+      "resolution_observation": "Delivery queues recovered after retry fanout was reduced.",
+      "gold_lesson": "Inspect provider timeouts and queue depth, then throttle retry fanout. Avoid scaling senders while provider health is unresolved.",
+      "gold_verified_by": "benchmark-reviewer-d"
+    },
+    {
+      "variant_id": "heldout-ledger-a",
+      "split": "confirmation",
+      "source_summary": "Ledger posting latency rose when dependency timeouts caused retry amplification.",
+      "recurrence_query": "Ledger latency, dependency timeouts, and retry volume are increasing.",
+      "root_cause": "Retry fanout amplified pressure on a degraded ledger dependency.",
+      "resolution_action": "Inspect dependency timeout rate and throttle retry fanout before scaling workers.",
+      "resolution_observation": "Posting latency recovered after retry fanout was throttled.",
+      "gold_lesson": "Inspect dependency timeouts and queue depth, then throttle retry fanout. Do not scale workers before dependency health recovers.",
+      "gold_verified_by": "benchmark-reviewer-e"
+    },
+    {
+      "variant_id": "heldout-catalog-a",
+      "split": "confirmation",
+      "source_summary": "Catalog refresh lag rose when upstream timeouts multiplied fetch retries.",
+      "recurrence_query": "Catalog refresh lag, upstream timeouts, and retry fanout are rising.",
+      "root_cause": "Retry amplification overloaded a degraded catalog upstream.",
+      "resolution_action": "Inspect upstream timeout rate and throttle retries before scaling refresh workers.",
+      "resolution_observation": "Refresh queues recovered after retry fanout was reduced.",
+      "gold_lesson": "Inspect upstream timeouts and queue depth, then throttle retry fanout. Avoid scaling refresh workers until upstream health recovers.",
+      "gold_verified_by": "benchmark-reviewer-f"
+    }
+  ]
+}

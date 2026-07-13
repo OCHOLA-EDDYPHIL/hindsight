@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent  # noqa: E402
-from hindsight.embeddings import DeterministicEmbeddingProvider  # noqa: E402
+from hindsight.embeddings import embedding_provider_from_env  # noqa: E402
 from hindsight.reasoning import DeterministicReasoningProvider  # noqa: E402
 from hindsight.tracing import configure_tracing_from_env  # noqa: E402
 
@@ -44,7 +44,7 @@ def main() -> None:
         if args.deterministic
         else None
     )
-    embedding_provider = DeterministicEmbeddingProvider()
+    embedding_provider = embedding_provider_from_env()
 
     if args.command == "start":
         result = run_incident_agent(

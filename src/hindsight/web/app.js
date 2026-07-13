@@ -301,7 +301,7 @@ function renderBeliefs() {
   const invalid = memories.length - current.length;
   elements.beliefTitle.textContent = state.asOf ? "Beliefs As Of" : "Current Beliefs";
   elements.memoryCount.textContent = `${current.length} live · ${invalid} invalid`;
-  elements.operationCount.textContent = `${state.operations.size} rewind${state.operations.size === 1 ? "" : "s"}`;
+  elements.operationCount.textContent = `${state.operations.size} operation${state.operations.size === 1 ? "" : "s"}`;
   elements.memories.innerHTML = memories.length
     ? memories.map(renderMemory).join("")
     : `<div class="empty-state"><span class="eyebrow">No beliefs yet</span><h3>Start with known-good context</h3><p>Unlock operator controls and reset the demo to seed the payment-latency memory.</p></div>`;
@@ -319,12 +319,13 @@ function renderBeliefs() {
 
 function renderMemory(memory) {
   const invalid = memory.status === "invalidated";
+  const review = memory.trust_status === "review_required";
   return `<button class="memory ${invalid ? "invalidated" : ""}" type="button" data-memory-id="${escapeHtml(memory.id)}">
     <span class="memory-bar" aria-hidden="true"></span>
     <span>
       <span class="memory-content">${escapeHtml(memory.content)}</span>
       <span class="memory-meta">
-        <span class="memory-status">${invalid ? "invalidated" : "current"}</span>
+        <span class="memory-status">${invalid ? "invalidated" : review ? "review required" : "current"}</span>
         <span>${escapeHtml(memory.writer)}</span>
         <span>${escapeHtml(formatTime(memory.written_at || memory.t_valid))}</span>
         ${memory.invalidation_reason ? `<span>${escapeHtml(memory.invalidation_reason)}</span>` : ""}
@@ -335,7 +336,9 @@ function renderMemory(memory) {
 }
 
 function renderOperation(operation) {
-  return `<article class="operation"><strong>${escapeHtml(operation.operation_type)}</strong><span>${escapeHtml(operation.reason)} · invalidated ${(operation.invalidated_memory_ids || []).length} · ${escapeHtml(formatTime(operation.created_at))}</span></article>`;
+  const effects = operation.effects || [];
+  const reviewCount = effects.filter((effect) => effect.effect_type === "review_required").length;
+  return `<article class="operation"><strong>${escapeHtml(operation.operation_type)} · ${escapeHtml(operation.status || "completed")}</strong><span>${escapeHtml(operation.reason)} · closed ${(operation.invalidated_memory_ids || []).length} · created ${(operation.restored_memory_ids || []).length}${reviewCount ? ` · review ${reviewCount}` : ""} · ${escapeHtml(formatTime(operation.created_at))}</span>${operation.failure_detail ? `<span>${escapeHtml(operation.failure_detail)}</span>` : ""}</article>`;
 }
 
 async function showMemory(memoryId) {
@@ -390,6 +393,10 @@ async function resetDemo() {
       method: "POST",
       body: JSON.stringify({namespace: state.namespace})
     });
+    state.namespace = payload.namespace;
+    const url = new URL(window.location.href);
+    url.searchParams.set("namespace", state.namespace);
+    history.replaceState({}, "", url);
     state.rewindAnchor = new Date().toISOString();
     elements.rewindTimestamp.value = isoToLocalInput(state.rewindAnchor);
     await Promise.all([loadSnapshot(), loadIncidents(payload.incident?.slug)]);
@@ -433,7 +440,8 @@ async function previewRewind() {
       })
     });
     state.rewindPreview = preview;
-    elements.rewindPreview.innerHTML = `<strong>${preview.invalidated_memories.length} memories will be invalidated.</strong><br>${preview.restored_memories.length} beliefs remain visible at the selected point. Derived reflections are included.`;
+    const effects = preview.effect_payload || {};
+    elements.rewindPreview.innerHTML = `<strong>${(effects.close_memory_ids || []).length} versions will close.</strong><br>${(effects.reassertions || []).length} historical beliefs will be reasserted as new audited versions. Preview expires ${escapeHtml(formatTime(preview.expires_at))}.`;
     updateOperatorState();
   } catch (error) {
     state.rewindPreview = null;
@@ -446,23 +454,37 @@ async function executeRewind() {
   if (!state.rewindPreview) return;
   setBusy(elements.executeRewind, true, "Rewinding…");
   try {
-    await request(`/namespaces/${encodeURIComponent(state.namespace)}/rewinds`, {
+    const accepted = await request(`/namespaces/${encodeURIComponent(state.namespace)}/rewinds`, {
       method: "POST",
+      headers: {"Idempotency-Key": crypto.randomUUID()},
       body: JSON.stringify({
-        target_timestamp: state.rewindPreview.target_timestamp,
-        reason: elements.rewindReason.value.trim(),
-        state_hash: state.rewindPreview.state_hash
+        preview_id: state.rewindPreview.id,
+        fingerprint: state.rewindPreview.fingerprint
       })
     });
     state.rewindPreview = null;
+    notify("Rewind queued. The approved preview will be verified before any memory changes.");
+    const operation = await waitForOperation(accepted.operation_id);
     await loadSnapshot();
-    notify("Belief state rewound. Invalidated memories remain visible for audit.");
+    if (operation.status === "completed") notify("Belief state rewound. Historical versions remain visible for audit.");
+    else notify(`Rewind ended in ${operation.status}: ${operation.failure_detail || "state changed"}`, "error");
   } catch (error) {
     notify(`Rewind failed: ${error.message}`, "error");
   } finally {
     setBusy(elements.executeRewind, false, "Execute rewind");
     updateOperatorState();
   }
+}
+
+async function waitForOperation(operationId) {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const operation = await request(`/memory/operations/${encodeURIComponent(operationId)}`);
+    state.operations.set(operation.id, operation);
+    renderMemoryPanel();
+    if (["completed", "conflict", "failed"].includes(operation.status)) return operation;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("operation did not reach a terminal state in time");
 }
 
 function connectEvents() {

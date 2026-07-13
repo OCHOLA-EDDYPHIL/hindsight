@@ -18,9 +18,10 @@ from hindsight.consolidation import (
     incident_closed_changefeed_event,
 )
 from hindsight.db import connect, database_url
-from hindsight.embeddings import DeterministicEmbeddingProvider
+from hindsight.embeddings import embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
+from hindsight.runs import resolve_incident
 from hindsight.tracing import set_span_attributes, start_span
 
 CROSS_EPISODE_NAMESPACE = "demo:cross-episode-payments"
@@ -64,7 +65,6 @@ class CrossEpisodeRunSummary:
     reflected_memory_id: str | None
     recalled_memory_ids: list[str]
     recalled_lesson_memory_ids: list[str]
-    steps_to_resolution: int
     elapsed_ms: int
 
 
@@ -77,26 +77,15 @@ class CrossEpisodeDemoResult:
     consolidation: ConsolidationResult
     episode_two: CrossEpisodeRunSummary
 
-    @property
-    def steps_saved(self) -> int:
-        return self.episode_one.steps_to_resolution - self.episode_two.steps_to_resolution
-
-    @property
-    def improvement_ratio(self) -> float:
-        if self.episode_one.steps_to_resolution == 0:
-            return 0.0
-        return self.steps_saved / self.episode_one.steps_to_resolution
-
-
-class CrossEpisodeDemoReasoningProvider:
-    """Deterministic provider that shortens the plan after a consolidated lesson."""
+class CrossEpisodeMechanismReasoningProvider:
+    """Fixture provider illustrating that recalled lessons enter the next prompt."""
 
     provider_name = "deterministic-demo"
     model_name = "cross-episode-v1"
 
     def generate(self, request: ReasoningRequest) -> ReasoningResponse:
         prompt = request.prompt.lower()
-        learned = "consolidated lesson" in prompt or "repeat guidance" in prompt
+        learned = "lesson from" in prompt and "safe action:" in prompt
         plan = SECOND_PLAN if learned else FIRST_PLAN
         return ReasoningResponse(
             text=plan,
@@ -106,7 +95,6 @@ class CrossEpisodeDemoReasoningProvider:
                 "prompt_characters": len(request.prompt),
                 "system_characters": len(request.system or ""),
                 "consolidated_lesson_seen": learned,
-                "steps_to_resolution": 2 if learned else 5,
             },
         )
 
@@ -118,12 +106,12 @@ def run_cross_episode_demo(
     keep_existing: bool = False,
     reasoning_provider: ReasoningProvider | None = None,
 ) -> CrossEpisodeDemoResult:
-    """Run two incident episodes where the second uses the first episode's lesson."""
+    """Illustrate cross-episode wiring; this is not a performance benchmark."""
 
     resolved_db_url = db_url or database_url()
-    if namespace == CROSS_EPISODE_NAMESPACE and not keep_existing:
-        namespace = f"{CROSS_EPISODE_NAMESPACE}:{uuid4().hex[:8]}"
-    provider = reasoning_provider or CrossEpisodeDemoReasoningProvider()
+    if not keep_existing:
+        namespace = f"{namespace}:session:{uuid4().hex[:8]}"
+    provider = reasoning_provider or CrossEpisodeMechanismReasoningProvider()
     with start_span(
         "hindsight.demo.cross_episode",
         {
@@ -131,8 +119,7 @@ def run_cross_episode_demo(
             "hindsight.memory.namespace": namespace,
         },
     ) as span:
-        if not keep_existing:
-            reset_cross_episode_demo(namespace=namespace, db_url=resolved_db_url)
+        _record_demo_session(namespace=namespace, db_url=resolved_db_url)
 
         first_incident = open_demo_incident(
             label="episode-one",
@@ -154,7 +141,10 @@ def run_cross_episode_demo(
             db_url=resolved_db_url,
         )
         consolidation_results = handle_incident_changefeed_event(
-            incident_closed_changefeed_event(resolved_incident),
+            incident_closed_changefeed_event(
+                resolved_incident,
+                source_event_id=str(resolved_incident["resolution_event_id"]),
+            ),
             db_url=resolved_db_url,
         )
         if not consolidation_results:
@@ -177,10 +167,6 @@ def run_cross_episode_demo(
         set_span_attributes(
             span,
             {
-                "hindsight.demo.episode_one_steps": episode_one.steps_to_resolution,
-                "hindsight.demo.episode_two_steps": episode_two.steps_to_resolution,
-                "hindsight.demo.steps_saved": episode_one.steps_to_resolution
-                - episode_two.steps_to_resolution,
                 "hindsight.memory.id": str(consolidation_results[0].memory["id"])
                 if consolidation_results[0].memory
                 else None,
@@ -196,43 +182,31 @@ def run_cross_episode_demo(
 
 
 def reset_cross_episode_demo(*, namespace: str, db_url: str | None = None) -> None:
-    """Clear prior cross-episode demo rows for one namespace."""
+    """Archive a demo session without deleting governed evidence."""
 
     resolved_db_url = db_url or database_url()
+    base_namespace = namespace.split(":session:", 1)[0]
     with connect(resolved_db_url) as conn:
-        rows = conn.execute(
-            """
-                SELECT id
-                FROM semantic_memories
-                WHERE namespace = %s
-            """,
-            (namespace,),
-        ).fetchall()
-        memory_ids = [row[0] for row in rows]
-        if memory_ids:
-            conn.execute(
-                """
-                    DELETE FROM memory_reads
-                    WHERE memory_kind = 'semantic'
-                        AND memory_id = ANY(%s)
-                """,
-                (memory_ids,),
-            )
-            conn.execute(
-                """
-                    DELETE FROM incident_semantic_memories
-                    WHERE memory_id = ANY(%s)
-                """,
-                (memory_ids,),
-            )
-        conn.execute("DELETE FROM semantic_memory_embeddings WHERE namespace = %s", (namespace,))
-        conn.execute("DELETE FROM semantic_memories WHERE namespace = %s", (namespace,))
         conn.execute(
             """
-                DELETE FROM incidents
-                WHERE slug LIKE %s
+                UPDATE demo_sessions
+                SET status = 'archived', archived_at = COALESCE(archived_at, now())
+                WHERE (namespace = %s OR namespace LIKE %s) AND status = 'active'
             """,
-            (f"{namespace}:%",),
+            (base_namespace, f"{base_namespace}:session:%"),
+        )
+        conn.commit()
+
+
+def _record_demo_session(*, namespace: str, db_url: str) -> None:
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+                INSERT INTO demo_sessions (demo_kind, namespace, created_by)
+                VALUES ('cross_episode_mechanism', %s, 'demo.runner')
+                ON CONFLICT (namespace) DO NOTHING
+            """,
+            (namespace,),
         )
         conn.commit()
 
@@ -270,7 +244,7 @@ def open_demo_incident(
             )
             memory = MemoryStore(
                 conn=conn,
-                embedding_provider=DeterministicEmbeddingProvider(),
+                embedding_provider=embedding_provider_from_env(),
             ).remember(
                 memory_kind="semantic",
                 namespace=namespace,
@@ -315,34 +289,21 @@ def resolve_demo_incident(
 
     resolved_db_url = db_url or database_url()
     with connect(resolved_db_url) as conn:
+        row = conn.execute("SELECT slug FROM incidents WHERE id = %s", (incident_id,)).fetchone()
+    if row is None:
+        raise RuntimeError(f"incident not found: {incident_id}")
+    resolution = resolve_incident(
+        slug=str(row[0]),
+        root_cause=ROOT_CAUSE,
+        action="Throttle retry fanout and hold worker scaling",
+        observation=RESOLUTION_SUMMARY,
+        recovered=True,
+        actor="demo.operator",
+        db_url=resolved_db_url,
+    )
+    incident = resolution["incident"]
+    with connect(resolved_db_url) as conn:
         with conn.transaction():
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                        UPDATE incidents
-                        SET status = 'resolved',
-                            resolved_at = now(),
-                            root_cause = %s
-                        WHERE id = %s
-                        RETURNING *
-                    """,
-                    (ROOT_CAUSE, incident_id),
-                )
-                incident = cur.fetchone()
-            if incident is None:
-                raise RuntimeError(f"incident not found: {incident_id}")
-            incident = dict(incident)
-            _insert_incident_event(
-                conn,
-                incident_id=incident["id"],
-                event_type="incident_resolved",
-                summary=RESOLUTION_SUMMARY,
-                metadata={
-                    "root_cause": ROOT_CAUSE,
-                    "steps_that_worked": ["confirm_processor_timeouts", "throttle_retry_fanout"],
-                    "wasted_steps": ["scale_workers_before_confirming_downstream_health"],
-                },
-            )
             if reflected_memory_id:
                 conn.execute(
                     """
@@ -390,7 +351,7 @@ def _run_episode(
             thread_id=f"{namespace}:{label}",
             db_url=db_url,
             reasoning_provider=reasoning_provider,
-            embedding_provider=DeterministicEmbeddingProvider(),
+            embedding_provider=embedding_provider_from_env(),
         )
         elapsed_ms = int((perf_counter() - started) * 1000)
         summary_result = _episode_summary(
@@ -405,7 +366,6 @@ def _run_episode(
                 "hindsight.memory.ids": summary_result.recalled_memory_ids,
                 "hindsight.memory.count": len(summary_result.recalled_memory_ids),
                 "hindsight.memory.id": summary_result.reflected_memory_id,
-                "hindsight.demo.steps_to_resolution": summary_result.steps_to_resolution,
             },
         )
         return summary_result
@@ -423,20 +383,18 @@ def _episode_summary(
     recalled_lesson_ids = [
         str(row.get("memory_id") or row.get("id"))
         for row in recalled
-        if "consolidated lesson" in str(row.get("memory_content") or row.get("content") or "").lower()
+        if row.get("content_schema") == "procedural_lesson.v1"
     ]
-    usage = result.state.get("reasoning", {}).get("usage", {})
     return CrossEpisodeRunSummary(
         label=label,
         incident_slug=incident["slug"],
         thread_id=result.thread_id,
-        decision_id=f"agent:{result.thread_id}:plan",
+        decision_id=str(result.state["decision_id"]),
         plan=result.plan,
         proposed_action=result.proposed_action,
         reflected_memory_id=result.reflected_memory_id,
         recalled_memory_ids=recalled_ids,
         recalled_lesson_memory_ids=recalled_lesson_ids,
-        steps_to_resolution=int(usage.get("steps_to_resolution", 0)),
         elapsed_ms=elapsed_ms,
     )
 

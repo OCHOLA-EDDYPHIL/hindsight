@@ -66,8 +66,8 @@ variable "embedding_provider" {
   default = "gemini"
 
   validation {
-    condition     = contains(["gemini", "bedrock", "deterministic"], var.embedding_provider)
-    error_message = "embedding_provider must be gemini, bedrock, or deterministic."
+    condition     = contains(["gemini", "bedrock"], var.embedding_provider)
+    error_message = "hosted embedding_provider must be gemini or bedrock."
   }
 }
 
@@ -79,6 +79,11 @@ variable "gemini_embedding_model" {
 variable "bedrock_model" {
   type    = string
   default = "anthropic.claude-3-haiku-20240307-v1:0"
+}
+
+variable "bedrock_embedding_model" {
+  type    = string
+  default = "amazon.titan-embed-text-v2:0"
 }
 
 variable "reasoning_max_attempts" {

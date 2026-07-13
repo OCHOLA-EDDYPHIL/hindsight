@@ -18,9 +18,10 @@ from hindsight.demo_state import (
     GOOD_MEMORY_CONTENT,
     POISONED_MEMORY_CONTENT,
 )
-from hindsight.embeddings import DeterministicEmbeddingProvider
+from hindsight.embeddings import embedding_provider_from_env
 from hindsight.mcp_server import inspect_decision_trace
 from hindsight.memory import MemoryStore, Provenance, RewindResult
+from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
@@ -95,10 +96,10 @@ def run_poison_rewind_demo(
     """Run the full M4 #20 poison, diagnose, and rewind sequence."""
 
     resolved_db_url = db_url or database_url()
-    if namespace == DEMO_NAMESPACE and not keep_existing:
-        namespace = f"{DEMO_NAMESPACE}:{uuid4().hex[:8]}"
+    if not keep_existing:
+        namespace = f"{namespace}:session:{uuid4().hex[:8]}"
     provider = reasoning_provider or MemoryBiasedDemoReasoningProvider()
-    embedding_provider = DeterministicEmbeddingProvider()
+    embedding_provider = embedding_provider_from_env()
     with start_span(
         "hindsight.demo.poison_rewind",
         {
@@ -106,8 +107,7 @@ def run_poison_rewind_demo(
             "hindsight.memory.namespace": namespace,
         },
     ) as span:
-        if not keep_existing:
-            reset_poison_rewind_demo(namespace=namespace, db_url=resolved_db_url)
+        _record_poison_demo_session(namespace=namespace, db_url=resolved_db_url)
 
         seed_good_demo_memory(namespace=namespace, db_url=resolved_db_url)
 
@@ -137,12 +137,39 @@ def run_poison_rewind_demo(
             db_url=resolved_db_url,
         )
 
-        with MemoryStore(url=resolved_db_url, embedding_provider=embedding_provider) as store:
-            rewind = store.rewind(
-                timestamp=rewind_target,
-                namespace=namespace,
-                actor="demo.operator",
-                reason=REWIND_REASON,
+        preview = preview_rewind(
+            namespace=namespace,
+            target_timestamp=rewind_target,
+            actor="demo.operator",
+            reason=REWIND_REASON,
+            db_url=resolved_db_url,
+        )
+        operation, _ = enqueue_operation(
+            preview_id=str(preview["id"]),
+            fingerprint=str(preview["fingerprint"]),
+            idempotency_key=f"demo-rewind:{uuid4()}",
+            db_url=resolved_db_url,
+        )
+        operation = execute_operation(
+            operation_id=str(operation["id"]),
+            embedding_provider=embedding_provider,
+            worker_id="demo.runner",
+            db_url=resolved_db_url,
+        )
+        with MemoryStore(url=resolved_db_url) as store:
+            rewind = RewindResult(
+                operation=operation,
+                restored_memories=store.list_current_semantic(namespace=namespace, limit=10_000),
+                invalidated_memories=[
+                    memory
+                    for memory_id in operation["invalidated_memory_ids"]
+                    if (
+                        memory := store.audit_memory(
+                            memory_kind="semantic", memory_id=str(memory_id)
+                        )
+                    )
+                    is not None
+                ],
             )
 
         corrected_run = run_demo_agent_turn(
@@ -173,26 +200,32 @@ def run_poison_rewind_demo(
 
 
 def reset_poison_rewind_demo(*, namespace: str = DEMO_NAMESPACE, db_url: str | None = None) -> None:
-    """Clear prior demo rows for one namespace so the script is repeatable."""
+    """Archive a demo session without deleting governed evidence."""
 
     resolved_db_url = db_url or database_url()
+    base_namespace = namespace.split(":session:", 1)[0]
     with connect(resolved_db_url) as conn:
-        conn.execute("DELETE FROM agent_runs WHERE namespace = %s", (namespace,))
         conn.execute(
             """
-                DELETE FROM memory_reads
-                WHERE memory_kind = 'semantic'
-                    AND memory_id IN (
-                        SELECT id
-                        FROM semantic_memories
-                        WHERE namespace = %s
-                    )
+                UPDATE demo_sessions
+                SET status = 'archived', archived_at = COALESCE(archived_at, now())
+                WHERE (namespace = %s OR namespace LIKE %s) AND status = 'active'
+            """,
+            (base_namespace, f"{base_namespace}:session:%"),
+        )
+        conn.commit()
+
+
+def _record_poison_demo_session(*, namespace: str, db_url: str) -> None:
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+                INSERT INTO demo_sessions (demo_kind, namespace, created_by)
+                VALUES ('poison_rewind', %s, 'demo.runner')
+                ON CONFLICT (namespace) DO NOTHING
             """,
             (namespace,),
         )
-        conn.execute("DELETE FROM memory_operations WHERE namespace = %s", (namespace,))
-        conn.execute("DELETE FROM semantic_memory_embeddings WHERE namespace = %s", (namespace,))
-        conn.execute("DELETE FROM semantic_memories WHERE namespace = %s", (namespace,))
         conn.commit()
 
 
@@ -205,7 +238,7 @@ def seed_good_demo_memory(
 
     with MemoryStore(
         url=db_url or database_url(),
-        embedding_provider=DeterministicEmbeddingProvider(),
+        embedding_provider=embedding_provider_from_env(),
     ) as store:
         return store.remember(
             memory_kind="semantic",
@@ -299,7 +332,7 @@ def poison_demo_memory(
     ) as span:
         with MemoryStore(
             url=db_url or database_url(),
-            embedding_provider=DeterministicEmbeddingProvider(),
+            embedding_provider=embedding_provider_from_env(),
         ) as store:
             memory = store.remember(
                 memory_kind="semantic",
@@ -344,16 +377,17 @@ def run_demo_agent_turn(
     ) as span:
         with MemoryStore(
             url=db_url or database_url(),
-            embedding_provider=DeterministicEmbeddingProvider(),
+            embedding_provider=embedding_provider_from_env(),
         ) as store:
-            recalled = store.recall(
+            recalled = list(store.retrieve_semantic(
                 namespace=namespace,
                 query=DEMO_INPUT,
                 limit=5,
                 decision_id=decision_id,
                 reader="agent.recall",
                 purpose="retrieve semantic incident context",
-            )
+                policy="semantic_strict",
+            ).hits)
             plan = provider.generate(
                 ReasoningRequest(
                     system=(

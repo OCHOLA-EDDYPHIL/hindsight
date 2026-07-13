@@ -263,7 +263,8 @@ data "aws_iam_policy_document" "worker" {
   statement {
     actions = ["bedrock:InvokeModel", "bedrock:Converse"]
     resources = [
-      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model}"
+      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model}",
+      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
     ]
   }
 }
@@ -297,6 +298,10 @@ data "aws_iam_policy_document" "changefeed" {
   statement {
     actions   = ["execute-api:ManageConnections"]
     resources = ["${aws_apigatewayv2_api.websocket.execution_arn}/${var.stage}/POST/@connections/*"]
+  }
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.runs.arn]
   }
 }
 
@@ -356,6 +361,7 @@ resource "aws_lambda_function" "worker" {
       GEMINI_MODEL                      = var.gemini_model
       GEMINI_EMBEDDING_MODEL            = var.gemini_embedding_model
       BEDROCK_MODEL                     = var.bedrock_model
+      BEDROCK_EMBEDDING_MODEL           = var.bedrock_embedding_model
       REASONING_MAX_ATTEMPTS            = tostring(var.reasoning_max_attempts)
     }
   }
@@ -401,6 +407,7 @@ resource "aws_lambda_function" "changefeed" {
       HINDSIGHT_WEBSOCKET_CONNECTION_TABLE    = aws_dynamodb_table.connections.name
       HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT = "https://${aws_apigatewayv2_api.websocket.id}.execute-api.${var.aws_region}.amazonaws.com/${var.stage}"
       HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM   = var.changefeed_token_parameter_name
+      HINDSIGHT_RUN_QUEUE_URL                 = aws_sqs_queue.runs.url
     }
   }
 }

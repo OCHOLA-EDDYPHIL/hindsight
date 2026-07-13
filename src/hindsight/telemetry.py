@@ -16,7 +16,7 @@ from psycopg.types.json import Jsonb
 
 from hindsight.agent import IncidentInput, IncidentAgentResult, run_incident_agent
 from hindsight.db import connect, database_url
-from hindsight.embeddings import DeterministicEmbeddingProvider
+from hindsight.embeddings import embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import DeterministicReasoningProvider, ReasoningProvider
 
@@ -222,7 +222,7 @@ class TelemetryIngestor:
                     incident_id=incident["id"],
                     log_excerpts=log_excerpts,
                 )
-                memory = MemoryStore(conn=conn, embedding_provider=DeterministicEmbeddingProvider()).remember(
+                memory = MemoryStore(conn=conn, embedding_provider=embedding_provider_from_env()).remember(
                     memory_kind="semantic",
                     namespace=namespace,
                     content=_memory_content(signal, log_excerpts=log_excerpts),
@@ -293,7 +293,7 @@ def run_telemetry_demo(
         thread_id=f"telemetry-demo:{signal.signal_id}",
         db_url=db_url or database_url(),
         reasoning_provider=provider,
-        embedding_provider=DeterministicEmbeddingProvider(),
+        embedding_provider=embedding_provider_from_env(),
     )
     return TelemetryDemoResult(
         ingestion=ingestion,

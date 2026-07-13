@@ -499,7 +499,12 @@ def memory_snapshot(
     timestamp = _parse_timestamp(as_of) if as_of else None
     if timestamp is not None:
         with MemoryStore(url=db_url or database_url()) as store:
-            memories = store.recall(namespace=namespace, query="", as_of=timestamp, limit=limit)
+            memories = store.list_semantic_as_of(
+                namespace=namespace,
+                system_as_of=timestamp,
+                valid_at=timestamp,
+                limit=limit,
+            )
         operations = _memory_operations(namespace=namespace, db_url=db_url, limit=limit, as_of=timestamp)
         return {
             "type": "snapshot",
@@ -668,7 +673,22 @@ def _memory_operations(
                 """,
                 params,
             )
-            return [dict(row) for row in cur.fetchall()]
+            operations = [dict(row) for row in cur.fetchall()]
+            for operation in operations:
+                effect_as_of_filter = "AND created_at <= %s" if as_of is not None else ""
+                effect_params = (
+                    (operation["id"], as_of) if as_of is not None else (operation["id"],)
+                )
+                cur.execute(
+                    f"""
+                        SELECT * FROM memory_operation_effects
+                        WHERE operation_id = %s {effect_as_of_filter}
+                        ORDER BY sequence
+                    """,
+                    effect_params,
+                )
+                operation["effects"] = [dict(row) for row in cur.fetchall()]
+            return operations
 
 
 def _normalize_memory(row: dict[str, Any]) -> dict[str, Any]:
@@ -681,6 +701,11 @@ def _normalize_memory(row: dict[str, Any]) -> dict[str, Any]:
         "source_ref": row.get("source_ref"),
         "justification": row.get("justification"),
         "metadata": row.get("metadata") or {},
+        "belief_id": str(row.get("belief_id")) if row.get("belief_id") else None,
+        "version_number": row.get("version_number"),
+        "content_schema": row.get("content_schema"),
+        "lineage_status": row.get("lineage_status"),
+        "trust_status": row.get("trust_status"),
         "t_valid": _jsonable(row.get("t_valid")),
         "t_invalid": _jsonable(row.get("t_invalid")),
         "written_at": _jsonable(row.get("written_at")),
@@ -701,6 +726,10 @@ def _normalize_operation(row: dict[str, Any]) -> dict[str, Any]:
         "target_timestamp": _jsonable(row.get("target_timestamp")),
         "invalidated_memory_ids": row.get("invalidated_memory_ids") or [],
         "restored_memory_ids": row.get("restored_memory_ids") or [],
+        "status": row.get("status"),
+        "failure_code": row.get("failure_code"),
+        "failure_detail": row.get("failure_detail"),
+        "effects": [_jsonable(item) for item in row.get("effects") or []],
         "created_at": _jsonable(row.get("created_at")),
     }
 

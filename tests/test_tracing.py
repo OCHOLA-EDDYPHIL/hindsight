@@ -116,6 +116,7 @@ def test_recall_and_record_read_spans_include_decision_metadata(monkeypatch):
     )
 
     rows = store.recall(
+        mode="current_text",
         namespace="demo:payments",
         query="raw recall query must not enter span attributes",
         decision_id=decision_id,
@@ -202,11 +203,22 @@ def _fake_store():
         def transaction(self):
             return nullcontext()
 
+        def execute(self, *args, **kwargs):
+            return None
+
     store = MemoryStore.__new__(MemoryStore)
     store._conn = FakeConnection()
     store._url = "postgresql://user:password@localhost/db"
     store._owns_connection = False
     store._embedding_provider = None
+    store._classify_output_reads = lambda **kwargs: None
+    store._complete_memory_lineage = lambda **kwargs: None
+    store._insert_external_evidence = lambda **kwargs: None
+    store._ensure_decision = lambda **kwargs: None
+    store._seal_decision = lambda *args, **kwargs: None
+    store._fetch_optional = lambda query, params: (
+        {"status": "open"} if "memory_decisions" in query else None
+    )
     return store
 
 

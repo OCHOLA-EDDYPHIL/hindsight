@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from typing import Any
 
@@ -14,11 +15,20 @@ from hindsight.db import connect
 JOB_KEY = "realtime_changefeed_job_id"
 FINGERPRINT_KEY = "realtime_changefeed_fingerprint"
 WATCHED_TABLES = (
+    "incidents",
     "semantic_memories",
     "memory_operations",
     "agent_runs",
     "agent_run_events",
 )
+CHANGEFEED_SCHEMA_VERSION = 2
+CHANGEFEED_OPTIONS = {
+    "diff": True,
+    "updated": True,
+    "initial_scan": "no",
+    "resolved": "10s",
+    "min_checkpoint_frequency": "10s",
+}
 
 
 def main() -> None:
@@ -47,7 +57,16 @@ def apply_changefeed(
     if not webhook_url.startswith("https://"):
         raise ValueError("changefeed webhook URL must use https")
     sink = f"webhook-{webhook_url}"
-    fingerprint = hashlib.sha256(f"{sink}\0{auth_token}".encode()).hexdigest()
+    fingerprint_payload = {
+        "schema_version": CHANGEFEED_SCHEMA_VERSION,
+        "sink": sink,
+        "auth_token_sha256": hashlib.sha256(auth_token.encode()).hexdigest(),
+        "tables": WATCHED_TABLES,
+        "options": CHANGEFEED_OPTIONS,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     with connect(db_url, application_name="hindsight-changefeed-deploy") as conn:
         with conn.transaction():
             existing_job = _app_meta(conn, JOB_KEY)
@@ -66,7 +85,8 @@ def apply_changefeed(
                 """
                     CREATE CHANGEFEED FOR TABLE {}
                     INTO {}
-                    WITH updated,
+                    WITH diff,
+                         updated,
                          initial_scan = 'no',
                          resolved = '10s',
                          min_checkpoint_frequency = '10s',

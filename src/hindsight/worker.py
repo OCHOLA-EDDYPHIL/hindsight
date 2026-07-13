@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from uuid import uuid4
 
 from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
+from hindsight.consolidation import enqueue_consolidation_job, process_consolidation_job
 from hindsight.embeddings import embedding_provider_from_env
 from hindsight.gemini import GeminiPoolExhaustedError, gemini_pool_from_env
+from hindsight.operations import execute_operation
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
 from hindsight.runtime import invalidate_runtime_settings_cache, runtime_settings
 from hindsight.runs import claim_run, fail_run, get_run, transition_run
@@ -37,8 +40,56 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
     """Process one start or resume command."""
 
     configure_tracing_from_env(service_name="hindsight-worker")
-    run_id = str(message.get("run_id") or "").strip()
     command = str(message.get("command") or "start").strip().lower()
+    if command == "consolidation":
+        incident_id = str(message.get("incident_id") or "").strip()
+        source_event_id = str(message.get("source_event_id") or "").strip()
+        if not incident_id or not source_event_id:
+            raise ValueError("incident_id and source_event_id are required")
+        settings = runtime_settings()
+        uses_gemini = any(
+            settings.provider_env.get(name, "").strip().lower() == "gemini"
+            for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
+        )
+        gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
+        reasoning = reasoning_provider_from_env(settings.provider_env, gemini_pool=gemini_pool)
+        embeddings = embedding_provider_from_env(
+            settings.provider_env,
+            gemini_pool=gemini_pool,
+        )
+        job = enqueue_consolidation_job(
+            incident_id=incident_id,
+            source_event_id=source_event_id,
+            db_url=settings.database_url,
+        )
+        result = process_consolidation_job(
+            job_id=str(job["id"]),
+            db_url=settings.database_url,
+            reasoning_provider=reasoning,
+            embedding_provider=embeddings,
+        )
+        return {"job_id": result.job_id, "created": result.created, "reason": result.reason}
+    if command == "memory_operation":
+        operation_id = str(message.get("operation_id") or "").strip()
+        if not operation_id:
+            raise ValueError("operation_id is required")
+        settings = runtime_settings()
+        uses_gemini = (
+            settings.provider_env.get("EMBEDDING_PROVIDER", "").strip().lower() == "gemini"
+        )
+        gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
+        embedding_provider = embedding_provider_from_env(
+            settings.provider_env,
+            gemini_pool=gemini_pool,
+        )
+        return execute_operation(
+            operation_id=operation_id,
+            embedding_provider=embedding_provider,
+            worker_id=str(message.get("worker_id") or f"sqs-worker:{uuid4()}"),
+            db_url=settings.database_url,
+        )
+
+    run_id = str(message.get("run_id") or "").strip()
     if not run_id:
         raise ValueError("run_id is required")
     if command not in {"start", "resume"}:
@@ -124,6 +175,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
                     namespace=run["namespace"],
                     service_slug=run.get("service_slug"),
                     title=run["incident_slug"],
+                    metadata={"retrieval_policy": run.get("retrieval_policy", "semantic_strict")},
                 ),
                 thread_id=run["thread_id"],
                 run_id=run_id,

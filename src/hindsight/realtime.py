@@ -15,6 +15,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from hindsight.aws import aws_client_config
+from hindsight.queueing import enqueue_run
 from hindsight.security import safe_error_detail
 
 CONNECTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
@@ -102,6 +103,19 @@ def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if not isinstance(rows, list):
             raise ValueError("changefeed payload must be a list")
         envelopes = [envelope for row in rows if (envelope := normalize_changefeed_row(row))]
+        consolidation_jobs = 0
+        for row in rows:
+            transition = _resolved_incident_transition(row)
+            if transition is None:
+                continue
+            enqueue_run(
+                {
+                    "command": "consolidation",
+                    "incident_id": transition["id"],
+                    "source_event_id": transition["resolution_event_id"],
+                }
+            )
+            consolidation_jobs += 1
         delivered = 0
         stale = 0
         for envelope in envelopes:
@@ -114,6 +128,7 @@ def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 "accepted": len(envelopes),
                 "delivered": delivered,
                 "stale_connections_removed": stale,
+                "consolidation_jobs_queued": consolidation_jobs,
             },
         )
     except (ValueError, json.JSONDecodeError) as exc:
@@ -158,6 +173,27 @@ def normalize_changefeed_row(row: Any) -> dict[str, Any] | None:
         "run_id": str(run_id) if run_id is not None else None,
         "occurred_at": str(updated),
         "data": data,
+    }
+
+
+def _resolved_incident_transition(row: Any) -> dict[str, str] | None:
+    if not isinstance(row, dict):
+        return None
+    topic = str(row.get("topic") or row.get("table") or "").split(".")[-1]
+    if topic != "incidents":
+        return None
+    value = row.get("value") if isinstance(row.get("value"), dict) else row
+    before = value.get("before") if isinstance(value, dict) else None
+    after = value.get("after") if isinstance(value, dict) else None
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    if before.get("status") == "resolved" or after.get("status") != "resolved":
+        return None
+    if not after.get("id") or not after.get("resolution_event_id"):
+        return None
+    return {
+        "id": str(after["id"]),
+        "resolution_event_id": str(after["resolution_event_id"]),
     }
 
 

@@ -108,6 +108,7 @@ def test_public_memory_api_remembers_recalls_and_invalidates(memory_store):
     )
 
     recalled = memory_store.recall(
+        mode="current_text",
         namespace=namespace,
         query="retry fanout",
     )
@@ -122,7 +123,9 @@ def test_public_memory_api_remembers_recalls_and_invalidates(memory_store):
 
     assert invalidated is not None
     assert invalidated["invalidated_by"] == "agent.rewind"
-    assert memory_store.recall(namespace=namespace, query="retry fanout") == []
+    assert memory_store.recall(
+        mode="current_text", namespace=namespace, query="retry fanout"
+    ) == []
 
 
 @requires_db
@@ -430,7 +433,9 @@ def test_as_of_recall_does_not_commit_caller_transaction():
             ),
         )
 
-        recalled = store.recall(namespace=namespace, query="", as_of=as_of, limit=5)
+        recalled = store.recall(
+            mode="as_of_list", namespace=namespace, query="", as_of=as_of, limit=5
+        )
 
         assert [row["id"] for row in recalled] == [baseline["id"]]
         conn.rollback()
@@ -485,6 +490,7 @@ def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
         )
         decision_id = f"decision-{uuid4()}"
         recalled = store.recall(
+            mode="semantic_strict",
             namespace=namespace,
             query="certificate expiry",
             limit=1,
@@ -529,9 +535,12 @@ def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
         assert store.audit_memory(memory_kind="semantic", memory_id=str(derived["id"]))[
             "t_invalid"
         ] is not None
-        assert [row["id"] for row in store.recall(namespace=namespace, query="payment")] == [
-            good["id"]
-        ]
+        assert [
+            row["id"]
+            for row in store.search_current_semantic_text(
+                namespace=namespace, query="payment"
+            )
+        ] == [good["id"]]
     finally:
         conn.rollback()
         conn.close()

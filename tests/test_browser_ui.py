@@ -48,6 +48,6 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.ID, "poisonDemo").click()
         wait.until(lambda browser: "2 live" in browser.find_element(By.ID, "memoryCount").text)
         driver.find_element(By.ID, "previewRewind").click()
-        wait.until(lambda browser: "will be invalidated" in browser.find_element(By.ID, "rewindPreview").text)
+        wait.until(lambda browser: "versions will close" in browser.find_element(By.ID, "rewindPreview").text)
     finally:
         driver.quit()

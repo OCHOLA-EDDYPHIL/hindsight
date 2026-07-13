@@ -32,6 +32,7 @@ ARTIFACTS = {
             "embeddings.py",
             "gemini.py",
             "memory.py",
+            "operations.py",
             "queueing.py",
             "runs.py",
             "runtime.py",
@@ -58,9 +59,11 @@ ARTIFACTS = {
             "agent.py",
             "aws.py",
             "db.py",
+            "consolidation.py",
             "embeddings.py",
             "gemini.py",
             "memory.py",
+            "operations.py",
             "reasoning.py",
             "runs.py",
             "runtime.py",
@@ -71,7 +74,13 @@ ARTIFACTS = {
     },
     "realtime": {
         "dependencies": [],
-        "modules": ["__init__.py", "aws.py", "realtime.py", "security.py"],
+        "modules": [
+            "__init__.py",
+            "aws.py",
+            "queueing.py",
+            "realtime.py",
+            "security.py",
+        ],
     },
 }
 

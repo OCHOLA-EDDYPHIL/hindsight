@@ -27,7 +27,7 @@ def test_async_sqlalchemy_url_uses_async_psycopg_driver():
     )
 
 
-def test_recall_falls_back_without_vector_store_after_vector_error(monkeypatch):
+def test_recall_does_not_silently_fall_back_after_vector_error(monkeypatch):
     import hindsight.agent as agent
     from hindsight.embeddings import DeterministicEmbeddingProvider
 
@@ -44,29 +44,24 @@ def test_recall_falls_back_without_vector_store_after_vector_error(monkeypatch):
         def __exit__(self, *exc_info):
             pass
 
-        def recall_similar_incidents(self, **kwargs):
+        def retrieve_semantic(self, **kwargs):
             raise RuntimeError("semantic_memory_embeddings is missing")
-
-        def recall(self, **kwargs):
-            assert self.embedding_provider is None
-            return [{"id": "memory-1", "content": "fallback memory"}]
 
     monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
 
-    result = agent._recall_for_state(
-        {
-            "namespace": "incident-test",
-            "service_slug": "payments-api",
-            "user_input": "checkout latency",
-            "decision_id": "agent:test:plan",
-        },
-        db_url="postgresql://db",
-        embedding_provider=DeterministicEmbeddingProvider(),
-    )
+    with pytest.raises(RuntimeError, match="governed retrieval failed"):
+        agent._recall_for_state(
+            {
+                "namespace": "incident-test",
+                "service_slug": "payments-api",
+                "user_input": "checkout latency",
+                "decision_id": "agent:test:plan",
+            },
+            db_url="postgresql://db",
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
 
-    assert calls == [True, False]
-    assert result["recalled_memories"] == [{"id": "memory-1", "content": "fallback memory"}]
-    assert "semantic_memory_embeddings is missing" in result["recall_error"]
+    assert calls == [True]
 
 
 def test_agent_storage_setup_is_cached(monkeypatch):
