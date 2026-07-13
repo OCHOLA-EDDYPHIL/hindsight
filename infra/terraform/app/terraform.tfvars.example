@@ -1,12 +1,12 @@
 aws_region = "us-east-1"
 stage      = "demo"
 
-database_url_parameter_name  = "/hindsight/demo/database-url"
-gemini_api_key_parameter_name = "/hindsight/demo/gemini-api-key"
-operator_token_parameter_name = "/hindsight/demo/operator-token"
+database_url_parameter_name    = "/hindsight/demo/database-url"
+gemini_api_keys_parameter_name = "/hindsight/demo/gemini-api-keys"
+operator_token_parameter_name  = "/hindsight/demo/operator-token"
 changefeed_token_parameter_name = "/hindsight/demo/changefeed-token"
 
 # Optional custom domain. The certificate must be in us-east-1 for CloudFront.
-# domain_name        = "hindsight.example.com"
-# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
-# route53_zone_id     = "Z123456789"
+# domain_name          = "hindsight.example.com"
+# acm_certificate_arn  = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+# cloudflare_zone_id   = "00000000000000000000000000000000"

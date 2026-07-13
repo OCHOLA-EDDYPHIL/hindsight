@@ -1,12 +1,19 @@
 # Terraform bootstrap
 
-Bootstrap is intentionally separate from routine application lifecycle. Run it once with trusted local AWS credentials to create the versioned state bucket and GitHub OIDC deployment role. Its state bucket has `prevent_destroy` and is never targeted by the application destroy workflow.
+Bootstrap is intentionally separate from routine application lifecycle. It reuses an existing versioned state bucket and GitHub OIDC provider, then creates the Hindsight deployment role, ACM certificate, and Cloudflare validation records. These resources are never targeted by the application destroy workflow.
 
 ```bash
-terraform -chdir=infra/terraform/bootstrap init
-terraform -chdir=infra/terraform/bootstrap apply
+export AWS_PROFILE=your-profile
+export CLOUDFLARE_API_TOKEN=your-scoped-token
+terraform -chdir=infra/terraform/bootstrap init \
+  -backend-config="bucket=your-existing-state-bucket" \
+  -backend-config="key=hindsight/bootstrap/terraform.tfstate" \
+  -backend-config="region=us-east-1" \
+  -backend-config="encrypt=true" \
+  -backend-config="use_lockfile=true"
+terraform -chdir=infra/terraform/bootstrap apply -var-file=terraform.tfvars
 ```
 
-Record the `state_bucket` and `github_deploy_role_arn` outputs as GitHub repository variables. If the AWS account already has a GitHub OIDC provider, set `create_github_oidc_provider = false` and pass its ARN instead of attempting to create a duplicate provider.
+Record the state bucket, deployment role, ACM certificate, domain, and Cloudflare zone outputs as GitHub repository variables. Set `create_github_oidc_provider = false` and pass the existing provider ARN when the AWS account already trusts GitHub.
 
-The deploy and destroy jobs target the GitHub `demo` environment and run only from `main`. Add a required reviewer to that environment before the first live apply when the repository plan supports environment protection rules.
+The Cloudflare token needs only Zone DNS Edit and Zone Read for the selected zone. Store it as `CLOUDFLARE_API_TOKEN` in the GitHub `demo` environment, never in Terraform state. The deploy and destroy jobs run only from `main`; add a required reviewer when repository environment protection is available.

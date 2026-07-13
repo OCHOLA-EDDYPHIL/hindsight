@@ -14,7 +14,7 @@ locals {
 
   parameter_arns = {
     database   = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.database_url_parameter_name}"
-    gemini     = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_key_parameter_name}"
+    gemini     = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_keys_parameter_name}"
     operator   = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.operator_token_parameter_name}"
     changefeed = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.changefeed_token_parameter_name}"
   }
@@ -24,6 +24,16 @@ locals {
     ".html" = "text/html; charset=utf-8"
     ".js"   = "text/javascript; charset=utf-8"
     ".svg"  = "image/svg+xml"
+  }
+}
+
+check "custom_domain_configuration" {
+  assert {
+    condition = (
+      var.domain_name == null ||
+      (var.acm_certificate_arn != null && var.cloudflare_zone_id != null)
+    )
+    error_message = "domain_name requires acm_certificate_arn and cloudflare_zone_id."
   }
 }
 
@@ -152,6 +162,24 @@ resource "aws_dynamodb_table" "connections" {
   server_side_encryption { enabled = true }
 }
 
+resource "aws_dynamodb_table" "gemini_key_health" {
+  name         = "${local.name}-gemini-key-health"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "slot_id"
+
+  attribute {
+    name = "slot_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption { enabled = true }
+}
+
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -214,6 +242,14 @@ data "aws_iam_policy_document" "worker" {
   statement {
     actions   = ["ssm:GetParameter"]
     resources = [local.parameter_arns.database, local.parameter_arns.gemini]
+  }
+  statement {
+    actions = [
+      "dynamodb:BatchGetItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:UpdateItem"
+    ]
+    resources = [aws_dynamodb_table.gemini_key_health.arn]
   }
   statement {
     actions = [
@@ -311,13 +347,16 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM   = var.database_url_parameter_name
-      HINDSIGHT_GEMINI_API_KEY_PARAM = var.gemini_api_key_parameter_name
-      HINDSIGHT_WORKER_MAX_RECEIVES  = "3"
-      LLM_PROVIDER                   = var.llm_provider
-      GEMINI_MODEL                   = var.gemini_model
-      BEDROCK_MODEL                  = var.bedrock_model
-      REASONING_MAX_ATTEMPTS         = tostring(var.reasoning_max_attempts)
+      HINDSIGHT_DATABASE_URL_PARAM      = var.database_url_parameter_name
+      HINDSIGHT_GEMINI_API_KEYS_PARAM   = var.gemini_api_keys_parameter_name
+      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE = aws_dynamodb_table.gemini_key_health.name
+      HINDSIGHT_WORKER_MAX_RECEIVES     = "3"
+      LLM_PROVIDER                      = var.llm_provider
+      EMBEDDING_PROVIDER                = var.embedding_provider
+      GEMINI_MODEL                      = var.gemini_model
+      GEMINI_EMBEDDING_MODEL            = var.gemini_embedding_model
+      BEDROCK_MODEL                     = var.bedrock_model
+      REASONING_MAX_ATTEMPTS            = tostring(var.reasoning_max_attempts)
     }
   }
 }
@@ -613,17 +652,16 @@ resource "aws_s3_bucket_policy" "ui" {
   policy = data.aws_iam_policy_document.ui_bucket.json
 }
 
-resource "aws_route53_record" "ui" {
-  count = var.domain_name != null && var.route53_zone_id != null ? 1 : 0
+resource "cloudflare_dns_record" "ui" {
+  count = var.domain_name != null && var.cloudflare_zone_id != null ? 1 : 0
 
-  zone_id = var.route53_zone_id
+  zone_id = var.cloudflare_zone_id
   name    = var.domain_name
-  type    = "A"
-  alias {
-    name                   = aws_cloudfront_distribution.ui.domain_name
-    zone_id                = aws_cloudfront_distribution.ui.hosted_zone_id
-    evaluate_target_health = false
-  }
+  content = aws_cloudfront_distribution.ui.domain_name
+  type    = "CNAME"
+  ttl     = 1
+  proxied = false
+  comment = "Hindsight demo CloudFront alias"
 }
 
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {

@@ -39,13 +39,18 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "cloudflare" {}
+
 run "complete_demo_graph" {
   command = plan
 
   variables {
-    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
-    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
-    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+    api_zip_path        = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path     = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    domain_name         = "hindsight.example.com"
+    acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
+    cloudflare_zone_id  = "00000000000000000000000000000000"
   }
 
   assert {
@@ -61,6 +66,16 @@ run "complete_demo_graph" {
   assert {
     condition     = aws_dynamodb_table.connections.ttl[0].enabled
     error_message = "WebSocket connection records must expire."
+  }
+
+  assert {
+    condition     = aws_dynamodb_table.gemini_key_health.ttl[0].enabled
+    error_message = "Gemini cooldown records must expire."
+  }
+
+  assert {
+    condition     = cloudflare_dns_record.ui[0].proxied == false
+    error_message = "CloudFront must use a DNS-only Cloudflare alias."
   }
 
   assert {

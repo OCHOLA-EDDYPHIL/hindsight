@@ -1,9 +1,11 @@
 aws_region        = "us-east-1"
+state_bucket_name = "existing-versioned-terraform-state-bucket"
 github_repository = "OCHOLA-EDDYPHIL/hindsight"
 github_subjects = [
-  "repo:OCHOLA-EDDYPHIL/hindsight:ref:refs/heads/main",
   "repo:OCHOLA-EDDYPHIL/hindsight:environment:demo",
 ]
+domain_name        = "hindsight.strathmoreedu.qzz.io"
+cloudflare_zone_id = "3545d878227ee71fb3df8d4b50d3d193"
 
 # If the account already has GitHub's OIDC provider:
 # create_github_oidc_provider       = false

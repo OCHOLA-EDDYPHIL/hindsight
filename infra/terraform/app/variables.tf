@@ -27,10 +27,10 @@ variable "database_url_parameter_name" {
   default     = "/hindsight/demo/database-url"
 }
 
-variable "gemini_api_key_parameter_name" {
-  description = "Existing SecureString parameter containing the Gemini API key."
+variable "gemini_api_keys_parameter_name" {
+  description = "Existing SecureString parameter containing the versioned Gemini key pool."
   type        = string
-  default     = "/hindsight/demo/gemini-api-key"
+  default     = "/hindsight/demo/gemini-api-keys"
 }
 
 variable "operator_token_parameter_name" {
@@ -59,6 +59,21 @@ variable "llm_provider" {
 variable "gemini_model" {
   type    = string
   default = "gemini-2.5-flash"
+}
+
+variable "embedding_provider" {
+  type    = string
+  default = "gemini"
+
+  validation {
+    condition     = contains(["gemini", "bedrock", "deterministic"], var.embedding_provider)
+    error_message = "embedding_provider must be gemini, bedrock, or deterministic."
+  }
+}
+
+variable "gemini_embedding_model" {
+  type    = string
+  default = "gemini-embedding-2"
 }
 
 variable "bedrock_model" {
@@ -106,8 +121,8 @@ variable "acm_certificate_arn" {
   nullable    = true
 }
 
-variable "route53_zone_id" {
-  description = "Optional hosted zone for the custom-domain alias."
+variable "cloudflare_zone_id" {
+  description = "Cloudflare zone for the custom-domain CNAME."
   type        = string
   default     = null
   nullable    = true

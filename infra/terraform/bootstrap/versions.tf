@@ -6,8 +6,16 @@ terraform {
       source  = "hashicorp/aws"
       version = ">= 5.80, < 7.0"
     }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = ">= 5.0, < 6.0"
+    }
   }
+
+  backend "s3" {}
 }
+
+provider "cloudflare" {}
 
 provider "aws" {
   region = var.aws_region

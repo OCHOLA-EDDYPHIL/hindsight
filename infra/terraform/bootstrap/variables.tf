@@ -4,10 +4,8 @@ variable "aws_region" {
 }
 
 variable "state_bucket_name" {
-  description = "Optional globally unique state bucket name."
+  description = "Existing versioned S3 bucket shared for Terraform state."
   type        = string
-  default     = null
-  nullable    = true
 }
 
 variable "github_repository" {
@@ -17,9 +15,31 @@ variable "github_repository" {
 }
 
 variable "github_subjects" {
-  description = "Allowed GitHub OIDC subject patterns. Narrow these to protected environments when configured."
+  description = "Allowed GitHub OIDC subjects. Keep this restricted to the protected deployment environment."
   type        = list(string)
-  default     = ["repo:OCHOLA-EDDYPHIL/hindsight:*"]
+  default     = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"]
+}
+
+variable "stage" {
+  type    = string
+  default = "demo"
+}
+
+variable "domain_name" {
+  description = "Stable CloudFront hostname prepared for the demo."
+  type        = string
+  default     = "hindsight.strathmoreedu.qzz.io"
+}
+
+variable "cloudflare_zone_id" {
+  description = "Cloudflare zone containing domain_name."
+  type        = string
+}
+
+variable "application_state_key" {
+  description = "Remote-state object used by the ephemeral application stack."
+  type        = string
+  default     = "hindsight/demo/terraform.tfstate"
 }
 
 variable "create_github_oidc_provider" {

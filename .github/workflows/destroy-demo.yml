@@ -22,15 +22,20 @@ env:
   TF_VAR_stage: demo
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_VAR_database_url_parameter_name: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
-  TF_VAR_gemini_api_key_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEY_PARAM || '/hindsight/demo/gemini-api-key' }}
+  TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
   TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+  TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
+  TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
+  TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
 
 jobs:
   destroy:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: demo
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Confirm destructive operation
         if: inputs.confirmation != 'destroy-demo'
