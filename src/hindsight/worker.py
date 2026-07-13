@@ -8,8 +8,8 @@ from typing import Any
 
 from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
 from hindsight.embeddings import DeterministicEmbeddingProvider
-from hindsight.lambda_handler import runtime_settings
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
+from hindsight.runtime import runtime_settings
 from hindsight.runs import claim_run, fail_run, get_run, transition_run
 from hindsight.security import safe_error_detail
 from hindsight.tracing import configure_tracing_from_env
