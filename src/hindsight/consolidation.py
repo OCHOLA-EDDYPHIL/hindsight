@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg.rows import dict_row
 
@@ -26,6 +26,7 @@ from hindsight.security import safe_error_detail
 CONSOLIDATION_WRITER = "consolidation.worker"
 LESSON_SCHEMA = "procedural_lesson.v1"
 TERMINAL_JOB_STATUSES = {"completed", "not_eligible", "failed"}
+MAX_CONSOLIDATION_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,10 @@ class ConsolidationResult:
 
 class LessonValidationError(ValueError):
     """Raised when model output does not cite eligible evidence exactly."""
+
+
+class ConsolidationLeaseLostError(RuntimeError):
+    """Raised when an attempt no longer owns a live consolidation lease."""
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -180,6 +185,7 @@ def process_consolidation_job(
     job = _claim_job(job_id=job_id, db_url=resolved_url)
     if job["status"] in TERMINAL_JOB_STATUSES:
         return _result_for_job(job=job, db_url=resolved_url)
+    lease_owner = str(job["lease_owner"])
     provider = reasoning_provider or DeterministicReasoningProvider()
     embeddings = embedding_provider or embedding_provider_from_env()
     decision_id = f"consolidation:{job_id}"
@@ -193,38 +199,64 @@ def process_consolidation_job(
         if context["reason"]:
             return _finish_without_lesson(
                 job_id=job_id,
+                lease_owner=lease_owner,
                 status="not_eligible",
                 reason=context["reason"],
                 db_url=resolved_url,
             )
         source_memories = context["source_memories"]
         evidence = _evidence_catalog(context)
-        with MemoryStore(url=resolved_url) as store:
-            store.open_decision(
-                decision_id=decision_id,
-                actor=CONSOLIDATION_WRITER,
-                decision_kind="lesson_synthesis",
-                purpose="Synthesize a reusable lesson from verified incident evidence",
-                namespace=context["namespace"],
-                metadata={"job_id": job_id},
-            )
-            for memory in source_memories:
-                store.record_read(
-                    decision_id=decision_id,
-                    memory_kind="semantic",
-                    memory_id=str(memory["id"]),
-                    reader=CONSOLIDATION_WRITER,
-                    purpose="Eligible source evidence for lesson synthesis",
+        with connect(resolved_url, application_name="hindsight-consolidation") as conn:
+            with conn.transaction():
+                _lock_current_lease(
+                    conn,
+                    job_id=job_id,
+                    lease_owner=lease_owner,
                 )
-            store._conn.execute(  # noqa: SLF001 - same durable decision transaction
-                """
-                    UPDATE consolidation_jobs
-                    SET decision_id = %s, updated_at = now()
-                    WHERE id = %s AND decision_id IS NULL
-                """,
-                (decision_id, job_id),
-            )
-            store._conn.commit()  # noqa: SLF001 - publish evidence before provider call
+                store = MemoryStore(conn=conn)
+                store.open_decision(
+                    decision_id=decision_id,
+                    actor=CONSOLIDATION_WRITER,
+                    decision_kind="lesson_synthesis",
+                    purpose="Synthesize a reusable lesson from verified incident evidence",
+                    namespace=context["namespace"],
+                    metadata={"job_id": job_id},
+                )
+                existing_read_ids = {
+                    str(row["memory_id"])
+                    for row in store.reads_for_decision(decision_id=decision_id)
+                }
+                for memory in source_memories:
+                    memory_id = str(memory["id"])
+                    if memory_id in existing_read_ids:
+                        continue
+                    store.record_read(
+                        decision_id=decision_id,
+                        memory_kind="semantic",
+                        memory_id=memory_id,
+                        reader=CONSOLIDATION_WRITER,
+                        purpose="Eligible source evidence for lesson synthesis",
+                    )
+                linked = conn.execute(
+                    """
+                        UPDATE consolidation_jobs
+                        SET decision_id = %s, updated_at = now()
+                        WHERE id = %s AND (decision_id IS NULL OR decision_id = %s)
+                            AND status = 'leased' AND lease_owner = %s
+                            AND lease_expires_at > now()
+                        RETURNING id
+                    """,
+                    (
+                        decision_id,
+                        job_id,
+                        decision_id,
+                        lease_owner,
+                    ),
+                ).fetchone()
+                if linked is None:
+                    raise ConsolidationLeaseLostError(
+                        f"consolidation lease is no longer current: {job_id}"
+                    )
         lesson = _generate_lesson(provider=provider, context=context, evidence=evidence)
         _validate_lesson(lesson=lesson, evidence=evidence)
         content = _render_lesson(lesson)
@@ -238,6 +270,11 @@ def process_consolidation_job(
         )
         with connect(resolved_url, application_name="hindsight-consolidation") as conn:
             with conn.transaction():
+                _lock_current_lease(
+                    conn,
+                    job_id=job_id,
+                    lease_owner=lease_owner,
+                )
                 store = MemoryStore(conn=conn, embedding_provider=embeddings)
                 existing = _existing_lesson(
                     conn,
@@ -245,7 +282,13 @@ def process_consolidation_job(
                     namespace=context["namespace"],
                 )
                 if existing is not None:
-                    _complete_job(conn, job_id=job_id, memory=existing)
+                    store.seal_decision(decision_id=decision_id)
+                    _complete_job(
+                        conn,
+                        job_id=job_id,
+                        lease_owner=lease_owner,
+                        memory=existing,
+                    )
                     return ConsolidationResult(
                         context["incident"],
                         context["namespace"],
@@ -293,7 +336,12 @@ def process_consolidation_job(
                     """,
                     (context["incident"]["id"], memory["belief_id"]),
                 )
-                _complete_job(conn, job_id=job_id, memory=memory)
+                _complete_job(
+                    conn,
+                    job_id=job_id,
+                    lease_owner=lease_owner,
+                    memory=memory,
+                )
         return ConsolidationResult(
             context["incident"],
             context["namespace"],
@@ -304,16 +352,21 @@ def process_consolidation_job(
             job_id,
         )
     except LessonValidationError as exc:
-        _fail_decision(decision_id=decision_id, db_url=resolved_url)
-        return _finish_without_lesson(
+        return _fail_job_and_decision(
             job_id=job_id,
-            status="failed",
+            lease_owner=lease_owner,
             reason=f"invalid_lesson:{exc}",
             db_url=resolved_url,
         )
+    except ConsolidationLeaseLostError:
+        raise
     except Exception as exc:
-        _fail_decision(decision_id=decision_id, db_url=resolved_url)
-        _retry_or_fail_job(job_id=job_id, exc=exc, db_url=resolved_url)
+        _retry_or_fail_job(
+            job_id=job_id,
+            lease_owner=lease_owner,
+            exc=exc,
+            db_url=resolved_url,
+        )
         raise
 
 
@@ -334,6 +387,7 @@ def incident_closed_changefeed_event(
 
 
 def _claim_job(*, job_id: str, db_url: str) -> dict[str, Any]:
+    lease_owner = f"{CONSOLIDATION_WRITER}:{uuid4()}"
     with connect(db_url, application_name="hindsight-consolidation") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -343,24 +397,80 @@ def _claim_job(*, job_id: str, db_url: str) -> dict[str, Any]:
                     raise LookupError(job_id)
                 if row["status"] in TERMINAL_JOB_STATUSES:
                     return dict(row)
+                cur.execute("SELECT now() AS current_time")
+                current_time = cur.fetchone()["current_time"]
                 if (
                     row["status"] == "leased"
                     and row["lease_expires_at"] is not None
-                    and row["lease_expires_at"] > datetime.now(UTC)
+                    and row["lease_expires_at"] > current_time
                 ):
                     raise RuntimeError("consolidation job already has an active lease")
+                if row["attempt_count"] >= MAX_CONSOLIDATION_ATTEMPTS:
+                    cur.execute(
+                        """
+                            UPDATE consolidation_jobs
+                            SET status = 'leased', lease_owner = %s,
+                                lease_expires_at = now() + INTERVAL '2 minutes',
+                                updated_at = now()
+                            WHERE id = %s
+                            RETURNING *
+                        """,
+                        (lease_owner, job_id),
+                    )
+                    claimed = cur.fetchone()
+                    _fail_open_decision(conn, decision_id=claimed["decision_id"])
+                    cur.execute(
+                        """
+                            UPDATE consolidation_jobs
+                            SET status = 'failed', lease_owner = NULL,
+                                lease_expires_at = NULL,
+                                error_code = 'RetryLimitExceeded',
+                                error_detail = 'maximum consolidation attempts exhausted',
+                                completed_at = now(), updated_at = now()
+                            WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                                AND lease_expires_at > now()
+                            RETURNING *
+                        """,
+                        (job_id, lease_owner),
+                    )
+                    terminal = cur.fetchone()
+                    if terminal is None:
+                        raise ConsolidationLeaseLostError(
+                            f"consolidation lease is no longer current: {job_id}"
+                        )
+                    return dict(terminal)
                 cur.execute(
                     """
                         UPDATE consolidation_jobs
                         SET status = 'leased', attempt_count = attempt_count + 1,
-                            lease_owner = 'consolidation-worker',
-                            lease_expires_at = now() + INTERVAL '2 minutes', updated_at = now()
+                            lease_owner = %s,
+                            lease_expires_at = now() + INTERVAL '2 minutes',
+                            updated_at = now()
                         WHERE id = %s
                         RETURNING *
                     """,
-                    (job_id,),
+                    (lease_owner, job_id),
                 )
                 return dict(cur.fetchone())
+
+
+def _lock_current_lease(conn: Any, *, job_id: str, lease_owner: str) -> dict[str, Any]:
+    """Lock and return a job only when this attempt still owns its live lease."""
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+                SELECT * FROM consolidation_jobs
+                WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                    AND lease_expires_at > now()
+                FOR UPDATE
+            """,
+            (job_id, lease_owner),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise ConsolidationLeaseLostError(f"consolidation lease is no longer current: {job_id}")
+    return dict(row)
 
 
 def _load_context(
@@ -581,63 +691,156 @@ def _existing_lesson(
         return dict(row) if row else None
 
 
-def _complete_job(conn: Any, *, job_id: str, memory: dict[str, Any]) -> None:
-    conn.execute(
+def _complete_job(conn: Any, *, job_id: str, lease_owner: str, memory: dict[str, Any]) -> None:
+    row = conn.execute(
         """
             UPDATE consolidation_jobs
             SET status = 'completed', lesson_belief_id = %s, lesson_memory_id = %s,
-                completed_at = now(), updated_at = now(), lease_expires_at = NULL
-            WHERE id = %s
+                reason = NULL, error_code = NULL, error_detail = NULL,
+                completed_at = now(), updated_at = now(), lease_owner = NULL,
+                lease_expires_at = NULL
+            WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                AND lease_expires_at > now()
+            RETURNING id
         """,
-        (memory["belief_id"], memory["id"], job_id),
-    )
+        (
+            memory["belief_id"],
+            memory["id"],
+            job_id,
+            lease_owner,
+        ),
+    ).fetchone()
+    if row is None:
+        raise ConsolidationLeaseLostError(f"consolidation lease is no longer current: {job_id}")
 
 
 def _finish_without_lesson(
-    *, job_id: str, status: str, reason: str, db_url: str
+    *, job_id: str, lease_owner: str, status: str, reason: str, db_url: str
 ) -> ConsolidationResult:
     with connect(db_url, application_name="hindsight-consolidation") as conn:
         with conn.transaction():
-            conn.execute(
+            job = _lock_current_lease(
+                conn,
+                job_id=job_id,
+                lease_owner=lease_owner,
+            )
+            _fail_open_decision(conn, decision_id=job.get("decision_id"))
+            row = conn.execute(
                 """
                     UPDATE consolidation_jobs
                     SET status = %s, reason = %s, completed_at = now(),
-                        updated_at = now(), lease_expires_at = NULL
-                    WHERE id = %s
+                        updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+                    WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        AND lease_expires_at > now()
+                    RETURNING id
                 """,
-                (status, reason[:1000], job_id),
-            )
+                (
+                    status,
+                    reason[:1000],
+                    job_id,
+                    lease_owner,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ConsolidationLeaseLostError(
+                    f"consolidation lease is no longer current: {job_id}"
+                )
     job = _get_job(job_id=job_id, db_url=db_url)
     return _result_for_job(job=job, db_url=db_url)
 
 
-def _retry_or_fail_job(*, job_id: str, exc: Exception, db_url: str) -> None:
+def _retry_or_fail_job(
+    *,
+    job_id: str,
+    lease_owner: str,
+    exc: Exception,
+    db_url: str,
+) -> None:
     with connect(db_url, application_name="hindsight-consolidation") as conn:
         with conn.transaction():
-            conn.execute(
+            job = _lock_current_lease(
+                conn,
+                job_id=job_id,
+                lease_owner=lease_owner,
+            )
+            row = conn.execute(
                 """
                     UPDATE consolidation_jobs
-                    SET status = CASE WHEN attempt_count < 3 THEN 'retrying' ELSE 'failed' END,
+                    SET status = CASE WHEN attempt_count < %s THEN 'retrying' ELSE 'failed' END,
                         error_code = %s, error_detail = %s,
-                        completed_at = CASE WHEN attempt_count < 3 THEN NULL ELSE now() END,
-                        updated_at = now(), lease_expires_at = NULL
-                    WHERE id = %s
+                        completed_at = CASE WHEN attempt_count < %s THEN NULL ELSE now() END,
+                        updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+                    WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        AND lease_expires_at > now()
+                    RETURNING status
                 """,
-                (type(exc).__name__, safe_error_detail(exc, max_chars=1000), job_id),
-            )
+                (
+                    MAX_CONSOLIDATION_ATTEMPTS,
+                    type(exc).__name__,
+                    safe_error_detail(exc, max_chars=1000),
+                    MAX_CONSOLIDATION_ATTEMPTS,
+                    job_id,
+                    lease_owner,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ConsolidationLeaseLostError(
+                    f"consolidation lease is no longer current: {job_id}"
+                )
+            if row[0] == "failed":
+                _fail_open_decision(
+                    conn,
+                    decision_id=job.get("decision_id"),
+                )
 
 
-def _fail_decision(*, decision_id: str, db_url: str) -> None:
+def _fail_job_and_decision(
+    *,
+    job_id: str,
+    lease_owner: str,
+    reason: str,
+    db_url: str,
+) -> ConsolidationResult:
     with connect(db_url, application_name="hindsight-consolidation") as conn:
         with conn.transaction():
-            conn.execute(
-                """
-                    UPDATE memory_decisions
-                    SET status = 'failed', sealed_at = COALESCE(sealed_at, now())
-                    WHERE id = %s AND status = 'open'
-                """,
-                (decision_id,),
+            job = _lock_current_lease(
+                conn,
+                job_id=job_id,
+                lease_owner=lease_owner,
             )
+            _fail_open_decision(
+                conn,
+                decision_id=job.get("decision_id"),
+            )
+            row = conn.execute(
+                """
+                    UPDATE consolidation_jobs
+                    SET status = 'failed', reason = %s, completed_at = now(),
+                        updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+                    WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        AND lease_expires_at > now()
+                    RETURNING id
+                """,
+                (reason[:1000], job_id, lease_owner),
+            ).fetchone()
+            if row is None:
+                raise ConsolidationLeaseLostError(
+                    f"consolidation lease is no longer current: {job_id}"
+                )
+    return _result_for_job(job=_get_job(job_id=job_id, db_url=db_url), db_url=db_url)
+
+
+def _fail_open_decision(conn: Any, *, decision_id: str | None) -> None:
+    if decision_id is None:
+        return
+    conn.execute(
+        """
+            UPDATE memory_decisions
+            SET status = 'failed', sealed_at = COALESCE(sealed_at, now())
+            WHERE id = %s AND status = 'open'
+        """,
+        (decision_id,),
+    )
 
 
 def _get_job(*, job_id: str, db_url: str) -> dict[str, Any]:

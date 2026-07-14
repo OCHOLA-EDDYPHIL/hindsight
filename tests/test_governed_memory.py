@@ -155,6 +155,73 @@ def test_memory_payload_and_provenance_fields_are_database_immutable():
 
 
 @requires_db
+def test_terminal_producer_decisions_reject_all_new_outputs():
+    from psycopg import errors
+
+    from hindsight.db import connect
+    from hindsight.memory import MemoryStore, Provenance, ProvenanceError
+
+    with connect() as conn:
+        for status in ("sealed", "failed"):
+            decision_id = f"terminal-producer:{status}:{uuid4()}"
+            with conn.transaction():
+                store = MemoryStore(conn=conn)
+                store.open_decision(
+                    decision_id=decision_id,
+                    actor="pytest",
+                    decision_kind="test_output",
+                    purpose="verify terminal producer rejection",
+                )
+                store.seal_decision(
+                    decision_id=decision_id, failed=status == "failed"
+                )
+            store = MemoryStore(conn=conn)
+            with pytest.raises(ProvenanceError, match="decision is not open"):
+                store.remember(
+                    memory_kind="semantic",
+                    namespace=f"terminal-{uuid4()}",
+                    content="must not be written",
+                    provenance=Provenance(
+                        "pytest", "evidence:terminal", "terminal decision test"
+                    ),
+                    producer_decision_id=decision_id,
+                )
+            with pytest.raises(ProvenanceError, match="decision is not open"):
+                store.remember(
+                    memory_kind="episodic",
+                    episode_id=f"terminal-{uuid4()}",
+                    role="assistant",
+                    content="must not be written",
+                    provenance=Provenance(
+                        "pytest", "evidence:terminal", "terminal decision test"
+                    ),
+                    producer_decision_id=decision_id,
+                )
+            assert conn.execute(
+                "SELECT count(*) FROM semantic_memories WHERE producer_decision_id = %s",
+                (decision_id,),
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM episodic_memories WHERE producer_decision_id = %s",
+                (decision_id,),
+            ).fetchone() == (0,)
+            with pytest.raises(errors.RaiseException, match="must be open"):
+                conn.execute(
+                    """
+                        INSERT INTO episodic_memories (
+                            episode_id, role, content, writer, source_ref, justification,
+                            producer_decision_id, content_schema, structured_payload,
+                            payload_digest, lineage_status, trust_status
+                        ) VALUES (%s, 'assistant', 'direct SQL output', 'pytest',
+                                  'evidence:direct', 'trigger test', %s,
+                                  'episodic.v1', '{}'::JSONB, 'digest', 'complete', 'active')
+                    """,
+                    (f"terminal-direct-{uuid4()}", decision_id),
+                )
+            conn.rollback()
+
+
+@requires_db
 def test_evolution_supersession_quarantines_cross_namespace_descendants_for_review():
     from hindsight.db import database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
@@ -251,6 +318,207 @@ def test_evolution_supersession_quarantines_cross_namespace_descendants_for_revi
         assert len(confirmed) == 1
         assert confirmed[0]["content"] == child["content"]
         assert confirmed[0]["trust_status"] == "active"
+
+
+@requires_db
+def test_review_retraction_resolves_every_closed_descendant_item():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import (
+        enqueue_operation,
+        execute_operation,
+        preview_review_resolution,
+        preview_supersession,
+    )
+
+    provider = DeterministicEmbeddingProvider()
+    namespaces = [f"review-closure-{index}-{uuid4()}" for index in range(3)]
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        root = store.remember(
+            memory_kind="semantic",
+            namespace=namespaces[0],
+            content="root threshold",
+            provenance=Provenance("pytest", "evidence:root", "root"),
+        )
+        parent = root
+        descendants = []
+        for index in range(1, 3):
+            decision_id = f"review-chain:{uuid4()}"
+            store.record_read(
+                decision_id=decision_id,
+                memory_kind="semantic",
+                memory_id=str(parent["id"]),
+                reader="pytest",
+                purpose="derive review chain",
+            )
+            parent = store.remember(
+                memory_kind="semantic",
+                namespace=namespaces[index],
+                content=f"descendant {index}",
+                provenance=Provenance("pytest", f"evidence:{index}", "descendant"),
+                producer_decision_id=decision_id,
+                parent_memory_ids=[str(parent["id"])],
+            )
+            descendants.append(parent)
+    evolution = preview_supersession(
+        root_memory_id=str(root["id"]),
+        intent="evolution",
+        content="evolved root threshold",
+        structured_payload={"threshold": "evolved"},
+        actor="pytest.operator",
+        reason="evolve root",
+        authorized_namespaces=namespaces,
+        db_url=database_url(),
+    )
+    operation, _ = enqueue_operation(
+        preview_id=str(evolution["id"]),
+        fingerprint=evolution["fingerprint"],
+        idempotency_key=f"review-evolution:{uuid4()}",
+        db_url=database_url(),
+    )
+    execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest",
+        db_url=database_url(),
+    )
+    with MemoryStore(url=database_url()) as store:
+        items = store._fetch_all(  # noqa: SLF001
+            """
+                SELECT * FROM memory_review_items
+                WHERE semantic_memory_id = ANY(%s) ORDER BY semantic_memory_id
+            """,
+            ([str(row["id"]) for row in descendants],),
+        )
+    selected = next(
+        row for row in items if str(row["semantic_memory_id"]) == str(descendants[0]["id"])
+    )
+    preview = preview_review_resolution(
+        review_item_id=str(selected["id"]),
+        action="retracted",
+        actor="pytest.operator",
+        reason="retract invalid descendant chain",
+        authorized_namespaces=namespaces,
+        db_url=database_url(),
+    )
+    retraction, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=preview["fingerprint"],
+        idempotency_key=f"review-retraction:{uuid4()}",
+        db_url=database_url(),
+    )
+    result = execute_operation(
+        operation_id=str(retraction["id"]),
+        embedding_provider=provider,
+        worker_id="pytest",
+        db_url=database_url(),
+    )
+    assert result["status"] == "completed"
+    with MemoryStore(url=database_url()) as store:
+        resolved = store._fetch_all(  # noqa: SLF001
+            "SELECT * FROM memory_review_items WHERE id = ANY(%s) ORDER BY id",
+            ([str(row["id"]) for row in items],),
+        )
+        assert {row["status"] for row in resolved} == {"retracted"}
+        assert {str(row["resolution_operation_id"]) for row in resolved} == {
+            str(retraction["id"])
+        }
+        for descendant in descendants:
+            assert store.audit_memory(
+                memory_kind="semantic", memory_id=str(descendant["id"])
+            )["t_invalid"] is not None
+
+
+@requires_db
+def test_review_retraction_rejects_an_already_closed_reviewed_memory():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import (
+        OperationConflictError,
+        enqueue_operation,
+        execute_operation,
+        preview_review_resolution,
+        preview_supersession,
+    )
+
+    provider = DeterministicEmbeddingProvider()
+    namespaces = [f"stale-review-{index}-{uuid4()}" for index in range(2)]
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        root = store.remember(
+            memory_kind="semantic",
+            namespace=namespaces[0],
+            content="root threshold",
+            provenance=Provenance("pytest", "evidence:root", "root"),
+        )
+    decision_id = f"stale-review-child:{uuid4()}"
+    with MemoryStore(url=database_url()) as store:
+        store.record_read(
+            decision_id=decision_id,
+            memory_kind="semantic",
+            memory_id=str(root["id"]),
+            reader="pytest",
+            purpose="derive reviewed child",
+        )
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        child = store.remember(
+            memory_kind="semantic",
+            namespace=namespaces[1],
+            content="derived threshold",
+            provenance=Provenance("pytest", "evidence:child", "child"),
+            producer_decision_id=decision_id,
+            parent_memory_ids=[str(root["id"])],
+        )
+    evolution = preview_supersession(
+        root_memory_id=str(root["id"]),
+        intent="evolution",
+        content="evolved root threshold",
+        structured_payload={"threshold": "evolved"},
+        actor="pytest.operator",
+        reason="evolve root",
+        authorized_namespaces=namespaces,
+        db_url=database_url(),
+    )
+    operation, _ = enqueue_operation(
+        preview_id=str(evolution["id"]),
+        fingerprint=evolution["fingerprint"],
+        idempotency_key=f"stale-review-evolution:{uuid4()}",
+        db_url=database_url(),
+    )
+    execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest",
+        db_url=database_url(),
+    )
+    with MemoryStore(url=database_url()) as store:
+        item = store._fetch_one(  # noqa: SLF001
+            "SELECT * FROM memory_review_items WHERE semantic_memory_id = %s",
+            (child["id"],),
+        )
+    with MemoryStore(url=database_url()) as store:
+        store.invalidate(
+            memory_id=str(child["id"]),
+            actor="pytest.operator",
+            reason="closed outside the review flow",
+        )
+
+    with pytest.raises(OperationConflictError, match="no longer current"):
+        preview_review_resolution(
+            review_item_id=str(item["id"]),
+            action="retracted",
+            actor="pytest.operator",
+            reason="reject stale review action",
+            authorized_namespaces=namespaces,
+            db_url=database_url(),
+        )
+    with MemoryStore(url=database_url()) as store:
+        unchanged = store._fetch_one(  # noqa: SLF001
+            "SELECT status FROM memory_review_items WHERE id = %s",
+            (item["id"],),
+        )
+        assert unchanged["status"] == "open"
 
 
 @requires_db
@@ -380,6 +648,139 @@ def test_stale_operation_preview_conflicts_without_partial_mutation():
     with MemoryStore(url=database_url()) as store:
         unchanged = store.audit_memory(memory_kind="semantic", memory_id=str(root["id"]))
         assert unchanged["t_invalid"] is None
+
+
+@requires_db
+def test_empty_rewind_preview_locks_the_first_namespace_revision():
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
+
+    provider = DeterministicEmbeddingProvider()
+    namespace = f"empty-rewind-{uuid4()}"
+    with connect() as conn:
+        target = conn.execute("SELECT now()").fetchone()[0]
+    sleep(0.02)
+    preview = preview_rewind(
+        namespace=namespace,
+        target_timestamp=target,
+        actor="pytest.operator",
+        reason="preview an empty namespace",
+        db_url=database_url(),
+    )
+    assert preview["expected_revisions"] == {namespace: 0}
+
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        late = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="first write after the empty preview",
+            provenance=Provenance("pytest", "evidence:late", "late first write"),
+        )
+    operation, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=preview["fingerprint"],
+        idempotency_key=f"empty-rewind:{uuid4()}",
+        db_url=database_url(),
+    )
+    result = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest",
+        db_url=database_url(),
+    )
+    assert result["status"] == "conflict"
+    assert result["failure_detail"] == "namespace revision changed after preview"
+    with MemoryStore(url=database_url()) as store:
+        assert store.audit_memory(
+            memory_kind="semantic", memory_id=str(late["id"])
+        )["t_invalid"] is None
+
+
+@requires_db
+def test_cross_namespace_descendant_after_preview_conflicts_via_parent_revision():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import enqueue_operation, execute_operation, preview_retraction
+
+    provider = DeterministicEmbeddingProvider()
+    root_namespace = f"preview-root-{uuid4()}"
+    child_namespace = f"preview-child-{uuid4()}"
+    future_namespace = f"preview-future-{uuid4()}"
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        root = store.remember(
+            memory_kind="semantic",
+            namespace=root_namespace,
+            content="root belief",
+            provenance=Provenance("pytest", "evidence:root", "root"),
+        )
+        child_decision = f"preview-child:{uuid4()}"
+        store.record_read(
+            decision_id=child_decision,
+            memory_kind="semantic",
+            memory_id=str(root["id"]),
+            reader="pytest",
+            purpose="derive child",
+        )
+        child = store.remember(
+            memory_kind="semantic",
+            namespace=child_namespace,
+            content="child belief",
+            provenance=Provenance("pytest", "evidence:child", "child"),
+            producer_decision_id=child_decision,
+            parent_memory_ids=[str(root["id"])],
+        )
+    preview = preview_retraction(
+        root_memory_id=str(root["id"]),
+        actor="pytest.operator",
+        reason="preview causal closure",
+        authorized_namespaces=[root_namespace, child_namespace],
+        db_url=database_url(),
+    )
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        grandchild_decision = f"preview-grandchild:{uuid4()}"
+        store.record_read(
+            decision_id=grandchild_decision,
+            memory_kind="semantic",
+            memory_id=str(child["id"]),
+            reader="pytest",
+            purpose="derive after preview",
+        )
+        grandchild = store.remember(
+            memory_kind="semantic",
+            namespace=future_namespace,
+            content="late descendant",
+            provenance=Provenance("pytest", "evidence:late", "late descendant"),
+            producer_decision_id=grandchild_decision,
+            parent_memory_ids=[str(child["id"])],
+        )
+    with MemoryStore(url=database_url()) as store:
+        child_revision = store._fetch_one(  # noqa: SLF001
+            "SELECT revision FROM memory_namespaces WHERE namespace = %s",
+            (child_namespace,),
+        )["revision"]
+    assert child_revision > preview["expected_revisions"][child_namespace]
+    operation, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=preview["fingerprint"],
+        idempotency_key=f"preview-cross-namespace:{uuid4()}",
+        db_url=database_url(),
+    )
+    result = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest",
+        db_url=database_url(),
+    )
+    assert result["status"] == "conflict"
+    assert result["failure_detail"] == "namespace revision changed after preview"
+    with MemoryStore(url=database_url()) as store:
+        for memory in (root, child, grandchild):
+            assert store.audit_memory(
+                memory_kind="semantic", memory_id=str(memory["id"])
+            )["t_invalid"] is None
 
 
 @requires_db

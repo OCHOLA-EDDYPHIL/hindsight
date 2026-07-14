@@ -386,6 +386,9 @@ class MemoryStore:
                 limit,
             ),
         )
+        rows = _project_historical_rows(
+            rows, system_as_of=system_as_of, valid_at=resolved_valid_at
+        )
         self._record_with_context(rows, memory_kind="semantic", context=read_context)
         return rows
 
@@ -454,6 +457,9 @@ class MemoryStore:
                 f"%{_escape_like(query)}%",
                 limit,
             ),
+        )
+        rows = _project_historical_rows(
+            rows, system_as_of=system_as_of, valid_at=resolved_valid_at
         )
         self._record_with_context(rows, memory_kind="semantic", context=read_context)
         return rows
@@ -856,6 +862,10 @@ class MemoryStore:
                 purpose=provenance.justification,
                 namespace=episode_id,
             )
+            classified_reads = self._prepare_output_reads(
+                producer_decision_id=producer_id,
+                parent_memory_ids=parent_memory_ids,
+            )
             query = """
                 INSERT INTO episodic_memories (
                     id, episode_id, role, content, metadata, t_valid,
@@ -865,7 +875,7 @@ class MemoryStore:
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s,
-                    %s, %s, %s, %s, 'building', 'active'
+                    %s, %s, %s, %s, 'complete', 'active'
                 )
                 RETURNING *
             """
@@ -891,13 +901,12 @@ class MemoryStore:
                 provenance=provenance,
                 observed_at=t_valid,
             )
-            self._classify_output_reads(
+            self._insert_output_lineage(
                 memory_kind="episodic",
                 memory_id=str(memory_id),
                 producer_decision_id=producer_id,
-                parent_memory_ids=parent_memory_ids,
+                classified_reads=classified_reads,
             )
-            self._complete_memory_lineage(memory_kind="episodic", memory_id=str(memory_id))
             self._seal_decision(producer_id)
             set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
             return self.audit_memory(memory_kind="episodic", memory_id=str(memory_id)) or memory
@@ -946,6 +955,17 @@ class MemoryStore:
                 purpose=provenance.justification,
                 namespace=namespace,
             )
+            classified_reads = self._prepare_output_reads(
+                producer_decision_id=producer_id,
+                parent_memory_ids=parent_memory_ids,
+                parent_edge_type="reasserted_from"
+                if transition_kind == "rewind_reassertion"
+                else "derived",
+            )
+            revision_namespaces = self._lock_output_namespaces(
+                namespace=namespace,
+                classified_reads=classified_reads,
+            )
             embedding = None
             profile = None
             if self._embedding_provider is not None:
@@ -968,7 +988,7 @@ class MemoryStore:
                     %s, %s,
                     COALESCE((SELECT max(version_number) + 1 FROM semantic_memories WHERE belief_id = %s), 1),
                     %s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s,
-                    %s, %s, %s, %s, %s, 'building', 'active', %s
+                    %s, %s, %s, %s, %s, 'complete', 'active', %s
                 )
                 RETURNING *
             """
@@ -995,14 +1015,6 @@ class MemoryStore:
             def write_row() -> dict[str, Any]:
                 self._conn.execute(
                     """
-                        INSERT INTO memory_namespaces (namespace)
-                        VALUES (%s)
-                        ON CONFLICT (namespace) DO NOTHING
-                    """,
-                    (namespace,),
-                )
-                self._conn.execute(
-                    """
                         INSERT INTO semantic_beliefs (id, namespace)
                         VALUES (%s, %s)
                         ON CONFLICT (id) DO NOTHING
@@ -1024,24 +1036,20 @@ class MemoryStore:
                     provenance=provenance,
                     observed_at=t_valid,
                 )
-                self._classify_output_reads(
+                self._insert_output_lineage(
                     memory_kind="semantic",
                     memory_id=str(memory_id),
                     producer_decision_id=producer_id,
-                    parent_memory_ids=parent_memory_ids,
-                    parent_edge_type="reasserted_from"
-                    if transition_kind == "rewind_reassertion"
-                    else "derived",
+                    classified_reads=classified_reads,
                 )
-                self._complete_memory_lineage(memory_kind="semantic", memory_id=str(memory_id))
                 self._seal_decision(producer_id)
                 self._conn.execute(
                     """
                         UPDATE memory_namespaces
                         SET revision = revision + 1, updated_at = now()
-                        WHERE namespace = %s
+                        WHERE namespace = ANY(%s)
                     """,
-                    (namespace,),
+                    (revision_namespaces,),
                 )
                 return row
 
@@ -1658,7 +1666,6 @@ class MemoryStore:
                     semantic_memory_id, belief_id
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (decision_id) DO UPDATE SET decision_id = excluded.decision_id
                 RETURNING *
             """,
             (
@@ -1675,6 +1682,51 @@ class MemoryStore:
                 memory["belief_id"],
             ),
         )
+
+    def remember_agent_reflection(
+        self,
+        *,
+        decision_id: str,
+        run_id: str,
+        thread_id: str,
+        incident_id: str,
+        namespace: str,
+        service_slug: str | None,
+        plan: str,
+        proposed_action: str,
+        action_approved: bool,
+        content: str,
+        metadata: dict[str, Any],
+        structured_payload: dict[str, Any],
+        provenance: Provenance,
+        parent_memory_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        """Atomically persist a reflection memory and its typed projection."""
+
+        with self._conn.transaction():
+            memory = self.write_semantic(
+                namespace=namespace,
+                content=content,
+                provenance=provenance,
+                metadata=metadata,
+                content_schema="agent_reflection.v1",
+                structured_payload=structured_payload,
+                producer_decision_id=decision_id,
+                parent_memory_ids=parent_memory_ids,
+            )
+            self.record_agent_reflection(
+                decision_id=decision_id,
+                run_id=run_id,
+                thread_id=thread_id,
+                incident_id=incident_id,
+                namespace=namespace,
+                service_slug=service_slug,
+                plan=plan,
+                proposed_action=proposed_action,
+                action_approved=action_approved,
+                memory=memory,
+            )
+            return memory
 
     def record_read(
         self,
@@ -1936,17 +1988,26 @@ class MemoryStore:
                 Jsonb(metadata or {}),
             ),
         )
+        decision = self._fetch_optional(
+            "SELECT status FROM memory_decisions WHERE id = %s FOR UPDATE",
+            (decision_id,),
+        )
+        if decision is None or decision["status"] != "open":
+            raise ProvenanceError(f"decision is not open: {decision_id}")
 
     def _seal_decision(self, decision_id: str, *, failed: bool = False) -> None:
         status = "failed" if failed else "sealed"
-        self._conn.execute(
+        row = self._conn.execute(
             """
                 UPDATE memory_decisions
                 SET status = %s, sealed_at = COALESCE(sealed_at, now())
                 WHERE id = %s AND status = 'open'
+                RETURNING id
             """,
             (status, decision_id),
-        )
+        ).fetchone()
+        if row is None:
+            raise ProvenanceError(f"decision is not open: {decision_id}")
 
     def _insert_external_evidence(
         self,
@@ -1983,15 +2044,13 @@ class MemoryStore:
             ),
         )
 
-    def _classify_output_reads(
+    def _prepare_output_reads(
         self,
         *,
-        memory_kind: MemoryKind,
-        memory_id: str,
         producer_decision_id: str,
         parent_memory_ids: Iterable[str] | None,
         parent_edge_type: Literal["derived", "reasserted_from"] = "derived",
-    ) -> None:
+    ) -> list[tuple[dict[str, Any], str]]:
         parents = {str(value) for value in (parent_memory_ids or [])}
         reads = self._fetch_all(
             "SELECT * FROM memory_reads WHERE decision_id = %s ORDER BY read_at, id",
@@ -2003,10 +2062,23 @@ class MemoryStore:
             raise ProvenanceError(
                 "derived parent was not read by producer decision: " + ", ".join(sorted(missing))
             )
-        for read in reads:
-            edge_type = (
-                parent_edge_type if str(read["memory_id"]) in parents else "context"
+        return [
+            (
+                read,
+                parent_edge_type if str(read["memory_id"]) in parents else "context",
             )
+            for read in reads
+        ]
+
+    def _insert_output_lineage(
+        self,
+        *,
+        memory_kind: MemoryKind,
+        memory_id: str,
+        producer_decision_id: str,
+        classified_reads: list[tuple[dict[str, Any], str]],
+    ) -> None:
+        for read, edge_type in classified_reads:
             self._conn.execute(
                 """
                     INSERT INTO memory_lineage_edges (
@@ -2027,12 +2099,44 @@ class MemoryStore:
                 ),
             )
 
-    def _complete_memory_lineage(self, *, memory_kind: MemoryKind, memory_id: str) -> None:
-        table = self._table_for_kind(memory_kind)
+    def _lock_output_namespaces(
+        self,
+        *,
+        namespace: str,
+        classified_reads: list[tuple[dict[str, Any], str]],
+    ) -> list[str]:
         self._conn.execute(
-            f"UPDATE {table} SET lineage_status = 'complete' WHERE id = %s",
-            (memory_id,),
+            """
+                INSERT INTO memory_namespaces (namespace)
+                VALUES (%s)
+                ON CONFLICT (namespace) DO NOTHING
+            """,
+            (namespace,),
         )
+        causal_parent_ids = [
+            str(read["semantic_memory_id"])
+            for read, edge_type in classified_reads
+            if edge_type in {"derived", "reasserted_from"}
+            and read.get("semantic_memory_id") is not None
+        ]
+        namespaces = {namespace}
+        if causal_parent_ids:
+            rows = self._fetch_all(
+                "SELECT DISTINCT namespace FROM semantic_memories WHERE id = ANY(%s)",
+                (causal_parent_ids,),
+            )
+            namespaces.update(str(row["namespace"]) for row in rows)
+        ordered = sorted(namespaces)
+        self._fetch_all(
+            """
+                SELECT namespace FROM memory_namespaces
+                WHERE namespace = ANY(%s)
+                ORDER BY namespace
+                FOR UPDATE
+            """,
+            (ordered,),
+        )
+        return ordered
 
     def _record_memory_operation(
         self,
@@ -2099,7 +2203,7 @@ class MemoryStore:
             ),
         )
         state = self._fetch_one(
-            "SELECT * FROM embedding_index_state WHERE singleton = true FOR UPDATE",
+            "SELECT * FROM embedding_index_state WHERE singleton = true",
             (),
         )
         active_profile_id = state.get("active_profile_id")
@@ -2120,37 +2224,33 @@ class MemoryStore:
                 )
         else:
             resolved_profile = profile or embedding_profile(self._embedding_provider)
-        self._conn.execute(
-            """
-                INSERT INTO embedding_profiles (
-                    id, provider, model, dimensions, capability,
-                    encoder_revision, configuration, max_distance, status
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'building')
-                ON CONFLICT (id) DO NOTHING
-            """,
-            (
-                resolved_profile.profile_id,
-                resolved_profile.provider,
-                resolved_profile.model,
-                resolved_profile.dimensions,
-                resolved_profile.capability,
-                resolved_profile.encoder_revision,
-                Jsonb(dict(resolved_profile.configuration)),
-                resolved_profile.max_distance,
-            ),
-        )
+        if active_profile_id is None:
+            self._conn.execute(
+                """
+                    INSERT INTO embedding_profiles (
+                        id, provider, model, dimensions, capability,
+                        encoder_revision, configuration, max_distance, status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'building')
+                    ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    resolved_profile.profile_id,
+                    resolved_profile.provider,
+                    resolved_profile.model,
+                    resolved_profile.dimensions,
+                    resolved_profile.capability,
+                    resolved_profile.encoder_revision,
+                    Jsonb(dict(resolved_profile.configuration)),
+                    resolved_profile.max_distance,
+                ),
+            )
         self._conn.execute(
             f"""
                 INSERT INTO semantic_memory_vectors (
                     memory_id, profile_id, namespace, content_digest, embedding
                 )
                 VALUES (%s, %s, %s, %s, %s::VECTOR({EMBEDDING_DIMENSIONS}))
-                ON CONFLICT (memory_id, profile_id) DO UPDATE SET
-                    namespace = excluded.namespace,
-                    content_digest = excluded.content_digest,
-                    embedding = excluded.embedding,
-                    embedded_at = now()
             """,
             (
                 memory_id,
@@ -2319,6 +2419,30 @@ def _payload_digest(
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _project_historical_rows(
+    rows: list[dict[str, Any]], *, system_as_of: datetime, valid_at: datetime
+) -> list[dict[str, Any]]:
+    projected = []
+    for source in rows:
+        row = dict(source)
+        invalidated_at = row.get("invalidated_at")
+        known = invalidated_at is not None and invalidated_at <= system_as_of
+        t_invalid = row.get("t_invalid")
+        row["snapshot_invalidated"] = bool(
+            known and t_invalid is not None and t_invalid <= valid_at
+        )
+        if not known:
+            for field in (
+                "t_invalid",
+                "invalidated_at",
+                "invalidated_by",
+                "invalidation_reason",
+            ):
+                row[field] = None
+        projected.append(row)
+    return projected
 
 
 def _hosted_runtime() -> bool:

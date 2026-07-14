@@ -1,4 +1,40 @@
 INSERT INTO memory_decisions (
+    id, actor, decision_kind, purpose, run_id, namespace, status,
+    opened_at, sealed_at, metadata
+)
+SELECT
+    decision_id,
+    'agent.run',
+    'agent_plan',
+    'Backfill durable agent run decision',
+    id,
+    namespace,
+    CASE
+        WHEN status = 'failed' THEN 'failed'
+        WHEN status IN ('completed', 'rejected') THEN 'sealed'
+        ELSE 'open'
+    END,
+    created_at,
+    CASE WHEN status IN ('completed', 'rejected', 'failed')
+        THEN COALESCE(completed_at, updated_at) END,
+    jsonb_build_object('migrated_from', 'agent_runs')
+FROM agent_runs
+ON CONFLICT (id) DO UPDATE SET
+    actor = excluded.actor,
+    decision_kind = excluded.decision_kind,
+    purpose = excluded.purpose,
+    run_id = excluded.run_id,
+    namespace = excluded.namespace,
+    status = excluded.status,
+    opened_at = excluded.opened_at,
+    sealed_at = excluded.sealed_at,
+    metadata = memory_decisions.metadata || excluded.metadata
+WHERE memory_decisions.actor = 'legacy.import'
+    AND memory_decisions.decision_kind = 'legacy_read'
+    AND memory_decisions.purpose = 'Backfill pre-governance memory read identity'
+    AND memory_decisions.status = 'sealed';
+
+INSERT INTO memory_decisions (
     id, actor, decision_kind, purpose, status, sealed_at
 )
 SELECT DISTINCT
@@ -10,23 +46,6 @@ SELECT DISTINCT
     now()
 FROM memory_reads
 ON CONFLICT (id) DO NOTHING;
-
-INSERT INTO memory_decisions (
-    id, actor, decision_kind, purpose, run_id, namespace, status, sealed_at
-)
-SELECT
-    decision_id,
-    'agent.run',
-    'agent_plan',
-    'Backfill durable agent run decision',
-    id,
-    namespace,
-    CASE WHEN status IN ('completed', 'rejected', 'failed') THEN 'sealed' ELSE 'open' END,
-    CASE WHEN status IN ('completed', 'rejected', 'failed') THEN COALESCE(completed_at, updated_at) END
-FROM agent_runs
-ON CONFLICT (id) DO UPDATE SET
-    run_id = excluded.run_id,
-    namespace = excluded.namespace;
 
 INSERT INTO memory_decisions (
     id, actor, decision_kind, purpose, namespace, status, sealed_at

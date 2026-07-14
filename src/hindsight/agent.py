@@ -370,9 +370,16 @@ def build_incident_graph(
                     "retrieval_id": state.get("retrieval_id"),
                     "recalled_memory_ids": parent_memory_ids,
                 }
-                memory = store.remember(
-                    memory_kind="semantic",
+                memory = store.remember_agent_reflection(
+                    decision_id=state["decision_id"],
+                    run_id=state["run_id"],
+                    thread_id=state["thread_id"],
+                    incident_id=state["incident_id"],
                     namespace=state["namespace"],
+                    service_slug=state.get("service_slug"),
+                    plan=str(structured_payload["plan"]),
+                    proposed_action=str(structured_payload["proposed_action"]),
+                    action_approved=bool(structured_payload["action_approved"]),
                     content=content,
                     provenance=Provenance(
                         writer="agent.reflect",
@@ -386,22 +393,8 @@ def build_incident_graph(
                         "recalled_memory_ids": parent_memory_ids,
                         "action_approved": state.get("action_approved", False),
                     },
-                    content_schema="agent_reflection.v1",
                     structured_payload=structured_payload,
-                    producer_decision_id=state["decision_id"],
                     parent_memory_ids=parent_memory_ids,
-                )
-                store.record_agent_reflection(
-                    decision_id=state["decision_id"],
-                    run_id=state["run_id"],
-                    thread_id=state["thread_id"],
-                    incident_id=state["incident_id"],
-                    namespace=state["namespace"],
-                    service_slug=state.get("service_slug"),
-                    plan=str(structured_payload["plan"]),
-                    proposed_action=str(structured_payload["proposed_action"]),
-                    action_approved=bool(structured_payload["action_approved"]),
-                    memory=memory,
                 )
             history = _chat_history(
                 thread_id=state["thread_id"],

@@ -449,6 +449,70 @@ def test_as_of_recall_does_not_commit_caller_transaction():
 
 
 @requires_db
+def test_historical_projection_hides_unknown_and_marks_future_invalidation_current():
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"historical-projection-{uuid4()}"
+    with MemoryStore(url=database_url()) as store:
+        unknown = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="future invalidation is not known yet",
+            provenance=Provenance("pytest", "evidence:unknown", "historical projection"),
+        )
+    with connect() as conn:
+        before_invalidation = conn.execute("SELECT now()").fetchone()[0]
+    sleep(0.02)
+    with MemoryStore(url=database_url()) as store:
+        store.invalidate(
+            memory_id=str(unknown["id"]),
+            actor="pytest",
+            reason="invalidate after historical snapshot",
+        )
+        scheduled = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="known invalidation takes effect later",
+            provenance=Provenance("pytest", "evidence:scheduled", "scheduled invalidation"),
+        )
+        with connect() as conn:
+            valid_at = conn.execute("SELECT now()").fetchone()[0]
+        future_valid_time = valid_at + timedelta(hours=1)
+        store.invalidate(
+            memory_id=str(scheduled["id"]),
+            actor="pytest",
+            reason="scheduled invalidation",
+            t_invalid=future_valid_time,
+        )
+    with connect() as conn:
+        system_after_schedule = conn.execute("SELECT now()").fetchone()[0]
+
+    with MemoryStore(url=database_url()) as store:
+        old_rows = store.list_semantic_as_of(
+            namespace=namespace,
+            system_as_of=before_invalidation,
+            valid_at=before_invalidation,
+        )
+        scheduled_rows = store.search_semantic_text_as_of(
+            namespace=namespace,
+            query="known invalidation",
+            system_as_of=system_after_schedule,
+            valid_at=valid_at,
+        )
+
+    old = next(row for row in old_rows if row["id"] == unknown["id"])
+    assert old["snapshot_invalidated"] is False
+    assert old["t_invalid"] is None
+    assert old["invalidated_at"] is None
+    assert old["invalidation_reason"] is None
+    assert len(scheduled_rows) == 1
+    assert scheduled_rows[0]["snapshot_invalidated"] is False
+    assert scheduled_rows[0]["t_invalid"] == future_valid_time
+    assert scheduled_rows[0]["invalidated_at"] is not None
+
+
+@requires_db
 def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider

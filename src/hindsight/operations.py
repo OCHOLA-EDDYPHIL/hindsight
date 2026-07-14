@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
@@ -48,43 +49,27 @@ def preview_rewind(
             limit=None,
             query=None,
         )
-        current = store.list_current_semantic(namespace=namespace, limit=100_000)
-    target_by_belief = {str(row["belief_id"]): row for row in target}
-    current_by_belief = {str(row["belief_id"]): row for row in current}
-    close_ids = sorted(
-        str(row["id"])
-        for belief_id, row in current_by_belief.items()
-        if belief_id not in target_by_belief
-        or str(target_by_belief[belief_id]["id"]) != str(row["id"])
-    )
-    reassertions = [
-        {
-            "source_memory_id": str(row["id"]),
-            "belief_id": belief_id,
-            "previous_version_id": str(current_by_belief[belief_id]["id"])
-            if belief_id in current_by_belief
-            else str(row["id"]),
-        }
-        for belief_id, row in sorted(target_by_belief.items())
-        if belief_id not in current_by_belief
-        or str(current_by_belief[belief_id]["id"]) != str(row["id"])
-    ]
-    request = {
-        "namespace": namespace,
-        "target_timestamp": _utc(target_timestamp).isoformat(),
-        "reason": reason,
-    }
-    effect = {
-        "target_memory_ids": sorted(str(row["id"]) for row in target),
-        "close_memory_ids": close_ids,
-        "reassertions": reassertions,
-    }
+
+    def build(cur: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        current = _current_semantic(cur, namespace=namespace)
+        effect = _rewind_effect(target=target, current=current)
+        effect["review_resolutions"] = _review_resolutions(
+            cur, memory_ids=effect["close_memory_ids"], status="superseded"
+        )
+        return (
+            {
+                "namespace": namespace,
+                "target_timestamp": _utc(target_timestamp).isoformat(),
+                "reason": reason,
+            },
+            effect,
+        )
+
     return _persist_preview(
         operation_type="rewind",
         actor=actor,
-        request=request,
-        effect=effect,
-        namespaces=[namespace],
+        lock_namespaces=[namespace],
+        build=build,
         db_url=resolved_url,
     )
 
@@ -100,27 +85,34 @@ def preview_retraction(
     """Persist a strict cross-namespace causal retraction preview."""
 
     resolved_url = db_url or database_url()
-    closure = _causal_closure(root_memory_id=root_memory_id, db_url=resolved_url)
-    if not closure:
-        raise LookupError(f"semantic memory not found: {root_memory_id}")
-    _require_complete_lineage(closure)
-    namespaces = sorted({str(row["namespace"]) for row in closure})
-    missing = set(namespaces) - set(authorized_namespaces)
-    if missing:
-        raise OperationAuthorizationError(
-            "cross-namespace authorization missing: " + ", ".join(sorted(missing))
+
+    def build(cur: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        closure = _causal_closure_with_cursor(cur, root_memory_id=root_memory_id)
+        if not closure:
+            raise LookupError(f"semantic memory not found: {root_memory_id}")
+        _require_complete_lineage(closure)
+        _require_authorized(closure, authorized_namespaces)
+        close_ids = [str(row["id"]) for row in closure]
+        return (
+            {
+                "root_memory_id": root_memory_id,
+                "namespace": str(closure[0]["namespace"]),
+                "reason": reason,
+                "authorized_namespaces": sorted(set(authorized_namespaces)),
+            },
+            {
+                "close_memory_ids": close_ids,
+                "review_resolutions": _review_resolutions(
+                    cur, memory_ids=close_ids, status="superseded"
+                ),
+            },
         )
+
     return _persist_preview(
         operation_type="retraction",
         actor=actor,
-        request={
-            "root_memory_id": root_memory_id,
-            "namespace": str(closure[0]["namespace"]),
-            "reason": reason,
-            "authorized_namespaces": sorted(set(authorized_namespaces)),
-        },
-        effect={"close_memory_ids": [str(row["id"]) for row in closure]},
-        namespaces=namespaces,
+        lock_namespaces=authorized_namespaces,
+        build=build,
         db_url=resolved_url,
     )
 
@@ -141,47 +133,52 @@ def preview_supersession(
     if intent not in {"correction", "evolution"}:
         raise ValueError(f"unsupported supersession intent: {intent}")
     resolved_url = db_url or database_url()
-    closure = _causal_closure(root_memory_id=root_memory_id, db_url=resolved_url)
-    if not closure:
-        raise LookupError(f"semantic memory not found: {root_memory_id}")
-    _require_complete_lineage(closure)
-    root = closure[0]
-    descendants = [row for row in closure if str(row["id"]) != root_memory_id]
-    affected = closure if intent == "correction" else [root, *descendants]
-    namespaces = sorted({str(row["namespace"]) for row in affected})
-    missing = set(namespaces) - set(authorized_namespaces)
-    if missing:
-        raise OperationAuthorizationError(
-            "cross-namespace authorization missing: " + ", ".join(sorted(missing))
+
+    def build(cur: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        closure = _causal_closure_with_cursor(cur, root_memory_id=root_memory_id)
+        if not closure:
+            raise LookupError(f"semantic memory not found: {root_memory_id}")
+        _require_complete_lineage(closure)
+        _require_authorized(closure, authorized_namespaces)
+        root = closure[0]
+        descendants = [row for row in closure if str(row["id"]) != root_memory_id]
+        close_ids = (
+            [str(row["id"]) for row in closure]
+            if intent == "correction"
+            else [root_memory_id]
         )
-    effect = {
-        "close_memory_ids": [str(row["id"]) for row in closure]
-        if intent == "correction"
-        else [root_memory_id],
-        "review_memory_ids": [str(row["id"]) for row in descendants]
-        if intent == "evolution"
-        else [],
-        "supersede": {
-            "source_memory_id": root_memory_id,
-            "belief_id": str(root["belief_id"]),
-            "previous_version_id": root_memory_id,
-            "content": content,
-            "structured_payload": structured_payload,
-            "intent": intent,
-        },
-    }
+        return (
+            {
+                "root_memory_id": root_memory_id,
+                "namespace": str(root["namespace"]),
+                "intent": intent,
+                "reason": reason,
+                "authorized_namespaces": sorted(set(authorized_namespaces)),
+            },
+            {
+                "close_memory_ids": close_ids,
+                "review_memory_ids": [str(row["id"]) for row in descendants]
+                if intent == "evolution"
+                else [],
+                "review_resolutions": _review_resolutions(
+                    cur, memory_ids=close_ids, status="superseded"
+                ),
+                "supersede": {
+                    "source_memory_id": root_memory_id,
+                    "belief_id": str(root["belief_id"]),
+                    "previous_version_id": root_memory_id,
+                    "content": content,
+                    "structured_payload": structured_payload,
+                    "intent": intent,
+                },
+            },
+        )
+
     return _persist_preview(
         operation_type="supersession",
         actor=actor,
-        request={
-            "root_memory_id": root_memory_id,
-            "namespace": str(root["namespace"]),
-            "intent": intent,
-            "reason": reason,
-            "authorized_namespaces": sorted(set(authorized_namespaces)),
-        },
-        effect=effect,
-        namespaces=namespaces,
+        lock_namespaces=authorized_namespaces,
+        build=build,
         db_url=resolved_url,
     )
 
@@ -200,61 +197,77 @@ def preview_review_resolution(
     if action not in {"confirmed", "retracted"}:
         raise ValueError(f"unsupported review action: {action}")
     resolved_url = db_url or database_url()
-    with connect(resolved_url, application_name="hindsight-api") as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
-                    SELECT item.*, memory.namespace, memory.lineage_status
-                         , anchor.result_memory_id AS anchor_memory_id
-                         , anchor.namespace AS anchor_namespace
-                    FROM memory_review_items AS item
-                    JOIN semantic_memories AS memory ON memory.id = item.semantic_memory_id
-                    LEFT JOIN memory_operation_effects AS anchor
-                        ON anchor.operation_id = item.operation_id
-                        AND anchor.effect_type = 'created'
-                    WHERE item.id = %s AND item.status = 'open'
-                """,
-                (review_item_id,),
-            )
-            item = cur.fetchone()
-    if item is None:
-        raise LookupError(f"open review item not found: {review_item_id}")
-    closure = _causal_closure(
-        root_memory_id=str(item["semantic_memory_id"]), db_url=resolved_url
-    )
-    _require_complete_lineage(closure)
-    if action == "confirmed" and item["anchor_memory_id"] is None:
-        raise OperationConflictError("evolution anchor version is missing")
-    affected = closure if action == "retracted" else [
-        dict(item),
-        {"namespace": item["anchor_namespace"]},
-    ]
-    namespaces = sorted({str(row["namespace"]) for row in affected})
-    missing = set(namespaces) - set(authorized_namespaces)
-    if missing:
-        raise OperationAuthorizationError(
-            "cross-namespace authorization missing: " + ", ".join(sorted(missing))
+
+    def build(cur: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        cur.execute(
+            """
+                SELECT item.*, memory.namespace, memory.lineage_status
+                     , anchor.result_memory_id AS anchor_memory_id
+                     , anchor.namespace AS anchor_namespace
+                FROM memory_review_items AS item
+                JOIN semantic_memories AS memory ON memory.id = item.semantic_memory_id
+                LEFT JOIN memory_operation_effects AS anchor
+                    ON anchor.operation_id = item.operation_id
+                    AND anchor.effect_type = 'created'
+                WHERE item.id = %s AND item.status = 'open'
+            """,
+            (review_item_id,),
         )
+        item = cur.fetchone()
+        if item is None:
+            raise LookupError(f"open review item not found: {review_item_id}")
+        reviewed_memory_id = str(item["semantic_memory_id"])
+        closure = _causal_closure_with_cursor(
+            cur, root_memory_id=reviewed_memory_id
+        )
+        if not closure or str(closure[0]["id"]) != reviewed_memory_id:
+            raise OperationConflictError("reviewed memory is no longer current")
+        _require_complete_lineage(closure)
+        if action == "confirmed" and item["anchor_memory_id"] is None:
+            raise OperationConflictError("evolution anchor version is missing")
+        affected = (
+            closure
+            if action == "retracted"
+            else [dict(item), {"namespace": item["anchor_namespace"]}]
+        )
+        _require_authorized(affected, authorized_namespaces)
+        close_ids = (
+            [str(row["id"]) for row in closure]
+            if action == "retracted"
+            else [reviewed_memory_id]
+        )
+        resolutions = _review_resolutions(
+            cur,
+            memory_ids=close_ids,
+            status="retracted" if action == "retracted" else "superseded",
+        )
+        if action == "confirmed":
+            for resolution in resolutions:
+                if resolution["id"] == review_item_id:
+                    resolution["status"] = "confirmed"
+        return (
+            {
+                "review_item_id": review_item_id,
+                "namespace": str(item["namespace"]),
+                "action": action,
+                "reason": reason,
+                "authorized_namespaces": sorted(set(authorized_namespaces)),
+            },
+            {
+                "semantic_memory_id": reviewed_memory_id,
+                "anchor_memory_id": str(item["anchor_memory_id"])
+                if item["anchor_memory_id"]
+                else None,
+                "close_memory_ids": close_ids,
+                "review_resolutions": resolutions,
+            },
+        )
+
     return _persist_preview(
         operation_type="review_resolution",
         actor=actor,
-        request={
-            "review_item_id": review_item_id,
-            "namespace": str(item["namespace"]),
-            "action": action,
-            "reason": reason,
-            "authorized_namespaces": sorted(set(authorized_namespaces)),
-        },
-        effect={
-            "semantic_memory_id": str(item["semantic_memory_id"]),
-            "anchor_memory_id": str(item["anchor_memory_id"])
-            if item["anchor_memory_id"]
-            else None,
-            "close_memory_ids": [str(row["id"]) for row in closure]
-            if action == "retracted"
-            else [],
-        },
-        namespaces=namespaces,
+        lock_namespaces=authorized_namespaces,
+        build=build,
         db_url=resolved_url,
     )
 
@@ -443,6 +456,13 @@ def execute_operation(
                         )
                     else:
                         raise ValueError(f"unsupported operation type: {leased['operation_type']}")
+                    _apply_review_resolutions(
+                        cur,
+                        operation_id=operation_id,
+                        resolutions=preview["effect_payload"].get(
+                            "review_resolutions", []
+                        ),
+                    )
                     revisions = _revision_map(cur, list(preview["expected_revisions"]))
                     invalidated = [
                         effect["source_memory_id"]
@@ -507,15 +527,24 @@ def _persist_preview(
     *,
     operation_type: OperationType,
     actor: str,
-    request: dict[str, Any],
-    effect: dict[str, Any],
-    namespaces: list[str],
+    lock_namespaces: list[str],
+    build: Callable[[Any], tuple[dict[str, Any], dict[str, Any]]],
     db_url: str,
 ) -> dict[str, Any]:
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                namespaces = sorted(set(lock_namespaces))
+                _ensure_namespace_rows(cur, namespaces)
                 revisions = _revision_map(cur, namespaces)
+                request, effect = build(cur)
+                affected_namespaces = _effect_namespaces(cur, effect)
+                unlocked = affected_namespaces - set(revisions)
+                if unlocked:
+                    raise OperationConflictError(
+                        "preview effect includes unlocked namespace state: "
+                        + ", ".join(sorted(unlocked))
+                    )
                 cur.execute(
                     "SELECT generation FROM embedding_index_state WHERE singleton = true"
                 )
@@ -601,6 +630,68 @@ def _verify_preview(*, cur: Any, operation: dict[str, Any], preview: dict[str, A
     generation = int(state["generation"]) if state is not None else None
     if generation != preview["embedding_generation"]:
         raise OperationConflictError("embedding generation changed after preview")
+    _verify_effect_state(cur=cur, operation=operation, preview=preview)
+
+
+def _verify_effect_state(
+    *, cur: Any, operation: dict[str, Any], preview: dict[str, Any]
+) -> None:
+    request = preview["request_payload"]
+    effect = preview["effect_payload"]
+    operation_type = operation["operation_type"]
+    if operation_type == "rewind":
+        cur.execute(
+            "SELECT * FROM semantic_memories WHERE id = ANY(%s)",
+            (effect["target_memory_ids"],),
+        )
+        target = [dict(row) for row in cur.fetchall()]
+        current = _current_semantic(cur, namespace=request["namespace"])
+        rebuilt = _rewind_effect(target=target, current=current)
+        if (
+            rebuilt["close_memory_ids"] != effect["close_memory_ids"]
+            or rebuilt["reassertions"] != effect["reassertions"]
+        ):
+            raise OperationConflictError("rewind effect changed after preview")
+    elif operation_type in {"retraction", "supersession"}:
+        closure = _causal_closure_with_cursor(
+            cur, root_memory_id=request["root_memory_id"]
+        )
+        _require_complete_lineage(closure)
+        _require_authorized(closure, request["authorized_namespaces"])
+        closure_ids = [str(row["id"]) for row in closure]
+        if operation_type == "retraction" or request.get("intent") == "correction":
+            if closure_ids != effect["close_memory_ids"]:
+                raise OperationConflictError("causal closure changed after preview")
+        else:
+            descendant_ids = [
+                value for value in closure_ids if value != request["root_memory_id"]
+            ]
+            if descendant_ids != effect["review_memory_ids"]:
+                raise OperationConflictError("evolution descendants changed after preview")
+    elif operation_type == "review_resolution":
+        if request["action"] == "retracted":
+            closure = _causal_closure_with_cursor(
+                cur, root_memory_id=effect["semantic_memory_id"]
+            )
+            _require_complete_lineage(closure)
+            _require_authorized(closure, request["authorized_namespaces"])
+            if [str(row["id"]) for row in closure] != effect["close_memory_ids"]:
+                raise OperationConflictError("review closure changed after preview")
+    expected_reviews = sorted(
+        effect.get("review_resolutions", []), key=lambda row: row["id"]
+    )
+    current_reviews = _review_resolutions(
+        cur, memory_ids=effect.get("close_memory_ids", []), status="open"
+    )
+    current_by_id = {row["id"]: row for row in current_reviews}
+    if set(current_by_id) != {row["id"] for row in expected_reviews}:
+        raise OperationConflictError("open review items changed after preview")
+    if any(
+        current_by_id[row["id"]]["semantic_memory_id"]
+        != row["semantic_memory_id"]
+        for row in expected_reviews
+    ):
+        raise OperationConflictError("review item target changed after preview")
 
 
 def _apply_rewind(
@@ -833,15 +924,31 @@ def _apply_review_resolution(
                 },
             }
         ]
-    store._conn.execute(  # noqa: SLF001
-        """
-            UPDATE memory_review_items
-            SET status = %s, resolution_operation_id = %s, resolved_at = now()
-            WHERE id = %s AND status = 'open'
-        """,
-        (request["action"], operation["id"], request["review_item_id"]),
-    )
     return results
+
+
+def _apply_review_resolutions(
+    cur: Any, *, operation_id: str, resolutions: list[dict[str, str]]
+) -> None:
+    for resolution in resolutions:
+        cur.execute(
+            """
+                UPDATE memory_review_items
+                SET status = %s, resolution_operation_id = %s, resolved_at = now()
+                WHERE id = %s AND semantic_memory_id = %s AND status = 'open'
+                RETURNING id
+            """,
+            (
+                resolution["status"],
+                operation_id,
+                resolution["id"],
+                resolution["semantic_memory_id"],
+            ),
+        )
+        if cur.fetchone() is None:
+            raise OperationConflictError(
+                f"review item changed after preview: {resolution['id']}"
+            )
 
 
 def _close_memories(
@@ -900,31 +1007,136 @@ def _precompute_embeddings(
     return prepared
 
 
+def _current_semantic(cur: Any, *, namespace: str) -> list[dict[str, Any]]:
+    cur.execute(
+        """
+            SELECT * FROM current_semantic_memories
+            WHERE namespace = %s
+            ORDER BY t_valid DESC, written_at DESC
+        """,
+        (namespace,),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _rewind_effect(
+    *, target: list[dict[str, Any]], current: list[dict[str, Any]]
+) -> dict[str, Any]:
+    target_by_belief = {str(row["belief_id"]): row for row in target}
+    current_by_belief = {str(row["belief_id"]): row for row in current}
+    close_ids = sorted(
+        str(row["id"])
+        for belief_id, row in current_by_belief.items()
+        if belief_id not in target_by_belief
+        or str(target_by_belief[belief_id]["id"]) != str(row["id"])
+    )
+    reassertions = [
+        {
+            "source_memory_id": str(row["id"]),
+            "belief_id": belief_id,
+            "previous_version_id": str(current_by_belief[belief_id]["id"])
+            if belief_id in current_by_belief
+            else str(row["id"]),
+        }
+        for belief_id, row in sorted(target_by_belief.items())
+        if belief_id not in current_by_belief
+        or str(current_by_belief[belief_id]["id"]) != str(row["id"])
+    ]
+    return {
+        "target_memory_ids": sorted(str(row["id"]) for row in target),
+        "close_memory_ids": close_ids,
+        "reassertions": reassertions,
+    }
+
+
+def _review_resolutions(
+    cur: Any, *, memory_ids: list[str], status: str
+) -> list[dict[str, str]]:
+    if not memory_ids:
+        return []
+    cur.execute(
+        """
+            SELECT id, semantic_memory_id
+            FROM memory_review_items
+            WHERE semantic_memory_id = ANY(%s) AND status = 'open'
+            ORDER BY id
+        """,
+        (memory_ids,),
+    )
+    return [
+        {
+            "id": str(row["id"]),
+            "semantic_memory_id": str(row["semantic_memory_id"]),
+            "status": status,
+        }
+        for row in cur.fetchall()
+    ]
+
+
+def _effect_namespaces(cur: Any, effect: dict[str, Any]) -> set[str]:
+    memory_ids = {
+        *[str(value) for value in effect.get("close_memory_ids", [])],
+        *[
+            str(item["source_memory_id"])
+            for item in effect.get("reassertions", [])
+        ],
+    }
+    if effect.get("semantic_memory_id"):
+        memory_ids.add(str(effect["semantic_memory_id"]))
+    if effect.get("anchor_memory_id"):
+        memory_ids.add(str(effect["anchor_memory_id"]))
+    if effect.get("supersede"):
+        memory_ids.add(str(effect["supersede"]["source_memory_id"]))
+    if not memory_ids:
+        return set()
+    cur.execute(
+        "SELECT DISTINCT namespace FROM semantic_memories WHERE id = ANY(%s)",
+        (sorted(memory_ids),),
+    )
+    return {str(row["namespace"]) for row in cur.fetchall()}
+
+
+def _require_authorized(
+    rows: list[dict[str, Any]], authorized_namespaces: list[str]
+) -> None:
+    missing = {str(row["namespace"]) for row in rows} - set(authorized_namespaces)
+    if missing:
+        raise OperationAuthorizationError(
+            "cross-namespace authorization missing: " + ", ".join(sorted(missing))
+        )
+
+
 def _causal_closure(*, root_memory_id: str, db_url: str) -> list[dict[str, Any]]:
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
-                    WITH RECURSIVE closure(id, depth) AS (
-                        SELECT %s::UUID, 0
-                        UNION
-                        SELECT edge.child_semantic_memory_id, closure.depth + 1
-                        FROM closure
-                        JOIN memory_reads AS read ON read.semantic_memory_id = closure.id
-                        JOIN memory_lineage_edges AS edge ON edge.parent_read_id = read.id
-                        WHERE edge.edge_type IN ('derived', 'reasserted_from')
-                            AND edge.child_semantic_memory_id IS NOT NULL
-                    )
-                    SELECT memory.*, min(closure.depth) AS causal_depth
-                    FROM closure
-                    JOIN semantic_memories AS memory ON memory.id = closure.id
-                    WHERE memory.t_invalid IS NULL
-                    GROUP BY memory.id
-                    ORDER BY causal_depth, memory.written_at, memory.id
-                """,
-                (root_memory_id,),
+            return _causal_closure_with_cursor(cur, root_memory_id=root_memory_id)
+
+
+def _causal_closure_with_cursor(
+    cur: Any, *, root_memory_id: str
+) -> list[dict[str, Any]]:
+    cur.execute(
+        """
+            WITH RECURSIVE closure(id, depth) AS (
+                SELECT %s::UUID, 0
+                UNION
+                SELECT edge.child_semantic_memory_id, closure.depth + 1
+                FROM closure
+                JOIN memory_reads AS read ON read.semantic_memory_id = closure.id
+                JOIN memory_lineage_edges AS edge ON edge.parent_read_id = read.id
+                WHERE edge.edge_type IN ('derived', 'reasserted_from')
+                    AND edge.child_semantic_memory_id IS NOT NULL
             )
-            return [dict(row) for row in cur.fetchall()]
+            SELECT memory.*, min(closure.depth) AS causal_depth
+            FROM closure
+            JOIN semantic_memories AS memory ON memory.id = closure.id
+            WHERE memory.t_invalid IS NULL
+            GROUP BY memory.id
+            ORDER BY causal_depth, memory.written_at, memory.id
+        """,
+        (root_memory_id,),
+    )
+    return [dict(row) for row in cur.fetchall()]
 
 
 def _require_complete_lineage(rows: list[dict[str, Any]]) -> None:
@@ -932,6 +1144,18 @@ def _require_complete_lineage(rows: list[dict[str, Any]]) -> None:
     if incomplete:
         raise OperationConflictError(
             "strict correction refused incomplete lineage: " + ", ".join(incomplete)
+        )
+
+
+def _ensure_namespace_rows(cur: Any, namespaces: list[str]) -> None:
+    for namespace in namespaces:
+        cur.execute(
+            """
+                INSERT INTO memory_namespaces (namespace)
+                VALUES (%s)
+                ON CONFLICT (namespace) DO NOTHING
+            """,
+            (namespace,),
         )
 
 

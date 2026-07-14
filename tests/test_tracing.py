@@ -211,8 +211,9 @@ def _fake_store():
     store._url = "postgresql://user:password@localhost/db"
     store._owns_connection = False
     store._embedding_provider = None
-    store._classify_output_reads = lambda **kwargs: None
-    store._complete_memory_lineage = lambda **kwargs: None
+    store._prepare_output_reads = lambda **kwargs: []
+    store._lock_output_namespaces = lambda namespace, **kwargs: [namespace]
+    store._insert_output_lineage = lambda **kwargs: None
     store._insert_external_evidence = lambda **kwargs: None
     store._ensure_decision = lambda **kwargs: None
     store._seal_decision = lambda *args, **kwargs: None

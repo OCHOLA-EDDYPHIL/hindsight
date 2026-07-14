@@ -28,7 +28,13 @@ GRANT SELECT ON TABLE
     incident_semantic_beliefs,
     memory_decisions,
     memory_reads,
-    memory_retrievals
+    memory_retrievals,
+    memory_operations,
+    agent_reflections,
+    agent_runs,
+    agent_run_events,
+    consolidation_jobs,
+    benchmark_actions
 TO hindsight_agent_writer;
 
 GRANT INSERT ON TABLE

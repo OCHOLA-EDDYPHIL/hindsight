@@ -175,11 +175,12 @@ def test_memory_snapshot_as_of_uses_explicit_historical_listing(monkeypatch):
                     "justification": "test",
                     "metadata": {},
                     "t_valid": datetime(2026, 7, 12, 14, 0, tzinfo=UTC),
-                    "t_invalid": None,
+                    "t_invalid": datetime(2026, 7, 12, 15, 0, tzinfo=UTC),
                     "written_at": datetime(2026, 7, 12, 14, 0, tzinfo=UTC),
-                    "invalidated_at": None,
-                    "invalidated_by": None,
-                    "invalidation_reason": None,
+                    "invalidated_at": datetime(2026, 7, 12, 14, 5, tzinfo=UTC),
+                    "invalidated_by": "demo.operator",
+                    "invalidation_reason": "scheduled correction",
+                    "snapshot_invalidated": False,
                 }
             ]
 
@@ -194,6 +195,8 @@ def test_memory_snapshot_as_of_uses_explicit_historical_listing(monkeypatch):
 
     assert snapshot["mode"] == "as_of"
     assert snapshot["memories"][0]["content"] == "as-of memory"
+    assert snapshot["memories"][0]["status"] == "current"
+    assert "2026-07-12T15:00:00+00:00" not in snapshot["timeline"]
     assert snapshot["operations"] == []
     assert calls[1][1]["namespace"] == "demo:payments"
     assert calls[1][1]["system_as_of"].isoformat() == "2026-07-12T14:00:00+00:00"

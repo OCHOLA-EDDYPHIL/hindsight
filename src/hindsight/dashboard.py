@@ -513,7 +513,7 @@ def memory_snapshot(
             "as_of": timestamp.isoformat(),
             "memories": [_normalize_memory(row) for row in memories],
             "operations": [_normalize_operation(row) for row in operations],
-            "timeline": _timeline(memories, operations),
+            "timeline": _timeline(memories, operations, cutoff=timestamp),
             "generated_at": datetime.now(UTC).isoformat(),
         }
 
@@ -692,7 +692,10 @@ def _memory_operations(
 
 
 def _normalize_memory(row: dict[str, Any]) -> dict[str, Any]:
-    invalidated = row.get("t_invalid") is not None or row.get("invalidated_at") is not None
+    invalidated = row.get(
+        "snapshot_invalidated",
+        row.get("t_invalid") is not None or row.get("invalidated_at") is not None,
+    )
     return {
         "id": str(row.get("id")),
         "namespace": row.get("namespace"),
@@ -734,16 +737,25 @@ def _normalize_operation(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _timeline(memories: list[dict[str, Any]], operations: list[dict[str, Any]]) -> list[str]:
+def _timeline(
+    memories: list[dict[str, Any]],
+    operations: list[dict[str, Any]],
+    *,
+    cutoff: datetime | None = None,
+) -> list[str]:
     values = set()
     for row in memories:
         for key in ("t_valid", "written_at", "t_invalid", "invalidated_at"):
             if row.get(key) is not None:
-                values.add(_jsonable(row[key]))
+                value = row[key]
+                if cutoff is None or not isinstance(value, datetime) or value <= cutoff:
+                    values.add(_jsonable(value))
     for row in operations:
         for key in ("target_timestamp", "created_at"):
             if row.get(key) is not None:
-                values.add(_jsonable(row[key]))
+                value = row[key]
+                if cutoff is None or not isinstance(value, datetime) or value <= cutoff:
+                    values.add(_jsonable(value))
     return sorted(str(value) for value in values if value is not None)
 
 
