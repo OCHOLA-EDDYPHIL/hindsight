@@ -362,33 +362,25 @@ class MemoryStore:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         resolved_valid_at = valid_at or system_as_of
-        rows = self._fetch_all(
-            """
+        rows = self._fetch_all_as_of(
+            system_as_of=system_as_of,
+            query="""
                 SELECT *, NULL::FLOAT8 AS distance
                 FROM semantic_memories
                 WHERE namespace = %s
-                    AND written_at <= %s
                     AND t_valid <= %s
-                    AND NOT (
-                        invalidated_at IS NOT NULL
-                        AND invalidated_at <= %s
-                        AND t_invalid <= %s
-                    )
+                    AND (t_invalid IS NULL OR t_invalid > %s)
                 ORDER BY t_valid DESC, written_at DESC
                 LIMIT %s
             """,
-            (
+            params=(
                 namespace,
-                system_as_of,
                 resolved_valid_at,
-                system_as_of,
                 resolved_valid_at,
                 limit,
             ),
         )
-        rows = _project_historical_rows(
-            rows, system_as_of=system_as_of, valid_at=resolved_valid_at
-        )
+        rows = _project_historical_rows(rows, valid_at=resolved_valid_at)
         self._record_with_context(rows, memory_kind="semantic", context=read_context)
         return rows
 
@@ -432,35 +424,27 @@ class MemoryStore:
 
         _require_query(query)
         resolved_valid_at = valid_at or system_as_of
-        rows = self._fetch_all(
-            """
+        rows = self._fetch_all_as_of(
+            system_as_of=system_as_of,
+            query="""
                 SELECT *, NULL::FLOAT8 AS distance
                 FROM semantic_memories
                 WHERE namespace = %s
-                    AND written_at <= %s
                     AND t_valid <= %s
-                    AND NOT (
-                        invalidated_at IS NOT NULL
-                        AND invalidated_at <= %s
-                        AND t_invalid <= %s
-                    )
+                    AND (t_invalid IS NULL OR t_invalid > %s)
                     AND content ILIKE %s ESCAPE '\\'
                 ORDER BY t_valid DESC, written_at DESC
                 LIMIT %s
             """,
-            (
+            params=(
                 namespace,
-                system_as_of,
                 resolved_valid_at,
-                system_as_of,
                 resolved_valid_at,
                 f"%{_escape_like(query)}%",
                 limit,
             ),
         )
-        rows = _project_historical_rows(
-            rows, system_as_of=system_as_of, valid_at=resolved_valid_at
-        )
+        rows = _project_historical_rows(rows, valid_at=resolved_valid_at)
         self._record_with_context(rows, memory_kind="semantic", context=read_context)
         return rows
 
@@ -1900,12 +1884,11 @@ class MemoryStore:
         if limit is not None:
             query_sql += " LIMIT %s"
             params.append(limit)
-        with connect(self._historical_read_url()) as read_conn:
-            as_of_literal = sql.Literal(as_of.isoformat()).as_string(read_conn)
-            with read_conn.transaction():
-                read_conn.execute(f"SET TRANSACTION AS OF SYSTEM TIME {as_of_literal}")
-                rows = self._fetch_all_on(read_conn, query_sql, tuple(params))
-        return rows
+        return self._fetch_all_as_of(
+            system_as_of=as_of,
+            query=query_sql,
+            params=tuple(params),
+        )
 
     def _semantic_rewind_candidates(
         self,
@@ -2362,6 +2345,21 @@ class MemoryStore:
             cur.execute(query, params)
             return [dict(row) for row in cur.fetchall()]
 
+    def _fetch_all_as_of(
+        self,
+        *,
+        system_as_of: datetime,
+        query: str,
+        params: tuple[Any, ...],
+    ) -> list[dict[str, Any]]:
+        """Read one exact CockroachDB MVCC snapshot on a separate connection."""
+
+        with connect(self._historical_read_url()) as read_conn:
+            as_of_literal = sql.Literal(system_as_of.isoformat()).as_string(read_conn)
+            with read_conn.transaction():
+                read_conn.execute(f"SET TRANSACTION AS OF SYSTEM TIME {as_of_literal}")
+                return self._fetch_all_on(read_conn, query, params)
+
     @staticmethod
     def _fetch_all_on(
         conn: psycopg.Connection, query: str, params: tuple[Any, ...]
@@ -2422,25 +2420,13 @@ def _payload_digest(
 
 
 def _project_historical_rows(
-    rows: list[dict[str, Any]], *, system_as_of: datetime, valid_at: datetime
+    rows: list[dict[str, Any]], *, valid_at: datetime
 ) -> list[dict[str, Any]]:
     projected = []
     for source in rows:
         row = dict(source)
-        invalidated_at = row.get("invalidated_at")
-        known = invalidated_at is not None and invalidated_at <= system_as_of
         t_invalid = row.get("t_invalid")
-        row["snapshot_invalidated"] = bool(
-            known and t_invalid is not None and t_invalid <= valid_at
-        )
-        if not known:
-            for field in (
-                "t_invalid",
-                "invalidated_at",
-                "invalidated_by",
-                "invalidation_reason",
-            ):
-                row[field] = None
+        row["snapshot_invalidated"] = bool(t_invalid is not None and t_invalid <= valid_at)
         projected.append(row)
     return projected
 

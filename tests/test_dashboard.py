@@ -2,10 +2,15 @@
 
 import http.client
 import json
+import os
 import threading
 from datetime import UTC, datetime
 from threading import Event
 from uuid import uuid4
+
+import pytest
+
+requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
 def test_changefeed_row_to_event_filters_namespace_and_marks_invalidated():
@@ -698,7 +703,6 @@ def test_memory_queries_fetch_recent_rows_then_return_display_order(monkeypatch)
         namespace="demo:payments",
         db_url="postgresql://db",
         limit=100,
-        as_of=datetime(2026, 7, 12, 14, 0, tzinfo=UTC),
     )
 
     memory_query, memory_params = executed[0]
@@ -708,10 +712,169 @@ def test_memory_queries_fetch_recent_rows_then_return_display_order(monkeypatch)
     assert "COALESCE(invalidated_at, written_at, t_invalid, t_valid) DESC" in memory_query
     assert "ORDER BY t_valid ASC" in memory_query
     assert memory_params == ("demo:payments", 100)
-    assert "created_at <= %s" in operation_query
     assert "ORDER BY created_at DESC" in operation_query
     assert "ORDER BY created_at ASC" in operation_query
-    assert operation_params == ("demo:payments", datetime(2026, 7, 12, 14, 0, tzinfo=UTC), 100)
+    assert operation_params == ("demo:payments", 100)
+
+
+def test_historical_operation_queries_set_mvcc_cutoff_before_snapshot_reads(monkeypatch):
+    import hindsight.dashboard as dashboard
+
+    operation_id = uuid4()
+    executed = []
+    transaction_events = []
+
+    class FakeCursor:
+        last_query = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def execute(self, query, params):
+            assert connection.in_transaction
+            self.last_query = query
+            executed.append((query, params))
+
+        def fetchall(self):
+            if "FROM memory_operation_effects" in self.last_query:
+                return [{"operation_id": operation_id, "sequence": 1}]
+            return [{"id": operation_id, "status": "queued"}]
+
+    class FakeTransaction:
+        def __enter__(self):
+            assert not connection.in_transaction
+            connection.in_transaction = True
+            transaction_events.append("enter")
+
+        def __exit__(self, *exc_info):
+            transaction_events.append("exit")
+            connection.in_transaction = False
+
+    class FakeConnection:
+        in_transaction = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def transaction(self):
+            return FakeTransaction()
+
+        def execute(self, query):
+            assert self.in_transaction
+            executed.append((query.as_string(), None))
+
+        def cursor(self, *, row_factory):
+            assert row_factory is dashboard.dict_row
+            return FakeCursor()
+
+    connection = FakeConnection()
+    monkeypatch.setattr(dashboard, "connect", lambda url: connection)
+
+    rows = dashboard._memory_operations(
+        namespace="demo:payments",
+        db_url="postgresql://db",
+        limit=100,
+        as_of=datetime(2026, 7, 12, 14, 0, tzinfo=UTC),
+    )
+
+    assert transaction_events == ["enter", "exit"]
+    assert executed[0] == (
+        "SET TRANSACTION AS OF SYSTEM TIME '2026-07-12T14:00:00+00:00'",
+        None,
+    )
+    assert "FROM memory_operations" in executed[1][0]
+    assert executed[1][1] == ("demo:payments", 100)
+    assert "FROM memory_operation_effects" in executed[2][0]
+    assert executed[2][1] == (operation_id,)
+    assert rows[0]["status"] == "queued"
+    assert rows[0]["effects"] == [{"operation_id": operation_id, "sequence": 1}]
+
+
+@requires_db
+def test_historical_operation_snapshot_reads_row_and_effects_at_same_mvcc_cutoff():
+    from psycopg.types.json import Jsonb
+
+    from hindsight.dashboard import _memory_operations
+    from hindsight.db import connect, database_url
+
+    namespace = f"test:dashboard-history:{uuid4()}"
+    operation_id = uuid4()
+    invalidated_memory_id = uuid4()
+    with connect() as conn:
+        try:
+            with conn.transaction():
+                before_enqueue = conn.execute("SELECT now()").fetchone()[0]
+            with conn.transaction():
+                conn.execute(
+                    """
+                        INSERT INTO memory_operations (
+                            id, operation_type, actor, reason, namespace, status,
+                            expected_revisions, request_payload, attempt_count
+                        )
+                        VALUES (%s, 'rewind', 'test.dashboard', 'historical snapshot test',
+                                %s, 'queued', '{}'::JSONB, '{}'::JSONB, 0)
+                    """,
+                    (operation_id, namespace),
+                )
+            with conn.transaction():
+                cutoff = conn.execute("SELECT now()").fetchone()[0]
+            with conn.transaction():
+                conn.execute(
+                    """
+                        UPDATE memory_operations
+                        SET status = 'completed', invalidated_memory_ids = %s,
+                            completed_at = now()
+                        WHERE id = %s
+                    """,
+                    (Jsonb([str(invalidated_memory_id)]), operation_id),
+                )
+                conn.execute(
+                    """
+                        INSERT INTO memory_operation_effects (
+                            operation_id, sequence, effect_type, namespace
+                        )
+                        VALUES (%s, 1, 'unchanged', %s)
+                    """,
+                    (operation_id, namespace),
+                )
+
+            historical = _memory_operations(
+                namespace=namespace,
+                db_url=database_url(),
+                limit=100,
+                as_of=cutoff,
+            )
+            before = _memory_operations(
+                namespace=namespace,
+                db_url=database_url(),
+                limit=100,
+                as_of=before_enqueue,
+            )
+            current = _memory_operations(
+                namespace=namespace,
+                db_url=database_url(),
+                limit=100,
+            )
+
+            assert before == []
+            assert len(historical) == 1
+            assert historical[0]["status"] == "queued"
+            assert historical[0]["invalidated_memory_ids"] == []
+            assert historical[0]["failure_code"] is None
+            assert historical[0]["effects"] == []
+            assert len(current) == 1
+            assert current[0]["status"] == "completed"
+            assert current[0]["invalidated_memory_ids"] == [str(invalidated_memory_id)]
+            assert len(current[0]["effects"]) == 1
+        finally:
+            with conn.transaction():
+                conn.execute("DELETE FROM memory_operations WHERE id = %s", (operation_id,))
 
 
 def test_dashboard_html_contains_sse_and_timeline_surface():

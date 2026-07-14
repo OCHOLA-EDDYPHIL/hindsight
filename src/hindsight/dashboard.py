@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 from uuid import UUID
 
+from psycopg import sql
 from psycopg.rows import dict_row
 
 from hindsight.db import connect, database_url
@@ -654,41 +655,49 @@ def _memory_operations(
     as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
     with connect(db_url or database_url()) as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            as_of_filter = "AND created_at <= %s" if as_of is not None else ""
-            params: tuple[Any, ...]
-            params = (namespace, as_of, limit) if as_of is not None else (namespace, limit)
-            cur.execute(
-                f"""
-                    SELECT *
-                    FROM (
-                        SELECT *
-                        FROM memory_operations
-                        WHERE namespace = %s
-                            {as_of_filter}
-                        ORDER BY created_at DESC, id DESC
-                        LIMIT %s
-                    ) AS recent_operations
-                    ORDER BY created_at ASC, id ASC
-                """,
-                params,
+        if as_of is not None:
+            as_of_statement = sql.SQL("SET TRANSACTION AS OF SYSTEM TIME {}").format(
+                sql.Literal(as_of.isoformat())
             )
-            operations = [dict(row) for row in cur.fetchall()]
-            for operation in operations:
-                effect_as_of_filter = "AND created_at <= %s" if as_of is not None else ""
-                effect_params = (
-                    (operation["id"], as_of) if as_of is not None else (operation["id"],)
-                )
-                cur.execute(
-                    f"""
-                        SELECT * FROM memory_operation_effects
-                        WHERE operation_id = %s {effect_as_of_filter}
-                        ORDER BY sequence
-                    """,
-                    effect_params,
-                )
-                operation["effects"] = [dict(row) for row in cur.fetchall()]
-            return operations
+            with conn.transaction():
+                conn.execute(as_of_statement)
+                return _memory_operation_rows(conn, namespace=namespace, limit=limit)
+        return _memory_operation_rows(conn, namespace=namespace, limit=limit)
+
+
+def _memory_operation_rows(
+    conn: Any,
+    *,
+    namespace: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+                SELECT *
+                FROM (
+                    SELECT *
+                    FROM memory_operations
+                    WHERE namespace = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                ) AS recent_operations
+                ORDER BY created_at ASC, id ASC
+            """,
+            (namespace, limit),
+        )
+        operations = [dict(row) for row in cur.fetchall()]
+        for operation in operations:
+            cur.execute(
+                """
+                    SELECT * FROM memory_operation_effects
+                    WHERE operation_id = %s
+                    ORDER BY sequence
+                """,
+                (operation["id"],),
+            )
+            operation["effects"] = [dict(row) for row in cur.fetchall()]
+        return operations
 
 
 def _normalize_memory(row: dict[str, Any]) -> dict[str, Any]:

@@ -513,6 +513,63 @@ def test_historical_projection_hides_unknown_and_marks_future_invalidation_curre
 
 
 @requires_db
+def test_historical_semantic_reads_return_mutable_fields_from_mvcc_snapshot():
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"historical-mutable-fields-{uuid4()}"
+    with MemoryStore(url=database_url()) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="processor timeout requires queue depth review",
+            provenance=Provenance(
+                "pytest",
+                "evidence:historical-mutable-fields",
+                "Verify historical mutable fields come from one MVCC snapshot",
+            ),
+        )
+    with connect() as conn:
+        system_as_of = conn.execute("SELECT now()").fetchone()[0]
+    sleep(0.05)
+    with connect() as conn:
+        conn.execute(
+            """
+                UPDATE semantic_memories
+                SET trust_status = 'review_required',
+                    lineage_status = 'legacy_unverified'
+                WHERE id = %s
+            """,
+            (memory["id"],),
+        )
+
+    with MemoryStore(url=database_url()) as store:
+        valid_at = system_as_of + timedelta(minutes=5)
+        listed = store.list_semantic_as_of(
+            namespace=namespace,
+            system_as_of=system_as_of,
+            valid_at=valid_at,
+        )
+        searched = store.search_semantic_text_as_of(
+            namespace=namespace,
+            query="queue depth",
+            system_as_of=system_as_of,
+            valid_at=valid_at,
+        )
+        current = store.audit_memory(memory_kind="semantic", memory_id=str(memory["id"]))
+
+    assert [(row["trust_status"], row["lineage_status"]) for row in listed] == [
+        ("active", "complete")
+    ]
+    assert [(row["trust_status"], row["lineage_status"]) for row in searched] == [
+        ("active", "complete")
+    ]
+    assert current is not None
+    assert current["trust_status"] == "review_required"
+    assert current["lineage_status"] == "legacy_unverified"
+
+
+@requires_db
 def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider

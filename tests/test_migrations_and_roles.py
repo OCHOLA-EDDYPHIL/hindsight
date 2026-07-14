@@ -50,11 +50,13 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
             memory_id = str(uuid4())
             open_decision = f"upgrade-open:{uuid4()}"
             failed_decision = f"upgrade-failed:{uuid4()}"
+            failed_lookalike_decision = f"upgrade-failed-lookalike:{uuid4()}"
             terminal_decision = f"upgrade-terminal:{uuid4()}"
             legacy_decision = f"upgrade-legacy:{uuid4()}"
             run_ids = {
                 open_decision: uuid4(),
                 failed_decision: uuid4(),
+                failed_lookalike_decision: uuid4(),
                 terminal_decision: uuid4(),
             }
             conn.execute(
@@ -69,6 +71,7 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
             for decision_id, status in (
                 (open_decision, "planning"),
                 (failed_decision, "failed"),
+                (failed_lookalike_decision, "failed"),
                 (terminal_decision, "reflecting"),
             ):
                 conn.execute(
@@ -86,14 +89,15 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                         decision_id,
                     ),
                 )
-                conn.execute(
-                    """
-                        INSERT INTO memory_reads (
-                            decision_id, memory_kind, memory_id, reader, purpose
-                        ) VALUES (%s, 'semantic', %s, 'legacy.agent', 'legacy read')
-                    """,
-                    (decision_id, memory_id),
-                )
+                if decision_id not in {failed_decision, failed_lookalike_decision}:
+                    conn.execute(
+                        """
+                            INSERT INTO memory_reads (
+                                decision_id, memory_kind, memory_id, reader, purpose
+                            ) VALUES (%s, 'semantic', %s, 'legacy.agent', 'legacy read')
+                        """,
+                        (decision_id, memory_id),
+                    )
             conn.execute(
                 """
                     INSERT INTO memory_reads (
@@ -113,12 +117,23 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                     INSERT INTO memory_decisions (
                         id, actor, decision_kind, purpose, run_id, namespace,
                         status, sealed_at
-                    ) VALUES (
-                        %s, 'agent.run', 'agent_plan', 'Legitimate terminal decision',
-                        %s, 'upgrade-test', 'sealed', now()
-                    )
+                    ) VALUES
+                        (
+                            %s, 'agent.run', 'agent_plan', 'Legitimate terminal decision',
+                            %s, 'upgrade-test', 'sealed', now()
+                        ),
+                        (
+                            %s, 'agent.run', 'agent_plan',
+                            'Legitimate failed-run decision', %s, 'upgrade-test',
+                            'sealed', now()
+                        )
                 """,
-                (terminal_decision, run_ids[terminal_decision]),
+                (
+                    terminal_decision,
+                    run_ids[terminal_decision],
+                    failed_lookalike_decision,
+                    run_ids[failed_lookalike_decision],
+                ),
             )
             conn.execute(
                 """
@@ -159,6 +174,18 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 "Legitimate terminal decision",
                 "sealed",
             )
+            assert conn.execute(
+                """
+                    SELECT actor, decision_kind, purpose, status
+                    FROM memory_decisions WHERE id = %s
+                """,
+                (failed_lookalike_decision,),
+            ).fetchone() == (
+                "agent.run",
+                "agent_plan",
+                "Legitimate failed-run decision",
+                "sealed",
+            )
             conn.execute(
                 """
                     UPDATE memory_decisions
@@ -168,6 +195,30 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                     WHERE id = %s
                 """,
                 (open_decision,),
+            )
+            # Reproduce the canonical-but-sealed failed decision emitted by the
+            # earlier 0008 draft for a failed run with no memory reads.
+            conn.execute(
+                """
+                    UPDATE memory_decisions
+                    SET status = 'sealed', sealed_at = now(), metadata = '{}'::JSONB
+                    WHERE id = %s
+                """,
+                (failed_decision,),
+            )
+            assert conn.execute(
+                """
+                    SELECT actor, decision_kind, purpose, run_id, namespace, status
+                    FROM memory_decisions WHERE id = %s
+                """,
+                (failed_decision,),
+            ).fetchone() == (
+                "agent.run",
+                "agent_plan",
+                "Backfill durable agent run decision",
+                run_ids[failed_decision],
+                "upgrade-test",
+                "sealed",
             )
 
             orphan_memory_id = uuid4()
@@ -227,6 +278,24 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
             assert conn.execute(
                 "SELECT status FROM memory_decisions WHERE id = %s", (failed_decision,)
             ).fetchone() == ("failed",)
+            assert conn.execute(
+                """
+                    SELECT decision.opened_at = run.created_at,
+                           decision.sealed_at = COALESCE(run.completed_at, run.updated_at),
+                           decision.metadata->>'migrated_from'
+                    FROM memory_decisions AS decision
+                    JOIN agent_runs AS run ON run.id = decision.run_id
+                    WHERE decision.id = %s
+                """,
+                (failed_decision,),
+            ).fetchone() == (True, True, "agent_runs")
+            assert conn.execute(
+                """
+                    SELECT purpose, status
+                    FROM memory_decisions WHERE id = %s
+                """,
+                (failed_lookalike_decision,),
+            ).fetchone() == ("Legitimate failed-run decision", "sealed")
             assert conn.execute(
                 "SELECT status FROM memory_decisions WHERE id = %s", (legacy_decision,)
             ).fetchone() == ("sealed",)

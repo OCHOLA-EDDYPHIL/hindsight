@@ -1,5 +1,7 @@
--- Repair only agent-run decisions created as sealed legacy-read placeholders
--- by an earlier draft of 0008. Legitimate terminal decisions stay terminal.
+-- Repair agent-run decisions created incorrectly by an earlier draft of 0008.
+-- That draft either retained a sealed legacy-read placeholder or created a
+-- canonical failed-run backfill as sealed. Legitimate terminal decisions stay
+-- terminal.
 
 UPDATE memory_decisions AS decision
 SET
@@ -19,10 +21,22 @@ SET
     metadata = decision.metadata || jsonb_build_object('migrated_from', 'agent_runs')
 FROM agent_runs AS run
 WHERE decision.id = run.decision_id
-    AND decision.actor = 'legacy.import'
-    AND decision.decision_kind = 'legacy_read'
-    AND decision.purpose = 'Backfill pre-governance memory read identity'
-    AND decision.status = 'sealed';
+    AND decision.status = 'sealed'
+    AND (
+        (
+            decision.actor = 'legacy.import'
+            AND decision.decision_kind = 'legacy_read'
+            AND decision.purpose = 'Backfill pre-governance memory read identity'
+        )
+        OR (
+            run.status = 'failed'
+            AND decision.actor = 'agent.run'
+            AND decision.decision_kind = 'agent_plan'
+            AND decision.purpose = 'Backfill durable agent run decision'
+            AND decision.run_id = run.id
+            AND decision.namespace = run.namespace
+        )
+    );
 
 -- An earlier reflection write path could commit the immutable semantic memory
 -- while rolling back its typed projection. Recover only unambiguous rows whose
