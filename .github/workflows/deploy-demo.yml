@@ -38,6 +38,10 @@ on:
         required: false
         type: boolean
         default: false
+      source_sha:
+        description: Exact caller-authorized revision to deploy
+        required: true
+        type: string
     outputs:
       ui_url:
         description: Deployed CloudFront/custom-domain URL
@@ -83,14 +87,19 @@ jobs:
     outputs:
       authorized: ${{ steps.authorize.outputs.authorized }}
       should_apply: ${{ steps.authorize.outputs.should_apply }}
+      source_sha: ${{ steps.authorize.outputs.source_sha }}
     steps:
       - id: authorize
         name: Authorize deployment source
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MANUAL_OPERATION: ${{ inputs.operation }}
           REQUESTED_APPLY: ${{ inputs.apply }}
+          REQUESTED_HEALTH_ONLY: ${{ inputs.health_only }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
           VALIDATION_MODE: ${{ inputs.validation_mode }}
           CALLER_WORKFLOW: ${{ github.workflow }}
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -102,8 +111,50 @@ jobs:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
+          if [[ "$VALIDATION_MODE" == "true" ]]; then
+            [[ "$REQUESTED_APPLY" == "true" \
+              && "$REQUESTED_HEALTH_ONLY" == "false" \
+              && "$CALLER_WORKFLOW" == "live acceptance" \
+              && "$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME" \
+              && "$ACTOR" == "$REPOSITORY_OWNER" \
+              && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+              && "$EMBEDDING_MAX_DISTANCE" == "0.35" ]] || {
+              echo "Validation deployment requires the owner-authorized live-acceptance workflow." >&2
+              exit 1
+            }
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              [[ "$LABEL_NAME" == "live-acceptance" \
+                && "$HEAD_REPOSITORY" == "$REPOSITORY" \
+                && "$REQUESTED_SOURCE_SHA" == "$PR_HEAD_SHA" ]] || {
+                echo "PR validation requires the labeled same-repository head revision." >&2
+                exit 1
+              }
+            elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              [[ "$REF_NAME" == "refs/heads/main" \
+                && "$REQUESTED_SOURCE_SHA" == "$EVENT_SHA" ]] || {
+                echo "Manual validation requires the exact main revision." >&2
+                exit 1
+              }
+            else
+              echo "Unsupported validation deployment event: $EVENT_NAME" >&2
+              exit 1
+            fi
+            [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "Validation deployment did not resolve a commit SHA." >&2
+              exit 1
+            }
+            {
+              echo "authorized=true"
+              echo "should_apply=true"
+              echo "source_sha=$REQUESTED_SOURCE_SHA"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             [[ "$REF_NAME" == "refs/heads/main" \
+              && "$CALLER_WORKFLOW" == "deploy demo" \
+              && "$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/deploy-demo.yml@$REF_NAME" \
               && "$ACTOR" == "$REPOSITORY_OWNER" \
               && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
               echo "Manual demo deployments require the repository owner on main." >&2
@@ -113,30 +164,24 @@ jobs:
               echo "Unsupported manual deployment operation." >&2
               exit 1
             }
-            echo "authorized=true" >> "$GITHUB_OUTPUT"
-            if [[ "$MANUAL_OPERATION" == "apply" ]]; then
-              echo "should_apply=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "should_apply=false" >> "$GITHUB_OUTPUT"
-            fi
+            [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "Manual deployment did not resolve a commit SHA." >&2
+              exit 1
+            }
+            {
+              echo "authorized=true"
+              if [[ "$MANUAL_OPERATION" == "apply" ]]; then
+                echo "should_apply=true"
+              else
+                echo "should_apply=false"
+              fi
+              echo "source_sha=$EVENT_SHA"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          [[ "$EVENT_NAME" == "pull_request" \
-            && "$VALIDATION_MODE" == "true" \
-            && "$REQUESTED_APPLY" == "true" \
-            && "$CALLER_WORKFLOW" == "live acceptance" \
-            && "$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@"* \
-            && "$LABEL_NAME" == "live-acceptance" \
-            && "$HEAD_REPOSITORY" == "$REPOSITORY" \
-            && "$ACTOR" == "$REPOSITORY_OWNER" \
-            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
-            && "$EMBEDDING_MAX_DISTANCE" == "0.35" ]] || {
-              echo "PR apply is allowed only through the owner-authorized live-acceptance workflow." >&2
-              exit 1
-            }
-          echo "authorized=true" >> "$GITHUB_OUTPUT"
-          echo "should_apply=true" >> "$GITHUB_OUTPUT"
+          echo "Unsupported deployment event: $EVENT_NAME" >&2
+          exit 1
 
   plan:
     needs: authorize
@@ -150,11 +195,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
       - name: Verify exact source revision
         env:
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
@@ -178,7 +223,9 @@ jobs:
       - name: Create deployment plan
         run: terraform -chdir=infra/terraform/app plan -input=false -out="$GITHUB_WORKSPACE/build/demo.tfplan"
       - id: plan_name
-        run: echo "name=demo-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+        env:
+          SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
+        run: echo "name=demo-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.plan_name.outputs.name }}
@@ -205,11 +252,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
       - name: Verify exact source revision
         env:
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
@@ -346,7 +393,7 @@ jobs:
           exit 1
       - name: Record deployment-health evidence
         env:
-          DEPLOYED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          DEPLOYED_SHA: ${{ needs.authorize.outputs.source_sha }}
           HEALTH_ONLY: ${{ inputs.health_only }}
           UI_URL: ${{ steps.stack_outputs.outputs.ui_url }}
           API_URL: ${{ steps.stack_outputs.outputs.api_url }}

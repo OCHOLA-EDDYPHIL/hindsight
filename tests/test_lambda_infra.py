@@ -76,7 +76,7 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert bootstrap.count('"lambda:ListVersionsByFunction"') == 1
     assert 'lambda_version_refresh_actions = ["lambda:ListVersionsByFunction"]' in bootstrap
     assert "actions   = local.lambda_version_refresh_actions" in version_refresh
-    assert 'resources = local.lambda_function_arns' in version_refresh
+    assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle
     assert "function:hindsight-${var.stage}-${component}" in bootstrap
     assert "bedrock:InvokeModel" in bootstrap
@@ -127,7 +127,7 @@ def test_deploy_health_only_is_owner_authorized_exact_main_and_checks_every_endp
     workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
 
     manual_authorization = workflow.split(
-        'if [[ "$EVENT_NAME" == "workflow_dispatch" ]]', 1
+        '\n          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]', 1
     )[1].split("exit 0", 1)[0]
     assert '"$REF_NAME" == "refs/heads/main"' in manual_authorization
     assert '"$ACTOR" == "$REPOSITORY_OWNER"' in manual_authorization
@@ -142,3 +142,32 @@ def test_deploy_health_only_is_owner_authorized_exact_main_and_checks_every_endp
     assert 'UI-proxied readiness" "$UI_URL/v1/health/ready' in workflow
     assert "from websockets.asyncio.client import connect" in workflow
     assert "Exact revision \\`$DEPLOYED_SHA\\` passed" in workflow
+
+
+def test_deploy_uses_the_caller_authorized_source_revision():
+    workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+    authorization = workflow.split("      - id: authorize\n", 1)[1].split("  plan:\n", 1)[0]
+    validation_branch = authorization.split('if [[ "$VALIDATION_MODE" == "true" ]]', 1)[1].split(
+        '\n          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]', 1
+    )[0]
+
+    assert "source_sha:" in workflow.split("  workflow_call:\n", 1)[1].split("    outputs:\n", 1)[0]
+    assert (
+        "required: true"
+        in workflow.split("      source_sha:\n", 1)[1].split("    outputs:\n", 1)[0]
+    )
+    assert '"$REQUESTED_HEALTH_ONLY" == "false"' in validation_branch
+    assert (
+        '"$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME"'
+    ) in validation_branch
+    assert '"$REQUESTED_SOURCE_SHA" == "$PR_HEAD_SHA"' in validation_branch
+    assert '"$REQUESTED_SOURCE_SHA" == "$EVENT_SHA"' in validation_branch
+    assert authorization.count("=~ ^[0-9a-f]{40}$") == 2
+    assert (
+        '"$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/deploy-demo.yml@$REF_NAME"'
+    ) in authorization
+    assert workflow.count("ref: ${{ needs.authorize.outputs.source_sha }}") == 2
+    assert workflow.count("EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}") == 2
+    assert "DEPLOYED_SHA: ${{ needs.authorize.outputs.source_sha }}" in workflow
+    assert "demo-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}" in workflow
+    assert "github.event.pull_request.head.sha || github.sha" not in workflow

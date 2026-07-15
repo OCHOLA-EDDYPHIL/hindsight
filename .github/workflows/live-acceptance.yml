@@ -1,6 +1,7 @@
 name: live acceptance
 
 on:
+  workflow_dispatch:
   pull_request:
     types:
       - labeled
@@ -26,26 +27,53 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       authorized: ${{ steps.authorization.outputs.authorized }}
+      acceptance_sha: ${{ steps.authorization.outputs.acceptance_sha }}
     steps:
       - id: authorization
-        name: Require an owner-authorized same-repository label event
+        name: Resolve owner-authorized acceptance revision
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
           LABEL_NAME: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
-          [[ "$LABEL_NAME" == "live-acceptance" \
-            && "$HEAD_REPOSITORY" == "$REPOSITORY" \
-            && "$ACTOR" == "$REPOSITORY_OWNER" \
-            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
-              echo "Live acceptance requires the repository owner to apply the live-acceptance label to a same-repository PR." >&2
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$REF_NAME" == "refs/heads/main" \
+              && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME" \
+              && "$ACTOR" == "$REPOSITORY_OWNER" \
+              && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
+              echo "Manual live acceptance requires the repository owner on main." >&2
               exit 1
             }
+            ACCEPTANCE_SHA="$EVENT_SHA"
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            [[ "$LABEL_NAME" == "live-acceptance" \
+              && "$HEAD_REPOSITORY" == "$REPOSITORY" \
+              && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME" \
+              && "$ACTOR" == "$REPOSITORY_OWNER" \
+              && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
+              echo "PR live acceptance requires the repository owner to apply the live-acceptance label to a same-repository PR." >&2
+              exit 1
+            }
+            ACCEPTANCE_SHA="$HEAD_SHA"
+          else
+            echo "Unsupported live-acceptance event: $EVENT_NAME" >&2
+            exit 1
+          fi
+          [[ "$ACCEPTANCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Live acceptance did not resolve a commit SHA." >&2
+            exit 1
+          }
           echo "authorized=true" >> "$GITHUB_OUTPUT"
+          echo "acceptance_sha=$ACCEPTANCE_SHA" >> "$GITHUB_OUTPUT"
 
   verify:
     needs: authorize
@@ -62,11 +90,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.authorize.outputs.acceptance_sha }}
           persist-credentials: false
-      - name: Verify exact PR head
+      - name: Verify exact acceptance revision
         env:
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
@@ -149,7 +177,9 @@ jobs:
           tests/test_reasoning.py::test_live_gemini_reasoning_provider
 
   deploy:
-    needs: verify
+    needs:
+      - authorize
+      - verify
     permissions:
       contents: read
       id-token: write
@@ -159,9 +189,12 @@ jobs:
       apply: true
       validation_mode: true
       embedding_max_distance: "0.35"
+      source_sha: ${{ needs.authorize.outputs.acceptance_sha }}
 
   semantic_acceptance:
-    needs: deploy
+    needs:
+      - authorize
+      - deploy
     runs-on: ubuntu-latest
     environment: demo
     timeout-minutes: 45
@@ -175,8 +208,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.authorize.outputs.acceptance_sha }}
           persist-credentials: false
+      - name: Verify exact acceptance revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
@@ -218,7 +255,7 @@ jobs:
           tests/test_live_semantic_acceptance.py::test_live_gemini_cutoff_generalizes_across_calibration_mechanisms
       - name: Record semantic acceptance evidence
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
         run: |
           {
             echo "### Live semantic acceptance"
@@ -228,6 +265,7 @@ jobs:
 
   benchmark:
     needs:
+      - authorize
       - deploy
       - semantic_acceptance
     runs-on: ubuntu-latest
@@ -239,13 +277,17 @@ jobs:
     env:
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
-      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ github.event.pull_request.head.sha }}
+      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
       HINDSIGHT_CHANGEFEED_WEBHOOK_URL: ${{ needs.deploy.outputs.api_url }}/internal/changefeed
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.authorize.outputs.acceptance_sha }}
           persist-credentials: false
+      - name: Verify exact acceptance revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
@@ -356,7 +398,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-benchmark-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          name: live-benchmark-${{ needs.authorize.outputs.acceptance_sha }}-${{ github.run_attempt }}
           path: live-acceptance-reports/*.json
           if-no-files-found: ignore
           retention-days: 90
@@ -370,6 +412,7 @@ jobs:
   restore_changefeed:
     if: always() && needs.deploy.result == 'success'
     needs:
+      - authorize
       - deploy
       - benchmark
     runs-on: ubuntu-latest
@@ -379,13 +422,17 @@ jobs:
       contents: read
       id-token: write
     env:
-      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ github.event.pull_request.head.sha }}
+      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
       HINDSIGHT_CHANGEFEED_WEBHOOK_URL: ${{ needs.deploy.outputs.api_url }}/internal/changefeed
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.authorize.outputs.acceptance_sha }}
           persist-credentials: false
+      - name: Verify exact acceptance revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
@@ -422,6 +469,7 @@ jobs:
 
   browser_acceptance:
     needs:
+      - authorize
       - deploy
       - benchmark
       - restore_changefeed
@@ -440,8 +488,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.authorize.outputs.acceptance_sha }}
           persist-credentials: false
+      - name: Verify exact acceptance revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
@@ -494,7 +546,7 @@ jobs:
         run: uv run pytest -q tests/test_hosted_acceptance.py tests/test_browser_ui.py
       - name: Record browser acceptance evidence
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
         run: |
           {
             echo "### Hosted browser acceptance"
@@ -516,9 +568,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Record merge-gate evidence
+      - name: Record acceptance evidence
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.authorize.outputs.acceptance_sha }}
           UI_URL: ${{ needs.deploy.outputs.ui_url }}
           API_URL: ${{ needs.deploy.outputs.api_url }}
           AUTHORIZED: ${{ needs.authorize.outputs.authorized }}
