@@ -191,6 +191,22 @@ def test_live_acceptance_restores_changefeed_after_benchmark_failure():
     assert "configure_changefeed.py status" in restore_step
 
 
+def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    browser_job = workflow.split("  browser_acceptance:\n", 1)[1].split(
+        "  acceptance_complete:\n", 1
+    )[0]
+
+    assert (
+        "HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}" in browser_job
+    )
+    assert 'CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER"' in browser_job
+    assert 'echo "::add-mask::$CHANGEFEED_TOKEN"' in browser_job
+    assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
+    assert "test_hosted_acceptance.py" in browser_job
+    assert "WebSocket reconnect/resubscribe/unsubscribe" in browser_job
+
+
 def test_live_acceptance_resolves_one_owner_authorized_revision():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     authorize = workflow.split("  authorize:\n", 1)[1].split("  verify:\n", 1)[0]

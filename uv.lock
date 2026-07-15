@@ -331,6 +331,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "selenium" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -355,6 +356,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "selenium", specifier = ">=4.30.0" },
+    { name = "websockets", specifier = ">=15.0,<16" },
 ]
 
 [[package]]

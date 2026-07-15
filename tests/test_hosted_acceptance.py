@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -168,6 +169,140 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
         store.seal_decision(decision_id=retrieval_decision)
     assert retrieval.selected_strategy == "semantic_vector"
     assert str(job[4]) in {str(hit["id"]) for hit in retrieval.hits}
+
+
+@requires_hosted_acceptance
+def test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe():
+    from websockets.asyncio.client import connect
+
+    api_url = _required_env("HOSTED_API_URL").rstrip("/")
+    websocket_url = _required_env("HINDSIGHT_WEBSOCKET_URL")
+    changefeed_token = _required_env("HINDSIGHT_CHANGEFEED_AUTH_TOKEN")
+    namespace = f"live-websocket-lifecycle:{uuid4().hex}"
+
+    async def scenario() -> None:
+        first = await connect(websocket_url, open_timeout=15, close_timeout=15)
+        await first.send(
+            json.dumps({"type": "subscribe", "namespace": namespace, "run_id": None})
+        )
+        await _wait_for_websocket_delivery(
+            first,
+            api_url=api_url,
+            token=changefeed_token,
+            namespace=namespace,
+        )
+        await first.close(code=1000)
+        await first.wait_closed()
+        assert first.close_code == 1000
+
+        async with connect(websocket_url, open_timeout=15, close_timeout=15) as second:
+            disconnected = await asyncio.to_thread(
+                _inject_changefeed_event,
+                api_url=api_url,
+                token=changefeed_token,
+                namespace=namespace,
+            )
+            assert disconnected["delivered"] == 0
+            await _assert_no_websocket_message(second)
+
+            await second.send(
+                json.dumps({"type": "subscribe", "namespace": namespace, "run_id": None})
+            )
+            await _wait_for_websocket_delivery(
+                second,
+                api_url=api_url,
+                token=changefeed_token,
+                namespace=namespace,
+            )
+
+            await second.send(json.dumps({"type": "unsubscribe"}))
+            await _wait_for_websocket_silence(
+                second,
+                api_url=api_url,
+                token=changefeed_token,
+                namespace=namespace,
+            )
+
+    asyncio.run(scenario())
+
+
+async def _wait_for_websocket_delivery(
+    socket, *, api_url: str, token: str, namespace: str
+) -> None:
+    for _ in range(20):
+        result = await asyncio.to_thread(
+            _inject_changefeed_event,
+            api_url=api_url,
+            token=token,
+            namespace=namespace,
+        )
+        if result["delivered"] == 1:
+            message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+            assert message["type"] == "run"
+            assert message["namespace"] == namespace
+            assert message["data"]["run"]["id"] == result["event_id"]
+            return
+        assert result["delivered"] == 0
+        await asyncio.sleep(0.5)
+    pytest.fail("WebSocket subscription did not become active")
+
+
+async def _wait_for_websocket_silence(
+    socket, *, api_url: str, token: str, namespace: str
+) -> None:
+    for _ in range(20):
+        result = await asyncio.to_thread(
+            _inject_changefeed_event,
+            api_url=api_url,
+            token=token,
+            namespace=namespace,
+        )
+        if result["delivered"] == 0:
+            break
+        assert result["delivered"] == 1
+        message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+        assert message["data"]["run"]["id"] == result["event_id"]
+        await asyncio.sleep(0.5)
+    else:
+        pytest.fail("WebSocket unsubscribe did not become active")
+
+    final = await asyncio.to_thread(
+        _inject_changefeed_event,
+        api_url=api_url,
+        token=token,
+        namespace=namespace,
+    )
+    assert final["delivered"] == 0
+    await _assert_no_websocket_message(socket)
+
+
+async def _assert_no_websocket_message(socket) -> None:
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(socket.recv(), timeout=2)
+
+
+def _inject_changefeed_event(
+    *, api_url: str, token: str, namespace: str
+) -> dict[str, object]:
+    event_id = str(uuid4())
+    response = _post_json(
+        f"{api_url}/internal/changefeed",
+        token=token,
+        payload={
+            "payload": [
+                {
+                    "topic": "agent_runs",
+                    "after": {
+                        "id": event_id,
+                        "namespace": namespace,
+                        "status": "triaging",
+                    },
+                }
+            ]
+        },
+    )
+    assert response["accepted"] == 1
+    return {**response, "event_id": event_id}
 
 
 def _post_json(url: str, *, token: str, payload: dict[str, object]) -> dict[str, object]:
