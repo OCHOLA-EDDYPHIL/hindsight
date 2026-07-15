@@ -132,6 +132,114 @@ def test_writes_after_build_snapshot_are_enqueued_before_activation(monkeypatch)
 
 
 @requires_db
+def test_retrieval_remains_explicit_and_complete_across_profile_rotation():
+    from hindsight.db import connect, database_url
+    from hindsight.embedding_index import (
+        EmbeddingCoverageError,
+        activate_profile,
+        begin_profile_build,
+    )
+    from hindsight.embeddings import DeterministicEmbeddingProvider, embedding_profile
+    from hindsight.memory import MemoryStore, Provenance
+
+    class RotationProvider(DeterministicEmbeddingProvider):
+        provider_name = "test-retrieval-rotation"
+        model_name = "test-retrieval-rotation-v1"
+        capability = "semantic"
+        encoder_revision = "test-retrieval-rotation-v1"
+
+    profile_a_provider = DeterministicEmbeddingProvider()
+    profile_b_provider = RotationProvider()
+    profile_a = embedding_profile(profile_a_provider)
+    profile_b = embedding_profile(profile_b_provider)
+    namespace = f"profile-retrieval-rotation-{uuid4()}"
+    with MemoryStore(url=database_url(), embedding_provider=profile_a_provider) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="processor retries amplified the downstream queue",
+            provenance=Provenance(
+                "pytest", "evidence:profile-a", "seed profile rotation retrieval"
+            ),
+        )
+
+    building = begin_profile_build(provider=profile_b_provider, db_url=database_url())
+    assert building["id"] == profile_b.profile_id
+    with pytest.raises(EmbeddingCoverageError, match="profile coverage incomplete"):
+        activate_profile(profile_id=profile_b.profile_id, db_url=database_url())
+    with MemoryStore(url=database_url(), embedding_provider=profile_a_provider) as store:
+        during_build_decision = f"profile-a-during-build:{uuid4()}"
+        during_build = store.retrieve_semantic(
+            namespace=namespace,
+            query="downstream queue retries",
+            decision_id=during_build_decision,
+            reader="pytest",
+            purpose="verify active-profile continuity during rotation",
+            policy="semantic_strict",
+            limit=1,
+        )
+        store.seal_decision(decision_id=during_build_decision)
+    assert during_build.embedding_profile == profile_a
+    assert [row["id"] for row in during_build.hits] == [memory["id"]]
+
+    premature_decision = f"profile-b-before-activation:{uuid4()}"
+    with MemoryStore(url=database_url(), embedding_provider=profile_b_provider) as store:
+        with pytest.raises(
+            RuntimeError,
+            match="configured embedding provider does not match the database-active profile",
+        ):
+            store.retrieve_semantic(
+                namespace=namespace,
+                query="downstream queue retries",
+                decision_id=premature_decision,
+                reader="pytest",
+                purpose="reject retrieval through an inactive profile",
+                policy="semantic_strict",
+                limit=1,
+            )
+        store.seal_decision(decision_id=premature_decision, failed=True)
+
+    _finish_build(provider=profile_b_provider, worker_id="pytest-retrieval-rotation")
+    activated = activate_profile(profile_id=profile_b.profile_id, db_url=database_url())
+    assert activated["active_profile_id"] == profile_b.profile_id
+    with connect() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM current_semantic_memories AS memory "
+            "LEFT JOIN semantic_memory_vectors AS vector "
+            "ON vector.memory_id = memory.id AND vector.profile_id = %s "
+            "WHERE memory.trust_status = 'active' AND vector.memory_id IS NULL",
+            (profile_b.profile_id,),
+        ).fetchone() == (0,)
+
+    with MemoryStore(url=database_url(), embedding_provider=profile_b_provider) as store:
+        after_activation_decision = f"profile-b-after-activation:{uuid4()}"
+        after_activation = store.retrieve_semantic(
+            namespace=namespace,
+            query="downstream queue retries",
+            decision_id=after_activation_decision,
+            reader="pytest",
+            purpose="verify retrieval continuity after rotation",
+            policy="semantic_strict",
+            limit=1,
+        )
+        store.seal_decision(decision_id=after_activation_decision)
+    assert after_activation.embedding_profile == profile_b
+    assert [row["id"] for row in after_activation.hits] == [memory["id"]]
+    with connect() as conn:
+        assert {
+            row[0]
+            for row in conn.execute(
+                "SELECT profile_id FROM semantic_memory_vectors WHERE memory_id = %s",
+                (memory["id"],),
+            ).fetchall()
+        } >= {profile_a.profile_id, profile_b.profile_id}
+
+    restored = begin_profile_build(provider=profile_a_provider, db_url=database_url())
+    _finish_build(provider=profile_a_provider, worker_id="pytest-retrieval-restore")
+    activate_profile(profile_id=str(restored["id"]), db_url=database_url())
+
+
+@requires_db
 def test_build_fence_blocks_overlapping_write_until_snapshot_commits(monkeypatch):
     import hindsight.memory as memory_module
     from hindsight.db import connect, database_url
