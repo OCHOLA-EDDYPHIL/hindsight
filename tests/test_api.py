@@ -60,18 +60,30 @@ def test_operator_session_sets_httponly_cookie(monkeypatch):
 def test_run_creation_returns_accepted_and_enqueues_once(monkeypatch):
     import hindsight.api as api
 
+    settings = SimpleNamespace(
+        database_url="postgresql://resolved/database",
+        provider_env={},
+    )
+    database_calls = []
     monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setattr(api, "runtime_database_url", lambda: settings.database_url)
     monkeypatch.setattr(
         api,
         "get_incident",
-        lambda **kwargs: {"slug": kwargs["slug"], "service_slug": "payments-api"},
+        lambda **kwargs: (
+            database_calls.append(("get_incident", kwargs))
+            or {"slug": kwargs["slug"], "service_slug": "payments-api"}
+        ),
     )
     monkeypatch.setattr(
         api,
         "create_run",
         lambda **kwargs: (
-            {"id": "run-1", "status": "queued", "service_slug": kwargs["service_slug"]},
-            True,
+            database_calls.append(("create_run", kwargs))
+            or (
+                {"id": "run-1", "status": "queued", "service_slug": kwargs["service_slug"]},
+                True,
+            )
         ),
     )
     messages = []
@@ -93,16 +105,31 @@ def test_run_creation_returns_accepted_and_enqueues_once(monkeypatch):
     assert response.status_code == 202
     assert response.json() == {"run_id": "run-1", "status": "queued", "created": True}
     assert messages == [{"command": "start", "run_id": "run-1"}]
+    assert database_calls[0] == (
+        "get_incident",
+        {"slug": "checkout-latency", "db_url": settings.database_url},
+    )
+    assert database_calls[1][0] == "create_run"
+    assert database_calls[1][1]["db_url"] == settings.database_url
 
 
 def test_rewind_execute_rejects_stale_preview(monkeypatch):
     import hindsight.api as api
 
+    settings = SimpleNamespace(
+        database_url="postgresql://resolved/database",
+        provider_env={},
+    )
+    calls = []
     monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setattr(api, "runtime_database_url", lambda: settings.database_url)
     monkeypatch.setattr(
         api,
         "enqueue_operation",
-        lambda **kwargs: (_ for _ in ()).throw(api.OperationConflictError("stale preview")),
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or (_ for _ in ()).throw(api.OperationConflictError("stale preview"))
+        ),
     )
     client = TestClient(api.app)
 
@@ -120,6 +147,112 @@ def test_rewind_execute_rejects_stale_preview(monkeypatch):
 
     assert response.status_code == 409
     assert response.json()["detail"] == "stale preview"
+    assert calls[0]["db_url"] == settings.database_url
+
+
+def test_db_backed_routes_share_the_resolved_runtime_database(monkeypatch):
+    import hindsight.api as api
+
+    settings = SimpleNamespace(
+        database_url="postgresql://resolved/database",
+        provider_env={},
+    )
+    calls = []
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(api, "runtime_database_url", lambda: settings.database_url)
+    monkeypatch.setattr(
+        api,
+        "runtime_settings",
+        lambda: (_ for _ in ()).throw(RuntimeError("provider secret is unavailable")),
+    )
+    monkeypatch.setattr(
+        api,
+        "list_incidents",
+        lambda **kwargs: calls.append(("incidents", kwargs)) or [],
+    )
+    monkeypatch.setattr(
+        api,
+        "get_run",
+        lambda **kwargs: calls.append(("run", kwargs)) or {"id": kwargs["run_id"]},
+    )
+    monkeypatch.setattr(
+        api,
+        "memory_snapshot",
+        lambda **kwargs: calls.append(("dashboard", kwargs)) or {"memories": []},
+    )
+    monkeypatch.setattr(
+        api,
+        "get_operation",
+        lambda **kwargs: calls.append(("operation", kwargs)) or {"id": kwargs["operation_id"]},
+    )
+    client = TestClient(api.app)
+
+    assert client.get("/v1/incidents?limit=1").status_code == 200
+    assert client.get("/v1/runs/run-1").status_code == 200
+    assert client.get("/v1/namespaces/demo:payments/beliefs").status_code == 200
+    assert client.get("/v1/memory/operations/operation-1").status_code == 200
+
+    assert calls == [
+        ("incidents", {"limit": 1, "db_url": settings.database_url}),
+        ("run", {"run_id": "run-1", "db_url": settings.database_url}),
+        (
+            "dashboard",
+            {
+                "namespace": "demo:payments",
+                "as_of": None,
+                "db_url": settings.database_url,
+                "limit": 100,
+            },
+        ),
+        (
+            "operation",
+            {"operation_id": "operation-1", "db_url": settings.database_url},
+        ),
+    ]
+
+
+def test_runtime_database_resolution_failure_does_not_reach_db_helpers(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://fallback/should-not-be-used")
+    monkeypatch.setattr(
+        api,
+        "runtime_database_url",
+        lambda: (_ for _ in ()).throw(RuntimeError("configured secret is unavailable")),
+    )
+    monkeypatch.setattr(
+        api,
+        "list_incidents",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("DB helper was called")),
+    )
+    client = TestClient(api.app)
+
+    response = client.get("/v1/incidents")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime configuration is unavailable"}
+
+
+def test_request_validation_precedes_database_resolution(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setattr(
+        api,
+        "runtime_database_url",
+        lambda: (_ for _ in ()).throw(AssertionError("database resolution was attempted")),
+    )
+    client = TestClient(api.app)
+
+    invalid_limit = client.get("/v1/namespaces/demo:payments/beliefs?limit=0")
+    missing_idempotency_key = client.post(
+        "/v1/memory/operations",
+        headers={"Authorization": "Bearer operator-secret"},
+        json={"preview_id": "preview-1", "fingerprint": "b" * 64},
+    )
+
+    assert invalid_limit.status_code == 422
+    assert missing_idempotency_key.status_code == 422
 
 
 def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):

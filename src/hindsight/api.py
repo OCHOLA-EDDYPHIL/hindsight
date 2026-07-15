@@ -41,7 +41,12 @@ from hindsight.operations import (
     preview_supersession,
 )
 from hindsight.queueing import RunQueueUnavailableError, enqueue_run
-from hindsight.runtime import function_auth_token, runtime_settings
+from hindsight.runtime import (
+    RuntimeSettings,
+    function_auth_token,
+    runtime_database_url,
+    runtime_settings,
+)
 from hindsight.runs import (
     RunConflictError,
     RunNotFoundError,
@@ -158,6 +163,26 @@ class AcceptedRun(BaseModel):
     created: bool
 
 
+def _api_runtime_settings() -> RuntimeSettings:
+    try:
+        return runtime_settings()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="runtime configuration is unavailable",
+        ) from exc
+
+
+def _api_database_url() -> str:
+    try:
+        return runtime_database_url()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="runtime configuration is unavailable",
+        ) from exc
+
+
 def _operator_required(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
@@ -173,9 +198,9 @@ def health_live() -> dict[str, str]:
 
 @app.get(f"{API_PREFIX}/health/ready", tags=["health"])
 def health_ready() -> dict[str, str]:
+    db_url = _api_database_url()
     try:
-        settings = runtime_settings()
-        with connect(settings.database_url, application_name="hindsight-health") as conn:
+        with connect(db_url, application_name="hindsight-health") as conn:
             conn.execute("SELECT 1").fetchone()
     except Exception as exc:
         raise HTTPException(status_code=503, detail="database is unavailable") from exc
@@ -184,7 +209,8 @@ def health_ready() -> dict[str, str]:
 
 @app.get(f"{API_PREFIX}/incidents", tags=["incidents"])
 def incidents_index(limit: Annotated[int, Field(ge=1, le=100)] = 30) -> dict[str, Any]:
-    rows = list_incidents(limit=limit)
+    db_url = _api_database_url()
+    rows = list_incidents(limit=limit, db_url=db_url)
     return {"items": rows, "count": len(rows)}
 
 
@@ -195,15 +221,17 @@ def incidents_index(limit: Annotated[int, Field(ge=1, le=100)] = 30) -> dict[str
     dependencies=[Depends(_operator_required)],
 )
 def incidents_create(payload: IncidentCreate) -> dict[str, Any]:
+    db_url = _api_database_url()
     try:
-        return create_incident(**payload.model_dump())
+        return create_incident(**payload.model_dump(), db_url=db_url)
     except psycopg_errors.UniqueViolation as exc:
         raise HTTPException(status_code=409, detail="incident slug already exists") from exc
 
 
 @app.get(f"{API_PREFIX}/incidents/{{slug}}", tags=["incidents"])
 def incidents_get(slug: str) -> dict[str, Any]:
-    incident = get_incident(slug=slug)
+    db_url = _api_database_url()
+    incident = get_incident(slug=slug, db_url=db_url)
     if incident is None:
         raise HTTPException(status_code=404, detail="incident not found")
     return incident
@@ -215,10 +243,12 @@ def incidents_get(slug: str) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def incidents_resolve(slug: str, payload: IncidentResolutionRequest) -> dict[str, Any]:
+    db_url = _api_database_url()
     try:
         return resolve_incident(
             slug=slug,
             actor="dashboard.operator",
+            db_url=db_url,
             **payload.model_dump(),
         )
     except LookupError as exc:
@@ -237,7 +267,8 @@ def runs_create(
     payload: RunCreate,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AcceptedRun:
-    incident = get_incident(slug=slug)
+    db_url = _api_database_url()
+    incident = get_incident(slug=slug, db_url=db_url)
     if incident is None:
         raise HTTPException(status_code=404, detail="incident not found")
     run, created = create_run(
@@ -248,6 +279,7 @@ def runs_create(
         thread_id=payload.thread_id,
         idempotency_key=idempotency_key,
         retrieval_policy=payload.retrieval_policy,
+        db_url=db_url,
     )
     if created:
         try:
@@ -257,6 +289,7 @@ def runs_create(
                 run_id=run["id"],
                 failure_code="queue_unavailable",
                 failure_detail=safe_error_detail(exc),
+                db_url=db_url,
             )
             raise HTTPException(status_code=503, detail="run queue is unavailable") from exc
     return AcceptedRun(run_id=run["id"], status=run["status"], created=created)
@@ -264,7 +297,8 @@ def runs_create(
 
 @app.get(f"{API_PREFIX}/runs/{{run_id}}", tags=["runs"])
 def runs_get(run_id: str) -> dict[str, Any]:
-    run = get_run(run_id=run_id)
+    db_url = _api_database_url()
+    run = get_run(run_id=run_id, db_url=db_url)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
@@ -277,8 +311,13 @@ def runs_get(run_id: str) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
+    db_url = _api_database_url()
     try:
-        prepare_approval(run_id=run_id, approved=payload.approved)
+        prepare_approval(
+            run_id=run_id,
+            approved=payload.approved,
+            db_url=db_url,
+        )
     except RunNotFoundError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
     except RunConflictError as exc:
@@ -294,6 +333,7 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
             phase="queue",
             summary="Approval could not be queued",
             fields={"failure_detail": safe_error_detail(exc)},
+            db_url=db_url,
         )
         raise HTTPException(status_code=503, detail="run queue is unavailable") from exc
     return {"run_id": run_id, "status": "resuming", "approved": payload.approved}
@@ -309,9 +349,10 @@ def beliefs_get(
 ) -> dict[str, Any]:
     if limit < 1 or limit > 100:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
+    db_url = _api_database_url()
     if system_as_of is not None or valid_at is not None:
         resolved_system_time = system_as_of or datetime.now().astimezone()
-        with MemoryStore() as store:
+        with MemoryStore(url=db_url) as store:
             rows = store.list_semantic_as_of(
                 namespace=namespace,
                 system_as_of=resolved_system_time,
@@ -328,13 +369,15 @@ def beliefs_get(
     return memory_snapshot(
         namespace=namespace,
         as_of=as_of.isoformat() if as_of else None,
+        db_url=db_url,
         limit=limit,
     )
 
 
 @app.get(f"{API_PREFIX}/memories/{{memory_kind}}/{{memory_id}}", tags=["memory"])
 def memories_get(memory_kind: Literal["episodic", "semantic"], memory_id: str) -> dict[str, Any]:
-    with MemoryStore() as store:
+    db_url = _api_database_url()
+    with MemoryStore(url=db_url) as store:
         memory = store.audit_memory(memory_kind=memory_kind, memory_id=memory_id)
         if memory is None:
             raise HTTPException(status_code=404, detail="memory not found")
@@ -347,8 +390,8 @@ def memories_get(memory_kind: Literal["episodic", "semantic"], memory_id: str) -
 
 @app.get(f"{API_PREFIX}/decisions/{{decision_id}}/influence", tags=["memory"])
 def decisions_influence(decision_id: str) -> dict[str, Any]:
-    settings = runtime_settings()
-    with connect(settings.database_url, application_name="hindsight-api") as conn:
+    db_url = _api_database_url()
+    with connect(db_url, application_name="hindsight-api") as conn:
         store = MemoryStore(conn=conn)
         reads = store.reads_for_decision(decision_id=decision_id)
         memories = []
@@ -379,12 +422,14 @@ def decisions_influence(decision_id: str) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def rewind_preview(namespace: str, payload: RewindRequest) -> dict[str, Any]:
+    db_url = _api_database_url()
     return _jsonable(
         preview_rewind(
             namespace=namespace,
             target_timestamp=payload.target_timestamp,
             actor="dashboard.operator",
             reason=payload.reason,
+            db_url=db_url,
         )
     )
 
@@ -413,6 +458,7 @@ def rewind_execute(
     dependencies=[Depends(_operator_required)],
 )
 def retraction_preview(payload: RetractionPreviewRequest) -> dict[str, Any]:
+    db_url = _api_database_url()
     try:
         return _jsonable(
             preview_retraction(
@@ -420,6 +466,7 @@ def retraction_preview(payload: RetractionPreviewRequest) -> dict[str, Any]:
                 actor="dashboard.operator",
                 reason=payload.reason,
                 authorized_namespaces=payload.authorized_namespaces,
+                db_url=db_url,
             )
         )
     except OperationAuthorizationError as exc:
@@ -432,6 +479,7 @@ def retraction_preview(payload: RetractionPreviewRequest) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
+    db_url = _api_database_url()
     try:
         return _jsonable(
             preview_supersession(
@@ -442,6 +490,7 @@ def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
                 actor="dashboard.operator",
                 reason=payload.reason,
                 authorized_namespaces=payload.authorized_namespaces,
+                db_url=db_url,
             )
         )
     except OperationAuthorizationError as exc:
@@ -456,6 +505,7 @@ def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
 def review_resolution_preview(
     review_item_id: str, payload: ReviewResolutionPreviewRequest
 ) -> dict[str, Any]:
+    db_url = _api_database_url()
     try:
         return _jsonable(
             preview_review_resolution(
@@ -464,6 +514,7 @@ def review_resolution_preview(
                 actor="dashboard.operator",
                 reason=payload.reason,
                 authorized_namespaces=payload.authorized_namespaces,
+                db_url=db_url,
             )
         )
     except LookupError as exc:
@@ -487,7 +538,8 @@ def operations_create(
 
 @app.get(f"{API_PREFIX}/memory/operations/{{operation_id}}", tags=["memory"])
 def operations_get(operation_id: str) -> dict[str, Any]:
-    operation = get_operation(operation_id=operation_id)
+    db_url = _api_database_url()
+    operation = get_operation(operation_id=operation_id, db_url=db_url)
     if operation is None:
         raise HTTPException(status_code=404, detail="memory operation not found")
     return _jsonable(operation)
@@ -498,11 +550,13 @@ def _approve_operation(
 ) -> dict[str, Any]:
     if not idempotency_key:
         raise HTTPException(status_code=422, detail="Idempotency-Key is required")
+    db_url = _api_database_url()
     try:
         operation, created = enqueue_operation(
             preview_id=payload.preview_id,
             fingerprint=payload.fingerprint,
             idempotency_key=idempotency_key,
+            db_url=db_url,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -527,7 +581,7 @@ def _approve_operation(
     dependencies=[Depends(_operator_required)],
 )
 def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
-    settings = runtime_settings()
+    settings = _api_runtime_settings()
     embedding_provider = embedding_provider_from_env(settings.provider_env)
     session_namespace = reset_poison_rewind_state(
         namespace=payload.namespace,
@@ -552,7 +606,7 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def demo_poison(payload: DemoPoisonRequest) -> dict[str, Any]:
-    settings = runtime_settings()
+    settings = _api_runtime_settings()
     embedding_provider = embedding_provider_from_env(settings.provider_env)
     return _jsonable(
         poison_demo_memory(
