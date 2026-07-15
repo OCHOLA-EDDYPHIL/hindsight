@@ -166,3 +166,16 @@ def test_live_acceptance_restores_changefeed_after_benchmark_failure():
     assert "if: always()" in restore_step
     assert "configure_changefeed.py apply" in restore_step
     assert "configure_changefeed.py status" in restore_step
+
+
+def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():
+    makefile = pathlib.Path("Makefile").read_text()
+
+    dev_up = makefile.split("dev-up:\n", 1)[1].split("\ndev-down:", 1)[0]
+    product_api = makefile.split("product-api-local:\n", 1)[1].split(
+        "\nchangefeed-apply:", 1
+    )[0]
+    assert "feature.vector_index.enabled = true" in dev_up
+    assert 'HINDSIGHT_DATABASE_URL_PARAM=""' in product_api
+    assert 'HINDSIGHT_GEMINI_API_KEY_PARAM=""' in product_api
+    assert 'HINDSIGHT_GEMINI_API_KEYS_PARAM=""' in product_api

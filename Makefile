@@ -7,6 +7,7 @@ BENCHMARK_MAX_DISTANCE ?= 0.35
 dev-up:
 	docker compose up -d --wait
 	docker compose exec -T crdb cockroach sql --insecure -e "SET CLUSTER SETTING kv.rangefeed.enabled = true"
+	docker compose exec -T crdb cockroach sql --insecure -e "SET CLUSTER SETTING feature.vector_index.enabled = true"
 	@echo "CockroachDB ready: sql at localhost:26257, admin ui at http://localhost:8080"
 
 dev-down:
@@ -71,7 +72,7 @@ memory-dashboard-local:
 	uv run python scripts/run_memory_dashboard.py --db-url "$(LOCAL_DATABASE_URL)"
 
 product-api-local:
-	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_DATABASE_URL_PARAM="" HINDSIGHT_GEMINI_API_KEY_PARAM="" HINDSIGHT_INLINE_WORKER=1 HINDSIGHT_SECURE_COOKIES=0 uv run uvicorn hindsight.api:app --reload --host 127.0.0.1 --port 8766
+	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_DATABASE_URL_PARAM="" HINDSIGHT_GEMINI_API_KEY_PARAM="" HINDSIGHT_GEMINI_API_KEYS_PARAM="" HINDSIGHT_INLINE_WORKER=1 HINDSIGHT_SECURE_COOKIES=0 uv run uvicorn hindsight.api:app --reload --host 127.0.0.1 --port 8766
 
 changefeed-apply:
 	uv run python scripts/configure_changefeed.py apply
