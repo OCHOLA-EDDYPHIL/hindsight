@@ -38,10 +38,109 @@ def test_explicit_text_miss_stays_empty_and_strict_retrieval_is_audited():
         assert [row["id"] for row in result.hits] == [memory["id"]]
         assert result.policy == "semantic_strict"
         assert result.selected_strategy == "semantic_vector"
+        assert result.fallback_reason is None
         retrieval = store._fetch_one(  # noqa: SLF001
             "SELECT * FROM memory_retrievals WHERE id = %s", (result.retrieval_id,)
         )
         assert retrieval["returned_memory_ids"] == [str(memory["id"])]
+        assert retrieval["fallback_reason"] is None
+
+
+@requires_db
+@pytest.mark.parametrize(
+    ("vector_failure", "query", "expected_strategy", "expected_reason"),
+    [
+        (False, "retry fanout", "keyword", "semantic_vector_empty"),
+        (True, "retry fanout", "keyword", "semantic_vector_error"),
+        (False, "certificate expiry", None, "semantic_vector_empty"),
+        (True, "certificate expiry", None, "semantic_vector_error"),
+    ],
+)
+def test_degraded_retrieval_returns_and_persists_its_fallback_reason(
+    monkeypatch, vector_failure, query, expected_strategy, expected_reason
+):
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"retrieval-fallback-reason-{uuid4()}"
+    decision_id = f"retrieval-fallback:{uuid4()}"
+    with MemoryStore(
+        url=database_url(), embedding_provider=DeterministicEmbeddingProvider()
+    ) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="processor timeout recovered after retry fanout was throttled",
+            provenance=Provenance(
+                "pytest", "evidence:fallback", "seed explicit fallback test"
+            ),
+        )
+
+        def vector_attempt(**_kwargs):
+            if vector_failure:
+                raise RuntimeError("simulated vector unavailability")
+            return []
+
+        monkeypatch.setattr(store, "search_semantic_vector", vector_attempt)
+        result = store.retrieve_semantic(
+            namespace=namespace,
+            query=query,
+            decision_id=decision_id,
+            reader="pytest.agent",
+            purpose="verify explicit fallback metadata",
+            policy="semantic_then_keyword",
+            limit=1,
+        )
+        store.seal_decision(decision_id=decision_id)
+        audit = store._fetch_one(  # noqa: SLF001 - persisted retrieval contract
+            "SELECT * FROM memory_retrievals WHERE id = %s", (result.retrieval_id,)
+        )
+
+    expected_hits = [memory["id"]] if expected_strategy == "keyword" else []
+    assert [row["id"] for row in result.hits] == expected_hits
+    assert result.selected_strategy == expected_strategy
+    assert result.fallback_reason == expected_reason
+    assert audit["selected_strategy"] == expected_strategy
+    assert audit["fallback_reason"] == expected_reason
+    assert audit["returned_memory_ids"] == [str(value) for value in expected_hits]
+
+
+@requires_db
+def test_strict_semantic_miss_returns_no_fallback_or_unrelated_rows(monkeypatch):
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"strict-empty-retrieval-{uuid4()}"
+    decision_id = f"strict-empty:{uuid4()}"
+    with MemoryStore(
+        url=database_url(), embedding_provider=DeterministicEmbeddingProvider()
+    ) as store:
+        store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="an unrelated recent operational note",
+            provenance=Provenance(
+                "pytest", "evidence:unrelated", "seed unrelated current memory"
+            ),
+        )
+        monkeypatch.setattr(store, "search_semantic_vector", lambda **_kwargs: [])
+        result = store.retrieve_semantic(
+            namespace=namespace,
+            query="certificate expiry",
+            decision_id=decision_id,
+            reader="pytest.agent",
+            purpose="verify strict empty retrieval",
+            policy="semantic_strict",
+            limit=5,
+        )
+        store.seal_decision(decision_id=decision_id)
+
+    assert result.status == "empty"
+    assert result.hits == ()
+    assert result.selected_strategy is None
+    assert result.fallback_reason is None
 
 
 @requires_db

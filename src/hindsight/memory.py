@@ -104,6 +104,7 @@ class RetrievalResult:
     policy_version: int
     status: Literal["succeeded", "empty", "degraded", "failed"]
     selected_strategy: str | None
+    fallback_reason: str | None
     embedding_profile: EmbeddingProfile | None
     attempts: tuple[RetrievalAttempt, ...]
     hits: tuple[dict[str, Any], ...]
@@ -549,6 +550,7 @@ class MemoryStore:
         profile: EmbeddingProfile | None = None
         rows: list[dict[str, Any]] = []
         selected_strategy: str | None = None
+        fallback_reason: str | None = None
         failure: Exception | None = None
         try:
             profile = self.ensure_active_embedding_profile()
@@ -591,6 +593,9 @@ class MemoryStore:
             )
 
         if policy == "semantic_then_keyword" and not rows:
+            fallback_reason = (
+                "semantic_vector_error" if failure is not None else "semantic_vector_empty"
+            )
             try:
                 with self._conn.transaction():
                     rows = self.search_current_semantic_text(
@@ -641,11 +646,11 @@ class MemoryStore:
                     INSERT INTO memory_retrievals (
                         id, decision_id, namespace, reader, purpose, policy,
                         policy_version, query_sha256, requested_limit, status,
-                        selected_strategy, embedding_profile_id, attempts,
+                        selected_strategy, fallback_reason, embedding_profile_id, attempts,
                         returned_memory_ids, error_code, completed_at
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, 1, %s, %s, %s,
-                            %s, %s, %s, %s, %s, now())
+                            %s, %s, %s, %s, %s, %s, now())
                 """,
                 (
                     retrieval_id,
@@ -658,6 +663,7 @@ class MemoryStore:
                     limit,
                     status,
                     selected_strategy,
+                    fallback_reason,
                     profile.profile_id if profile is not None else None,
                     Jsonb([attempt.__dict__ for attempt in attempts]),
                     Jsonb([str(row["id"]) for row in rows]),
@@ -686,6 +692,7 @@ class MemoryStore:
             policy_version=1,
             status=status,
             selected_strategy=selected_strategy,
+            fallback_reason=fallback_reason,
             embedding_profile=profile,
             attempts=tuple(attempts),
             hits=tuple(rows),
