@@ -46,6 +46,28 @@ def test_deterministic_embedding_provider_is_stable():
     assert any(value != 0 for value in first)
 
 
+def test_bedrock_embedding_provider_uses_bounded_adaptive_retries(monkeypatch):
+    import hindsight.embeddings as embeddings
+
+    calls = []
+
+    def fake_client(service_name, **kwargs):
+        calls.append((service_name, kwargs))
+        return object()
+
+    monkeypatch.setattr("boto3.client", fake_client)
+
+    provider = embeddings.BedrockTitanEmbeddingProvider(
+        model_id="bedrock-embed-test",
+        region_name="us-east-1",
+    )
+
+    assert provider.model_name == "bedrock-embed-test"
+    service_name, kwargs = calls[0]
+    assert service_name == "bedrock-runtime"
+    assert kwargs["config"].retries == {"max_attempts": 5, "mode": "adaptive"}
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVE_BEDROCK_EMBEDDINGS") != "1",
     reason="live Bedrock embedding invocation is opt-in",

@@ -12,7 +12,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
-from hindsight.aws import aws_client_config
+from hindsight.aws import (
+    AWS_BEDROCK_MAX_ATTEMPTS,
+    AWS_BEDROCK_RETRY_MODE,
+    aws_client_config,
+)
 from hindsight.gemini import GeminiCredentialPool, gemini_pool_from_env
 
 DEFAULT_LLM_PROVIDER = "gemini"
@@ -164,7 +168,10 @@ class BedrockReasoningProvider:
             client = boto3.client(
                 "bedrock-runtime",
                 region_name=region_name,
-                config=aws_client_config(),
+                config=aws_client_config(
+                    max_attempts=AWS_BEDROCK_MAX_ATTEMPTS,
+                    retry_mode=AWS_BEDROCK_RETRY_MODE,
+                ),
             )
         self.model_name = model_name
         self._client = client
