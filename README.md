@@ -90,7 +90,7 @@ uv run python scripts/run_learning_benchmark.py confirmation \
 
 `preregister` derives the minimum independent sample from the completed pilot, then commits all twelve pilot-frozen held-out variants rather than outcome-selecting a subset. Two repetitions are aggregated within each incident variant, and same-mechanism variants are then aggregated before inference. Efficacy and reference noninferiority use one-sided exact sign-flip tests over mechanism-level action differences with Bonferroni control, plus an observed one-action minimum-effect gate; the pilot power calculation is explicitly a nominal normal approximation. Six mechanisms support pilot standard deviations up to about 0.755 actions at the frozen alpha, power, and effect target. If either endpoint requires more than six mechanisms, confirmation is not created and the study authorizes no claim; the corpus must be versioned and expanded without retuning against held-out outcomes. The study contract pins the code commit, corpus, providers, active embedding profile, cutoff, simulator, and endpoints, and permits only one outcome-bearing pilot and confirmation for that identity. `confirmation` loads that durable contract and cannot regenerate it. `ci-smoke` uses deterministic fixtures, skips live semantic rank checks, and is never eligible for performance claims.
 
-The owner-authorized `live acceptance` workflow runs provider, migration, hosted deployment, benchmark, and Firefox checks on GitHub-hosted runners. It assumes the demo role through OIDC and reads the encrypted database and Gemini pool from SSM; local `.env` credentials are not copied into GitHub. Gemini semantic validation is mandatory. Set the repository variable `HINDSIGHT_REQUIRE_BEDROCK_ACCEPTANCE=1` when the account has Titan invocation quota; otherwise the workflow records that Bedrock invocation was deferred and makes no Bedrock-live claim.
+The owner-authorized `live acceptance` workflow is configured to run Gemini provider, migration, hosted deployment, benchmark, and Firefox checks on GitHub-hosted runners. It assumes the demo role through OIDC and reads the encrypted database and Gemini pool from SSM; local `.env` credentials are not copied into GitHub. Gemini semantic validation is mandatory, and only a successful exact-SHA run is hosted evidence.
 
 ## Live memory dashboard
 
@@ -155,7 +155,9 @@ make changefeed-pause
 
 Hosted retrieval is strict semantic vector search by default. A miss stays empty; keyword fallback occurs only when a run explicitly selects the degraded `semantic_then_keyword` policy, and every attempt, ordered hit, decision, and profile is audited. The deterministic hashing provider is a lexical-hash test fixture—not a semantic encoder—and hosted activation rejects it.
 
-The hosted worker uses an SSM-backed Gemini key pool for reasoning and 1,024-dimensional `gemini-embedding-2` vectors, or configured Bedrock models. Local runs can set `GEMINI_API_KEY` plus numbered keys such as `GEMINI_API_KEY_1`.
+The submission configuration selects an SSM-backed Gemini key pool for reasoning and 1,024-dimensional `gemini-embedding-2` vectors. Local runs can set `GEMINI_API_KEY` plus numbered keys such as `GEMINI_API_KEY_1`. Hosted behavior remains evidence-pending until an exact-SHA live-acceptance run succeeds.
+
+Bedrock adapters remain in the provider abstraction for explicit development work, but they are quota-deferred, unhosted, not configured or verified in the deployed submission, excluded from live acceptance, and not part of this submission.
 
 Embedding spaces are content-addressed profiles. Model rotation builds vectors side-by-side and activation fails until every current trusted memory has coverage, so retrieval never mixes spaces or silently loses rows:
 

@@ -1,8 +1,10 @@
 """Provider-pluggable reasoning backends.
 
-The agent runtime should choose a model provider through configuration, not
-architecture. Live hosted providers are opt-in; tests use deterministic
-responses unless explicitly configured otherwise.
+Gemini is the submission provider and tests use deterministic responses unless
+explicitly configured otherwise; hosted behavior requires separate exact-SHA
+acceptance evidence. The Bedrock adapter is retained only for explicit
+development work; it is quota-deferred, unhosted, and excluded from the
+submission and live acceptance.
 """
 
 from __future__ import annotations
@@ -147,7 +149,7 @@ class GeminiReasoningProvider:
 
 
 class BedrockReasoningProvider:
-    """Amazon Bedrock Runtime reasoning provider using the Converse API."""
+    """Dormant, unhosted Bedrock adapter excluded from the submission."""
 
     provider_name = "bedrock"
 
@@ -244,7 +246,7 @@ def reasoning_provider_from_env(
     *,
     gemini_pool: GeminiCredentialPool | None = None,
 ) -> ReasoningProvider:
-    """Build the configured reasoning provider from environment values."""
+    """Build the provider, defaulting to Gemini and never implicitly to Bedrock."""
 
     env = os.environ if environ is None else environ
     provider = (env.get("LLM_PROVIDER") or DEFAULT_LLM_PROVIDER).strip().lower()
