@@ -282,13 +282,14 @@ jobs:
           --embedding-provider "$TF_VAR_embedding_provider"
           --operator-parameter "$TF_VAR_operator_token_parameter_name"
           --changefeed-parameter "$TF_VAR_changefeed_token_parameter_name"
-      - name: Apply database migrations
+      - name: Apply database migrations and initialize agent persistence
         shell: bash
         run: |
           DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
           echo "::add-mask::$DATABASE_URL"
           export DATABASE_URL
           uv run python scripts/migrate.py
+          uv run python scripts/initialize_agent_storage.py
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
