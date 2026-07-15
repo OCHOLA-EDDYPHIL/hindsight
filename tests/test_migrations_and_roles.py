@@ -19,6 +19,32 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
 
 
+def test_agent_writer_can_fence_and_enqueue_but_cannot_administer_embedding_index():
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+    migration = (MIGRATIONS / "0012_embedding_index_write_fence.sql").read_text()
+    agent_section = roles.split("TO hindsight_agent_writer;", 3)
+    select_grant, insert_grant, update_grant = agent_section[:3]
+
+    assert "embedding_index_write_fence" in select_grant
+    assert "embedding_backfill_tasks" in select_grant
+    assert "embedding_backfill_tasks" in insert_grant
+    assert "embedding_index_write_fence" in update_grant
+    assert "embedding_backfill_tasks" not in update_grant
+    assert "embedding_profiles" not in update_grant
+    assert "embedding_index_state" not in update_grant
+
+    worker_update_grant = roles.split("GRANT UPDATE ON TABLE", 2)[2].split(
+        "TO hindsight_memory_worker;", 1
+    )[0]
+    assert "incident_semantic_beliefs" in worker_update_grant
+
+    assert "CREATE ROLE IF NOT EXISTS hindsight_agent_writer LOGIN" in migration
+    assert "CREATE ROLE IF NOT EXISTS hindsight_memory_worker LOGIN" in migration
+    assert "GRANT SELECT, UPDATE ON TABLE embedding_index_write_fence" in migration
+    assert "GRANT SELECT, INSERT ON TABLE embedding_backfill_tasks" in migration
+    assert "GRANT UPDATE ON TABLE incident_semantic_beliefs" in migration
+
+
 def _database_url(name: str) -> str:
     parts = urlsplit(os.environ["DATABASE_URL"])
     return urlunsplit(parts._replace(path=f"/{name}"))
@@ -267,6 +293,70 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 (orphan_memory_id, run_ids[terminal_decision]),
             )
             _apply(conn, [MIGRATIONS / "0011_repair_governed_decisions.sql"])
+
+            # Model hosted roles provisioned from the pre-0012 role template.
+            # The migration must upgrade them without a manual roles.sql replay,
+            # and its grants must remain safe when the SQL is retried directly.
+            conn.execute("CREATE ROLE IF NOT EXISTS hindsight_agent_writer LOGIN")
+            conn.execute("CREATE ROLE IF NOT EXISTS hindsight_memory_worker LOGIN")
+            _apply(conn, [MIGRATIONS / "0012_embedding_index_write_fence.sql"])
+            _apply(conn, [MIGRATIONS / "0012_embedding_index_write_fence.sql"])
+            upgrade_privileges = {
+                (table_name, grantee, privilege)
+                for table_name, grantee, privilege in conn.execute(
+                    """
+                        SELECT table_name, grantee, privilege_type
+                        FROM information_schema.table_privileges
+                        WHERE table_schema = 'public'
+                          AND table_name IN (
+                              'embedding_index_write_fence',
+                              'embedding_backfill_tasks',
+                              'incident_semantic_beliefs'
+                          )
+                          AND grantee IN (
+                              'hindsight_agent_writer',
+                              'hindsight_memory_worker'
+                          )
+                    """
+                ).fetchall()
+            }
+            assert upgrade_privileges == {
+                (
+                    "embedding_index_write_fence",
+                    "hindsight_agent_writer",
+                    "SELECT",
+                ),
+                (
+                    "embedding_index_write_fence",
+                    "hindsight_agent_writer",
+                    "UPDATE",
+                ),
+                (
+                    "embedding_backfill_tasks",
+                    "hindsight_agent_writer",
+                    "SELECT",
+                ),
+                (
+                    "embedding_backfill_tasks",
+                    "hindsight_agent_writer",
+                    "INSERT",
+                ),
+                (
+                    "embedding_index_write_fence",
+                    "hindsight_memory_worker",
+                    "SELECT",
+                ),
+                (
+                    "embedding_index_write_fence",
+                    "hindsight_memory_worker",
+                    "UPDATE",
+                ),
+                (
+                    "incident_semantic_beliefs",
+                    "hindsight_memory_worker",
+                    "UPDATE",
+                ),
+            }
             repaired = conn.execute(
                 """
                     SELECT actor, decision_kind, status, sealed_at
@@ -333,6 +423,12 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                     (terminal_decision,),
                 )
 
+        class RestrictedRotationProvider(DeterministicEmbeddingProvider):
+            provider_name = "restricted-role-rotation"
+            model_name = "restricted-role-rotation-v1"
+            capability = "semantic"
+            encoder_revision = "restricted-role-rotation-v1"
+
         provider = DeterministicEmbeddingProvider()
         building = begin_profile_build(provider=provider, db_url=target_url)
         while run_backfill_batch(
@@ -345,6 +441,10 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
         activate_profile(profile_id=str(building["id"]), db_url=target_url)
         with psycopg.connect(target_url, autocommit=True) as conn:
             conn.execute((ROOT / "infra/db/roles.sql").read_text())
+        rotation = begin_profile_build(
+            provider=RestrictedRotationProvider(),
+            db_url=target_url,
+        )
 
         with psycopg.connect(target_url) as conn:
             conn.execute("SET ROLE hindsight_agent_writer")
@@ -418,6 +518,28 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 )
             conn.rollback()
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    """
+                        UPDATE embedding_backfill_tasks
+                        SET status = 'leased'
+                        WHERE memory_id = %s AND profile_id = %s
+                    """,
+                    (semantic["id"], rotation["id"]),
+                )
+            conn.rollback()
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    "UPDATE embedding_profiles SET status = 'failed' WHERE id = %s",
+                    (rotation["id"],),
+                )
+            conn.rollback()
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    "UPDATE embedding_index_state SET building_profile_id = NULL "
+                    "WHERE singleton = true"
+                )
+            conn.rollback()
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute("DELETE FROM semantic_memories WHERE id = %s", (semantic["id"],))
             conn.rollback()
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
@@ -429,6 +551,15 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                     """
                 )
             conn.rollback()
+            conn.execute("RESET ROLE")
+            task = conn.execute(
+                """
+                    SELECT status FROM embedding_backfill_tasks
+                    WHERE memory_id = %s AND profile_id = %s
+                """,
+                (semantic["id"], rotation["id"]),
+            ).fetchone()
+            assert task == ("pending",)
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(

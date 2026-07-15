@@ -13,6 +13,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hindsight.db import connect, database_url
+from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.security import safe_error_detail
@@ -21,6 +22,8 @@ OperationType = Literal["rewind", "retraction", "supersession", "review_resoluti
 SupersessionIntent = Literal["correction", "evolution"]
 ReviewAction = Literal["confirmed", "retracted"]
 PREVIEW_TTL = timedelta(minutes=15)
+MAX_OPERATION_ATTEMPTS = 3
+OPERATION_LEASE_TTL = timedelta(minutes=4)
 
 
 class OperationConflictError(RuntimeError):
@@ -29,6 +32,10 @@ class OperationConflictError(RuntimeError):
 
 class OperationAuthorizationError(PermissionError):
     """Raised when cross-namespace authority is incomplete."""
+
+
+class _OperationLeaseLostError(RuntimeError):
+    """Raised when an operation attempt no longer owns its durable lease token."""
 
 
 def preview_rewind(
@@ -386,71 +393,132 @@ def get_operation(*, operation_id: str, db_url: str | None = None) -> dict[str, 
             return operation
 
 
+def reap_exhausted_operations(
+    *, db_url: str | None = None, limit: int = 100
+) -> dict[str, int]:
+    """Fail expired final attempts even when their SQS delivery was interrupted."""
+
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    resolved_url = db_url or database_url()
+    failed = 0
+    with connect(resolved_url, application_name="hindsight-memory-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                        SELECT id, attempt_count
+                        FROM memory_operations
+                        WHERE status = 'leased'
+                            AND attempt_count >= %s
+                            AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                        ORDER BY created_at, id
+                        LIMIT %s
+                        FOR UPDATE
+                    """,
+                    (MAX_OPERATION_ATTEMPTS, limit),
+                )
+                exhausted = [dict(row) for row in cur.fetchall()]
+                for operation in exhausted:
+                    detail = "final memory operation attempt expired without completion"
+                    cur.execute(
+                        """
+                            UPDATE memory_operations
+                            SET status = 'failed', failure_code = 'OperationAttemptExpired',
+                                failure_detail = %s, completed_at = now(),
+                                lease_owner = NULL, lease_expires_at = NULL
+                            WHERE id = %s AND status = 'leased'
+                                AND attempt_count >= %s
+                                AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                            RETURNING id
+                        """,
+                        (detail, operation["id"], MAX_OPERATION_ATTEMPTS),
+                    )
+                    if cur.fetchone() is None:
+                        continue
+                    failed += 1
+                    _append_event(
+                        cur,
+                        str(operation["id"]),
+                        "failed",
+                        "Final memory operation attempt expired",
+                        metadata={
+                            "attempt": int(operation["attempt_count"]),
+                            "failure_code": "OperationAttemptExpired",
+                        },
+                    )
+    return {"failed": failed}
+
+
 def execute_operation(
     *,
     operation_id: str,
-    embedding_provider: EmbeddingProvider,
+    embedding_provider: EmbeddingProvider | None = None,
+    embedding_provider_factory: Callable[[], EmbeddingProvider] | None = None,
     worker_id: str,
     db_url: str | None = None,
 ) -> dict[str, Any]:
     """Lease, verify, and atomically apply one queued memory operation."""
 
+    if (embedding_provider is None) == (embedding_provider_factory is None):
+        raise ValueError("configure exactly one embedding provider or provider factory")
     resolved_url = db_url or database_url()
-    operation, preview = _load_for_execution(operation_id=operation_id, db_url=resolved_url)
-    if operation["status"] in {"completed", "conflict", "failed"}:
-        return operation
-    prepared = _precompute_embeddings(
-        preview=preview, provider=embedding_provider, db_url=resolved_url
+    _, lease_token = _claim_operation(
+        operation_id=operation_id,
+        worker_id=worker_id,
+        db_url=resolved_url,
     )
-    with connect(resolved_url, application_name="hindsight-memory-worker") as conn:
-        try:
+    if lease_token is None:
+        current = get_operation(operation_id=operation_id, db_url=resolved_url)
+        if current is None:
+            raise LookupError(operation_id)
+        return current
+
+    try:
+        provider = (
+            embedding_provider_factory()
+            if embedding_provider_factory is not None
+            else embedding_provider
+        )
+        if provider is None:  # pragma: no cover - guarded by argument validation
+            raise RuntimeError("embedding provider factory returned no provider")
+        _, preview = _load_for_execution(operation_id=operation_id, db_url=resolved_url)
+        prepared = _precompute_embeddings(
+            preview=preview, provider=provider, db_url=resolved_url
+        )
+        with connect(resolved_url, application_name="hindsight-memory-worker") as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(
-                        """
-                            UPDATE memory_operations
-                            SET status = 'leased', lease_owner = %s,
-                                lease_expires_at = now() + INTERVAL '2 minutes',
-                                attempt_count = attempt_count + 1
-                            WHERE id = %s
-                                AND status IN ('queued', 'retrying', 'leased')
-                                AND (lease_expires_at IS NULL OR lease_expires_at < now()
-                                     OR lease_owner = %s)
-                            RETURNING *
-                        """,
-                        (worker_id, operation_id, worker_id),
+                    leased = _lock_current_operation_lease(
+                        cur,
+                        operation_id=operation_id,
+                        lease_token=lease_token,
                     )
-                    leased = cur.fetchone()
-                    if leased is None:
-                        current = get_operation(operation_id=operation_id, db_url=resolved_url)
-                        if current is None:
-                            raise LookupError(operation_id)
-                        return current
-                    _append_event(cur, operation_id, "leased", "Memory operation leased")
-                    _verify_preview(cur=cur, operation=dict(leased), preview=preview)
-                    store = MemoryStore(conn=conn, embedding_provider=embedding_provider)
+                    lock_embedding_index_write_fence(conn)
+                    _verify_preview(cur=cur, operation=leased, preview=preview)
+                    store = MemoryStore(conn=conn, embedding_provider=provider)
                     if leased["operation_type"] == "rewind":
                         effects = _apply_rewind(
                             store=store,
-                            operation=dict(leased),
+                            operation=leased,
                             preview=preview,
                             embeddings=prepared,
                         )
                     elif leased["operation_type"] == "retraction":
                         effects = _apply_retraction(
-                            store=store, operation=dict(leased), preview=preview
+                            store=store, operation=leased, preview=preview
                         )
                     elif leased["operation_type"] == "supersession":
                         effects = _apply_supersession(
                             store=store,
-                            operation=dict(leased),
+                            operation=leased,
                             preview=preview,
                             embeddings=prepared,
                         )
                     elif leased["operation_type"] == "review_resolution":
                         effects = _apply_review_resolution(
                             store=store,
-                            operation=dict(leased),
+                            operation=leased,
                             preview=preview,
                             embeddings=prepared,
                         )
@@ -474,16 +542,6 @@ def execute_operation(
                         for effect in effects
                         if effect["effect_type"] in {"created", "reasserted"}
                     ]
-                    cur.execute(
-                        """
-                            UPDATE memory_operations
-                            SET status = 'completed', completed_at = now(),
-                                lease_expires_at = NULL, applied_revisions = %s,
-                                invalidated_memory_ids = %s, restored_memory_ids = %s
-                            WHERE id = %s
-                        """,
-                        (Jsonb(revisions), Jsonb(invalidated), Jsonb(restored), operation_id),
-                    )
                     for sequence, effect in enumerate(effects, start=1):
                         cur.execute(
                             """
@@ -505,18 +563,57 @@ def execute_operation(
                                 Jsonb(effect.get("metadata") or {}),
                             ),
                         )
-                    _append_event(cur, operation_id, "completed", "Memory operation completed")
-        except OperationConflictError as exc:
-            _mark_terminal(
-                operation_id=operation_id,
-                status="conflict",
-                code="stale_preview",
-                detail=str(exc),
-                db_url=resolved_url,
-            )
-        except Exception as exc:
-            _mark_retry(operation_id=operation_id, exc=exc, db_url=resolved_url)
-            raise
+                    cur.execute(
+                        """
+                            UPDATE memory_operations
+                            SET status = 'completed', completed_at = now(),
+                                lease_owner = NULL, lease_expires_at = NULL,
+                                failure_code = NULL, failure_detail = NULL,
+                                applied_revisions = %s,
+                                invalidated_memory_ids = %s, restored_memory_ids = %s
+                            WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                            RETURNING id
+                        """,
+                        (
+                            Jsonb(revisions),
+                            Jsonb(invalidated),
+                            Jsonb(restored),
+                            operation_id,
+                            lease_token,
+                        ),
+                    )
+                    if cur.fetchone() is None:
+                        raise _OperationLeaseLostError(
+                            f"memory operation lease is no longer current: {operation_id}"
+                        )
+                    _append_event(
+                        cur,
+                        operation_id,
+                        "completed",
+                        "Memory operation completed",
+                        metadata={
+                            "attempt": int(leased["attempt_count"]),
+                        },
+                    )
+    except OperationConflictError as exc:
+        _mark_terminal(
+            operation_id=operation_id,
+            lease_token=lease_token,
+            status="conflict",
+            code="stale_preview",
+            detail=str(exc),
+            db_url=resolved_url,
+        )
+    except _OperationLeaseLostError:
+        raise
+    except Exception as exc:
+        _mark_retry(
+            operation_id=operation_id,
+            lease_token=lease_token,
+            exc=exc,
+            db_url=resolved_url,
+        )
+        raise
     result = get_operation(operation_id=operation_id, db_url=resolved_url)
     if result is None:
         raise LookupError(operation_id)
@@ -614,6 +711,110 @@ def _load_for_execution(*, operation_id: str, db_url: str) -> tuple[dict[str, An
                 "fingerprint": row["fingerprint"],
             }
             return operation, preview
+
+
+def _claim_operation(
+    *, operation_id: str, worker_id: str, db_url: str
+) -> tuple[dict[str, Any], str | None]:
+    """Commit one uniquely fenced attempt before any provider or application work."""
+
+    lease_token = f"{worker_id}:{uuid4()}"
+    with connect(db_url, application_name="hindsight-memory-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT * FROM memory_operations WHERE id = %s FOR UPDATE",
+                    (operation_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise LookupError(operation_id)
+                operation = dict(row)
+                if operation["status"] in {"completed", "conflict", "failed"}:
+                    return operation, None
+
+                cur.execute("SELECT now() AS current_time")
+                current_time = cur.fetchone()["current_time"]
+                if (
+                    operation["status"] == "leased"
+                    and operation["lease_expires_at"] is not None
+                    and operation["lease_expires_at"] > current_time
+                ):
+                    return operation, None
+
+                attempt_count = int(operation["attempt_count"])
+                if attempt_count >= MAX_OPERATION_ATTEMPTS:
+                    detail = "maximum memory operation attempts exhausted"
+                    cur.execute(
+                        """
+                            UPDATE memory_operations
+                            SET status = 'failed', failure_code = 'RetryLimitExceeded',
+                                failure_detail = %s, completed_at = now(),
+                                lease_owner = NULL, lease_expires_at = NULL
+                            WHERE id = %s
+                            RETURNING *
+                        """,
+                        (detail, operation_id),
+                    )
+                    terminal = dict(cur.fetchone())
+                    _append_event(
+                        cur,
+                        operation_id,
+                        "failed",
+                        "Maximum memory operation attempts exhausted",
+                        metadata={
+                            "attempt": attempt_count,
+                            "failure_code": "RetryLimitExceeded",
+                        },
+                    )
+                    return terminal, None
+
+                cur.execute(
+                    """
+                        UPDATE memory_operations
+                        SET status = 'leased', lease_owner = %s,
+                            lease_expires_at = now() + %s,
+                            attempt_count = attempt_count + 1,
+                            completed_at = NULL
+                        WHERE id = %s
+                        RETURNING *
+                    """,
+                    (lease_token, OPERATION_LEASE_TTL, operation_id),
+                )
+                claimed = dict(cur.fetchone())
+                _append_event(
+                    cur,
+                    operation_id,
+                    "leased",
+                    "Memory operation leased",
+                    metadata={
+                        "attempt": int(claimed["attempt_count"]),
+                        "worker_id": worker_id,
+                    },
+                )
+                return claimed, lease_token
+
+
+def _lock_current_operation_lease(
+    cur: Any, *, operation_id: str, lease_token: str
+) -> dict[str, Any]:
+    """Renew and lock an attempt only while its exact lease token is current."""
+
+    cur.execute(
+        """
+            UPDATE memory_operations
+            SET lease_expires_at = now() + %s
+            WHERE id = %s AND status = 'leased' AND lease_owner = %s
+            RETURNING *
+        """,
+        (OPERATION_LEASE_TTL, operation_id, lease_token),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise _OperationLeaseLostError(
+            f"memory operation lease is no longer current: {operation_id}"
+        )
+    return dict(row)
 
 
 def _verify_preview(*, cur: Any, operation: dict[str, Any], preview: dict[str, Any]) -> None:
@@ -1173,57 +1374,116 @@ def _revision_map(cur: Any, namespaces: list[str]) -> dict[str, int]:
     return rows
 
 
-def _append_event(cur: Any, operation_id: str, status: str, summary: str) -> None:
+def _append_event(
+    cur: Any,
+    operation_id: str,
+    status: str,
+    summary: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
     cur.execute(
         """
             INSERT INTO memory_operation_events (
-                operation_id, sequence, status, summary
+                operation_id, sequence, status, summary, metadata
             )
-            SELECT %s, COALESCE(max(sequence), 0) + 1, %s, %s
+            SELECT %s, COALESCE(max(sequence), 0) + 1, %s, %s, %s
             FROM memory_operation_events
             WHERE operation_id = %s
         """,
-        (operation_id, status, summary, operation_id),
+        (operation_id, status, summary, Jsonb(metadata or {}), operation_id),
     )
 
 
 def _mark_terminal(
-    *, operation_id: str, status: str, code: str, detail: str, db_url: str
+    *,
+    operation_id: str,
+    lease_token: str,
+    status: str,
+    code: str,
+    detail: str,
+    db_url: str,
 ) -> None:
     with connect(db_url, application_name="hindsight-memory-worker") as conn:
         with conn.transaction():
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
                         UPDATE memory_operations
                         SET status = %s, failure_code = %s, failure_detail = %s,
-                            completed_at = now(), lease_expires_at = NULL
-                        WHERE id = %s
+                            completed_at = now(), lease_owner = NULL,
+                            lease_expires_at = NULL
+                        WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        RETURNING attempt_count
                     """,
-                    (status, code, detail, operation_id),
+                    (status, code, detail, operation_id, lease_token),
                 )
-                _append_event(cur, operation_id, status, detail)
+                row = cur.fetchone()
+                if row is None:
+                    raise _OperationLeaseLostError(
+                        f"memory operation lease is no longer current: {operation_id}"
+                    )
+                _append_event(
+                    cur,
+                    operation_id,
+                    status,
+                    detail,
+                    metadata={
+                        "attempt": int(row["attempt_count"]),
+                        "failure_code": code,
+                    },
+                )
 
 
-def _mark_retry(*, operation_id: str, exc: Exception, db_url: str) -> None:
+def _mark_retry(
+    *, operation_id: str, lease_token: str, exc: Exception, db_url: str
+) -> None:
+    error_code = type(exc).__name__
+    error_detail = safe_error_detail(exc, max_chars=1000)
     with connect(db_url, application_name="hindsight-memory-worker") as conn:
         with conn.transaction():
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
                         UPDATE memory_operations
-                        SET status = CASE WHEN attempt_count < 3 THEN 'retrying' ELSE 'failed' END,
+                        SET status = CASE
+                                WHEN attempt_count < %s THEN 'retrying'
+                                ELSE 'failed'
+                            END,
                             failure_code = %s, failure_detail = %s,
-                            completed_at = CASE WHEN attempt_count < 3 THEN NULL ELSE now() END,
-                            lease_expires_at = NULL
-                        WHERE id = %s
-                        RETURNING status
+                            completed_at = CASE
+                                WHEN attempt_count < %s THEN NULL
+                                ELSE now()
+                            END,
+                            lease_owner = NULL, lease_expires_at = NULL
+                        WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        RETURNING status, attempt_count
                     """,
-                    (type(exc).__name__, safe_error_detail(exc, max_chars=1000), operation_id),
+                    (
+                        MAX_OPERATION_ATTEMPTS,
+                        error_code,
+                        error_detail,
+                        MAX_OPERATION_ATTEMPTS,
+                        operation_id,
+                        lease_token,
+                    ),
                 )
                 row = cur.fetchone()
-                status = str(row[0]) if row else "failed"
-                _append_event(cur, operation_id, status, "Memory operation attempt failed")
+                if row is None:
+                    raise _OperationLeaseLostError(
+                        f"memory operation lease is no longer current: {operation_id}"
+                    )
+                status = str(row["status"])
+                _append_event(
+                    cur,
+                    operation_id,
+                    status,
+                    "Memory operation attempt failed",
+                    metadata={
+                        "attempt": int(row["attempt_count"]),
+                        "failure_code": error_code,
+                    },
+                )
 
 
 def _digest(value: dict[str, Any]) -> str:

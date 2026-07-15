@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from psycopg.rows import dict_row
 
 from hindsight.db import connect, database_url
+from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import (
@@ -27,6 +28,9 @@ CONSOLIDATION_WRITER = "consolidation.worker"
 LESSON_SCHEMA = "procedural_lesson.v1"
 TERMINAL_JOB_STATUSES = {"completed", "not_eligible", "failed"}
 MAX_CONSOLIDATION_ATTEMPTS = 3
+ELIGIBLE_SOURCE_RELATIONSHIPS = {"summary", "resolution", "root_cause"}
+ELIGIBLE_SOURCE_LINEAGE_STATUSES = {"complete", "legacy_unverified"}
+SOURCE_EVIDENCE_CHANGED_REASON = "source evidence changed during synthesis"
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,10 @@ class LessonValidationError(ValueError):
 
 class ConsolidationLeaseLostError(RuntimeError):
     """Raised when an attempt no longer owns a live consolidation lease."""
+
+
+class ConsolidationEvidenceChangedError(RuntimeError):
+    """Raised when selected source evidence is no longer eligible or linked."""
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -197,11 +205,18 @@ def process_consolidation_job(
             db_url=resolved_url,
         )
         if context["reason"]:
+            reason = context["reason"]
+            if _decision_has_ineligible_source_read(
+                decision_id=job.get("decision_id"),
+                incident_id=str(job["incident_id"]),
+                db_url=resolved_url,
+            ):
+                reason = SOURCE_EVIDENCE_CHANGED_REASON
             return _finish_without_lesson(
                 job_id=job_id,
                 lease_owner=lease_owner,
                 status="not_eligible",
-                reason=context["reason"],
+                reason=reason,
                 db_url=resolved_url,
             )
         source_memories = context["source_memories"]
@@ -226,6 +241,11 @@ def process_consolidation_job(
                     str(row["memory_id"])
                     for row in store.reads_for_decision(decision_id=decision_id)
                 }
+                _validate_read_evidence(
+                    conn,
+                    context=context,
+                    decision_id=decision_id,
+                )
                 for memory in source_memories:
                     memory_id = str(memory["id"])
                     if memory_id in existing_read_ids:
@@ -260,6 +280,7 @@ def process_consolidation_job(
         lesson = _generate_lesson(provider=provider, context=context, evidence=evidence)
         _validate_lesson(lesson=lesson, evidence=evidence)
         content = _render_lesson(lesson)
+        prepared_embedding = embeddings.embed_document(content)
         parent_ids = sorted(
             {
                 citation["evidence_id"].removeprefix("memory:")
@@ -270,12 +291,18 @@ def process_consolidation_job(
         )
         with connect(resolved_url, application_name="hindsight-consolidation") as conn:
             with conn.transaction():
+                lock_embedding_index_write_fence(conn)
                 _lock_current_lease(
                     conn,
                     job_id=job_id,
                     lease_owner=lease_owner,
                 )
                 store = MemoryStore(conn=conn, embedding_provider=embeddings)
+                _lock_publication_evidence(
+                    conn,
+                    context=context,
+                    decision_id=decision_id,
+                )
                 existing = _existing_lesson(
                     conn,
                     incident_id=context["incident"]["id"],
@@ -316,6 +343,7 @@ def process_consolidation_job(
                     structured_payload=lesson,
                     producer_decision_id=decision_id,
                     parent_memory_ids=parent_ids,
+                    precomputed_embedding=prepared_embedding,
                 )
                 conn.execute(
                     """
@@ -350,6 +378,14 @@ def process_consolidation_job(
             None,
             [str(row["id"]) for row in source_memories],
             job_id,
+        )
+    except ConsolidationEvidenceChangedError:
+        return _finish_without_lesson(
+            job_id=job_id,
+            lease_owner=lease_owner,
+            status="not_eligible",
+            reason=SOURCE_EVIDENCE_CHANGED_REASON,
+            db_url=resolved_url,
         )
     except LessonValidationError as exc:
         return _fail_job_and_decision(
@@ -484,26 +520,33 @@ def _load_context(
             event = cur.fetchone()
             if incident is None or event is None:
                 return {"reason": "incident or resolution event not found"}
-            target_namespace = namespace or _incident_namespace(cur, incident_id=incident["id"])
             if incident["status"] != "resolved":
                 return {"incident": dict(incident), "reason": "incident is not resolved"}
-            if event["event_schema"] != "incident_resolution.v1":
+            if (
+                event["incident_id"] != incident["id"]
+                or incident["resolution_event_id"] != event["id"]
+                or event["event_type"] != "incident_resolved"
+                or event["event_schema"] != "incident_resolution.v1"
+            ):
                 return {"incident": dict(incident), "reason": "structured resolution evidence missing"}
-            if not target_namespace:
-                return {"incident": dict(incident), "reason": "no linked memory namespace"}
             cur.execute(
                 """
-                    SELECT memory.*
+                    SELECT memory.*, link.relationship AS incident_relationship
                     FROM incident_semantic_memories AS link
                     JOIN semantic_memories AS memory ON memory.id = link.memory_id
                     WHERE link.incident_id = %s
                         AND link.relationship IN ('summary', 'resolution', 'root_cause')
                         AND memory.lineage_status IN ('complete', 'legacy_unverified')
+                        AND memory.trust_status = 'active'
+                        AND memory.t_invalid IS NULL
                     ORDER BY memory.written_at, memory.id
                 """,
                 (incident["id"],),
             )
             memories = [dict(row) for row in cur.fetchall()]
+            target_namespace = namespace or (
+                str(memories[0]["namespace"]) if memories else None
+            )
             if not memories:
                 return {
                     "incident": dict(incident),
@@ -529,18 +572,238 @@ def _load_context(
             }
 
 
-def _incident_namespace(cur: Any, *, incident_id: UUID) -> str | None:
-    cur.execute(
-        """
-            SELECT memory.namespace
-            FROM incident_semantic_memories AS link
-            JOIN semantic_memories AS memory ON memory.id = link.memory_id
-            WHERE link.incident_id = %s ORDER BY memory.written_at LIMIT 1
-        """,
-        (incident_id,),
+def _validate_read_evidence(
+    conn: Any,
+    *,
+    context: dict[str, Any],
+    decision_id: str,
+) -> None:
+    """Validate selected evidence under row locks before recording decision reads."""
+
+    _lock_and_validate_evidence(
+        conn,
+        context=context,
+        decision_id=decision_id,
+        require_all_reads=False,
     )
-    row = cur.fetchone()
-    return str(row["namespace"]) if row else None
+
+
+def _lock_publication_evidence(
+    conn: Any,
+    *,
+    context: dict[str, Any],
+    decision_id: str,
+) -> None:
+    """Lock namespaces and revalidate the exact evidence set before publication."""
+
+    namespaces = sorted(
+        {
+            str(context["namespace"]),
+            *(str(memory["namespace"]) for memory in context["source_memories"]),
+        }
+    )
+    for namespace in namespaces:
+        conn.execute(
+            """
+                INSERT INTO memory_namespaces (namespace)
+                VALUES (%s)
+                ON CONFLICT (namespace) DO NOTHING
+            """,
+            (namespace,),
+        )
+    locked_namespaces = conn.execute(
+        """
+            SELECT namespace FROM memory_namespaces
+            WHERE namespace = ANY(%s)
+            ORDER BY namespace
+            FOR UPDATE
+        """,
+        (namespaces,),
+    ).fetchall()
+    if {str(row[0]) for row in locked_namespaces} != set(namespaces):
+        raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+    _lock_and_validate_evidence(
+        conn,
+        context=context,
+        decision_id=decision_id,
+        require_all_reads=True,
+    )
+
+
+def _lock_and_validate_evidence(
+    conn: Any,
+    *,
+    context: dict[str, Any],
+    decision_id: str,
+    require_all_reads: bool,
+) -> None:
+    expected_incident = context["incident"]
+    expected_event = context["resolution_event"]
+    expected_sources = {
+        str(memory["id"]): str(memory["incident_relationship"])
+        for memory in context["source_memories"]
+    }
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT * FROM incidents WHERE id = %s FOR UPDATE",
+            (expected_incident["id"],),
+        )
+        incident = cur.fetchone()
+        cur.execute("SELECT * FROM incident_events WHERE id = %s", (expected_event["id"],))
+        event = cur.fetchone()
+        cur.execute(
+            """
+                SELECT memory_id, relationship
+                FROM incident_semantic_memories
+                WHERE incident_id = %s
+                ORDER BY memory_id
+            """,
+            (expected_incident["id"],),
+        )
+        links = [dict(row) for row in cur.fetchall()]
+        linked_ids = [str(row["memory_id"]) for row in links]
+        memories: list[dict[str, Any]] = []
+        if linked_ids:
+            cur.execute(
+                """
+                    SELECT * FROM semantic_memories
+                    WHERE id = ANY(%s)
+                    ORDER BY id
+                    FOR UPDATE
+                """,
+                (linked_ids,),
+            )
+            memories = [dict(row) for row in cur.fetchall()]
+        cur.execute(
+            """
+                SELECT memory_kind, memory_id
+                FROM memory_reads
+                WHERE decision_id = %s
+                ORDER BY read_at, id
+            """,
+            (decision_id,),
+        )
+        decision_reads = [dict(row) for row in cur.fetchall()]
+
+    if not _incident_matches_snapshot(incident, expected_incident):
+        raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+    if not _event_matches_snapshot(
+        event,
+        expected_event,
+        incident_id=expected_incident["id"],
+        resolution_event_id=expected_incident["resolution_event_id"],
+    ):
+        raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+
+    memory_by_id = {str(memory["id"]): memory for memory in memories}
+    current_sources = {
+        str(link["memory_id"]): str(link["relationship"])
+        for link in links
+        if (memory := memory_by_id.get(str(link["memory_id"]))) is not None
+        and _source_is_eligible(memory=memory, relationship=str(link["relationship"]))
+    }
+    if current_sources != expected_sources:
+        raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+
+    read_ids: set[str] = set()
+    for read in decision_reads:
+        if read["memory_kind"] != "semantic":
+            raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+        read_ids.add(str(read["memory_id"]))
+    expected_ids = set(expected_sources)
+    if not read_ids.issubset(expected_ids):
+        raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+    if require_all_reads and read_ids != expected_ids:
+        raise ConsolidationEvidenceChangedError(SOURCE_EVIDENCE_CHANGED_REASON)
+
+
+def _source_is_eligible(*, memory: dict[str, Any], relationship: str) -> bool:
+    return (
+        relationship in ELIGIBLE_SOURCE_RELATIONSHIPS
+        and memory["lineage_status"] in ELIGIBLE_SOURCE_LINEAGE_STATUSES
+        and memory["trust_status"] == "active"
+        and memory["t_invalid"] is None
+    )
+
+
+def _incident_matches_snapshot(
+    incident: dict[str, Any] | None,
+    expected: dict[str, Any],
+) -> bool:
+    if incident is None or incident["status"] != "resolved":
+        return False
+    fields = (
+        "id",
+        "slug",
+        "title",
+        "severity",
+        "status",
+        "resolved_at",
+        "summary",
+        "root_cause",
+        "resolution_event_id",
+    )
+    return all(incident.get(field) == expected.get(field) for field in fields)
+
+
+def _event_matches_snapshot(
+    event: dict[str, Any] | None,
+    expected: dict[str, Any],
+    *,
+    incident_id: UUID,
+    resolution_event_id: UUID,
+) -> bool:
+    if event is None:
+        return False
+    fields = (
+        "id",
+        "incident_id",
+        "event_type",
+        "event_schema",
+        "payload_digest",
+        "structured_payload",
+    )
+    return (
+        event["incident_id"] == incident_id
+        and event["id"] == resolution_event_id
+        and event["event_type"] == "incident_resolved"
+        and event["event_schema"] == "incident_resolution.v1"
+        and all(event.get(field) == expected.get(field) for field in fields)
+    )
+
+
+def _decision_has_ineligible_source_read(
+    *,
+    decision_id: str | None,
+    incident_id: str,
+    db_url: str,
+) -> bool:
+    if decision_id is None:
+        return False
+    with connect(db_url, application_name="hindsight-consolidation") as conn:
+        row = conn.execute(
+            """
+                SELECT 1
+                FROM memory_reads AS read
+                LEFT JOIN semantic_memories AS memory
+                    ON read.memory_kind = 'semantic' AND memory.id = read.semantic_memory_id
+                LEFT JOIN incident_semantic_memories AS link
+                    ON link.incident_id = %s AND link.memory_id = memory.id
+                WHERE read.decision_id = %s
+                    AND (
+                        read.memory_kind != 'semantic'
+                        OR memory.id IS NULL
+                        OR memory.t_invalid IS NOT NULL
+                        OR memory.trust_status != 'active'
+                        OR memory.lineage_status NOT IN ('complete', 'legacy_unverified')
+                        OR link.memory_id IS NULL
+                        OR link.relationship NOT IN ('summary', 'resolution', 'root_cause')
+                    )
+                LIMIT 1
+            """,
+            (incident_id, decision_id),
+        ).fetchone()
+    return row is not None
 
 
 def _evidence_catalog(context: dict[str, Any]) -> dict[str, str]:
@@ -682,6 +945,7 @@ def _existing_lesson(
                 JOIN semantic_memories AS memory ON memory.belief_id = link.belief_id
                 WHERE link.incident_id = %s AND link.relationship = 'lesson'
                     AND memory.namespace = %s AND memory.t_invalid IS NULL
+                    AND memory.trust_status = 'active'
                     AND memory.writer = %s
                 ORDER BY memory.version_number DESC LIMIT 1
             """,

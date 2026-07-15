@@ -147,6 +147,27 @@ def runtime_settings(
     return settings
 
 
+def runtime_database_url(
+    *,
+    environ: Mapping[str, str] | None = None,
+    ssm_client: Any | None = None,
+) -> str:
+    """Resolve only the database setting without touching provider credentials."""
+
+    env = os.environ if environ is None else environ
+    client = ssm_client
+    if client is None and _needs_ssm(env):
+        client = _ssm_client(env)
+    return _database_url_for_lambda(
+        _secret_value(
+            env=env,
+            client=client,
+            param_env=DATABASE_URL_PARAM_ENV,
+            fallback_env="DATABASE_URL",
+        )
+    )
+
+
 def invalidate_runtime_settings_cache() -> None:
     """Force the next invocation to reload mutable SSM-backed settings."""
 

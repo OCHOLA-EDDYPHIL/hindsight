@@ -22,6 +22,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hindsight.db import connect, database_url
+from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import (
     EMBEDDING_DIMENSIONS,
     EmbeddingProfile,
@@ -173,6 +174,14 @@ class MemoryStore:
         reconstructable.
         """
 
+        prepared_embedding = None
+        if memory_kind == "semantic":
+            provenance.validate()
+            if not namespace or not namespace.strip():
+                raise ProvenanceError("namespace is required for semantic memory")
+            if self._embedding_provider is not None:
+                prepared_embedding, _ = self._prepare_semantic_embedding(content=content)
+
         with start_span(
             "hindsight.memory.remember",
             {
@@ -198,6 +207,7 @@ class MemoryStore:
                         structured_payload=structured_payload,
                         producer_decision_id=producer_decision_id,
                         parent_memory_ids=parent_memory_ids,
+                        precomputed_embedding=prepared_embedding,
                     )
                     set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
                     return memory
@@ -738,6 +748,7 @@ class MemoryStore:
         self._validate_embedding_provider_dimensions()
         configured = embedding_profile(self._embedding_provider)
         with self._conn.transaction():
+            lock_embedding_index_write_fence(self._conn)
             state = self._fetch_one(
                 "SELECT * FROM embedding_index_state WHERE singleton = true FOR UPDATE",
                 (),
@@ -932,6 +943,11 @@ class MemoryStore:
             producer_id = producer_decision_id or f"memory:write:{memory_id}"
             payload = structured_payload or {"content": content, **(metadata or {})}
             digest = _payload_digest(content=content, payload=payload, metadata=metadata or {})
+            embedding, profile = self._prepare_semantic_embedding(
+                content=content,
+                precomputed_embedding=precomputed_embedding,
+            )
+            lock_embedding_index_write_fence(self._conn)
             self._ensure_decision(
                 decision_id=producer_id,
                 actor=provenance.writer,
@@ -950,15 +966,6 @@ class MemoryStore:
                 namespace=namespace,
                 classified_reads=classified_reads,
             )
-            embedding = None
-            profile = None
-            if self._embedding_provider is not None:
-                self._validate_embedding_provider_dimensions()
-                embedding = precomputed_embedding or self._embedding_provider.embed_document(content)
-                self._validate_semantic_embedding(embedding)
-                profile = embedding_profile(self._embedding_provider)
-            elif precomputed_embedding is not None:
-                raise RuntimeError("precomputed embedding requires an embedding provider")
             query = """
                 INSERT INTO semantic_memories (
                     id, belief_id, version_number, previous_version_id,
@@ -1014,6 +1021,7 @@ class MemoryStore:
                         profile=profile,
                         content_digest=digest,
                     )
+                self._enqueue_building_profile_task(memory_id=str(row["id"]))
                 self._insert_external_evidence(
                     memory_kind="semantic",
                     memory_id=str(memory_id),
@@ -1687,6 +1695,7 @@ class MemoryStore:
     ) -> dict[str, Any]:
         """Atomically persist a reflection memory and its typed projection."""
 
+        embedding, _ = self._prepare_semantic_embedding(content=content)
         with self._conn.transaction():
             memory = self.write_semantic(
                 namespace=namespace,
@@ -1697,6 +1706,7 @@ class MemoryStore:
                 structured_payload=structured_payload,
                 producer_decision_id=decision_id,
                 parent_memory_ids=parent_memory_ids,
+                precomputed_embedding=embedding,
             )
             self.record_agent_reflection(
                 decision_id=decision_id,
@@ -2168,28 +2178,13 @@ class MemoryStore:
         if self._embedding_provider is None:
             raise RuntimeError("embedding provider is not configured")
         self._validate_semantic_embedding(embedding)
-        legacy_row = self._fetch_one(
-            f"""
-                INSERT INTO semantic_memory_embeddings (
-                    memory_id, namespace, embedding, provider, model, dimensions
-                )
-                VALUES (%s, %s, %s::VECTOR({EMBEDDING_DIMENSIONS}), %s, %s, %s)
-                RETURNING memory_id, namespace, provider, model, dimensions, embedded_at
-            """,
-            (
-                memory_id,
-                namespace,
-                vector_literal(embedding),
-                self._embedding_provider.provider_name,
-                self._embedding_provider.model_name,
-                self._embedding_provider.dimensions,
-            ),
-        )
         state = self._fetch_one(
             "SELECT * FROM embedding_index_state WHERE singleton = true",
             (),
         )
         active_profile_id = state.get("active_profile_id")
+        building_profile_id = state.get("building_profile_id")
+        configured_profile = profile or embedding_profile(self._embedding_provider)
         if active_profile_id is not None:
             active = self._fetch_one(
                 "SELECT * FROM embedding_profiles WHERE id = %s",
@@ -2206,8 +2201,14 @@ class MemoryStore:
                     f"{resolved_profile.profile_id} != {active_profile_id}"
                 )
         else:
-            resolved_profile = profile or embedding_profile(self._embedding_provider)
-        if active_profile_id is None:
+            resolved_profile = configured_profile
+            if building_profile_id not in {None, resolved_profile.profile_id}:
+                raise RuntimeError(
+                    "a different embedding profile build is already in progress: "
+                    f"{building_profile_id}"
+                )
+            if resolved_profile.capability == "lexical_hash" and _hosted_runtime():
+                raise RuntimeError("hosted semantic memory cannot activate a lexical-hash profile")
             self._conn.execute(
                 """
                     INSERT INTO embedding_profiles (
@@ -2228,6 +2229,23 @@ class MemoryStore:
                     resolved_profile.max_distance,
                 ),
             )
+        legacy_row = self._fetch_one(
+            f"""
+                INSERT INTO semantic_memory_embeddings (
+                    memory_id, namespace, embedding, provider, model, dimensions
+                )
+                VALUES (%s, %s, %s::VECTOR({EMBEDDING_DIMENSIONS}), %s, %s, %s)
+                RETURNING memory_id, namespace, provider, model, dimensions, embedded_at
+            """,
+            (
+                memory_id,
+                namespace,
+                vector_literal(embedding),
+                self._embedding_provider.provider_name,
+                self._embedding_provider.model_name,
+                self._embedding_provider.dimensions,
+            ),
+        )
         self._conn.execute(
             f"""
                 INSERT INTO semantic_memory_vectors (
@@ -2258,8 +2276,6 @@ class MemoryStore:
                 raise RuntimeError(
                     "embedding profile cannot activate until all current memories are backfilled"
                 )
-            if resolved_profile.capability == "lexical_hash" and _hosted_runtime():
-                raise RuntimeError("hosted semantic memory cannot activate a lexical-hash profile")
             self._conn.execute(
                 """
                     UPDATE embedding_profiles
@@ -2271,12 +2287,31 @@ class MemoryStore:
             self._conn.execute(
                 """
                     UPDATE embedding_index_state
-                    SET active_profile_id = %s, generation = generation + 1, updated_at = now()
+                    SET active_profile_id = %s, building_profile_id = NULL,
+                        generation = generation + 1, updated_at = now()
                     WHERE singleton = true
                 """,
                 (resolved_profile.profile_id,),
             )
         return legacy_row
+
+    def _enqueue_building_profile_task(self, *, memory_id: str) -> None:
+        state = self._fetch_one(
+            "SELECT active_profile_id, building_profile_id "
+            "FROM embedding_index_state WHERE singleton = true",
+            (),
+        )
+        building_profile_id = state.get("building_profile_id")
+        if building_profile_id in {None, state.get("active_profile_id")}:
+            return
+        self._conn.execute(
+            """
+                INSERT INTO embedding_backfill_tasks (memory_id, profile_id)
+                VALUES (%s, %s)
+                ON CONFLICT (memory_id, profile_id) DO NOTHING
+            """,
+            (memory_id, building_profile_id),
+        )
 
     def _record_retrieval(
         self,
@@ -2386,6 +2421,25 @@ class MemoryStore:
         self._validate_embedding_provider_dimensions()
         if len(embedding) != EMBEDDING_DIMENSIONS:
             raise ValueError(f"expected {EMBEDDING_DIMENSIONS} dimensions, got {len(embedding)}")
+
+    def _prepare_semantic_embedding(
+        self,
+        *,
+        content: str,
+        precomputed_embedding: list[float] | None = None,
+    ) -> tuple[list[float] | None, EmbeddingProfile | None]:
+        if self._embedding_provider is None:
+            if precomputed_embedding is not None:
+                raise RuntimeError("precomputed embedding requires an embedding provider")
+            return None, None
+        self._validate_embedding_provider_dimensions()
+        embedding = (
+            precomputed_embedding
+            if precomputed_embedding is not None
+            else self._embedding_provider.embed_document(content)
+        )
+        self._validate_semantic_embedding(embedding)
+        return embedding, embedding_profile(self._embedding_provider)
 
     def _in_savepoint(self, callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if self._conn.autocommit:

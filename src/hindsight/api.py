@@ -28,6 +28,7 @@ from hindsight.demo_state import (
     reset_poison_rewind_state,
     seed_good_demo_memory,
 )
+from hindsight.embeddings import embedding_provider_from_env
 from hindsight.memory import MemoryStore
 from hindsight.operations import (
     OperationAuthorizationError,
@@ -526,9 +527,18 @@ def _approve_operation(
     dependencies=[Depends(_operator_required)],
 )
 def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
-    session_namespace = reset_poison_rewind_state(namespace=payload.namespace)
-    incident = ensure_poison_rewind_incident()
-    memory = seed_good_demo_memory(namespace=session_namespace)
+    settings = runtime_settings()
+    embedding_provider = embedding_provider_from_env(settings.provider_env)
+    session_namespace = reset_poison_rewind_state(
+        namespace=payload.namespace,
+        db_url=settings.database_url,
+    )
+    incident = ensure_poison_rewind_incident(db_url=settings.database_url)
+    memory = seed_good_demo_memory(
+        namespace=session_namespace,
+        db_url=settings.database_url,
+        embedding_provider=embedding_provider,
+    )
     return {
         "namespace": session_namespace,
         "incident": incident,
@@ -542,7 +552,15 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def demo_poison(payload: DemoPoisonRequest) -> dict[str, Any]:
-    return _jsonable(poison_demo_memory(namespace=payload.namespace))
+    settings = runtime_settings()
+    embedding_provider = embedding_provider_from_env(settings.provider_env)
+    return _jsonable(
+        poison_demo_memory(
+            namespace=payload.namespace,
+            db_url=settings.database_url,
+            embedding_provider=embedding_provider,
+        )
+    )
 
 
 @app.get(f"{API_PREFIX}/operator/session", tags=["operator"])

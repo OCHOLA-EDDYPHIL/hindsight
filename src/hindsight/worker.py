@@ -11,9 +11,13 @@ from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_a
 from hindsight.consolidation import enqueue_consolidation_job, process_consolidation_job
 from hindsight.embeddings import embedding_provider_from_env
 from hindsight.gemini import GeminiPoolExhaustedError, gemini_pool_from_env
-from hindsight.operations import execute_operation
+from hindsight.operations import execute_operation, reap_exhausted_operations
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
-from hindsight.runtime import invalidate_runtime_settings_cache, runtime_settings
+from hindsight.runtime import (
+    invalidate_runtime_settings_cache,
+    runtime_database_url,
+    runtime_settings,
+)
 from hindsight.runs import claim_run, fail_run, get_run, transition_run
 from hindsight.security import safe_error_detail
 from hindsight.tracing import configure_tracing_from_env
@@ -24,6 +28,8 @@ WORKER_MAX_RECEIVES_ENV = "HINDSIGHT_WORKER_MAX_RECEIVES"
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Process SQS messages with per-record failure reporting."""
 
+    if "command" in event and not event.get("Records"):
+        return process_message(event) or {}
     failures = []
     for record in event.get("Records", []):
         message_id = str(record.get("messageId") or "unknown")
@@ -41,6 +47,8 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
 
     configure_tracing_from_env(service_name="hindsight-worker")
     command = str(message.get("command") or "start").strip().lower()
+    if command == "reap_memory_operations":
+        return reap_exhausted_operations(db_url=runtime_database_url())
     if command == "consolidation":
         incident_id = str(message.get("incident_id") or "").strip()
         source_event_id = str(message.get("source_event_id") or "").strip()
@@ -73,20 +81,24 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
         operation_id = str(message.get("operation_id") or "").strip()
         if not operation_id:
             raise ValueError("operation_id is required")
-        settings = runtime_settings()
-        uses_gemini = (
-            settings.provider_env.get("EMBEDDING_PROVIDER", "").strip().lower() == "gemini"
-        )
-        gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
-        embedding_provider = embedding_provider_from_env(
-            settings.provider_env,
-            gemini_pool=gemini_pool,
-        )
+
+        def provider_factory():
+            settings = runtime_settings()
+            uses_gemini = (
+                settings.provider_env.get("EMBEDDING_PROVIDER", "").strip().lower()
+                == "gemini"
+            )
+            gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
+            return embedding_provider_from_env(
+                settings.provider_env,
+                gemini_pool=gemini_pool,
+            )
+
         return execute_operation(
             operation_id=operation_id,
-            embedding_provider=embedding_provider,
+            embedding_provider_factory=provider_factory,
             worker_id=str(message.get("worker_id") or f"sqs-worker:{uuid4()}"),
-            db_url=settings.database_url,
+            db_url=runtime_database_url(),
         )
 
     run_id = str(message.get("run_id") or "").strip()

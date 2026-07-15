@@ -58,10 +58,12 @@ def test_configure_tracing_respects_explicit_disabled_flag(monkeypatch):
 
 
 def test_memory_write_spans_include_ids_and_omit_content(monkeypatch):
+    import hindsight.memory as memory_module
     from hindsight.memory import Provenance
 
     memory_id = uuid4()
     store = _fake_store()
+    monkeypatch.setattr(memory_module, "lock_embedding_index_write_fence", lambda _conn: None)
     monkeypatch.setattr(
         store,
         "_fetch_one",

@@ -16,4 +16,6 @@ terraform -chdir=infra/terraform/bootstrap apply -var-file=terraform.tfvars
 
 Record the state bucket, deployment role, ACM certificate, domain, and Cloudflare zone outputs as GitHub repository variables. Set `create_github_oidc_provider = false` and pass the existing provider ARN when the AWS account already trusts GitHub.
 
+When using Bedrock embeddings, keep `bedrock_embedding_model` aligned with the application stack's `HINDSIGHT_BEDROCK_EMBEDDING_MODEL` repository variable so the deployment workflow can build that exact profile without broader model permissions.
+
 The Cloudflare token needs only Zone DNS Edit and Zone Read for the selected zone. Store it as `CLOUDFLARE_API_TOKEN` in the GitHub `demo` environment, never in Terraform state. The deploy and destroy jobs run only from `main`; add a required reviewer when repository environment protection is available.

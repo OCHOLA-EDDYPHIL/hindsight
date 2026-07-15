@@ -16,8 +16,10 @@ GRANT SELECT ON TABLE
     memory_namespaces,
     embedding_profiles,
     embedding_index_state,
+    embedding_index_write_fence,
     semantic_memory_embeddings,
     semantic_memory_vectors,
+    embedding_backfill_tasks,
     services,
     incidents,
     incident_services,
@@ -44,6 +46,7 @@ GRANT INSERT ON TABLE
     memory_namespaces,
     semantic_memory_embeddings,
     semantic_memory_vectors,
+    embedding_backfill_tasks,
     memory_decisions,
     memory_reads,
     memory_retrievals,
@@ -61,6 +64,7 @@ TO hindsight_agent_writer;
 
 GRANT UPDATE ON TABLE
     memory_namespaces,
+    embedding_index_write_fence,
     memory_decisions,
     agent_runs,
     agent_run_events,
@@ -76,6 +80,7 @@ GRANT SELECT ON TABLE
     memory_namespaces,
     embedding_profiles,
     embedding_index_state,
+    embedding_index_write_fence,
     semantic_memory_embeddings,
     semantic_memory_vectors,
     embedding_backfill_tasks,
@@ -142,6 +147,7 @@ GRANT UPDATE ON TABLE
     memory_namespaces,
     embedding_profiles,
     embedding_index_state,
+    embedding_index_write_fence,
     semantic_memory_embeddings,
     semantic_memory_vectors,
     embedding_backfill_tasks,
@@ -151,6 +157,7 @@ GRANT UPDATE ON TABLE
     consolidation_jobs,
     agent_runs,
     agent_run_events,
+    incident_semantic_beliefs,
     incidents
 TO hindsight_memory_worker;
 

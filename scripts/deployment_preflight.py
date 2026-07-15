@@ -25,27 +25,46 @@ def main() -> None:
     parser.add_argument("--certificate-arn", required=True)
     parser.add_argument("--cloudflare-zone-id", required=True)
     parser.add_argument("--database-parameter", required=True)
-    parser.add_argument("--gemini-parameter", required=True)
+    parser.add_argument("--gemini-parameter")
     parser.add_argument("--operator-parameter", required=True)
     parser.add_argument("--changefeed-parameter", required=True)
+    parser.add_argument(
+        "--llm-provider",
+        choices=("gemini", "bedrock", "deterministic"),
+        default=os.environ.get("LLM_PROVIDER", "gemini"),
+    )
+    parser.add_argument(
+        "--embedding-provider",
+        choices=("gemini", "bedrock"),
+        default=os.environ.get("EMBEDDING_PROVIDER", "gemini"),
+    )
     args = parser.parse_args()
 
     ssm = boto3.client("ssm", region_name=args.region, config=aws_client_config(read_timeout=10))
     names = [
         args.database_parameter,
-        args.gemini_parameter,
         args.operator_parameter,
         args.changefeed_parameter,
     ]
+    needs_gemini = "gemini" in {args.llm_provider, args.embedding_provider}
+    if needs_gemini:
+        if not args.gemini_parameter:
+            raise RuntimeError("--gemini-parameter is required for a Gemini provider")
+        names.append(args.gemini_parameter)
     response = ssm.get_parameters(Names=names, WithDecryption=True)
     if response.get("InvalidParameters"):
         missing = ", ".join(response["InvalidParameters"])
         raise RuntimeError(f"missing SSM parameters: {missing}")
     values = {parameter["Name"]: parameter["Value"] for parameter in response["Parameters"]}
-    credentials = parse_gemini_credentials({"GEMINI_API_KEYS": values[args.gemini_parameter]})
-    if not credentials:
-        raise RuntimeError("Gemini key pool is empty")
-    print(f"preflight: {len(names)} SSM parameters and {len(credentials)} Gemini slots ready")
+    gemini_slots = 0
+    if needs_gemini:
+        credentials = parse_gemini_credentials(
+            {"GEMINI_API_KEYS": values[args.gemini_parameter]}
+        )
+        if not credentials:
+            raise RuntimeError("Gemini key pool is empty")
+        gemini_slots = len(credentials)
+    print(f"preflight: {len(names)} SSM parameters and {gemini_slots} Gemini slots ready")
 
     acm = boto3.client("acm", region_name=args.region, config=aws_client_config(read_timeout=10))
     certificate = acm.describe_certificate(CertificateArn=args.certificate_arn)["Certificate"]

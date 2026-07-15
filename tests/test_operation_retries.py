@@ -1,0 +1,386 @@
+"""Regression coverage for durable governed-operation attempts and fencing."""
+
+import os
+from uuid import uuid4
+
+import pytest
+
+requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
+
+
+def _enqueue_supersession():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import enqueue_operation, preview_supersession
+
+    provider = DeterministicEmbeddingProvider()
+    namespace = f"operation-retry-{uuid4()}"
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        root = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="certificate expiry caused the timeout",
+            provenance=Provenance("pytest", "evidence:root", "seed governed operation"),
+        )
+    preview = preview_supersession(
+        root_memory_id=str(root["id"]),
+        intent="correction",
+        content="retry amplification caused the timeout",
+        structured_payload={"cause": "retry_amplification"},
+        actor="pytest.operator",
+        reason="correct the incident cause",
+        authorized_namespaces=[namespace],
+        db_url=database_url(),
+    )
+    operation, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=preview["fingerprint"],
+        idempotency_key=f"operation-retry:{uuid4()}",
+        db_url=database_url(),
+    )
+    return provider, root, operation
+
+
+def _expire_lease(operation_id: str) -> None:
+    from hindsight.db import connect
+
+    with connect() as conn:
+        conn.execute(
+            """
+                UPDATE memory_operations
+                SET lease_expires_at = now() - INTERVAL '1 second'
+                WHERE id = %s
+            """,
+            (operation_id,),
+        )
+
+
+@requires_db
+def test_precompute_failures_persist_three_attempts_and_reach_failed():
+    from hindsight.db import database_url
+    from hindsight.memory import MemoryStore
+    from hindsight.operations import execute_operation, get_operation
+
+    class FailingEmbeddingProvider:
+        provider_name = "test"
+        model_name = "precompute-failure-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def embed_document(self, _text):
+            self.calls += 1
+            raise RuntimeError("temporary embedding outage")
+
+        def embed_query(self, _text):
+            raise AssertionError("query embeddings are not expected")
+
+    _provider, root, operation = _enqueue_supersession()
+    failing = FailingEmbeddingProvider()
+    expected_statuses = ["retrying", "retrying", "failed"]
+
+    for attempt, expected_status in enumerate(expected_statuses, start=1):
+        with pytest.raises(RuntimeError, match="temporary embedding outage"):
+            execute_operation(
+                operation_id=str(operation["id"]),
+                embedding_provider=failing,
+                worker_id="pytest-operation-worker",
+                db_url=database_url(),
+            )
+        persisted = get_operation(
+            operation_id=str(operation["id"]), db_url=database_url()
+        )
+        assert persisted["status"] == expected_status
+        assert persisted["attempt_count"] == attempt
+        assert persisted["lease_owner"] is None
+        assert persisted["lease_expires_at"] is None
+        assert persisted["failure_code"] == "RuntimeError"
+
+    terminal = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=failing,
+        worker_id="pytest-operation-worker",
+        db_url=database_url(),
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_count"] == 3
+    assert terminal["completed_at"] is not None
+    assert failing.calls == 3
+    assert [event["status"] for event in terminal["events"]] == [
+        "queued",
+        "leased",
+        "retrying",
+        "leased",
+        "retrying",
+        "leased",
+        "failed",
+    ]
+    assert [
+        event["metadata"]["attempt"]
+        for event in terminal["events"]
+        if event["status"] == "leased"
+    ] == [1, 2, 3]
+    assert [
+        event["metadata"]["attempt"]
+        for event in terminal["events"]
+        if event["status"] in {"retrying", "failed"}
+    ] == [1, 2, 3]
+    assert terminal["effects"] == []
+    with MemoryStore(url=database_url()) as store:
+        assert store.audit_memory(
+            memory_kind="semantic", memory_id=str(root["id"])
+        )["t_invalid"] is None
+
+
+@requires_db
+def test_provider_factory_failure_is_recorded_after_durable_claim():
+    from hindsight.db import database_url
+    from hindsight.operations import execute_operation, get_operation
+
+    _provider, _root, operation = _enqueue_supersession()
+
+    def unavailable_provider():
+        raise RuntimeError("embedding provider configuration unavailable")
+
+    with pytest.raises(RuntimeError, match="configuration unavailable"):
+        execute_operation(
+            operation_id=str(operation["id"]),
+            embedding_provider_factory=unavailable_provider,
+            worker_id="pytest-provider-factory",
+            db_url=database_url(),
+        )
+
+    persisted = get_operation(operation_id=str(operation["id"]), db_url=database_url())
+    assert persisted["status"] == "retrying"
+    assert persisted["attempt_count"] == 1
+    assert persisted["failure_code"] == "RuntimeError"
+    assert [event["status"] for event in persisted["events"]] == [
+        "queued",
+        "leased",
+        "retrying",
+    ]
+
+
+@requires_db
+def test_application_rollback_keeps_attempt_and_retry_can_complete(monkeypatch):
+    import hindsight.operations as operations
+    from hindsight.db import database_url
+    from hindsight.memory import MemoryStore
+
+    provider, root, operation = _enqueue_supersession()
+    original_apply = operations._apply_supersession
+
+    def fail_application(**_kwargs):
+        raise RuntimeError("temporary database-side failure")
+
+    monkeypatch.setattr(operations, "_apply_supersession", fail_application)
+    with pytest.raises(RuntimeError, match="database-side failure"):
+        operations.execute_operation(
+            operation_id=str(operation["id"]),
+            embedding_provider=provider,
+            worker_id="pytest-operation-worker",
+            db_url=database_url(),
+        )
+
+    retrying = operations.get_operation(
+        operation_id=str(operation["id"]), db_url=database_url()
+    )
+    assert retrying["status"] == "retrying"
+    assert retrying["attempt_count"] == 1
+    assert retrying["effects"] == []
+    with MemoryStore(url=database_url()) as store:
+        assert store.audit_memory(
+            memory_kind="semantic", memory_id=str(root["id"])
+        )["t_invalid"] is None
+
+    monkeypatch.setattr(operations, "_apply_supersession", original_apply)
+    completed = operations.execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest-operation-worker",
+        db_url=database_url(),
+    )
+    assert completed["status"] == "completed"
+    assert completed["attempt_count"] == 2
+    assert completed["lease_owner"] is None
+    assert completed["lease_expires_at"] is None
+    assert completed["failure_code"] is None
+    assert completed["failure_detail"] is None
+    assert [event["status"] for event in completed["events"]] == [
+        "queued",
+        "leased",
+        "retrying",
+        "leased",
+        "completed",
+    ]
+
+
+@requires_db
+def test_same_worker_cannot_reenter_and_stale_lease_token_cannot_transition():
+    import hindsight.operations as operations
+    from hindsight.db import database_url
+
+    _provider, _root, operation = _enqueue_supersession()
+    operation_id = str(operation["id"])
+    first, first_token = operations._claim_operation(
+        operation_id=operation_id,
+        worker_id="same-worker",
+        db_url=database_url(),
+    )
+    assert first["attempt_count"] == 1
+    assert first_token is not None
+
+    active, duplicate_token = operations._claim_operation(
+        operation_id=operation_id,
+        worker_id="same-worker",
+        db_url=database_url(),
+    )
+    assert duplicate_token is None
+    assert active["attempt_count"] == 1
+    assert active["lease_owner"] == first_token
+
+    _expire_lease(operation_id)
+    operations._mark_retry(
+        operation_id=operation_id,
+        lease_token=first_token,
+        exc=RuntimeError("slow precompute failed after lease expiry"),
+        db_url=database_url(),
+    )
+    retrying = operations.get_operation(
+        operation_id=operation_id, db_url=database_url()
+    )
+    assert retrying["status"] == "retrying"
+    assert retrying["attempt_count"] == 1
+
+    replacement, replacement_token = operations._claim_operation(
+        operation_id=operation_id,
+        worker_id="same-worker",
+        db_url=database_url(),
+    )
+    assert replacement["attempt_count"] == 2
+    assert replacement_token is not None
+    assert replacement_token != first_token
+
+    with pytest.raises(operations._OperationLeaseLostError):
+        operations._mark_retry(
+            operation_id=operation_id,
+            lease_token=first_token,
+            exc=RuntimeError("stale attempt failed"),
+            db_url=database_url(),
+        )
+    current = operations.get_operation(operation_id=operation_id, db_url=database_url())
+    assert current["status"] == "leased"
+    assert current["attempt_count"] == 2
+    assert current["lease_owner"] == replacement_token
+
+    operations._mark_retry(
+        operation_id=operation_id,
+        lease_token=replacement_token,
+        exc=RuntimeError("replacement cleanup"),
+        db_url=database_url(),
+    )
+
+
+@requires_db
+def test_expired_third_attempt_is_reaped_without_creating_attempt_four():
+    import hindsight.operations as operations
+    from hindsight.db import database_url
+
+    _provider, _root, operation = _enqueue_supersession()
+    operation_id = str(operation["id"])
+    tokens = []
+    for _attempt in range(operations.MAX_OPERATION_ATTEMPTS):
+        claimed, token = operations._claim_operation(
+            operation_id=operation_id,
+            worker_id="crashing-worker",
+            db_url=database_url(),
+        )
+        tokens.append(token)
+        assert claimed["attempt_count"] == len(tokens)
+        _expire_lease(operation_id)
+
+    assert operations.reap_exhausted_operations(db_url=database_url()) == {"failed": 1}
+    terminal = operations.get_operation(operation_id=operation_id, db_url=database_url())
+    terminal_token = terminal["lease_owner"]
+    assert terminal_token is None
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_count"] == 3
+    assert terminal["failure_code"] == "OperationAttemptExpired"
+    assert terminal["lease_owner"] is None
+    assert terminal["lease_expires_at"] is None
+    assert len(set(tokens)) == 3
+    persisted = operations.get_operation(
+        operation_id=operation_id, db_url=database_url()
+    )
+    assert [event["status"] for event in persisted["events"]] == [
+        "queued",
+        "leased",
+        "leased",
+        "leased",
+        "failed",
+    ]
+    assert persisted["events"][-1]["metadata"] == {
+        "attempt": 3,
+        "failure_code": "OperationAttemptExpired",
+    }
+
+
+@requires_db
+def test_stale_preview_conflict_is_fenced_and_audited():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import (
+        enqueue_operation,
+        execute_operation,
+        preview_retraction,
+    )
+
+    provider = DeterministicEmbeddingProvider()
+    namespace = f"operation-conflict-{uuid4()}"
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        root = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="previewed root",
+            provenance=Provenance("pytest", "evidence:root", "root"),
+        )
+    preview = preview_retraction(
+        root_memory_id=str(root["id"]),
+        actor="pytest.operator",
+        reason="retract previewed root",
+        authorized_namespaces=[namespace],
+        db_url=database_url(),
+    )
+    operation, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=preview["fingerprint"],
+        idempotency_key=f"operation-conflict:{uuid4()}",
+        db_url=database_url(),
+    )
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="concurrent namespace write",
+            provenance=Provenance("pytest", "evidence:late", "invalidate preview"),
+        )
+
+    result = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest-conflict-worker",
+        db_url=database_url(),
+    )
+    assert result["status"] == "conflict"
+    assert result["attempt_count"] == 1
+    assert result["lease_owner"] is None
+    assert result["lease_expires_at"] is None
+    assert [event["status"] for event in result["events"]] == [
+        "queued",
+        "leased",
+        "conflict",
+    ]
+    assert result["events"][-1]["metadata"]["attempt"] == 1
+    assert result["events"][-1]["metadata"]["failure_code"] == "stale_preview"

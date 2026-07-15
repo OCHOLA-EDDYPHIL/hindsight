@@ -1,5 +1,7 @@
 """Product API contract and operator-boundary tests."""
 
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 
@@ -118,3 +120,71 @@ def test_rewind_execute_rejects_stale_preview(monkeypatch):
 
     assert response.status_code == 409
     assert response.json()["detail"] == "stale preview"
+
+
+def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
+    import hindsight.api as api
+
+    settings = SimpleNamespace(
+        database_url="postgresql://hosted/database",
+        provider_env={"EMBEDDING_PROVIDER": "gemini"},
+    )
+    provider = object()
+    calls = []
+    monkeypatch.setattr(api, "runtime_settings", lambda: settings)
+    monkeypatch.setattr(
+        api,
+        "embedding_provider_from_env",
+        lambda provider_env: calls.append(("provider", provider_env)) or provider,
+    )
+    monkeypatch.setattr(
+        api,
+        "reset_poison_rewind_state",
+        lambda **kwargs: calls.append(("reset", kwargs)) or "demo:session:hosted",
+    )
+    monkeypatch.setattr(
+        api,
+        "ensure_poison_rewind_incident",
+        lambda **kwargs: calls.append(("incident", kwargs)) or {"id": "incident-1"},
+    )
+    monkeypatch.setattr(
+        api,
+        "seed_good_demo_memory",
+        lambda **kwargs: calls.append(("seed", kwargs)) or {"id": "seed-1"},
+    )
+    monkeypatch.setattr(
+        api,
+        "poison_demo_memory",
+        lambda **kwargs: calls.append(("poison", kwargs)) or {"id": "poison-1"},
+    )
+
+    reset = api.demo_reset(api.DemoResetRequest(namespace="demo:hosted"))
+    poison = api.demo_poison(api.DemoPoisonRequest(namespace=reset["namespace"]))
+
+    assert reset["seed_memory"] == {"id": "seed-1"}
+    assert poison == {"id": "poison-1"}
+    assert calls == [
+        ("provider", settings.provider_env),
+        (
+            "reset",
+            {"namespace": "demo:hosted", "db_url": settings.database_url},
+        ),
+        ("incident", {"db_url": settings.database_url}),
+        (
+            "seed",
+            {
+                "namespace": "demo:session:hosted",
+                "db_url": settings.database_url,
+                "embedding_provider": provider,
+            },
+        ),
+        ("provider", settings.provider_env),
+        (
+            "poison",
+            {
+                "namespace": "demo:session:hosted",
+                "db_url": settings.database_url,
+                "embedding_provider": provider,
+            },
+        ),
+    ]

@@ -114,6 +114,14 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   statement {
+    sid     = "EmbeddingProfileBuild"
+    actions = ["bedrock:InvokeModel"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
+    ]
+  }
+
+  statement {
     sid = "ApplicationLifecycle"
     actions = [
       "apigateway:DELETE",
@@ -161,6 +169,17 @@ data "aws_iam_policy_document" "github_deploy" {
       "dynamodb:UpdateItem",
       "dynamodb:UpdateTable",
       "dynamodb:UpdateTimeToLive",
+      "events:DeleteRule",
+      "events:DescribeRule",
+      "events:DisableRule",
+      "events:EnableRule",
+      "events:ListTagsForResource",
+      "events:ListTargetsByRule",
+      "events:PutRule",
+      "events:PutTargets",
+      "events:RemoveTargets",
+      "events:TagResource",
+      "events:UntagResource",
       "lambda:AddPermission",
       "lambda:CreateEventSourceMapping",
       "lambda:CreateFunction",

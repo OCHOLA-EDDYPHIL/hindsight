@@ -89,13 +89,13 @@ def test_incident_changefeed_handler_consolidates_resolved_after_row(monkeypatch
 
 @requires_db
 def test_consolidation_writes_idempotent_lesson_with_provenance():
-    from hindsight.consolidation import consolidate_resolved_incident
+    import hindsight.consolidation as consolidation
     from hindsight.cross_episode import (
         ROOT_CAUSE,
         open_demo_incident,
         resolve_demo_incident,
     )
-    from hindsight.db import database_url
+    from hindsight.db import connect, database_url
 
     namespace = f"consolidation-test-{uuid4()}"
     incident = open_demo_incident(
@@ -110,11 +110,11 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
         db_url=database_url(),
     )
 
-    first = consolidate_resolved_incident(
+    first = consolidation.consolidate_resolved_incident(
         incident_id=str(resolved["id"]),
         db_url=database_url(),
     )
-    second = consolidate_resolved_incident(
+    second = consolidation.consolidate_resolved_incident(
         incident_id=str(resolved["id"]),
         db_url=database_url(),
     )
@@ -130,6 +130,20 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
     assert second.reason == "lesson already exists"
     assert second.memory is not None
     assert second.memory["id"] == first.memory["id"]
+    with connect() as conn:
+        conn.execute(
+            """
+                UPDATE semantic_memories
+                SET trust_status = 'review_required'
+                WHERE id = %s
+            """,
+            (first.memory["id"],),
+        )
+        assert consolidation._existing_lesson(  # noqa: SLF001 - idempotency regression
+            conn,
+            incident_id=resolved["id"],
+            namespace=namespace,
+        ) is None
 
 
 @requires_db
@@ -188,6 +202,292 @@ def test_invalid_model_citation_publishes_no_lesson_and_records_terminal_reason(
     assert result.memory is None
     assert result.created is False
     assert result.reason.startswith("invalid_lesson:")
+
+
+@requires_db
+@pytest.mark.parametrize("governance_state", ["invalidated", "review_required"])
+def test_consolidation_rejects_governed_invalid_source_evidence(governance_state):
+    from hindsight.consolidation import consolidate_resolved_incident
+    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+
+    namespace = f"consolidation-unsafe-source-{governance_state}-{uuid4()}"
+    incident = open_demo_incident(
+        label="source",
+        namespace=namespace,
+        summary="governed-invalid evidence must not produce a lesson",
+        db_url=database_url(),
+    )
+    resolved = resolve_demo_incident(
+        incident_id=str(incident["id"]),
+        reflected_memory_id=None,
+        db_url=database_url(),
+    )
+    with connect() as conn:
+        source_id = conn.execute(
+            """
+                SELECT memory_id FROM incident_semantic_memories
+                WHERE incident_id = %s AND relationship = 'summary'
+            """,
+            (resolved["id"],),
+        ).fetchone()[0]
+        if governance_state == "invalidated":
+            conn.execute(
+                """
+                    UPDATE semantic_memories
+                    SET t_invalid = now(), invalidated_by = 'test.governance',
+                        invalidation_reason = 'unsafe consolidation fixture',
+                        invalidated_at = now()
+                    WHERE id = %s
+                """,
+                (source_id,),
+            )
+        else:
+            conn.execute(
+                """
+                    UPDATE semantic_memories
+                    SET trust_status = 'review_required'
+                    WHERE id = %s
+                """,
+                (source_id,),
+            )
+
+    result = consolidate_resolved_incident(
+        incident_id=str(resolved["id"]),
+        db_url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    )
+
+    assert result.created is False
+    assert result.memory is None
+    assert result.reason == "no eligible semantic source evidence"
+    with connect() as conn:
+        assert conn.execute(
+            """
+                SELECT count(*)
+                FROM incident_semantic_memories AS link
+                JOIN semantic_memories AS memory ON memory.id = link.memory_id
+                WHERE link.incident_id = %s AND link.relationship = 'lesson'
+                    AND memory.writer = 'consolidation.worker'
+            """,
+            (resolved["id"],),
+        ).fetchone() == (0,)
+
+
+@requires_db
+def test_consolidation_excludes_quarantined_rows_from_mixed_source_evidence():
+    import json
+
+    from hindsight.consolidation import consolidate_resolved_incident
+    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.reasoning import ReasoningResponse
+
+    class CaptureEvidenceProvider:
+        provider_name = "test-model"
+        model_name = "capture-eligible-evidence-v1"
+
+        def __init__(self):
+            self.evidence_ids = set()
+
+        def generate(self, request):
+            prompt = json.loads(request.prompt)
+            self.evidence_ids = set(prompt["evidence"])
+            evidence_id = next(
+                key for key in prompt["evidence"] if key.startswith("memory:")
+            )
+            return ReasoningResponse(
+                text=json.dumps(
+                    {
+                        "schema_version": 1,
+                        "title": "Eligible evidence only",
+                        "claims": [
+                            {
+                                "kind": "situation",
+                                "text": "Use only current trusted evidence",
+                                "citations": [
+                                    {
+                                        "evidence_id": evidence_id,
+                                        "quote": prompt["evidence"][evidence_id],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                provider=self.provider_name,
+                model=self.model_name,
+            )
+
+    namespace = f"consolidation-mixed-sources-{uuid4()}"
+    trusted_namespace = f"{namespace}:trusted"
+    incident = open_demo_incident(
+        label="source",
+        namespace=namespace,
+        summary="one trusted and one quarantined source",
+        db_url=database_url(),
+    )
+    resolved = resolve_demo_incident(
+        incident_id=str(incident["id"]),
+        reflected_memory_id=None,
+        db_url=database_url(),
+    )
+    with connect() as conn:
+        with conn.transaction():
+            quarantined_id = conn.execute(
+                """
+                    SELECT memory_id FROM incident_semantic_memories
+                    WHERE incident_id = %s AND relationship = 'summary'
+                """,
+                (resolved["id"],),
+            ).fetchone()[0]
+            trusted = MemoryStore(
+                conn=conn,
+                embedding_provider=DeterministicEmbeddingProvider(),
+            ).remember(
+                memory_kind="semantic",
+                namespace=trusted_namespace,
+                content="This current trusted source is eligible for synthesis.",
+                provenance=Provenance(
+                    writer="test.fixture",
+                    source_ref=f"test:{uuid4()}",
+                    justification="Create mixed consolidation evidence",
+                ),
+            )
+            conn.execute(
+                """
+                    INSERT INTO incident_semantic_memories (
+                        incident_id, memory_id, relationship
+                    ) VALUES (%s, %s, 'root_cause')
+                """,
+                (resolved["id"], trusted["id"]),
+            )
+            conn.execute(
+                """
+                    UPDATE semantic_memories
+                    SET trust_status = 'review_required'
+                    WHERE id = %s
+                """,
+                (quarantined_id,),
+            )
+
+    provider = CaptureEvidenceProvider()
+    result = consolidate_resolved_incident(
+        incident_id=str(resolved["id"]),
+        db_url=database_url(),
+        reasoning_provider=provider,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    )
+
+    assert result.created is True
+    assert result.namespace == trusted_namespace
+    assert f"memory:{quarantined_id}" not in provider.evidence_ids
+    assert result.source_memory_ids is not None
+    assert result.source_memory_ids == [str(trusted["id"])]
+    with connect() as conn:
+        assert conn.execute(
+            """
+                SELECT count(*) FROM memory_reads
+                WHERE decision_id = %s AND semantic_memory_id = %s
+            """,
+            (f"consolidation:{result.job_id}", quarantined_id),
+        ).fetchone() == (0,)
+
+
+@requires_db
+def test_governance_change_during_synthesis_prevents_lesson_publication():
+    import json
+
+    from hindsight.consolidation import consolidate_resolved_incident
+    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.reasoning import ReasoningResponse
+
+    class QuarantineDuringSynthesisProvider:
+        provider_name = "test-model"
+        model_name = "quarantine-during-synthesis-v1"
+
+        def generate(self, request):
+            prompt = json.loads(request.prompt)
+            evidence_id = next(
+                key for key in prompt["evidence"] if key.startswith("memory:")
+            )
+            memory_id = evidence_id.removeprefix("memory:")
+            with connect() as conn:
+                conn.execute(
+                    """
+                        UPDATE semantic_memories
+                        SET trust_status = 'review_required'
+                        WHERE id = %s
+                    """,
+                    (memory_id,),
+                )
+            return ReasoningResponse(
+                text=json.dumps(
+                    {
+                        "schema_version": 1,
+                        "title": "Stale synthesis",
+                        "claims": [
+                            {
+                                "kind": "situation",
+                                "text": "This output must be rejected",
+                                "citations": [
+                                    {
+                                        "evidence_id": evidence_id,
+                                        "quote": prompt["evidence"][evidence_id],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                provider=self.provider_name,
+                model=self.model_name,
+            )
+
+    namespace = f"consolidation-mid-synthesis-governance-{uuid4()}"
+    incident = open_demo_incident(
+        label="source",
+        namespace=namespace,
+        summary="evidence becomes unsafe while the model is running",
+        db_url=database_url(),
+    )
+    resolved = resolve_demo_incident(
+        incident_id=str(incident["id"]),
+        reflected_memory_id=None,
+        db_url=database_url(),
+    )
+    result = consolidate_resolved_incident(
+        incident_id=str(resolved["id"]),
+        db_url=database_url(),
+        reasoning_provider=QuarantineDuringSynthesisProvider(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    )
+
+    assert result.created is False
+    assert result.memory is None
+    assert result.reason == "source evidence changed during synthesis"
+    with connect() as conn:
+        job = conn.execute(
+            """
+                SELECT status, decision_id FROM consolidation_jobs
+                WHERE id = %s
+            """,
+            (result.job_id,),
+        ).fetchone()
+        assert job[0] == "not_eligible"
+        assert conn.execute(
+            "SELECT status FROM memory_decisions WHERE id = %s",
+            (job[1],),
+        ).fetchone() == ("failed",)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE producer_decision_id = %s",
+            (job[1],),
+        ).fetchone() == (0,)
 
 
 @requires_db
@@ -490,6 +790,88 @@ def test_retry_that_becomes_ineligible_fails_linked_decision_atomically():
         ).fetchone() == ("not_eligible", None, None)
         assert conn.execute(
             "SELECT status FROM memory_decisions WHERE id = %s", (job[1],)
+        ).fetchone() == ("failed",)
+
+
+@requires_db
+def test_retry_rejects_a_previously_read_source_after_quarantine():
+    from hindsight.consolidation import consolidate_resolved_incident
+    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+
+    class FailProvider:
+        provider_name = "test-model"
+        model_name = "fail-before-source-quarantine-v1"
+
+        def generate(self, request):
+            raise RuntimeError("temporary model outage")
+
+    namespace = f"consolidation-stale-read-retry-{uuid4()}"
+    incident = open_demo_incident(
+        label="source",
+        namespace=namespace,
+        summary="a previously read source becomes quarantined",
+        db_url=database_url(),
+    )
+    resolved = resolve_demo_incident(
+        incident_id=str(incident["id"]),
+        reflected_memory_id=None,
+        db_url=database_url(),
+    )
+    with pytest.raises(RuntimeError, match="temporary model outage"):
+        consolidate_resolved_incident(
+            incident_id=str(resolved["id"]),
+            db_url=database_url(),
+            reasoning_provider=FailProvider(),
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
+
+    with connect() as conn:
+        job = conn.execute(
+            """
+                SELECT id, decision_id, status
+                FROM consolidation_jobs WHERE incident_id = %s
+            """,
+            (resolved["id"],),
+        ).fetchone()
+        assert job[2] == "retrying"
+        source_id = conn.execute(
+            """
+                SELECT semantic_memory_id FROM memory_reads
+                WHERE decision_id = %s AND memory_kind = 'semantic'
+                LIMIT 1
+            """,
+            (job[1],),
+        ).fetchone()[0]
+        conn.execute(
+            """
+                UPDATE semantic_memories
+                SET trust_status = 'review_required'
+                WHERE id = %s
+            """,
+            (source_id,),
+        )
+
+    result = consolidate_resolved_incident(
+        incident_id=str(resolved["id"]),
+        db_url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    )
+
+    assert result.created is False
+    assert result.reason == "source evidence changed during synthesis"
+    with connect() as conn:
+        assert conn.execute(
+            """
+                SELECT status, lease_owner, lease_expires_at
+                FROM consolidation_jobs WHERE id = %s
+            """,
+            (job[0],),
+        ).fetchone() == ("not_eligible", None, None)
+        assert conn.execute(
+            "SELECT status FROM memory_decisions WHERE id = %s",
+            (job[1],),
         ).fetchone() == ("failed",)
 
 

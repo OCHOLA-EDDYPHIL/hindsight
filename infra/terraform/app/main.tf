@@ -225,11 +225,25 @@ resource "aws_iam_role_policy_attachment" "basic_logs" {
 data "aws_iam_policy_document" "api" {
   statement {
     actions   = ["ssm:GetParameter"]
-    resources = [local.parameter_arns.database, local.parameter_arns.operator]
+    resources = [local.parameter_arns.database, local.parameter_arns.gemini, local.parameter_arns.operator]
+  }
+  statement {
+    actions = [
+      "dynamodb:BatchGetItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:UpdateItem"
+    ]
+    resources = [aws_dynamodb_table.gemini_key_health.arn]
   }
   statement {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.runs.arn]
+  }
+  statement {
+    actions = ["bedrock:InvokeModel"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
+    ]
   }
 }
 
@@ -329,8 +343,14 @@ resource "aws_lambda_function" "api" {
     variables = {
       HINDSIGHT_DATABASE_URL_PARAM        = var.database_url_parameter_name
       HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM = var.operator_token_parameter_name
+      HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
+      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
       HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
       HINDSIGHT_SECURE_COOKIES            = "1"
+      LLM_PROVIDER                        = var.llm_provider
+      EMBEDDING_PROVIDER                  = var.embedding_provider
+      GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
+      BEDROCK_EMBEDDING_MODEL             = var.bedrock_embedding_model
     }
   }
 }
@@ -417,6 +437,27 @@ resource "aws_lambda_event_source_mapping" "worker" {
   function_name           = aws_lambda_function.worker.arn
   batch_size              = 5
   function_response_types = ["ReportBatchItemFailures"]
+}
+
+resource "aws_cloudwatch_event_rule" "operation_reaper" {
+  name                = "${local.name}-operation-reaper"
+  description         = "Terminalize expired final governed-memory operation attempts"
+  schedule_expression = "rate(1 minute)"
+}
+
+resource "aws_cloudwatch_event_target" "operation_reaper" {
+  rule      = aws_cloudwatch_event_rule.operation_reaper.name
+  target_id = "memory-operation-reaper"
+  arn       = aws_lambda_function.worker.arn
+  input     = jsonencode({ command = "reap_memory_operations" })
+}
+
+resource "aws_lambda_permission" "operation_reaper" {
+  statement_id  = "AllowOperationReaper"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.worker.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.operation_reaper.arn
 }
 
 resource "aws_apigatewayv2_api" "http" {

@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from hindsight.db import connect, database_url
-from hindsight.embeddings import embedding_provider_from_env
+from hindsight.embeddings import EmbeddingProvider
 from hindsight.memory import MemoryStore, Provenance
 
 DEMO_NAMESPACE = "demo:payments-poison-rewind"
@@ -58,11 +58,14 @@ def reset_poison_rewind_state(
 
 
 def seed_good_demo_memory(
-    *, namespace: str = DEMO_NAMESPACE, db_url: str | None = None
+    *,
+    embedding_provider: EmbeddingProvider,
+    namespace: str = DEMO_NAMESPACE,
+    db_url: str | None = None,
 ) -> dict[str, Any]:
     with MemoryStore(
         url=db_url or database_url(),
-        embedding_provider=embedding_provider_from_env(),
+        embedding_provider=embedding_provider,
     ) as store:
         return store.remember(
             memory_kind="semantic",
@@ -78,11 +81,14 @@ def seed_good_demo_memory(
 
 
 def poison_demo_memory(
-    *, namespace: str = DEMO_NAMESPACE, db_url: str | None = None
+    *,
+    embedding_provider: EmbeddingProvider,
+    namespace: str = DEMO_NAMESPACE,
+    db_url: str | None = None,
 ) -> dict[str, Any]:
     with MemoryStore(
         url=db_url or database_url(),
-        embedding_provider=embedding_provider_from_env(),
+        embedding_provider=embedding_provider,
     ) as store:
         return store.remember(
             memory_kind="semantic",

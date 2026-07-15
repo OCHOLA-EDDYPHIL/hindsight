@@ -17,6 +17,7 @@ ARTIFACTS = {
         "dependencies": [
             "certifi>=2026.6.17",
             "fastapi>=0.135.0",
+            "google-genai>=2.11.0",
             "mangum>=0.19.0",
             "opentelemetry-api>=1.43.0",
             "psycopg[binary]>=3.2",
@@ -29,6 +30,7 @@ ARTIFACTS = {
             "dashboard.py",
             "db.py",
             "demo_state.py",
+            "embedding_index.py",
             "embeddings.py",
             "gemini.py",
             "memory.py",
@@ -61,6 +63,7 @@ ARTIFACTS = {
             "db.py",
             "consolidation.py",
             "embeddings.py",
+            "embedding_index.py",
             "gemini.py",
             "memory.py",
             "operations.py",

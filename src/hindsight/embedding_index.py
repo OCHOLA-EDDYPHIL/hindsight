@@ -17,6 +17,26 @@ class EmbeddingCoverageError(RuntimeError):
     """Raised when a profile cannot safely become active."""
 
 
+def lock_embedding_index_write_fence(conn: Any) -> None:
+    """Fence semantic writes against profile snapshots and activation.
+
+    Callers must already be inside the transaction that will perform the
+    fenced work, and must acquire this lock before namespace, profile, index
+    state, or memory-row locks.
+    """
+
+    row = conn.execute(
+        """
+            SELECT singleton
+            FROM embedding_index_write_fence
+            WHERE singleton = true
+            FOR UPDATE
+        """
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("embedding index write fence is not initialized")
+
+
 def begin_profile_build(
     *,
     provider: EmbeddingProvider,
@@ -28,7 +48,32 @@ def begin_profile_build(
     profile = embedding_profile(provider, max_distance=max_distance)
     with connect(db_url, application_name="hindsight-embedding-index") as conn:
         with conn.transaction():
+            lock_embedding_index_write_fence(conn)
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                        SELECT * FROM embedding_index_state
+                        WHERE singleton = true FOR UPDATE
+                    """
+                )
+                state = cur.fetchone()
+                if state is None:
+                    raise RuntimeError("embedding index state is not initialized")
+                building_profile_id = state["building_profile_id"]
+                if building_profile_id not in {None, profile.profile_id}:
+                    raise EmbeddingCoverageError(
+                        "a different embedding profile build is already in progress: "
+                        f"{building_profile_id}"
+                    )
+                if state["active_profile_id"] == profile.profile_id:
+                    cur.execute(
+                        "SELECT * FROM embedding_profiles WHERE id = %s",
+                        (profile.profile_id,),
+                    )
+                    active = cur.fetchone()
+                    if active is None:
+                        raise RuntimeError("active embedding profile is missing")
+                    return dict(active)
                 cur.execute(
                     """
                         INSERT INTO embedding_profiles (
@@ -37,8 +82,8 @@ def begin_profile_build(
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'building')
                         ON CONFLICT (id) DO UPDATE SET
                             max_distance = excluded.max_distance,
-                            status = CASE WHEN embedding_profiles.status = 'active'
-                                          THEN 'active' ELSE 'building' END
+                            status = 'building',
+                            retired_at = NULL
                         RETURNING *
                     """,
                     (
@@ -192,11 +237,25 @@ def activate_profile(*, profile_id: str, db_url: str | None = None) -> dict[str,
 
     with connect(db_url, application_name="hindsight-embedding-index") as conn:
         with conn.transaction():
+            lock_embedding_index_write_fence(conn)
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                        SELECT * FROM embedding_index_state
+                        WHERE singleton = true FOR UPDATE
+                    """
+                )
+                state = cur.fetchone()
+                if state is None:
+                    raise RuntimeError("embedding index state is not initialized")
                 cur.execute("SELECT * FROM embedding_profiles WHERE id = %s FOR UPDATE", (profile_id,))
                 profile = cur.fetchone()
                 if profile is None:
                     raise LookupError(profile_id)
+                if state["active_profile_id"] == profile_id:
+                    return dict(state)
+                if state["building_profile_id"] != profile_id:
+                    raise EmbeddingCoverageError("profile is not the current building profile")
                 if profile["capability"] == "lexical_hash" and os.environ.get(
                     "AWS_LAMBDA_FUNCTION_NAME"
                 ):
@@ -214,8 +273,12 @@ def activate_profile(*, profile_id: str, db_url: str | None = None) -> dict[str,
                 missing = int(cur.fetchone()["missing"])
                 cur.execute(
                     """
-                        SELECT count(*) AS failed FROM embedding_backfill_tasks
-                        WHERE profile_id = %s AND status = 'failed'
+                        SELECT count(*) AS failed
+                        FROM embedding_backfill_tasks AS task
+                        JOIN current_semantic_memories AS memory
+                            ON memory.id = task.memory_id
+                        WHERE task.profile_id = %s AND task.status = 'failed'
+                            AND memory.trust_status = 'active'
                     """,
                     (profile_id,),
                 )
