@@ -96,6 +96,42 @@ def test_gemini_provider_uses_injected_client_without_network():
     assert calls[0]["model"] == "gemini-test"
     assert "incident commander" in calls[0]["contents"]
     assert calls[0]["config"]["max_output_tokens"] == 64
+    assert "response_mime_type" not in calls[0]["config"]
+    assert "response_json_schema" not in calls[0]["config"]
+    assert "thinking_config" not in calls[0]["config"]
+
+
+def test_gemini_provider_requests_json_schema_when_supplied():
+    from hindsight.reasoning import GeminiReasoningProvider, ReasoningRequest
+
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text='{"status":"ready"}', usage_metadata=None)
+
+    schema = {
+        "type": "object",
+        "properties": {"status": {"type": "string", "enum": ["ready"]}},
+        "required": ["status"],
+    }
+    provider = GeminiReasoningProvider(
+        model_name="gemini-test",
+        client=SimpleNamespace(models=FakeModels()),
+    )
+
+    provider.generate(
+        ReasoningRequest(
+            prompt="Return status.",
+            response_json_schema=schema,
+            thinking_budget=0,
+        )
+    )
+
+    assert calls[0]["config"]["response_mime_type"] == "application/json"
+    assert calls[0]["config"]["response_json_schema"] == schema
+    assert calls[0]["config"]["thinking_config"] == {"thinking_budget": 0}
 
 
 def test_gemini_provider_reports_pool_slot_without_key_material():

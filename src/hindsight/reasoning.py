@@ -33,6 +33,8 @@ class ReasoningRequest:
     temperature: float = 0.2
     max_output_tokens: int | None = None
     routing_key: str | None = None
+    response_json_schema: Mapping[str, Any] | None = None
+    thinking_budget: int | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,12 @@ class GeminiReasoningProvider:
         config: dict[str, Any] = {"temperature": request.temperature}
         if request.max_output_tokens is not None:
             config["max_output_tokens"] = request.max_output_tokens
+        if request.response_json_schema is not None:
+            config["response_mime_type"] = "application/json"
+            config["response_json_schema"] = request.response_json_schema
+        if request.thinking_budget is not None:
+            config["thinking_config"] = {"thinking_budget": request.thinking_budget}
+
         def invoke(client: Any) -> Any:
             return client.models.generate_content(
                 model=self.model_name, contents=contents, config=config
