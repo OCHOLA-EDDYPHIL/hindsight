@@ -64,6 +64,12 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "events:PutTargets" in bootstrap
     assert "bedrock:InvokeModel" in bootstrap
     assert "foundation-model/${var.bedrock_embedding_model}" in bootstrap
+    assert "s3:GetBucketAcl" in bootstrap
+    assert "apigateway:TagResource" in bootstrap
+    assert "apigateway:UntagResource" in bootstrap
+    assert "cloudwatch:ListTagsForResource" in bootstrap
+    assert "cloudwatch:TagResource" in bootstrap
+    assert "cloudwatch:UntagResource" in bootstrap
 
 
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
