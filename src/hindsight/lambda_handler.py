@@ -10,18 +10,18 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import boto3
 
 from hindsight.aws import aws_client_config
+from hindsight.db import database_url_with_tls_roots
 from hindsight.agent import (
     IncidentAgentResult,
     IncidentInput,
     resume_incident_agent,
     run_incident_agent,
 )
-from hindsight.embeddings import DeterministicEmbeddingProvider
+from hindsight.embeddings import embedding_provider_from_env
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
 from hindsight.security import safe_error_detail
 from hindsight.tracing import configure_tracing_from_env
@@ -167,11 +167,19 @@ def runtime_settings(
     provider_env = {
         "LLM_PROVIDER": env.get("LLM_PROVIDER", "gemini"),
         "GEMINI_MODEL": env.get("GEMINI_MODEL", ""),
+        "GEMINI_EMBEDDING_MODEL": env.get("GEMINI_EMBEDDING_MODEL", ""),
+        "EMBEDDING_PROVIDER": env.get(
+            "EMBEDDING_PROVIDER", env.get("LLM_PROVIDER", "gemini")
+        ),
         "BEDROCK_MODEL": env.get("BEDROCK_MODEL", ""),
+        "BEDROCK_EMBEDDING_MODEL": env.get("BEDROCK_EMBEDDING_MODEL", ""),
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }
-    if provider_env["LLM_PROVIDER"].strip().lower() == "gemini":
+    if any(
+        provider_env[name].strip().lower() == "gemini"
+        for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
+    ):
         gemini_key = _optional_secret_value(
             env=env,
             client=client,
@@ -230,7 +238,7 @@ def _start(
         pause_before_act=_optional_bool(payload, "pause_before_act", default=False),
         db_url=resolved_settings.database_url,
         reasoning_provider=provider,
-        embedding_provider=DeterministicEmbeddingProvider(),
+        embedding_provider=embedding_provider_from_env(resolved_settings.provider_env),
     )
 
 
@@ -247,7 +255,7 @@ def _resume(
         approved=_optional_bool(payload, "approved", default=True),
         db_url=resolved_settings.database_url,
         reasoning_provider=provider,
-        embedding_provider=DeterministicEmbeddingProvider(),
+        embedding_provider=embedding_provider_from_env(resolved_settings.provider_env),
     )
 
 
@@ -537,13 +545,7 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _database_url_for_lambda(url: str) -> str:
-    parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if query.get("sslmode") == "verify-full" and "sslrootcert" not in query:
-        import certifi
-
-        query["sslrootcert"] = certifi.where()
-    return urlunsplit(parts._replace(query=urlencode(query)))
+    return database_url_with_tls_roots(url)
 
 
 def _ssm_client(env: Mapping[str, str]) -> Any:

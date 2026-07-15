@@ -140,14 +140,14 @@
               <span class="eyebrow">Audited correction</span>
               <h3 id="rewindTitle">Rewind belief state</h3>
             </div>
-            <span class="count" id="operationCount">0 rewinds</span>
+            <span class="count" id="operationCount">0 operations</span>
           </div>
           <label for="rewindTimestamp">Restore beliefs as of</label>
           <input id="rewindTimestamp" type="datetime-local" step="1">
           <label for="rewindReason">Reason</label>
           <input id="rewindReason" value="Poisoned memory led to an unsafe recommendation">
           <div class="rewind-actions">
-            <button class="button quiet" id="previewRewind" type="button">Preview</button>
+            <button class="button quiet" id="previewRewind" type="button" data-operator disabled>Preview</button>
             <button class="button danger" id="executeRewind" type="button" data-operator disabled>Execute rewind</button>
           </div>
           <div class="rewind-preview" id="rewindPreview">Choose a point on the belief timeline to preview its impact.</div>

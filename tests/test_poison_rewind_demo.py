@@ -25,7 +25,7 @@ def test_poison_rewind_demo_runs_bad_trace_rewind_and_corrected_turn():
 
     result = run_poison_rewind_demo(db_url=database_url(), namespace=namespace)
 
-    assert result.namespace == namespace
+    assert result.namespace.startswith(f"{namespace}:session:")
     assert result.clean_run.plan == GOOD_RECOMMENDATION
     assert result.bad_run.plan == BAD_RECOMMENDATION
     assert str(result.poison_memory["id"]) in result.bad_run.recalled_memory_ids

@@ -7,11 +7,11 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import boto3
 
 from hindsight.aws import aws_client_config
+from hindsight.db import database_url_with_tls_roots
 
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
 GEMINI_API_KEY_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEY_PARAM"
@@ -96,6 +96,7 @@ def runtime_settings(
             "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE", ""
         ),
         "BEDROCK_MODEL": env.get("BEDROCK_MODEL", ""),
+        "BEDROCK_EMBEDDING_MODEL": env.get("BEDROCK_EMBEDDING_MODEL", ""),
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }
@@ -144,6 +145,27 @@ def runtime_settings(
         _SETTINGS_CACHE = settings
         _SETTINGS_CACHE_AT = time.monotonic()
     return settings
+
+
+def runtime_database_url(
+    *,
+    environ: Mapping[str, str] | None = None,
+    ssm_client: Any | None = None,
+) -> str:
+    """Resolve only the database setting without touching provider credentials."""
+
+    env = os.environ if environ is None else environ
+    client = ssm_client
+    if client is None and _needs_ssm(env):
+        client = _ssm_client(env)
+    return _database_url_for_lambda(
+        _secret_value(
+            env=env,
+            client=client,
+            param_env=DATABASE_URL_PARAM_ENV,
+            fallback_env="DATABASE_URL",
+        )
+    )
 
 
 def invalidate_runtime_settings_cache() -> None:
@@ -214,13 +236,7 @@ def _int_env(env: Mapping[str, str], name: str, *, default: int) -> int:
 
 
 def _database_url_for_lambda(url: str) -> str:
-    parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if query.get("sslmode") == "verify-full" and "sslrootcert" not in query:
-        import certifi
-
-        query["sslrootcert"] = certifi.where()
-    return urlunsplit(parts._replace(query=urlencode(query)))
+    return database_url_with_tls_roots(url)
 
 
 def _ssm_client(env: Mapping[str, str]) -> Any:

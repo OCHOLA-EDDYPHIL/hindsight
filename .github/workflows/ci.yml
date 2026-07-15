@@ -8,12 +8,26 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_ci?sslmode=disable
+      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: deterministic
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - run: |
+          for _ in $(seq 1 30); do
+            docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1' && break
+            sleep 1
+          done
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+          uv run python scripts/migrate.py
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - run: uv run python scripts/run_learning_benchmark.py ci-smoke
       - run: node --input-type=module --check < src/hindsight/web/app.js
       - uses: hashicorp/setup-terraform@v3
       - run: terraform fmt -check -recursive infra/terraform

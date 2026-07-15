@@ -1,0 +1,527 @@
+{
+  "schema_version": 3,
+  "variants": [
+    {
+      "variant_id": "pilot-payments-retry",
+      "split": "pilot",
+      "simulator_kind": "retry_amplification",
+      "source_summary": "A sluggish card processor was flooded by exponentially repeated authorization attempts during a checkout incident.",
+      "recurrence_query": "Checkout requests keep multiplying after slow card replies and buyers remain stuck; what should the operator do before adding workers?",
+      "root_cause": "Unbounded retries amplified load on a degraded payment processor.",
+      "resolution_action": "Measure processor timeouts and queue growth, cap retry fanout, and defer worker scaling until the dependency recovers.",
+      "resolution_observation": "Authorizations recovered after duplicate attempts were limited and the downstream backlog drained.",
+      "reference_lesson": "When payment authorization degrades, constrain retry fanout after checking downstream latency and backlog; extra consumers otherwise intensify pressure.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-release",
+          "role": "background",
+          "content": "The checkout release, certificate bundle, and fraud rules were unchanged during the event."
+        },
+        {
+          "context_id": "hard-scale",
+          "role": "hard_distractor",
+          "content": "Checkout requests keep multiplying after slow card replies and buyers remain stuck; add workers immediately to increase throughput."
+        },
+        {
+          "context_id": "hard-certificates",
+          "role": "hard_distractor",
+          "content": "Checkout requests keep multiplying after slow card replies and buyers remain stuck; rotate gateway certificates before inspecting downstream pressure."
+        }
+      ]
+    },
+    {
+      "variant_id": "pilot-catalog-cache",
+      "split": "pilot",
+      "simulator_kind": "cache_stampede",
+      "source_summary": "A popular catalog entry expired simultaneously across nodes, causing synchronized origin fetches that overwhelmed inventory storage.",
+      "recurrence_query": "Product pages turn slow whenever cached item details expire and thousands of requests hit storage together; which mitigation comes first?",
+      "root_cause": "Synchronized cache expiry triggered a catalog cache stampede against the origin.",
+      "resolution_action": "Enable single-flight refresh, serve stale values briefly, and jitter expiration before increasing origin capacity.",
+      "resolution_observation": "Page latency normalized once one refresher rebuilt each entry and expiry times were dispersed.",
+      "reference_lesson": "For catalog miss storms, coalesce refresh work and stagger expiration while allowing bounded stale reads; scaling the backing store is secondary.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-assets",
+          "role": "background",
+          "content": "Image assets and merchandising rules matched the last successful publication."
+        },
+        {
+          "context_id": "hard-database-scale",
+          "role": "hard_distractor",
+          "content": "Product pages turn slow whenever cached item details expire and thousands of requests hit storage together; immediately double database capacity."
+        },
+        {
+          "context_id": "hard-cache-flush",
+          "role": "hard_distractor",
+          "content": "Product pages turn slow whenever cached item details expire and thousands of requests hit storage together; flush every cached item at once."
+        }
+      ]
+    },
+    {
+      "variant_id": "pilot-search-connections",
+      "split": "pilot",
+      "simulator_kind": "connection_leak",
+      "source_summary": "Canceled indexing requests failed to return database sessions, gradually exhausting the search service pool.",
+      "recurrence_query": "Search updates stop after several hours while open database sessions only rise and available pool slots vanish; what is the safe response?",
+      "root_cause": "An error path leaked database connections from the search indexer.",
+      "resolution_action": "Stop the leaking workers, restore pool headroom, and release sessions in a guaranteed cleanup path before tuning limits.",
+      "resolution_observation": "Indexing resumed and session counts stabilized after cleanup ran for canceled requests.",
+      "reference_lesson": "Monotonically consumed pool capacity calls for isolating the owner and fixing deterministic session release; raising the limit merely delays exhaustion.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-schema",
+          "role": "background",
+          "content": "Search mappings and analyzer versions remained on their approved revisions."
+        },
+        {
+          "context_id": "hard-pool-limit",
+          "role": "hard_distractor",
+          "content": "Search updates stop after several hours while open database sessions only rise and available pool slots vanish; raise the pool limit immediately."
+        },
+        {
+          "context_id": "hard-reindex",
+          "role": "hard_distractor",
+          "content": "Search updates stop after several hours while open database sessions only rise and available pool slots vanish; launch a full reindex immediately."
+        }
+      ]
+    },
+    {
+      "variant_id": "pilot-inventory-partition",
+      "split": "pilot",
+      "simulator_kind": "hot_partition",
+      "source_summary": "A flash-sale warehouse identifier concentrated reservation writes on one shard while neighboring ranges stayed idle.",
+      "recurrence_query": "Stock holds time out for one warehouse during a sale while other shards are quiet; which intervention should lead?",
+      "root_cause": "A warehouse-scoped key created a hot partition for inventory reservations.",
+      "resolution_action": "Throttle the dominant key, spread reservation keys across buckets, and preserve ordering with an explicit mapping.",
+      "resolution_observation": "Reservation latency fell after traffic was redistributed and the overloaded range caught up.",
+      "reference_lesson": "When a single tenant or location saturates one range, reduce that key's pressure and shard its write path rather than scaling idle peers.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-item-data",
+          "role": "background",
+          "content": "Item master data and warehouse routing configuration passed consistency checks."
+        },
+        {
+          "context_id": "hard-global-scale",
+          "role": "hard_distractor",
+          "content": "Stock holds time out for one warehouse during a sale while other shards are quiet; scale every shard equally before inspecting keys."
+        },
+        {
+          "context_id": "hard-retry",
+          "role": "hard_distractor",
+          "content": "Stock holds time out for one warehouse during a sale while other shards are quiet; retry every failed hold without throttling."
+        }
+      ]
+    },
+    {
+      "variant_id": "pilot-fulfillment-poison-message",
+      "split": "pilot",
+      "simulator_kind": "poison_message",
+      "recurrence_query": "Order updates freeze because one malformed event returns to the queue after every handler failure; what should lead before adding consumers?",
+      "source_summary": "A corrupt fulfillment payload repeatedly crashed deserialization and was redelivered ahead of healthy work.",
+      "root_cause": "A poison fulfillment message was replayed indefinitely by the consumer group.",
+      "resolution_action": "Inspect the failing payload, quarantine it for repair, and resume healthy deliveries before changing consumer capacity.",
+      "resolution_observation": "Order updates resumed after the malformed record moved to quarantine and redelivery stopped.",
+      "reference_lesson": "When one queue record fails deterministically, identify and quarantine that payload before scaling workers that would repeat the same failure.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-schema",
+          "role": "background",
+          "content": "The fulfillment event schema and deployment revision matched the prior healthy interval."
+        },
+        {
+          "context_id": "hard-consumers",
+          "role": "hard_distractor",
+          "content": "Order updates freeze because one malformed event returns to the queue after every handler failure; add consumers immediately."
+        },
+        {
+          "context_id": "hard-replay",
+          "role": "hard_distractor",
+          "content": "Order updates freeze because one malformed event returns to the queue after every handler failure; replay it without inspection."
+        }
+      ]
+    },
+    {
+      "variant_id": "pilot-booking-lock-contention",
+      "split": "pilot",
+      "simulator_kind": "lock_contention",
+      "recurrence_query": "Reservations stall while many transactions wait behind one checkout that stays open; what should happen before timeout changes?",
+      "source_summary": "A booking checkout held row locks during a slow fraud call, causing reservation transactions to accumulate behind it.",
+      "root_cause": "A long-lived booking transaction blocked the reservation lock graph.",
+      "resolution_action": "Inspect lock ownership, terminate the abandoned blocker, and move the remote call outside the transaction.",
+      "resolution_observation": "Reservation latency recovered after the blocking transaction ended and waiting writes drained.",
+      "reference_lesson": "For a growing lock queue, find and terminate the blocking owner before extending timeouts that merely prolong waiter occupancy.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-availability",
+          "role": "background",
+          "content": "Inventory availability and booking rules passed their consistency checks."
+        },
+        {
+          "context_id": "hard-timeouts",
+          "role": "hard_distractor",
+          "content": "Reservations stall while many transactions wait behind one checkout that stays open; increase every timeout immediately."
+        },
+        {
+          "context_id": "hard-retry",
+          "role": "hard_distractor",
+          "content": "Reservations stall while many transactions wait behind one checkout that stays open; retry all waiting transactions at once."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-notifications-retry",
+      "split": "confirmation",
+      "simulator_kind": "retry_amplification",
+      "source_summary": "An impaired SMS gateway received growing waves of duplicate delivery submissions from impatient notification workers.",
+      "recurrence_query": "Text messages arrive late as each missing provider acknowledgement launches more sends; what must happen before sender capacity changes?",
+      "root_cause": "Aggressive delivery retries amplified pressure on a degraded SMS provider.",
+      "resolution_action": "Inspect acknowledgement latency, bound resend fanout, and drain queued deliveries before adding senders.",
+      "resolution_observation": "Message delay cleared after duplicate submissions stopped and provider acknowledgements recovered.",
+      "reference_lesson": "For an unhealthy delivery gateway, cap repeated submissions and observe its backlog before scaling producers that can worsen overload.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-templates",
+          "role": "background",
+          "content": "Message templates and recipient preferences were unchanged throughout the delay."
+        },
+        {
+          "context_id": "hard-senders",
+          "role": "hard_distractor",
+          "content": "Text messages arrive late as each missing provider acknowledgement launches more sends; add sender capacity immediately."
+        },
+        {
+          "context_id": "hard-templates",
+          "role": "hard_distractor",
+          "content": "Text messages arrive late as each missing provider acknowledgement launches more sends; rewrite all templates before checking delivery pressure."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-media-retry",
+      "split": "confirmation",
+      "simulator_kind": "retry_amplification",
+      "source_summary": "Slow encoder callbacks prompted duplicate transcode submissions until the external media service became saturated.",
+      "recurrence_query": "Video jobs remain pending because every delayed encoder callback creates replacement work; which action safely precedes adding transcoders?",
+      "root_cause": "Callback retries multiplied work against a degraded encoding dependency.",
+      "resolution_action": "Measure callback delay, deduplicate job submissions, and cap retry concurrency while the encoder backlog drains.",
+      "resolution_observation": "Processing recovered after redundant jobs were suppressed and callback latency returned to normal.",
+      "reference_lesson": "During encoder degradation, enforce idempotency and bound resubmission concurrency; more local workers otherwise manufacture downstream load.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-codecs",
+          "role": "background",
+          "content": "Codec presets and source-object checksums were stable during the incident."
+        },
+        {
+          "context_id": "hard-transcoders",
+          "role": "hard_distractor",
+          "content": "Video jobs remain pending because every delayed encoder callback creates replacement work; add transcoders immediately."
+        },
+        {
+          "context_id": "hard-presets",
+          "role": "hard_distractor",
+          "content": "Video jobs remain pending because every delayed encoder callback creates replacement work; replace every codec preset first."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-shipping-poison-message",
+      "split": "confirmation",
+      "simulator_kind": "poison_message",
+      "source_summary": "A broken carrier notification caused parser exits while broker delivery cycles kept it ahead of subsequent tracking changes.",
+      "recurrence_query": "Tracking updates stop because one broken carrier event returns after every handler crash; what comes before adding consumers?",
+      "root_cause": "A poison carrier event was replayed indefinitely by the tracking consumer.",
+      "resolution_action": "Inspect the failing event, quarantine it with its error metadata, and resume the remaining partition.",
+      "resolution_observation": "Tracking caught up after the malformed event moved aside and repeated delivery ceased.",
+      "reference_lesson": "A deterministically failing queue payload should be identified and quarantined before worker scaling multiplies redelivery.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-mappings",
+          "role": "background",
+          "content": "Carrier mappings and tracking-state rules matched the approved configuration."
+        },
+        {
+          "context_id": "hard-consumers",
+          "role": "hard_distractor",
+          "content": "Tracking updates stop because one broken carrier event returns after every handler crash; add consumers immediately."
+        },
+        {
+          "context_id": "hard-replay",
+          "role": "hard_distractor",
+          "content": "Tracking updates stop because one broken carrier event returns after every handler crash; replay the event continuously without inspection."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-auth-cache",
+      "split": "confirmation",
+      "simulator_kind": "cache_stampede",
+      "source_summary": "Simultaneous expiry of signing-key metadata made every authentication node refresh from the identity control plane.",
+      "recurrence_query": "Logins pause on the hour when cached key records expire and all nodes fetch them together; what should be changed first?",
+      "root_cause": "Aligned authentication-cache expiry caused a refresh stampede.",
+      "resolution_action": "Coalesce key refresh, jitter expiration, and permit bounded stale metadata while a single fetch completes.",
+      "resolution_observation": "Login latency stabilized after refreshes were serialized and node expiry times diverged.",
+      "reference_lesson": "Periodic identity-control-plane surges call for single-flight renewal and staggered freshness windows, not more simultaneous refreshers.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-signing",
+          "role": "background",
+          "content": "No signing-key rotation or login-page deployment occurred during the affected hour."
+        },
+        {
+          "context_id": "hard-identity-scale",
+          "role": "hard_distractor",
+          "content": "Logins pause on the hour when cached key records expire and all nodes fetch them together; scale the identity service immediately."
+        },
+        {
+          "context_id": "hard-flush",
+          "role": "hard_distractor",
+          "content": "Logins pause on the hour when cached key records expire and all nodes fetch them together; flush cached records on every node first."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-pricing-cache",
+      "split": "confirmation",
+      "simulator_kind": "cache_stampede",
+      "source_summary": "A promotion boundary invalidated the same price entries fleet-wide, concentrating recomputation on the pricing database.",
+      "recurrence_query": "Sale prices load slowly at campaign start as identical cache misses trigger simultaneous recalculation; which safeguard should lead?",
+      "root_cause": "Fleet-wide price invalidation triggered a cache stampede.",
+      "resolution_action": "Use request coalescing, prewarm imminent promotions, and spread freshness deadlines across instances.",
+      "resolution_observation": "Pricing recovered after one computation populated each offer and future expirations were staggered.",
+      "reference_lesson": "Known promotion boundaries should be prewarmed and guarded by single-flight recomputation with dispersed expiry, protecting the backing database.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-rules",
+          "role": "background",
+          "content": "Discount rules and currency tables passed their pre-campaign validation."
+        },
+        {
+          "context_id": "hard-database",
+          "role": "hard_distractor",
+          "content": "Sale prices load slowly at campaign start as identical cache misses trigger simultaneous recalculation; double database capacity immediately."
+        },
+        {
+          "context_id": "hard-invalidate",
+          "role": "hard_distractor",
+          "content": "Sale prices load slowly at campaign start as identical cache misses trigger simultaneous recalculation; invalidate every price again."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-recommendations-lock-contention",
+      "split": "confirmation",
+      "simulator_kind": "lock_contention",
+      "source_summary": "A recommendation refresh transaction held catalog locks while waiting on remote feature generation, blocking online updates.",
+      "recurrence_query": "Personalized lists stall while many writes wait behind one refresh transaction that remains open; what should precede longer timeouts?",
+      "root_cause": "A long-running recommendation refresh became the blocking owner in the catalog lock graph.",
+      "resolution_action": "Inspect lock ownership, terminate the stuck refresh, and move remote feature work outside the transaction.",
+      "resolution_observation": "List updates resumed after the blocker ended and queued writers acquired their locks.",
+      "reference_lesson": "When waiters accumulate behind one transaction, identify and terminate the blocker before extending timeouts that retain more locks.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-model",
+          "role": "background",
+          "content": "The ranking artifact passed offline quality and checksum validation."
+        },
+        {
+          "context_id": "hard-timeouts",
+          "role": "hard_distractor",
+          "content": "Personalized lists stall while many writes wait behind one refresh transaction that remains open; increase every timeout immediately."
+        },
+        {
+          "context_id": "hard-retry",
+          "role": "hard_distractor",
+          "content": "Personalized lists stall while many writes wait behind one refresh transaction that remains open; retry all writers without inspecting locks."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-support-connections",
+      "split": "confirmation",
+      "simulator_kind": "connection_leak",
+      "source_summary": "Attachment failures bypassed cleanup in the support API, leaving one database session checked out for every abandoned case.",
+      "recurrence_query": "Case creation degrades through the day while checked-out connections climb after failed attachments; which corrective step should lead?",
+      "root_cause": "The support attachment error path leaked pooled database connections.",
+      "resolution_action": "Quiesce affected workers, reclaim sessions, and enforce connection release in a finally block around attachment persistence.",
+      "resolution_observation": "Case throughput stabilized once failed uploads returned their sessions and pool occupancy stopped climbing.",
+      "reference_lesson": "Steadily rising checkout counts after errors require closing the faulty ownership path and recovering headroom, rather than enlarging the pool.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-routing",
+          "role": "background",
+          "content": "Support forms and routing rules matched the prior healthy release."
+        },
+        {
+          "context_id": "hard-pool",
+          "role": "hard_distractor",
+          "content": "Case creation degrades through the day while checked-out connections climb after failed attachments; increase the pool limit immediately."
+        },
+        {
+          "context_id": "hard-storage",
+          "role": "hard_distractor",
+          "content": "Case creation degrades through the day while checked-out connections climb after failed attachments; replace attachment storage before tracing ownership."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-analytics-connections",
+      "split": "confirmation",
+      "simulator_kind": "connection_leak",
+      "source_summary": "Timed-out batch commits left warehouse sessions open in the analytics ingester until its connection pool emptied.",
+      "recurrence_query": "Dashboard ingestion stalls after repeated batch timeouts while active warehouse connections never fall; what response is safest first?",
+      "root_cause": "A timeout branch leaked warehouse connections in the analytics sink.",
+      "resolution_action": "Pause the leaking consumers, terminate orphan sessions, and guarantee release around every commit outcome.",
+      "resolution_observation": "Batches advanced after orphaned sessions were reclaimed and connection usage reached a steady baseline.",
+      "reference_lesson": "A pool that never recovers after timed-out commits needs deterministic resource cleanup and owner isolation before capacity tuning.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-schemas",
+          "role": "background",
+          "content": "Event schemas and dashboard definitions were unchanged during the ingestion lag."
+        },
+        {
+          "context_id": "hard-connections",
+          "role": "hard_distractor",
+          "content": "Dashboard ingestion stalls after repeated batch timeouts while active warehouse connections never fall; provision more connections immediately."
+        },
+        {
+          "context_id": "hard-replay",
+          "role": "hard_distractor",
+          "content": "Dashboard ingestion stalls after repeated batch timeouts while active warehouse connections never fall; replay every batch before fixing cleanup."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-billing-poison-message",
+      "split": "confirmation",
+      "simulator_kind": "poison_message",
+      "source_summary": "An invalid tax envelope caused decoder exits and monopolized invoice dispatch through recurring broker delivery.",
+      "recurrence_query": "Invoices stop because the same malformed tax record reappears after each worker failure; what should happen before adding consumers?",
+      "root_cause": "A poison tax message was redelivered indefinitely to invoice consumers.",
+      "resolution_action": "Inspect and quarantine the invalid record, retain its failure evidence, and release healthy invoices.",
+      "resolution_observation": "Invoice processing recovered after the malformed record left the active queue.",
+      "reference_lesson": "Repeated deterministic failure of one event requires payload quarantine and diagnosis, not more consumers replaying it.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-tax-data",
+          "role": "background",
+          "content": "Tax tables and invoice templates matched their approved versions."
+        },
+        {
+          "context_id": "hard-consumers",
+          "role": "hard_distractor",
+          "content": "Invoices stop because the same malformed tax record reappears after each worker failure; add consumers immediately."
+        },
+        {
+          "context_id": "hard-replay",
+          "role": "hard_distractor",
+          "content": "Invoices stop because the same malformed tax record reappears after each worker failure; replay it continuously without inspection."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-ledger-partition",
+      "split": "confirmation",
+      "simulator_kind": "hot_partition",
+      "source_summary": "One enterprise tenant generated most ledger postings under a tenant-prefixed key, saturating a single storage range.",
+      "recurrence_query": "Balance updates lag for one large customer while neighboring database ranges stay idle; what should operators change first?",
+      "root_cause": "Tenant-prefixed ledger keys concentrated writes on a hot partition.",
+      "resolution_action": "Rate-limit the dominant tenant and distribute its postings across deterministic buckets while preserving sequence metadata.",
+      "resolution_observation": "Posting latency dropped after the tenant workload spread across ranges and the original hotspot drained.",
+      "reference_lesson": "Tenant-localized range saturation calls for per-tenant throttling and bucketed keys with ordering metadata, not fleet-wide expansion.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-accounting",
+          "role": "background",
+          "content": "Accounting rules and currency conversion tables passed validation."
+        },
+        {
+          "context_id": "hard-scale-ranges",
+          "role": "hard_distractor",
+          "content": "Balance updates lag for one large customer while neighboring database ranges stay idle; scale every range equally immediately."
+        },
+        {
+          "context_id": "hard-global-replay",
+          "role": "hard_distractor",
+          "content": "Balance updates lag for one large customer while neighboring database ranges stay idle; replay all customer postings before identifying the key."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-events-partition",
+      "split": "confirmation",
+      "simulator_kind": "hot_partition",
+      "source_summary": "A celebrity live stream routed nearly all reactions through one stream-prefixed event key and overloaded its broker partition.",
+      "recurrence_query": "Reaction events fall behind for one live stream while other broker partitions have spare capacity; which mitigation should lead?",
+      "root_cause": "A stream-scoped routing key created a hot event partition.",
+      "resolution_action": "Throttle the dominant stream and salt its event key across ordered subpartitions with a merge sequence.",
+      "resolution_observation": "Reaction lag cleared after traffic spread across partitions and consumers merged events by sequence.",
+      "reference_lesson": "A single-stream broker hotspot needs targeted backpressure and salted routing with explicit reordering, rather than more idle consumers.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-client",
+          "role": "background",
+          "content": "The reaction client and event schema matched the prior healthy release."
+        },
+        {
+          "context_id": "hard-consumers",
+          "role": "hard_distractor",
+          "content": "Reaction events fall behind for one live stream while other broker partitions have spare capacity; add consumers to every partition immediately."
+        },
+        {
+          "context_id": "hard-republish",
+          "role": "hard_distractor",
+          "content": "Reaction events fall behind for one live stream while other broker partitions have spare capacity; republish all events to the same key."
+        }
+      ]
+    },
+    {
+      "variant_id": "confirm-exports-lock-contention",
+      "split": "confirmation",
+      "simulator_kind": "lock_contention",
+      "source_summary": "A report-index transaction retained metadata locks during slow object upload, blocking every later export registration.",
+      "recurrence_query": "Downloads queue while many report writes wait behind one export transaction that never closes; what comes before timeout increases?",
+      "root_cause": "A stalled export transaction became the long-lived blocker in the metadata lock graph.",
+      "resolution_action": "Inspect the lock graph, terminate the abandoned export, and separate object upload from the metadata transaction.",
+      "resolution_observation": "Report registration resumed after the blocker ended and waiting transactions drained.",
+      "reference_lesson": "A growing metadata lock queue needs identification and termination of its blocking owner before longer timeouts deepen contention.",
+      "reference_source": "project-curated-simulator-spec-v1",
+      "context_memories": [
+        {
+          "context_id": "background-templates",
+          "role": "background",
+          "content": "Report templates and retention settings were unchanged during the delay."
+        },
+        {
+          "context_id": "hard-timeouts",
+          "role": "hard_distractor",
+          "content": "Downloads queue while many report writes wait behind one export transaction that never closes; increase every timeout immediately."
+        },
+        {
+          "context_id": "hard-retry",
+          "role": "hard_distractor",
+          "content": "Downloads queue while many report writes wait behind one export transaction that never closes; retry every waiting write without inspecting locks."
+        }
+      ]
+    }
+  ]
+}

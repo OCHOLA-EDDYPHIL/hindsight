@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hindsight.db import connect, database_url
-from hindsight.memory import MemoryKind, MemoryStore
+from hindsight.memory import MemoryKind, MemoryStore, ReadContext
 
 MCP_READER = "mcp.memory_inspector"
 MCP_ACTOR_ENV = "HINDSIGHT_MCP_ACTOR"
@@ -56,15 +56,17 @@ def create_mcp_server(*, db_url: str | None = None) -> FastMCP:
     @server.tool()
     def beliefs_as_of(
         namespace: str,
-        as_of: str,
+        system_as_of: str,
+        valid_at: str | None = None,
         query: str | None = None,
         limit: int = 10,
     ) -> dict[str, Any]:
-        """Return semantic memories visible at an ISO-8601 timestamp."""
+        """Inspect independent system-time and valid-time axes."""
 
         return inspect_beliefs_as_of(
             namespace=namespace,
-            as_of=as_of,
+            as_of=system_as_of,
+            valid_at=valid_at,
             query=query,
             limit=limit,
             actor=_mcp_actor(),
@@ -180,6 +182,7 @@ def inspect_beliefs_as_of(
     *,
     namespace: str,
     as_of: str,
+    valid_at: str | None = None,
     query: str | None = None,
     limit: int = 10,
     actor: str = MCP_READER,
@@ -192,19 +195,29 @@ def inspect_beliefs_as_of(
         raise ValueError("namespace is required")
     limit = _validated_limit(limit)
     timestamp = _parse_timestamp(as_of)
+    valid_timestamp = _parse_timestamp(valid_at) if valid_at else timestamp
     decision_id = _decision_id("beliefs-as-of")
     resolved_db_url = db_url or database_url()
     with connect(resolved_db_url) as conn:
         store = MemoryStore(conn=conn, url=resolved_db_url)
-        rows = store.recall(
-            namespace=namespace,
-            query=query or "",
-            as_of=timestamp,
-            limit=limit,
-            decision_id=decision_id,
-            reader=actor,
-            purpose=purpose,
-        )
+        context = ReadContext(decision_id=decision_id, reader=actor, purpose=purpose)
+        if query:
+            rows = store.search_semantic_text_as_of(
+                namespace=namespace,
+                query=query,
+                system_as_of=timestamp,
+                valid_at=valid_timestamp,
+                limit=limit,
+                read_context=context,
+            )
+        else:
+            rows = store.list_semantic_as_of(
+                namespace=namespace,
+                system_as_of=timestamp,
+                valid_at=valid_timestamp,
+                limit=limit,
+                read_context=context,
+            )
         audit_event = _record_mcp_audit_event(
             conn,
             tool_name="beliefs_as_of",
@@ -213,6 +226,7 @@ def inspect_beliefs_as_of(
             arguments={
                 "namespace": namespace,
                 "as_of": timestamp.isoformat(),
+                "valid_at": valid_timestamp.isoformat(),
                 "query": query,
                 "limit": limit,
                 "decision_id": decision_id,
@@ -226,6 +240,8 @@ def inspect_beliefs_as_of(
         "audit_event_id": str(audit_event["id"]),
         "namespace": namespace,
         "as_of": timestamp.isoformat(),
+        "system_as_of": timestamp.isoformat(),
+        "valid_at": valid_timestamp.isoformat(),
         "count": len(rows),
         "memories": _jsonable(rows),
     }

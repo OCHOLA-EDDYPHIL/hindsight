@@ -12,6 +12,7 @@ import math
 import os
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
 from hindsight.aws import aws_client_config
@@ -31,9 +32,63 @@ class EmbeddingProvider(Protocol):
     provider_name: str
     model_name: str
     dimensions: int
+    capability: str
+    encoder_revision: str
 
     def embed(self, text: str) -> list[float]:
         """Return one embedding vector for text."""
+
+    def embed_document(self, text: str) -> list[float]:
+        """Embed stored content for the document side of retrieval."""
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a query for the query side of retrieval."""
+
+
+@dataclass(frozen=True)
+class EmbeddingProfile:
+    """Content-addressed description of one compatible vector space."""
+
+    profile_id: str
+    provider: str
+    model: str
+    dimensions: int
+    capability: str
+    encoder_revision: str
+    configuration: Mapping[str, Any] = field(default_factory=dict)
+    max_distance: float | None = None
+
+
+def embedding_profile(
+    provider: EmbeddingProvider,
+    *,
+    configuration: Mapping[str, Any] | None = None,
+    max_distance: float | None = None,
+) -> EmbeddingProfile:
+    """Return a stable profile identity for provider/model/encoding behavior."""
+
+    payload = {
+        "provider": provider.provider_name,
+        "model": provider.model_name,
+        "dimensions": provider.dimensions,
+        "capability": provider.capability,
+        "encoder_revision": provider.encoder_revision,
+        "configuration": dict(configuration or {}),
+        "max_distance": max_distance,
+    }
+    profile_id = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return EmbeddingProfile(
+        profile_id=profile_id,
+        provider=provider.provider_name,
+        model=provider.model_name,
+        dimensions=provider.dimensions,
+        capability=provider.capability,
+        encoder_revision=provider.encoder_revision,
+        configuration=payload["configuration"],
+        max_distance=max_distance,
+    )
 
 
 def vector_literal(values: Sequence[float], *, dimensions: int = EMBEDDING_DIMENSIONS) -> str:
@@ -49,6 +104,8 @@ class DeterministicEmbeddingProvider:
 
     provider_name = "deterministic"
     model_name = "stable-hash-v1"
+    capability = "lexical_hash"
+    encoder_revision = "hashed-unigram-tf-v1"
 
     def __init__(self, *, dimensions: int = EMBEDDING_DIMENSIONS):
         self.dimensions = dimensions
@@ -69,11 +126,19 @@ class DeterministicEmbeddingProvider:
             return vector
         return [value / norm for value in vector]
 
+    def embed_document(self, text: str) -> list[float]:
+        return self.embed(text)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed(text)
+
 
 class GeminiEmbeddingProvider:
     """Gemini Developer API embeddings routed through the shared key pool."""
 
     provider_name = "gemini"
+    capability = "semantic"
+    encoder_revision = "gemini-retrieval-task-v1"
 
     def __init__(
         self,
@@ -86,12 +151,15 @@ class GeminiEmbeddingProvider:
         self.dimensions = dimensions
         self._credential_pool = credential_pool
 
-    def embed(self, text: str) -> list[float]:
+    def _embed(self, text: str, *, task_type: str) -> list[float]:
         def invoke(client: Any) -> Any:
             return client.models.embed_content(
                 model=self.model_name,
                 contents=text,
-                config={"output_dimensionality": self.dimensions},
+                config={
+                    "output_dimensionality": self.dimensions,
+                    "task_type": task_type,
+                },
             )
 
         execution = self._credential_pool.execute(invoke, routing_key=text)
@@ -110,11 +178,22 @@ class GeminiEmbeddingProvider:
             )
         return vector
 
+    def embed(self, text: str) -> list[float]:
+        return self.embed_document(text)
+
+    def embed_document(self, text: str) -> list[float]:
+        return self._embed(text, task_type="RETRIEVAL_DOCUMENT")
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text, task_type="RETRIEVAL_QUERY")
+
 
 class BedrockTitanEmbeddingProvider:
     """Amazon Bedrock Titan Text Embeddings V2 provider."""
 
     provider_name = "bedrock"
+    capability = "semantic"
+    encoder_revision = "titan-text-v2-normalized-v1"
 
     def __init__(
         self,
@@ -123,10 +202,6 @@ class BedrockTitanEmbeddingProvider:
         dimensions: int = EMBEDDING_DIMENSIONS,
         region_name: str | None = None,
     ):
-        if os.environ.get(LIVE_BEDROCK_EMBEDDINGS_FLAG) != "1":
-            raise RuntimeError(
-                f"Set {LIVE_BEDROCK_EMBEDDINGS_FLAG}=1 to enable live Bedrock embeddings"
-            )
         import boto3
 
         self.model_name = model_id
@@ -158,6 +233,12 @@ class BedrockTitanEmbeddingProvider:
                 f"Bedrock returned {len(embedding)} dimensions, expected {self.dimensions}"
             )
         return [float(value) for value in embedding]
+
+    def embed_document(self, text: str) -> list[float]:
+        return self.embed(text)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed(text)
 
 
 def embedding_provider_from_env(

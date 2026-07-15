@@ -159,7 +159,7 @@ def test_mcp_beliefs_as_of_passes_requested_url_to_memory_store(monkeypatch):
         def __init__(self, *, conn: FakeConnection, url: str | None = None):
             captured["url"] = url
 
-        def recall(self, **kwargs: object) -> list[dict[str, object]]:
+        def list_semantic_as_of(self, **kwargs: object) -> list[dict[str, object]]:
             return []
 
     monkeypatch.setattr(mcp_server, "connect", lambda url: FakeConnection())

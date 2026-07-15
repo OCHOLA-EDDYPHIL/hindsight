@@ -108,6 +108,7 @@ def test_public_memory_api_remembers_recalls_and_invalidates(memory_store):
     )
 
     recalled = memory_store.recall(
+        mode="current_text",
         namespace=namespace,
         query="retry fanout",
     )
@@ -122,7 +123,9 @@ def test_public_memory_api_remembers_recalls_and_invalidates(memory_store):
 
     assert invalidated is not None
     assert invalidated["invalidated_by"] == "agent.rewind"
-    assert memory_store.recall(namespace=namespace, query="retry fanout") == []
+    assert memory_store.recall(
+        mode="current_text", namespace=namespace, query="retry fanout"
+    ) == []
 
 
 @requires_db
@@ -430,7 +433,9 @@ def test_as_of_recall_does_not_commit_caller_transaction():
             ),
         )
 
-        recalled = store.recall(namespace=namespace, query="", as_of=as_of, limit=5)
+        recalled = store.recall(
+            mode="as_of_list", namespace=namespace, query="", as_of=as_of, limit=5
+        )
 
         assert [row["id"] for row in recalled] == [baseline["id"]]
         conn.rollback()
@@ -441,6 +446,127 @@ def test_as_of_recall_does_not_commit_caller_transaction():
     finally:
         conn.rollback()
         conn.close()
+
+
+@requires_db
+def test_historical_projection_hides_unknown_and_marks_future_invalidation_current():
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"historical-projection-{uuid4()}"
+    with MemoryStore(url=database_url()) as store:
+        unknown = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="future invalidation is not known yet",
+            provenance=Provenance("pytest", "evidence:unknown", "historical projection"),
+        )
+    with connect() as conn:
+        before_invalidation = conn.execute("SELECT now()").fetchone()[0]
+    sleep(0.02)
+    with MemoryStore(url=database_url()) as store:
+        store.invalidate(
+            memory_id=str(unknown["id"]),
+            actor="pytest",
+            reason="invalidate after historical snapshot",
+        )
+        scheduled = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="known invalidation takes effect later",
+            provenance=Provenance("pytest", "evidence:scheduled", "scheduled invalidation"),
+        )
+        with connect() as conn:
+            valid_at = conn.execute("SELECT now()").fetchone()[0]
+        future_valid_time = valid_at + timedelta(hours=1)
+        store.invalidate(
+            memory_id=str(scheduled["id"]),
+            actor="pytest",
+            reason="scheduled invalidation",
+            t_invalid=future_valid_time,
+        )
+    with connect() as conn:
+        system_after_schedule = conn.execute("SELECT now()").fetchone()[0]
+
+    with MemoryStore(url=database_url()) as store:
+        old_rows = store.list_semantic_as_of(
+            namespace=namespace,
+            system_as_of=before_invalidation,
+            valid_at=before_invalidation,
+        )
+        scheduled_rows = store.search_semantic_text_as_of(
+            namespace=namespace,
+            query="known invalidation",
+            system_as_of=system_after_schedule,
+            valid_at=valid_at,
+        )
+
+    old = next(row for row in old_rows if row["id"] == unknown["id"])
+    assert old["snapshot_invalidated"] is False
+    assert old["t_invalid"] is None
+    assert old["invalidated_at"] is None
+    assert old["invalidation_reason"] is None
+    assert len(scheduled_rows) == 1
+    assert scheduled_rows[0]["snapshot_invalidated"] is False
+    assert scheduled_rows[0]["t_invalid"] == future_valid_time
+    assert scheduled_rows[0]["invalidated_at"] is not None
+
+
+@requires_db
+def test_historical_semantic_reads_return_mutable_fields_from_mvcc_snapshot():
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"historical-mutable-fields-{uuid4()}"
+    with MemoryStore(url=database_url()) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="processor timeout requires queue depth review",
+            provenance=Provenance(
+                "pytest",
+                "evidence:historical-mutable-fields",
+                "Verify historical mutable fields come from one MVCC snapshot",
+            ),
+        )
+    with connect() as conn:
+        system_as_of = conn.execute("SELECT now()").fetchone()[0]
+    sleep(0.05)
+    with connect() as conn:
+        conn.execute(
+            """
+                UPDATE semantic_memories
+                SET trust_status = 'review_required',
+                    lineage_status = 'legacy_unverified'
+                WHERE id = %s
+            """,
+            (memory["id"],),
+        )
+
+    with MemoryStore(url=database_url()) as store:
+        valid_at = system_as_of + timedelta(minutes=5)
+        listed = store.list_semantic_as_of(
+            namespace=namespace,
+            system_as_of=system_as_of,
+            valid_at=valid_at,
+        )
+        searched = store.search_semantic_text_as_of(
+            namespace=namespace,
+            query="queue depth",
+            system_as_of=system_as_of,
+            valid_at=valid_at,
+        )
+        current = store.audit_memory(memory_kind="semantic", memory_id=str(memory["id"]))
+
+    assert [(row["trust_status"], row["lineage_status"]) for row in listed] == [
+        ("active", "complete")
+    ]
+    assert [(row["trust_status"], row["lineage_status"]) for row in searched] == [
+        ("active", "complete")
+    ]
+    assert current is not None
+    assert current["trust_status"] == "review_required"
+    assert current["lineage_status"] == "legacy_unverified"
 
 
 @requires_db
@@ -485,6 +611,7 @@ def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
         )
         decision_id = f"decision-{uuid4()}"
         recalled = store.recall(
+            mode="semantic_strict",
             namespace=namespace,
             query="certificate expiry",
             limit=1,
@@ -529,9 +656,12 @@ def test_rewind_invalidates_poisoned_and_derived_semantic_memories():
         assert store.audit_memory(memory_kind="semantic", memory_id=str(derived["id"]))[
             "t_invalid"
         ] is not None
-        assert [row["id"] for row in store.recall(namespace=namespace, query="payment")] == [
-            good["id"]
-        ]
+        assert [
+            row["id"]
+            for row in store.search_current_semantic_text(
+                namespace=namespace, query="payment"
+            )
+        ] == [good["id"]]
     finally:
         conn.rollback()
         conn.close()

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from hindsight.db import connect, database_url
-from hindsight.embeddings import DeterministicEmbeddingProvider
+from hindsight.embeddings import EmbeddingProvider
 from hindsight.memory import MemoryStore, Provenance
 
 DEMO_NAMESPACE = "demo:payments-poison-rewind"
@@ -28,32 +29,43 @@ POISONED_MEMORY_CONTENT = (
 )
 
 
-def reset_poison_rewind_state(*, namespace: str = DEMO_NAMESPACE, db_url: str | None = None) -> None:
+def reset_poison_rewind_state(
+    *, namespace: str = DEMO_NAMESPACE, db_url: str | None = None
+) -> str:
+    """Archive matching active sessions and return a fresh session namespace."""
+
     resolved_db_url = db_url or database_url()
+    base_namespace = namespace.split(":session:", 1)[0]
+    session_namespace = f"{base_namespace}:session:{uuid4().hex[:8]}"
     with connect(resolved_db_url) as conn:
-        conn.execute("DELETE FROM agent_runs WHERE namespace = %s", (namespace,))
         conn.execute(
             """
-                DELETE FROM memory_reads
-                WHERE memory_kind = 'semantic'
-                    AND memory_id IN (
-                        SELECT id FROM semantic_memories WHERE namespace = %s
-                    )
+                UPDATE demo_sessions
+                SET status = 'archived', archived_at = COALESCE(archived_at, now())
+                WHERE (namespace = %s OR namespace LIKE %s) AND status = 'active'
             """,
-            (namespace,),
+            (base_namespace, f"{base_namespace}:session:%"),
         )
-        conn.execute("DELETE FROM memory_operations WHERE namespace = %s", (namespace,))
-        conn.execute("DELETE FROM semantic_memory_embeddings WHERE namespace = %s", (namespace,))
-        conn.execute("DELETE FROM semantic_memories WHERE namespace = %s", (namespace,))
+        conn.execute(
+            """
+                INSERT INTO demo_sessions (demo_kind, namespace, created_by)
+                VALUES ('poison_rewind', %s, 'dashboard.operator')
+            """,
+            (session_namespace,),
+        )
         conn.commit()
+    return session_namespace
 
 
 def seed_good_demo_memory(
-    *, namespace: str = DEMO_NAMESPACE, db_url: str | None = None
+    *,
+    embedding_provider: EmbeddingProvider,
+    namespace: str = DEMO_NAMESPACE,
+    db_url: str | None = None,
 ) -> dict[str, Any]:
     with MemoryStore(
         url=db_url or database_url(),
-        embedding_provider=DeterministicEmbeddingProvider(),
+        embedding_provider=embedding_provider,
     ) as store:
         return store.remember(
             memory_kind="semantic",
@@ -69,11 +81,14 @@ def seed_good_demo_memory(
 
 
 def poison_demo_memory(
-    *, namespace: str = DEMO_NAMESPACE, db_url: str | None = None
+    *,
+    embedding_provider: EmbeddingProvider,
+    namespace: str = DEMO_NAMESPACE,
+    db_url: str | None = None,
 ) -> dict[str, Any]:
     with MemoryStore(
         url=db_url or database_url(),
-        embedding_provider=DeterministicEmbeddingProvider(),
+        embedding_provider=embedding_provider,
     ) as store:
         return store.remember(
             memory_kind="semantic",

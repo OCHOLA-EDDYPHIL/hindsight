@@ -211,6 +211,36 @@ def test_runtime_settings_loads_versioned_pool_from_ssm():
     assert settings.provider_env["EMBEDDING_PROVIDER"] == "gemini"
 
 
+def test_runtime_database_url_does_not_resolve_provider_secrets():
+    from hindsight.runtime import (
+        DATABASE_URL_PARAM_ENV,
+        GEMINI_API_KEYS_PARAM_ENV,
+        runtime_database_url,
+    )
+
+    requested = []
+
+    class FakeSsm:
+        def get_parameter(self, *, Name, WithDecryption):
+            requested.append(Name)
+            assert WithDecryption is True
+            if Name != "/hindsight/test/database-url":
+                raise AssertionError("provider secrets must be deferred until after claim")
+            return {"Parameter": {"Value": "postgresql://db"}}
+
+    result = runtime_database_url(
+        environ={
+            DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
+            GEMINI_API_KEYS_PARAM_ENV: "/hindsight/test/gemini-api-keys",
+            "EMBEDDING_PROVIDER": "gemini",
+        },
+        ssm_client=FakeSsm(),
+    )
+
+    assert result == "postgresql://db"
+    assert requested == ["/hindsight/test/database-url"]
+
+
 def test_cooldown_registry_failure_does_not_block_model_call():
     from hindsight.gemini import (
         FailOpenCooldownStore,

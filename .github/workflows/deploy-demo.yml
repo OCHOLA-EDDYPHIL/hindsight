@@ -11,6 +11,33 @@ on:
         options:
           - plan
           - apply
+  workflow_call:
+    inputs:
+      apply:
+        description: Apply the reviewed Terraform plan
+        required: false
+        type: boolean
+        default: false
+      validation_mode:
+        description: Restrict deployment to the owner-authorized PR acceptance caller
+        required: false
+        type: boolean
+        default: false
+      embedding_max_distance:
+        description: Precommitted active-profile cosine-distance cutoff
+        required: false
+        type: string
+        default: "0.35"
+    outputs:
+      ui_url:
+        description: Deployed CloudFront/custom-domain URL
+        value: ${{ jobs.apply.outputs.ui_url }}
+      api_url:
+        description: Deployed HTTP API endpoint
+        value: ${{ jobs.apply.outputs.api_url }}
+      websocket_url:
+        description: Deployed WebSocket endpoint
+        value: ${{ jobs.apply.outputs.websocket_url }}
 
 permissions:
   contents: read
@@ -29,21 +56,90 @@ env:
   TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
   TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+  TF_VAR_llm_provider: ${{ inputs.validation_mode && 'gemini' || vars.HINDSIGHT_LLM_PROVIDER || 'gemini' }}
+  TF_VAR_gemini_model: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-2.5-flash' }}
+  TF_VAR_embedding_provider: ${{ inputs.validation_mode && 'gemini' || vars.HINDSIGHT_EMBEDDING_PROVIDER || 'gemini' }}
+  TF_VAR_gemini_embedding_model: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
+  TF_VAR_bedrock_model: ${{ vars.HINDSIGHT_BEDROCK_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0' }}
+  TF_VAR_bedrock_embedding_model: ${{ vars.HINDSIGHT_BEDROCK_EMBEDDING_MODEL || 'amazon.titan-embed-text-v2:0' }}
   TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
   TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
   TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+  EMBEDDING_MAX_DISTANCE: ${{ inputs.embedding_max_distance || '0.35' }}
 
 jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.authorize.outputs.authorized }}
+      should_apply: ${{ steps.authorize.outputs.should_apply }}
+    steps:
+      - id: authorize
+        name: Authorize deployment source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          MANUAL_OPERATION: ${{ inputs.operation }}
+          REQUESTED_APPLY: ${{ inputs.apply }}
+          VALIDATION_MODE: ${{ inputs.validation_mode }}
+          CALLER_WORKFLOW: ${{ github.workflow }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$REF_NAME" == "refs/heads/main" ]] || {
+              echo "Manual demo deployments are restricted to main." >&2
+              exit 1
+            }
+            [[ "$MANUAL_OPERATION" == "plan" || "$MANUAL_OPERATION" == "apply" ]] || {
+              echo "Unsupported manual deployment operation." >&2
+              exit 1
+            }
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            if [[ "$MANUAL_OPERATION" == "apply" ]]; then
+              echo "should_apply=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_apply=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          [[ "$EVENT_NAME" == "pull_request" \
+            && "$VALIDATION_MODE" == "true" \
+            && "$REQUESTED_APPLY" == "true" \
+            && "$CALLER_WORKFLOW" == "live acceptance" \
+            && "$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@"* \
+            && "$LABEL_NAME" == "live-acceptance" \
+            && "$HEAD_REPOSITORY" == "$REPOSITORY" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EMBEDDING_MAX_DISTANCE" == "0.35" ]] || {
+              echo "PR apply is allowed only through the owner-authorized live-acceptance workflow." >&2
+              exit 1
+            }
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+          echo "should_apply=true" >> "$GITHUB_OUTPUT"
+
   plan:
-    if: github.ref == 'refs/heads/main'
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
     runs-on: ubuntu-latest
     environment: demo
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     outputs:
-      artifact-name: ${{ steps.plan-name.outputs.name }}
+      artifact_name: ${{ steps.plan_name.outputs.name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
       - uses: aws-actions/configure-aws-credentials@v4
@@ -52,6 +148,9 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
       - run: uv sync --frozen
       - run: uv run python scripts/build_lambda_artifacts.py
+      - name: Record deployment artifact identities
+        shell: bash
+        run: sha256sum build/lambda-artifacts/*.zip > build/lambda-artifacts.sha256
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
@@ -62,23 +161,35 @@ jobs:
           -backend-config="use_lockfile=true"
       - name: Create deployment plan
         run: terraform -chdir=infra/terraform/app plan -input=false -out="$GITHUB_WORKSPACE/build/demo.tfplan"
-      - id: plan-name
-        run: echo "name=demo-plan-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+      - id: plan_name
+        run: echo "name=demo-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.plan-name.outputs.name }}
-          path: build/demo.tfplan
-          retention-days: 2
+          name: ${{ steps.plan_name.outputs.name }}
+          path: |
+            build/demo.tfplan
+            build/lambda-artifacts/*.zip
+            build/lambda-artifacts.sha256
+          retention-days: 90
 
   apply:
-    if: inputs.operation == 'apply'
-    needs: plan
+    needs:
+      - authorize
+      - plan
+    if: needs.authorize.outputs.should_apply == 'true'
     runs-on: ubuntu-latest
     environment: demo
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    outputs:
+      ui_url: ${{ steps.stack_outputs.outputs.ui_url }}
+      api_url: ${{ steps.stack_outputs.outputs.api_url }}
+      websocket_url: ${{ steps.stack_outputs.outputs.websocket_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
       - uses: aws-actions/configure-aws-credentials@v4
@@ -86,11 +197,12 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - run: uv sync --frozen
-      - run: uv run python scripts/build_lambda_artifacts.py
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.plan.outputs.artifact-name }}
+          name: ${{ needs.plan.outputs.artifact_name }}
           path: build
+      - name: Verify planned deployment artifacts
+        run: sha256sum --check build/lambda-artifacts.sha256
       - name: Verify durable dependencies
         run: >-
           uv run python scripts/deployment_preflight.py
@@ -98,8 +210,17 @@ jobs:
           --cloudflare-zone-id "$TF_VAR_cloudflare_zone_id"
           --database-parameter "$TF_VAR_database_url_parameter_name"
           --gemini-parameter "$TF_VAR_gemini_api_keys_parameter_name"
+          --llm-provider "$TF_VAR_llm_provider"
+          --embedding-provider "$TF_VAR_embedding_provider"
           --operator-parameter "$TF_VAR_operator_token_parameter_name"
           --changefeed-parameter "$TF_VAR_changefeed_token_parameter_name"
+      - name: Apply database migrations
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          uv run python scripts/migrate.py
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
@@ -109,7 +230,7 @@ jobs:
           -backend-config="encrypt=true"
           -backend-config="use_lockfile=true"
       - run: terraform -chdir=infra/terraform/app apply -input=false -auto-approve "$GITHUB_WORKSPACE/build/demo.tfplan"
-      - name: Apply database migrations and changefeed
+      - name: Configure embedding profile and changefeed
         shell: bash
         run: |
           DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
@@ -120,27 +241,46 @@ jobs:
           export DATABASE_URL
           export HINDSIGHT_CHANGEFEED_AUTH_TOKEN="$CHANGEFEED_TOKEN"
           export HINDSIGHT_CHANGEFEED_WEBHOOK_URL="$CHANGEFEED_WEBHOOK_URL"
-          uv run python scripts/migrate.py
           export HINDSIGHT_DATABASE_URL_PARAM="$TF_VAR_database_url_parameter_name"
           export HINDSIGHT_GEMINI_API_KEYS_PARAM="$TF_VAR_gemini_api_keys_parameter_name"
           HINDSIGHT_GEMINI_KEY_HEALTH_TABLE="$(terraform -chdir=infra/terraform/app output -raw gemini_key_health_table)"
           export HINDSIGHT_GEMINI_KEY_HEALTH_TABLE
-          export EMBEDDING_PROVIDER=gemini
-          export GEMINI_EMBEDDING_MODEL=gemini-embedding-2
-          uv run python scripts/reembed_memories.py
+          export LLM_PROVIDER="$TF_VAR_llm_provider"
+          export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"
+          export GEMINI_EMBEDDING_MODEL="$TF_VAR_gemini_embedding_model"
+          export BEDROCK_EMBEDDING_MODEL="$TF_VAR_bedrock_embedding_model"
+          uv run python scripts/reembed_memories.py --max-distance "$EMBEDDING_MAX_DISTANCE"
           uv run python scripts/configure_changefeed.py apply
       - name: Invalidate deployed UI
         run: >-
           aws cloudfront create-invalidation
           --distribution-id "$(terraform -chdir=infra/terraform/app output -raw cloudfront_distribution_id)"
           --paths '/*'
-      - name: Smoke test deployed product
+      - id: stack_outputs
+        name: Capture deployed endpoints
         shell: bash
         run: |
           UI_URL="$(terraform -chdir=infra/terraform/app output -raw ui_url)"
+          API_URL="$(terraform -chdir=infra/terraform/app output -raw api_url)"
+          WEBSOCKET_URL="$(terraform -chdir=infra/terraform/app output -raw websocket_url)"
+          {
+            echo "ui_url=$UI_URL"
+            echo "api_url=$API_URL"
+            echo "websocket_url=$WEBSOCKET_URL"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Demo deployment"
+            echo
+            echo "- UI: $UI_URL"
+            echo "- API: $API_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test deployed product
+        shell: bash
+        env:
+          UI_URL: ${{ steps.stack_outputs.outputs.ui_url }}
+        run: |
           for _ in {1..12}; do
             if curl --fail --silent --show-error "$UI_URL/v1/health/ready"; then
-              echo "ui_url=$UI_URL" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             sleep 10

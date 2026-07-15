@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -41,9 +43,13 @@ def create_incident(
     severity: str,
     summary: str,
     service_slug: str | None = None,
+    consolidation_policy: str = "managed",
     db_url: str | None = None,
 ) -> dict[str, Any]:
     """Create one open incident and optionally associate its service."""
+
+    if consolidation_policy not in {"managed", "manual"}:
+        raise ValueError("consolidation_policy must be managed or manual")
 
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
@@ -51,12 +57,13 @@ def create_incident(
                 cur.execute(
                     """
                         INSERT INTO incidents (
-                            slug, title, severity, status, started_at, summary
+                            slug, title, severity, status, started_at, summary,
+                            consolidation_policy
                         )
-                        VALUES (%s, %s, %s, 'open', now(), %s)
+                        VALUES (%s, %s, %s, 'open', now(), %s, %s)
                         RETURNING *
                     """,
-                    (slug, title, severity, summary),
+                    (slug, title, severity, summary, consolidation_policy),
                 )
                 incident = dict(cur.fetchone())
                 if service_slug:
@@ -72,6 +79,89 @@ def create_incident(
                             (incident["id"], service["id"], summary),
                         )
         return _jsonable(incident)
+
+
+def resolve_incident(
+    *,
+    slug: str,
+    root_cause: str,
+    action: str,
+    observation: str,
+    recovered: bool,
+    actor: str,
+    occurred_at: datetime | None = None,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Record an independently structured resolution transition and evidence event."""
+
+    payload = {
+        "schema_version": 1,
+        "incident_slug": slug,
+        "root_cause": root_cause,
+        "action": action,
+        "observation": observation,
+        "recovered": recovered,
+        "actor": actor,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with connect(db_url, application_name="hindsight-api") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM incidents WHERE slug = %s FOR UPDATE", (slug,))
+                before = cur.fetchone()
+                if before is None:
+                    raise LookupError(slug)
+                if before["status"] == "resolved":
+                    cur.execute(
+                        """
+                            SELECT * FROM incident_events
+                            WHERE incident_id = %s AND event_type = 'incident_resolved'
+                            ORDER BY occurred_at DESC LIMIT 1
+                        """,
+                        (before["id"],),
+                    )
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        return _jsonable(
+                            {"incident": dict(before), "event": dict(existing), "created": False}
+                        )
+                resolved_at = occurred_at or datetime.now(UTC)
+                event_id = uuid4()
+                cur.execute(
+                    """
+                        INSERT INTO incident_events (
+                            id, incident_id, occurred_at, event_type, summary, metadata,
+                            event_schema, payload_digest, structured_payload
+                        )
+                        VALUES (%s, %s, %s, 'incident_resolved', %s, %s,
+                                'incident_resolution.v1', %s, %s)
+                        RETURNING *
+                    """,
+                    (
+                        event_id,
+                        before["id"],
+                        resolved_at,
+                        observation,
+                        Jsonb({"actor": actor}),
+                        digest,
+                        Jsonb(payload),
+                    ),
+                )
+                event = dict(cur.fetchone())
+                cur.execute(
+                    """
+                        UPDATE incidents
+                        SET status = 'resolved', resolved_at = %s, root_cause = %s,
+                            resolution_event_id = %s
+                        WHERE id = %s
+                        RETURNING *
+                    """,
+                    (resolved_at, root_cause, event_id, before["id"]),
+                )
+                incident = dict(cur.fetchone())
+                return _jsonable({"incident": incident, "event": event, "created": True})
 
 
 def list_incidents(*, limit: int = 30, db_url: str | None = None) -> list[dict[str, Any]]:
@@ -159,10 +249,13 @@ def create_run(
     service_slug: str | None = None,
     thread_id: str | None = None,
     idempotency_key: str | None = None,
+    retrieval_policy: str = "semantic_strict",
     db_url: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Create a queued run, returning ``(run, created)``."""
 
+    if retrieval_policy not in {"semantic_strict", "semantic_then_keyword"}:
+        raise ValueError(f"unsupported retrieval policy: {retrieval_policy}")
     run_id = uuid4()
     resolved_thread_id = thread_id or f"{incident_slug}:{run_id}"
     decision_id = f"agent:{run_id}:plan"
@@ -181,11 +274,27 @@ def create_run(
                 incident = cur.fetchone()
                 cur.execute(
                     """
+                        INSERT INTO memory_decisions (
+                            id, actor, decision_kind, purpose, namespace, metadata
+                        )
+                        VALUES (%s, 'agent.run', 'agent_plan', %s, %s, %s)
+                        ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        decision_id,
+                        "Triage incident, retrieve evidence, and propose a safe action",
+                        namespace,
+                        Jsonb({"thread_id": resolved_thread_id}),
+                    ),
+                )
+                cur.execute(
+                    """
                         INSERT INTO agent_runs (
                             id, idempotency_key, thread_id, incident_id, incident_slug,
-                            namespace, service_slug, user_input, status, decision_id
+                            namespace, service_slug, user_input, status, decision_id,
+                            retrieval_policy
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s)
                         RETURNING *
                     """,
                     (
@@ -198,9 +307,14 @@ def create_run(
                         service_slug,
                         user_input,
                         decision_id,
+                        retrieval_policy,
                     ),
                 )
                 run = dict(cur.fetchone())
+                cur.execute(
+                    "UPDATE memory_decisions SET run_id = %s WHERE id = %s",
+                    (run_id, decision_id),
+                )
                 _append_event_with_cursor(
                     cur,
                     run_id=run_id,
@@ -380,7 +494,7 @@ def fail_run(
         raise RunNotFoundError(str(run_id))
     if existing["status"] in TERMINAL_RUN_STATUSES:
         return existing
-    return transition_run(
+    failed = transition_run(
         run_id=run_id,
         status="failed",
         phase="failure",
@@ -391,6 +505,17 @@ def fail_run(
         },
         db_url=db_url,
     )
+    with connect(db_url, application_name="hindsight-worker") as conn:
+        conn.execute(
+            """
+                UPDATE memory_decisions
+                SET status = 'failed', sealed_at = COALESCE(sealed_at, now())
+                WHERE id = %s AND status = 'open'
+            """,
+            (failed["decision_id"],),
+        )
+        conn.commit()
+    return failed
 
 
 def _append_event_with_cursor(

@@ -233,10 +233,32 @@ def test_bedrock_provider_configures_bounded_boto_client(monkeypatch):
     reason="live Gemini reasoning invocation is opt-in",
 )
 def test_live_gemini_reasoning_provider():
-    from hindsight.reasoning import GeminiReasoningProvider, ReasoningRequest
-
-    response = GeminiReasoningProvider().generate(
-        ReasoningRequest(prompt="Reply with exactly: ok", max_output_tokens=8)
+    from hindsight.reasoning import (
+        DEFAULT_GEMINI_MODEL,
+        GeminiReasoningProvider,
+        ReasoningRequest,
     )
+
+    configured_model = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+    provider = GeminiReasoningProvider(model_name=configured_model)
+
+    assert provider.model_name == configured_model
+    response = provider.generate(
+        ReasoningRequest(prompt="Reply with exactly: ok", max_output_tokens=64)
+    )
+
+    assert response.text.strip() == "ok"
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_BEDROCK_REASONING") != "1",
+    reason="live Bedrock reasoning invocation is opt-in",
+)
+def test_live_bedrock_reasoning_provider():
+    from hindsight.reasoning import BedrockReasoningProvider, ReasoningRequest
+
+    response = BedrockReasoningProvider(
+        region_name=os.environ.get("AWS_REGION", "us-east-1")
+    ).generate(ReasoningRequest(prompt="Reply with exactly: ok", max_output_tokens=64))
 
     assert response.text.strip()

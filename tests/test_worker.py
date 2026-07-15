@@ -3,6 +3,57 @@
 from types import SimpleNamespace
 
 
+def test_scheduled_worker_reaps_expired_memory_operations(monkeypatch):
+    import hindsight.worker as worker
+
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(worker, "runtime_database_url", lambda: "postgresql://db")
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("provider settings resolved")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "reap_exhausted_operations",
+        lambda **kwargs: {"failed": 1, "db_url": kwargs["db_url"]},
+    )
+
+    assert worker.handler({"command": "reap_memory_operations"}, None) == {
+        "failed": 1,
+        "db_url": "postgresql://db",
+    }
+
+
+def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypatch):
+    import hindsight.worker as worker
+
+    provider = object()
+    captured = {}
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(worker, "runtime_database_url", lambda: "postgresql://db")
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: SimpleNamespace(provider_env={"EMBEDDING_PROVIDER": "deterministic"}),
+    )
+    monkeypatch.setattr(worker, "embedding_provider_from_env", lambda *_args, **_kwargs: provider)
+
+    def execute(**kwargs):
+        captured.update(kwargs)
+        return {"provider": kwargs["embedding_provider_factory"]()}
+
+    monkeypatch.setattr(worker, "execute_operation", execute)
+
+    result = worker.process_message(
+        {"command": "memory_operation", "operation_id": "operation-1"}
+    )
+
+    assert result == {"provider": provider}
+    assert captured["db_url"] == "postgresql://db"
+    assert captured["embedding_provider_factory"] is not None
+
+
 def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     import hindsight.worker as worker
     from hindsight.agent import IncidentAgentResult

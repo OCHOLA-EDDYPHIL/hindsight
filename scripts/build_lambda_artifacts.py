@@ -17,6 +17,7 @@ ARTIFACTS = {
         "dependencies": [
             "certifi>=2026.6.17",
             "fastapi>=0.135.0",
+            "google-genai>=2.11.0",
             "mangum>=0.19.0",
             "opentelemetry-api>=1.43.0",
             "psycopg[binary]>=3.2",
@@ -29,9 +30,11 @@ ARTIFACTS = {
             "dashboard.py",
             "db.py",
             "demo_state.py",
+            "embedding_index.py",
             "embeddings.py",
             "gemini.py",
             "memory.py",
+            "operations.py",
             "queueing.py",
             "runs.py",
             "runtime.py",
@@ -58,9 +61,12 @@ ARTIFACTS = {
             "agent.py",
             "aws.py",
             "db.py",
+            "consolidation.py",
             "embeddings.py",
+            "embedding_index.py",
             "gemini.py",
             "memory.py",
+            "operations.py",
             "reasoning.py",
             "runs.py",
             "runtime.py",
@@ -71,7 +77,13 @@ ARTIFACTS = {
     },
     "realtime": {
         "dependencies": [],
-        "modules": ["__init__.py", "aws.py", "realtime.py", "security.py"],
+        "modules": [
+            "__init__.py",
+            "aws.py",
+            "queueing.py",
+            "realtime.py",
+            "security.py",
+        ],
     },
 }
 

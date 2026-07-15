@@ -1,4 +1,4 @@
-"""Run the M4 cross-episode learning demo."""
+"""Run the cross-episode mechanism demo (not a performance benchmark)."""
 
 from __future__ import annotations
 
@@ -30,14 +30,7 @@ def main() -> None:
         db_url=args.db_url,
         keep_existing=args.keep_existing,
     )
-    payload = _jsonable(result)
-    payload["comparison"] = {
-        "episode_one_steps": result.episode_one.steps_to_resolution,
-        "episode_two_steps": result.episode_two.steps_to_resolution,
-        "steps_saved": result.steps_saved,
-        "improvement_ratio": result.improvement_ratio,
-    }
-    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    print(json.dumps(_jsonable(result), indent=2, sort_keys=True, default=str))
 
 
 def _jsonable(value: Any) -> Any:

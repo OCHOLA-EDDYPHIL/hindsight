@@ -16,4 +16,17 @@ terraform -chdir=infra/terraform/bootstrap apply -var-file=terraform.tfvars
 
 Record the state bucket, deployment role, ACM certificate, domain, and Cloudflare zone outputs as GitHub repository variables. Set `create_github_oidc_provider = false` and pass the existing provider ARN when the AWS account already trusts GitHub.
 
-The Cloudflare token needs only Zone DNS Edit and Zone Read for the selected zone. Store it as `CLOUDFLARE_API_TOKEN` in the GitHub `demo` environment, never in Terraform state. The deploy and destroy jobs run only from `main`; add a required reviewer when repository environment protection is available.
+When using Bedrock embeddings, keep `bedrock_embedding_model` aligned with the application stack's `HINDSIGHT_BEDROCK_EMBEDDING_MODEL` repository variable so the deployment workflow can build that exact profile without broader model permissions.
+
+## Upgrading an existing deployment role
+
+The application workflow cannot update its own bootstrap role. Before running live acceptance for a revision that adds AWS services or provider checks, apply the bootstrap plan with a separate trusted bootstrap administrator (or a separately protected bootstrap role). For the governed-memory release, the minimal role-policy delta is:
+
+- `bedrock:InvokeModel` for the configured Titan embedding-model ARN;
+- the EventBridge rule/target lifecycle actions used by the operation reaper;
+- the Lambda reserved-concurrency lifecycle actions used by the hosted functions;
+- the finite S3 bucket/object metadata and CloudWatch log-delivery lifecycle actions required by the AWS provider.
+
+Review the bootstrap plan and require it to update only the deployment role's inline policy when the certificate, OIDC provider, state bucket, domain, and Cloudflare records already exist. Do not place local `.env` AWS keys in the application workflow or grant the application role permission to rewrite itself. The live workflow can assume the upgraded role through the existing `repo:OCHOLA-EDDYPHIL/hindsight:environment:demo` OIDC subject after that one-time policy update.
+
+The Cloudflare token needs only Zone DNS Edit and Zone Read for the selected zone. Store it as `CLOUDFLARE_API_TOKEN` in the GitHub `demo` environment, never in Terraform state. Routine deploy/destroy dispatches run from `main`; the owner-labelled live-acceptance workflow may deploy an exact same-repository PR SHA through the same protected environment. Add a required reviewer when repository environment protection is available.

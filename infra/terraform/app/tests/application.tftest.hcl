@@ -82,4 +82,13 @@ run "complete_demo_graph" {
     condition     = length(aws_cloudwatch_metric_alarm.lambda_errors) == 4
     error_message = "Every Lambda surface must have an error alarm."
   }
+
+  assert {
+    condition = (
+      aws_iam_role.apigateway_cloudwatch.name == "hindsight-demo-apigateway-cloudwatch" &&
+      aws_iam_role_policy_attachment.apigateway_cloudwatch.role == aws_iam_role.apigateway_cloudwatch.name &&
+      endswith(aws_iam_role_policy_attachment.apigateway_cloudwatch.policy_arn, "AmazonAPIGatewayPushToCloudWatchLogs")
+    )
+    error_message = "API Gateway access logs require the Terraform-owned account role and managed policy."
+  }
 }

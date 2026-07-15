@@ -28,7 +28,18 @@ from hindsight.demo_state import (
     reset_poison_rewind_state,
     seed_good_demo_memory,
 )
+from hindsight.embeddings import embedding_provider_from_env
 from hindsight.memory import MemoryStore
+from hindsight.operations import (
+    OperationAuthorizationError,
+    OperationConflictError,
+    enqueue_operation,
+    get_operation,
+    preview_retraction,
+    preview_review_resolution,
+    preview_rewind,
+    preview_supersession,
+)
 from hindsight.queueing import RunQueueUnavailableError, enqueue_run
 from hindsight.runtime import function_auth_token, runtime_settings
 from hindsight.runs import (
@@ -41,6 +52,7 @@ from hindsight.runs import (
     get_run,
     list_incidents,
     prepare_approval,
+    resolve_incident,
     transition_run,
 )
 from hindsight.security import safe_error_detail
@@ -86,16 +98,46 @@ class RunCreate(BaseModel):
     user_input: str = Field(min_length=1, max_length=20_000)
     namespace: str = Field(min_length=1, max_length=500)
     thread_id: str | None = Field(default=None, max_length=500)
+    retrieval_policy: Literal["semantic_strict", "semantic_then_keyword"] = "semantic_strict"
 
 
 class ApprovalRequest(BaseModel):
     approved: bool
 
 
+class IncidentResolutionRequest(BaseModel):
+    root_cause: str = Field(min_length=1, max_length=10_000)
+    action: str = Field(min_length=1, max_length=10_000)
+    observation: str = Field(min_length=1, max_length=10_000)
+    recovered: bool
+
+
 class RewindRequest(BaseModel):
     target_timestamp: datetime
     reason: str = Field(min_length=1, max_length=500)
-    state_hash: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+class OperationApprovalRequest(BaseModel):
+    preview_id: str = Field(min_length=1, max_length=100)
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
+class RetractionPreviewRequest(BaseModel):
+    root_memory_id: str
+    reason: str = Field(min_length=1, max_length=500)
+    authorized_namespaces: list[str] = Field(min_length=1)
+
+
+class SupersessionPreviewRequest(RetractionPreviewRequest):
+    intent: Literal["correction", "evolution"]
+    content: str = Field(min_length=1, max_length=20_000)
+    structured_payload: dict[str, Any]
+
+
+class ReviewResolutionPreviewRequest(BaseModel):
+    action: Literal["confirmed", "retracted"]
+    reason: str = Field(min_length=1, max_length=500)
+    authorized_namespaces: list[str] = Field(min_length=1)
 
 
 class OperatorSessionRequest(BaseModel):
@@ -168,6 +210,22 @@ def incidents_get(slug: str) -> dict[str, Any]:
 
 
 @app.post(
+    f"{API_PREFIX}/incidents/{{slug}}/resolution",
+    tags=["incidents"],
+    dependencies=[Depends(_operator_required)],
+)
+def incidents_resolve(slug: str, payload: IncidentResolutionRequest) -> dict[str, Any]:
+    try:
+        return resolve_incident(
+            slug=slug,
+            actor="dashboard.operator",
+            **payload.model_dump(),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="incident not found") from exc
+
+
+@app.post(
     f"{API_PREFIX}/incidents/{{slug}}/runs",
     tags=["runs"],
     status_code=status.HTTP_202_ACCEPTED,
@@ -189,6 +247,7 @@ def runs_create(
         service_slug=incident.get("service_slug"),
         thread_id=payload.thread_id,
         idempotency_key=idempotency_key,
+        retrieval_policy=payload.retrieval_policy,
     )
     if created:
         try:
@@ -241,9 +300,31 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
 
 
 @app.get(f"{API_PREFIX}/namespaces/{{namespace}}/beliefs", tags=["memory"])
-def beliefs_get(namespace: str, as_of: datetime | None = None, limit: int = 100) -> dict[str, Any]:
+def beliefs_get(
+    namespace: str,
+    as_of: datetime | None = None,
+    system_as_of: datetime | None = None,
+    valid_at: datetime | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
     if limit < 1 or limit > 100:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
+    if system_as_of is not None or valid_at is not None:
+        resolved_system_time = system_as_of or datetime.now().astimezone()
+        with MemoryStore() as store:
+            rows = store.list_semantic_as_of(
+                namespace=namespace,
+                system_as_of=resolved_system_time,
+                valid_at=valid_at,
+                limit=limit,
+            )
+        return {
+            "namespace": namespace,
+            "system_as_of": resolved_system_time.isoformat(),
+            "valid_at": (valid_at or resolved_system_time).isoformat(),
+            "count": len(rows),
+            "memories": _jsonable(rows),
+        }
     return memory_snapshot(
         namespace=namespace,
         as_of=as_of.isoformat() if as_of else None,
@@ -292,32 +373,152 @@ def decisions_influence(decision_id: str) -> dict[str, Any]:
     return {"decision_id": decision_id, "count": len(memories), "memories": _jsonable(memories)}
 
 
-@app.post(f"{API_PREFIX}/namespaces/{{namespace}}/rewinds/preview", tags=["memory"])
+@app.post(
+    f"{API_PREFIX}/namespaces/{{namespace}}/rewinds/preview",
+    tags=["memory"],
+    dependencies=[Depends(_operator_required)],
+)
 def rewind_preview(namespace: str, payload: RewindRequest) -> dict[str, Any]:
-    with MemoryStore() as store:
-        preview = store.preview_rewind(timestamp=payload.target_timestamp, namespace=namespace)
-    return _jsonable(dataclasses.asdict(preview))
+    return _jsonable(
+        preview_rewind(
+            namespace=namespace,
+            target_timestamp=payload.target_timestamp,
+            actor="dashboard.operator",
+            reason=payload.reason,
+        )
+    )
 
 
 @app.post(
     f"{API_PREFIX}/namespaces/{{namespace}}/rewinds",
     tags=["memory"],
+    status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(_operator_required)],
 )
-def rewind_execute(namespace: str, payload: RewindRequest) -> dict[str, Any]:
-    if payload.state_hash is None:
-        raise HTTPException(status_code=422, detail="state_hash from rewind preview is required")
-    with MemoryStore() as store:
-        preview = store.preview_rewind(timestamp=payload.target_timestamp, namespace=namespace)
-        if not hmac.compare_digest(preview.state_hash, payload.state_hash):
-            raise HTTPException(status_code=409, detail="belief state changed; preview rewind again")
-        result = store.rewind(
-            timestamp=payload.target_timestamp,
-            namespace=namespace,
-            actor="dashboard.operator",
-            reason=payload.reason,
+def rewind_execute(
+    namespace: str,
+    payload: OperationApprovalRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> dict[str, Any]:
+    del namespace
+    return _approve_operation(
+        payload=payload,
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/memory/retractions/preview",
+    tags=["memory"],
+    dependencies=[Depends(_operator_required)],
+)
+def retraction_preview(payload: RetractionPreviewRequest) -> dict[str, Any]:
+    try:
+        return _jsonable(
+            preview_retraction(
+                root_memory_id=payload.root_memory_id,
+                actor="dashboard.operator",
+                reason=payload.reason,
+                authorized_namespaces=payload.authorized_namespaces,
+            )
         )
-    return _jsonable(dataclasses.asdict(result))
+    except OperationAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post(
+    f"{API_PREFIX}/memory/supersessions/preview",
+    tags=["memory"],
+    dependencies=[Depends(_operator_required)],
+)
+def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
+    try:
+        return _jsonable(
+            preview_supersession(
+                root_memory_id=payload.root_memory_id,
+                intent=payload.intent,
+                content=payload.content,
+                structured_payload=payload.structured_payload,
+                actor="dashboard.operator",
+                reason=payload.reason,
+                authorized_namespaces=payload.authorized_namespaces,
+            )
+        )
+    except OperationAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post(
+    f"{API_PREFIX}/memory/reviews/{{review_item_id}}/preview",
+    tags=["memory"],
+    dependencies=[Depends(_operator_required)],
+)
+def review_resolution_preview(
+    review_item_id: str, payload: ReviewResolutionPreviewRequest
+) -> dict[str, Any]:
+    try:
+        return _jsonable(
+            preview_review_resolution(
+                review_item_id=review_item_id,
+                action=payload.action,
+                actor="dashboard.operator",
+                reason=payload.reason,
+                authorized_namespaces=payload.authorized_namespaces,
+            )
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post(
+    f"{API_PREFIX}/memory/operations",
+    tags=["memory"],
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(_operator_required)],
+)
+def operations_create(
+    payload: OperationApprovalRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> dict[str, Any]:
+    return _approve_operation(payload=payload, idempotency_key=idempotency_key)
+
+
+@app.get(f"{API_PREFIX}/memory/operations/{{operation_id}}", tags=["memory"])
+def operations_get(operation_id: str) -> dict[str, Any]:
+    operation = get_operation(operation_id=operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="memory operation not found")
+    return _jsonable(operation)
+
+
+def _approve_operation(
+    *, payload: OperationApprovalRequest, idempotency_key: str | None
+) -> dict[str, Any]:
+    if not idempotency_key:
+        raise HTTPException(status_code=422, detail="Idempotency-Key is required")
+    try:
+        operation, created = enqueue_operation(
+            preview_id=payload.preview_id,
+            fingerprint=payload.fingerprint,
+            idempotency_key=idempotency_key,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if created or operation["status"] in {"queued", "retrying"}:
+        try:
+            enqueue_run({"command": "memory_operation", "operation_id": str(operation["id"])})
+        except RunQueueUnavailableError as exc:
+            raise HTTPException(status_code=503, detail="operation queue is unavailable") from exc
+    return {
+        "operation_id": str(operation["id"]),
+        "status": operation["status"],
+        "created": created,
+        "operation_url": f"{API_PREFIX}/memory/operations/{operation['id']}",
+    }
 
 
 @app.post(
@@ -326,11 +527,20 @@ def rewind_execute(namespace: str, payload: RewindRequest) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
-    reset_poison_rewind_state(namespace=payload.namespace)
-    incident = ensure_poison_rewind_incident()
-    memory = seed_good_demo_memory(namespace=payload.namespace)
+    settings = runtime_settings()
+    embedding_provider = embedding_provider_from_env(settings.provider_env)
+    session_namespace = reset_poison_rewind_state(
+        namespace=payload.namespace,
+        db_url=settings.database_url,
+    )
+    incident = ensure_poison_rewind_incident(db_url=settings.database_url)
+    memory = seed_good_demo_memory(
+        namespace=session_namespace,
+        db_url=settings.database_url,
+        embedding_provider=embedding_provider,
+    )
     return {
-        "namespace": payload.namespace,
+        "namespace": session_namespace,
         "incident": incident,
         "seed_memory": _jsonable(memory),
     }
@@ -342,7 +552,15 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
     dependencies=[Depends(_operator_required)],
 )
 def demo_poison(payload: DemoPoisonRequest) -> dict[str, Any]:
-    return _jsonable(poison_demo_memory(namespace=payload.namespace))
+    settings = runtime_settings()
+    embedding_provider = embedding_provider_from_env(settings.provider_env)
+    return _jsonable(
+        poison_demo_memory(
+            namespace=payload.namespace,
+            db_url=settings.database_url,
+            embedding_provider=embedding_provider,
+        )
+    )
 
 
 @app.get(f"{API_PREFIX}/operator/session", tags=["operator"])

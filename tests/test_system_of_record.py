@@ -23,6 +23,7 @@ def seeded_conn():
         with conn.transaction():
             conn.execute("DELETE FROM incident_semantic_memories")
             conn.execute("DELETE FROM incident_runbooks")
+            conn.execute("DELETE FROM consolidation_jobs")
             conn.execute("DELETE FROM incident_events")
             conn.execute("DELETE FROM incident_services")
             conn.execute("DELETE FROM runbooks")

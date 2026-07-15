@@ -15,7 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from hindsight.db import database_url
-from hindsight.embeddings import DeterministicEmbeddingProvider, EmbeddingProvider
+from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
@@ -71,6 +71,7 @@ class IncidentAgentState(TypedDict, total=False):
     proposed_action: str
     action_approved: bool
     reflected_memory: dict[str, Any]
+    retrieval_id: NotRequired[str | None]
 
 
 ProgressCallback = Callable[[str, str, dict[str, Any]], None]
@@ -205,7 +206,7 @@ def build_incident_graph(
     """Build the incident graph; compile it with a checkpointer before use."""
 
     resolved_db_url = db_url or database_url()
-    resolved_embedding_provider = embedding_provider or DeterministicEmbeddingProvider()
+    resolved_embedding_provider = embedding_provider or embedding_provider_from_env()
 
     def triage(state: IncidentAgentState) -> dict[str, Any]:
         history = _chat_history(
@@ -351,9 +352,34 @@ def build_incident_graph(
                 url=resolved_db_url,
                 embedding_provider=resolved_embedding_provider,
             ) as store:
-                memory = store.remember(
-                    memory_kind="semantic",
+                parent_memory_ids = [
+                    str(row.get("memory_id") or row.get("id"))
+                    for row in state.get("recalled_memories", [])
+                    if row.get("memory_id") or row.get("id")
+                ]
+                structured_payload = {
+                    "schema_version": 1,
+                    "thread_id": state["thread_id"],
+                    "run_id": state["run_id"],
+                    "incident_id": state["incident_id"],
+                    "namespace": state["namespace"],
+                    "service_slug": state.get("service_slug"),
+                    "plan": state.get("plan", "").strip(),
+                    "proposed_action": state.get("proposed_action", "").strip(),
+                    "action_approved": bool(state.get("action_approved")),
+                    "retrieval_id": state.get("retrieval_id"),
+                    "recalled_memory_ids": parent_memory_ids,
+                }
+                memory = store.remember_agent_reflection(
+                    decision_id=state["decision_id"],
+                    run_id=state["run_id"],
+                    thread_id=state["thread_id"],
+                    incident_id=state["incident_id"],
                     namespace=state["namespace"],
+                    service_slug=state.get("service_slug"),
+                    plan=str(structured_payload["plan"]),
+                    proposed_action=str(structured_payload["proposed_action"]),
+                    action_approved=bool(structured_payload["action_approved"]),
                     content=content,
                     provenance=Provenance(
                         writer="agent.reflect",
@@ -364,13 +390,11 @@ def build_incident_graph(
                         "thread_id": state["thread_id"],
                         "incident_id": state["incident_id"],
                         "service_slug": state.get("service_slug"),
-                        "recalled_memory_ids": [
-                            str(row.get("memory_id") or row.get("id"))
-                            for row in state.get("recalled_memories", [])
-                            if row.get("memory_id") or row.get("id")
-                        ],
+                        "recalled_memory_ids": parent_memory_ids,
                         "action_approved": state.get("action_approved", False),
                     },
+                    structured_payload=structured_payload,
+                    parent_memory_ids=parent_memory_ids,
                 )
             history = _chat_history(
                 thread_id=state["thread_id"],
@@ -414,44 +438,33 @@ def _recall_for_state(
     embedding_provider: EmbeddingProvider,
 ) -> dict[str, Any]:
     memories: list[dict[str, Any]] = []
-    recall_error = None
+    retrieval_id = None
     with MemoryStore(
         url=db_url,
         embedding_provider=embedding_provider,
     ) as store:
         try:
-            service_slug = state.get("service_slug")
-            if service_slug:
-                memories = store.recall_similar_incidents(
-                    namespace=state["namespace"],
-                    query=state["user_input"],
-                    service_slug=service_slug,
-                    decision_id=state["decision_id"],
-                    reader="agent.recall",
-                    purpose="retrieve similar incident context",
-                )
+            requested_policy = str(
+                state.get("metadata", {}).get("retrieval_policy") or "semantic_strict"
+            )
+            if requested_policy not in {"semantic_strict", "semantic_then_keyword"}:
+                raise ValueError(f"unsupported retrieval policy: {requested_policy}")
+            result = store.retrieve_semantic(
+                namespace=state["namespace"],
+                query=state["user_input"],
+                decision_id=state["decision_id"],
+                reader="agent.recall",
+                purpose="retrieve governed incident context",
+                policy=requested_policy,  # type: ignore[arg-type]
+            )
+            memories = list(result.hits)
+            retrieval_id = result.retrieval_id
         except Exception as exc:
-            recall_error = str(exc)
-    if not memories:
-        try:
-            fallback_embedding_provider = None if recall_error else embedding_provider
-            with MemoryStore(
-                url=db_url,
-                embedding_provider=fallback_embedding_provider,
-            ) as fallback_store:
-                memories = fallback_store.recall(
-                    namespace=state["namespace"],
-                    query=state["user_input"],
-                    decision_id=state["decision_id"],
-                    reader="agent.recall",
-                    purpose="retrieve semantic incident context",
-                )
-        except Exception as exc:
-            recall_error = _append_error(recall_error, str(exc))
-            memories = []
-    update: dict[str, Any] = {"recalled_memories": _jsonable_rows(memories)}
-    if recall_error:
-        update["recall_error"] = recall_error
+            raise RuntimeError(f"governed retrieval failed: {exc}") from exc
+    update: dict[str, Any] = {
+        "recalled_memories": _jsonable_rows(memories),
+        "retrieval_id": retrieval_id,
+    }
     return update
 
 
@@ -501,12 +514,6 @@ def _ensure_sync_entrypoint() -> None:
         "run_incident_agent and resume_incident_agent are synchronous helpers; "
         "call them outside an active event loop"
     )
-
-
-def _append_error(existing: str | None, new_error: str) -> str:
-    if existing:
-        return f"{existing}; {new_error}"
-    return new_error
 
 
 def _report_progress(
