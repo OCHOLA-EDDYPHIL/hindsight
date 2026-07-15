@@ -11,6 +11,11 @@ on:
         options:
           - plan
           - apply
+      health_only:
+        description: Stop after exact-main deployment health checks
+        required: true
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       apply:
@@ -28,6 +33,11 @@ on:
         required: false
         type: string
         default: "0.35"
+      health_only:
+        description: Stop after deployment health checks
+        required: false
+        type: boolean
+        default: false
     outputs:
       ui_url:
         description: Deployed CloudFront/custom-domain URL
@@ -93,8 +103,10 @@ jobs:
         shell: bash
         run: |
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            [[ "$REF_NAME" == "refs/heads/main" ]] || {
-              echo "Manual demo deployments are restricted to main." >&2
+            [[ "$REF_NAME" == "refs/heads/main" \
+              && "$ACTOR" == "$REPOSITORY_OWNER" \
+              && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
+              echo "Manual demo deployments require the repository owner on main." >&2
               exit 1
             }
             [[ "$MANUAL_OPERATION" == "plan" || "$MANUAL_OPERATION" == "apply" ]] || {
@@ -140,6 +152,10 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify exact source revision
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
       - uses: aws-actions/configure-aws-credentials@v4
@@ -178,6 +194,7 @@ jobs:
       - plan
     if: needs.authorize.outputs.should_apply == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: demo
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -190,6 +207,10 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify exact source revision
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
       - uses: aws-actions/configure-aws-credentials@v4
@@ -231,6 +252,7 @@ jobs:
           -backend-config="use_lockfile=true"
       - run: terraform -chdir=infra/terraform/app apply -input=false -auto-approve "$GITHUB_WORKSPACE/build/demo.tfplan"
       - name: Configure embedding profile and changefeed
+        if: inputs.health_only != true
         shell: bash
         run: |
           DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
@@ -268,21 +290,77 @@ jobs:
             echo "api_url=$API_URL"
             echo "websocket_url=$WEBSOCKET_URL"
           } >> "$GITHUB_OUTPUT"
-          {
-            echo "### Demo deployment"
-            echo
-            echo "- UI: $UI_URL"
-            echo "- API: $API_URL"
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Smoke test deployed product
+      - name: Verify deployed HTTP health
         shell: bash
         env:
           UI_URL: ${{ steps.stack_outputs.outputs.ui_url }}
+          API_URL: ${{ steps.stack_outputs.outputs.api_url }}
         run: |
+          check_200() {
+            local label="$1"
+            local url="$2"
+            local status
+            status="$(curl --silent --show-error --connect-timeout 5 --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' "$url")" || return 1
+            if [[ "$status" != "200" ]]; then
+              echo "$label returned HTTP $status" >&2
+              return 1
+            fi
+          }
           for _ in {1..12}; do
-            if curl --fail --silent --show-error "$UI_URL/v1/health/ready"; then
+            if check_200 "UI root" "$UI_URL/" \
+              && check_200 "direct API liveness" "$API_URL/v1/health/live" \
+              && check_200 "direct API readiness" "$API_URL/v1/health/ready" \
+              && check_200 "direct DB-backed route" "$API_URL/v1/incidents?limit=1" \
+              && check_200 "UI-proxied readiness" "$UI_URL/v1/health/ready"; then
               exit 0
             fi
             sleep 10
           done
           exit 1
+      - name: Verify WebSocket connect and clean close
+        shell: bash
+        env:
+          WEBSOCKET_URL: ${{ steps.stack_outputs.outputs.websocket_url }}
+        run: |
+          for _ in {1..12}; do
+            if uv run python - "$WEBSOCKET_URL" <<'PY'
+          import asyncio
+          import sys
+
+          from websockets.asyncio.client import connect
+
+
+          async def verify() -> None:
+              async with connect(sys.argv[1], open_timeout=15, close_timeout=15):
+                  pass
+
+
+          asyncio.run(verify())
+          PY
+            then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+      - name: Record deployment-health evidence
+        env:
+          DEPLOYED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEALTH_ONLY: ${{ inputs.health_only }}
+          UI_URL: ${{ steps.stack_outputs.outputs.ui_url }}
+          API_URL: ${{ steps.stack_outputs.outputs.api_url }}
+          WEBSOCKET_URL: ${{ steps.stack_outputs.outputs.websocket_url }}
+        shell: bash
+        run: |
+          {
+            echo "### Deployment health"
+            echo
+            echo "Exact revision \`$DEPLOYED_SHA\` passed the deployment-health checks."
+            echo
+            echo "- Health-only mode: $HEALTH_ONLY"
+            echo "- UI: $UI_URL"
+            echo "- API: $API_URL"
+            echo "- WebSocket: $WEBSOCKET_URL"
+            echo "- Checks: UI root, direct API live/ready, DB-backed incident list, UI-proxied readiness, WebSocket connect/close"
+          } >> "$GITHUB_STEP_SUMMARY"
