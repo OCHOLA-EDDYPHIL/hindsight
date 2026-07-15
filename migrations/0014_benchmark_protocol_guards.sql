@@ -372,6 +372,13 @@ AFTER INSERT ON benchmark_experiments
 FOR EACH ROW
 EXECUTE FUNCTION bind_benchmark_confirmation_preregistration();
 
+-- CockroachDB cannot replace a function while an active trigger references it.
+-- Rebind the two v1 guards atomically inside this migration transaction.
+DROP TRIGGER IF EXISTS benchmark_experiment_contract_immutable
+    ON benchmark_experiments;
+DROP TRIGGER IF EXISTS benchmark_trial_trace_immutable
+    ON benchmark_trials;
+
 CREATE OR REPLACE FUNCTION guard_benchmark_experiment_contract()
 RETURNS TRIGGER
 LANGUAGE PLpgSQL
@@ -424,6 +431,16 @@ BEGIN
     RETURN NEW;
 END
 $$;
+
+CREATE TRIGGER benchmark_experiment_contract_immutable
+BEFORE UPDATE ON benchmark_experiments
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_experiment_contract();
+
+CREATE TRIGGER benchmark_trial_trace_immutable
+BEFORE UPDATE ON benchmark_trials
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_trial_trace();
 
 CREATE OR REPLACE FUNCTION guard_benchmark_experiment_delete()
 RETURNS TRIGGER
