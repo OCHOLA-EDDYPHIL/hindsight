@@ -35,6 +35,7 @@ from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 MemoryKind = Literal["episodic", "semantic"]
 RetrievalPolicy = Literal["semantic_strict", "semantic_then_keyword"]
+MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS = 3
 RecallMode = Literal[
     "semantic_strict",
     "semantic_then_keyword",
@@ -184,44 +185,62 @@ class MemoryStore:
                 "hindsight.provenance.writer": provenance.writer,
             },
         ) as span:
-            with self._conn.transaction():
-                if memory_kind == "semantic":
-                    if not namespace or not namespace.strip():
-                        raise ProvenanceError("namespace is required for semantic memory")
-                    memory = self.write_semantic(
-                        namespace=namespace,
-                        content=content,
-                        provenance=provenance,
-                        metadata=metadata,
-                        t_valid=t_valid,
-                        content_schema=content_schema,
-                        structured_payload=structured_payload,
-                        producer_decision_id=producer_decision_id,
-                        parent_memory_ids=parent_memory_ids,
-                        precomputed_embedding=prepared_embedding,
-                    )
-                    set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
-                    return memory
-                if memory_kind == "episodic":
-                    if not episode_id or not episode_id.strip():
-                        raise ProvenanceError("episode_id is required for episodic memory")
-                    if not role or not role.strip():
-                        raise ProvenanceError("role is required for episodic memory")
-                    memory = self.write_episodic(
-                        episode_id=episode_id,
-                        role=role,
-                        content=content,
-                        provenance=provenance,
-                        metadata=metadata,
-                        t_valid=t_valid,
-                        content_schema=content_schema,
-                        structured_payload=structured_payload,
-                        producer_decision_id=producer_decision_id,
-                        parent_memory_ids=parent_memory_ids,
-                    )
-                    set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
-                    return memory
-            raise ValueError(f"Unsupported memory kind: {memory_kind}")
+            attempts = MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS if self._owns_connection else 1
+            for attempt in range(1, attempts + 1):
+                try:
+                    with self._conn.transaction():
+                        if memory_kind == "semantic":
+                            if not namespace or not namespace.strip():
+                                raise ProvenanceError("namespace is required for semantic memory")
+                            memory = self.write_semantic(
+                                namespace=namespace,
+                                content=content,
+                                provenance=provenance,
+                                metadata=metadata,
+                                t_valid=t_valid,
+                                content_schema=content_schema,
+                                structured_payload=structured_payload,
+                                producer_decision_id=producer_decision_id,
+                                parent_memory_ids=parent_memory_ids,
+                                precomputed_embedding=prepared_embedding,
+                            )
+                            set_span_attributes(
+                                span, {"hindsight.memory.id": str(memory["id"])}
+                            )
+                            return memory
+                        if memory_kind == "episodic":
+                            if not episode_id or not episode_id.strip():
+                                raise ProvenanceError("episode_id is required for episodic memory")
+                            if not role or not role.strip():
+                                raise ProvenanceError("role is required for episodic memory")
+                            memory = self.write_episodic(
+                                episode_id=episode_id,
+                                role=role,
+                                content=content,
+                                provenance=provenance,
+                                metadata=metadata,
+                                t_valid=t_valid,
+                                content_schema=content_schema,
+                                structured_payload=structured_payload,
+                                producer_decision_id=producer_decision_id,
+                                parent_memory_ids=parent_memory_ids,
+                            )
+                            set_span_attributes(
+                                span, {"hindsight.memory.id": str(memory["id"])}
+                            )
+                            return memory
+                        raise ValueError(f"Unsupported memory kind: {memory_kind}")
+                except SerializationFailure:
+                    if not self._owns_connection or attempt == attempts:
+                        raise
+                    self._reconnect_owned_connection()
+            raise RuntimeError("owned memory write retry loop exited without a result")
+
+    def _reconnect_owned_connection(self) -> None:
+        if not self._owns_connection or self._url is None:
+            raise RuntimeError("cannot reconnect a caller-owned memory connection")
+        self._conn.close()
+        self._conn = connect(self._url)
 
     def recall(
         self,
