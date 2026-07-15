@@ -1,4 +1,4 @@
-"""Tests for the M4 signature poison, diagnose, and rewind demo."""
+"""Tests for the memory poisoning and rewind demo."""
 
 import os
 from uuid import uuid4
