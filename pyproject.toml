@@ -25,6 +25,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
     "selenium>=4.30.0",
+    "websockets>=15.0,<16",
 ]
 
 [build-system]

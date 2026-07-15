@@ -482,6 +482,7 @@ jobs:
     env:
       HINDSIGHT_BROWSER_BASE_URL: ${{ needs.deploy.outputs.ui_url }}
       HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
+      HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
       RUN_HOSTED_ACCEPTANCE: "1"
@@ -506,6 +507,7 @@ jobs:
           OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           [[ -n "$OPERATOR_TOKEN" && "$OPERATOR_TOKEN" != "None" ]] || {
             echo "Hosted operator token is unavailable." >&2
             exit 1
@@ -518,9 +520,14 @@ jobs:
             echo "Gemini credential material is unavailable." >&2
             exit 1
           }
+          [[ -n "$CHANGEFEED_TOKEN" && "$CHANGEFEED_TOKEN" != "None" ]] || {
+            echo "Hosted changefeed token is unavailable." >&2
+            exit 1
+          }
           echo "::add-mask::$OPERATOR_TOKEN"
           echo "::add-mask::$DATABASE_URL"
           echo "::add-mask::$GEMINI_MATERIAL"
+          echo "::add-mask::$CHANGEFEED_TOKEN"
           while IFS= read -r api_key; do
             [[ -n "$api_key" ]] && echo "::add-mask::$api_key"
           done < <(
@@ -530,6 +537,7 @@ jobs:
           delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
           {
             printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
+            printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
             printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
             echo "GEMINI_API_KEYS<<$delimiter"
             printf '%s\n' "$GEMINI_MATERIAL"
@@ -540,9 +548,10 @@ jobs:
         run: |
           [[ "$HINDSIGHT_BROWSER_BASE_URL" == https://* ]]
           [[ "$HOSTED_API_URL" == https://* ]]
+          [[ "$HINDSIGHT_WEBSOCKET_URL" == wss://* ]]
           curl --fail --silent --show-error "$HINDSIGHT_BROWSER_BASE_URL/v1/health/ready"
           curl --fail --silent --show-error "$HOSTED_API_URL/v1/health/ready"
-      - name: Run hosted changefeed, worker, and Firefox acceptance
+      - name: Run hosted changefeed, WebSocket, worker, and Firefox acceptance
         run: uv run pytest -q tests/test_hosted_acceptance.py tests/test_browser_ui.py
       - name: Record browser acceptance evidence
         env:
@@ -551,7 +560,7 @@ jobs:
           {
             echo "### Hosted browser acceptance"
             echo
-            echo "The deployed changefeed, worker, typed reflection, governance history, and Firefox workflow completed at \`$HEAD_SHA\`."
+            echo "The deployed changefeed, WebSocket reconnect/resubscribe/unsubscribe, worker, typed reflection, governance history, and Firefox workflow completed at \`$HEAD_SHA\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
   acceptance_complete:
