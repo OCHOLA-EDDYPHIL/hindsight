@@ -109,3 +109,24 @@ def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     assert "export EMBEDDING_PROVIDER=gemini" not in workflow
     assert "github.triggering_actor" in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
+
+
+def test_deploy_health_only_is_owner_authorized_exact_main_and_checks_every_endpoint():
+    workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+
+    manual_authorization = workflow.split(
+        'if [[ "$EVENT_NAME" == "workflow_dispatch" ]]', 1
+    )[1].split("exit 0", 1)[0]
+    assert '"$REF_NAME" == "refs/heads/main"' in manual_authorization
+    assert '"$ACTOR" == "$REPOSITORY_OWNER"' in manual_authorization
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in manual_authorization
+    assert workflow.count("Verify exact source revision") == 2
+    assert "timeout-minutes: 60" in workflow
+    assert "if: inputs.health_only != true" in workflow
+    assert "--connect-timeout 5 --max-time 15" in workflow
+    assert 'direct API liveness" "$API_URL/v1/health/live' in workflow
+    assert 'direct API readiness" "$API_URL/v1/health/ready' in workflow
+    assert 'direct DB-backed route" "$API_URL/v1/incidents?limit=1' in workflow
+    assert 'UI-proxied readiness" "$UI_URL/v1/health/ready' in workflow
+    assert "from websockets.asyncio.client import connect" in workflow
+    assert "Exact revision \\`$DEPLOYED_SHA\\` passed" in workflow
