@@ -179,3 +179,15 @@ def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():
     assert 'HINDSIGHT_DATABASE_URL_PARAM=""' in product_api
     assert 'HINDSIGHT_GEMINI_API_KEY_PARAM=""' in product_api
     assert 'HINDSIGHT_GEMINI_API_KEYS_PARAM=""' in product_api
+
+
+def test_telemetry_demo_uses_the_configured_local_database_url():
+    makefile = pathlib.Path("Makefile").read_text()
+
+    telemetry_demo = makefile.split("telemetry-demo:\n", 1)[1].split(
+        "\npoison-rewind-demo:", 1
+    )[0]
+    assert (
+        'DATABASE_URL="$(LOCAL_DATABASE_URL)" '
+        "uv run python scripts/run_telemetry_demo.py"
+    ) in telemetry_demo

@@ -39,7 +39,7 @@ mcp-server:
 	uv run python scripts/run_mcp_server.py
 
 telemetry-demo:
-	uv run python scripts/run_telemetry_demo.py
+	DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python scripts/run_telemetry_demo.py
 
 poison-rewind-demo:
 	uv run python scripts/run_poison_rewind_demo.py all
