@@ -1,4 +1,4 @@
-"""Run the M4 signature memory poisoning and rewind demo."""
+"""Run the memory poisoning and rewind demo."""
 
 from __future__ import annotations
 

@@ -341,7 +341,7 @@ def poison_demo_memory(
                 provenance=Provenance(
                     writer="demo.poison",
                     source_ref="demo:simulated-memory-poisoning",
-                    justification="Scripted M4 memory poisoning for rewind demonstration",
+                    justification="Scripted memory poisoning for rewind demonstration",
                 ),
                 metadata={
                     "demo": "poison-rewind",
