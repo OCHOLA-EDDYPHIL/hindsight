@@ -217,6 +217,179 @@ def test_application_rollback_keeps_attempt_and_retry_can_complete(monkeypatch):
 
 
 @requires_db
+def test_serialization_failure_retries_whole_transaction_without_duplicate_rows(
+    monkeypatch,
+):
+    import hindsight.operations as operations
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore
+
+    provider, root, operation = _enqueue_supersession()
+    operation_id = str(operation["id"])
+    original_embed = provider.embed_document
+    original_insert = MemoryStore._insert_semantic_embedding
+    embedding_calls = 0
+    insertion_attempts = 0
+
+    def count_embedding(text):
+        nonlocal embedding_calls
+        embedding_calls += 1
+        return original_embed(text)
+
+    def force_first_retry(store, **kwargs):
+        nonlocal insertion_attempts
+        insertion_attempts += 1
+        if insertion_attempts == 1:
+            store._conn.execute(  # noqa: SLF001 - inject a real Cockroach retry
+                "SELECT crdb_internal.force_retry('1h'::INTERVAL)"
+            ).fetchone()
+        return original_insert(store, **kwargs)
+
+    monkeypatch.setattr(provider, "embed_document", count_embedding)
+    monkeypatch.setattr(MemoryStore, "_insert_semantic_embedding", force_first_retry)
+
+    completed = operations.execute_operation(
+        operation_id=operation_id,
+        embedding_provider=provider,
+        worker_id="pytest-serialization-retry",
+        db_url=database_url(),
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["attempt_count"] == 1
+    assert embedding_calls == 1
+    assert insertion_attempts == 2
+    assert [event["status"] for event in completed["events"]] == [
+        "queued",
+        "leased",
+        "completed",
+    ]
+    assert [effect["effect_type"] for effect in completed["effects"]] == [
+        "closed",
+        "created",
+    ]
+    created_id = str(completed["effects"][1]["result_memory_id"])
+    decision_id = f"operation:{operation_id}:supersede"
+    with connect() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE created_by_operation_id = %s",
+            (operation_id,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memory_embeddings WHERE memory_id = %s",
+            (created_id,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memory_vectors WHERE memory_id = %s",
+            (created_id,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_decisions WHERE id = %s", (decision_id,)
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_reads WHERE decision_id = %s", (decision_id,)
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_lineage_edges WHERE child_semantic_memory_id = %s",
+            (created_id,),
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_operation_effects WHERE operation_id = %s",
+            (operation_id,),
+        ).fetchone() == (2,)
+        assert conn.execute(
+            """
+                SELECT count(*) FROM memory_operation_events
+                WHERE operation_id = %s AND status = 'completed'
+            """,
+            (operation_id,),
+        ).fetchone() == (1,)
+    with MemoryStore(url=database_url()) as store:
+        assert store.audit_memory(
+            memory_kind="semantic", memory_id=str(root["id"])
+        )["t_invalid"] is not None
+
+
+@requires_db
+def test_exhausted_transaction_retries_enter_existing_operation_retry(monkeypatch):
+    import hindsight.operations as operations
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore
+    from psycopg import errors
+
+    provider, root, operation = _enqueue_supersession()
+    operation_id = str(operation["id"])
+    original_embed = provider.embed_document
+    original_insert = MemoryStore._insert_semantic_embedding
+    embedding_calls = 0
+    insertion_attempts = 0
+
+    def count_embedding(text):
+        nonlocal embedding_calls
+        embedding_calls += 1
+        return original_embed(text)
+
+    def force_every_retry(store, **_kwargs):
+        nonlocal insertion_attempts
+        insertion_attempts += 1
+        store._conn.execute(  # noqa: SLF001 - inject a real Cockroach retry
+            "SELECT crdb_internal.force_retry('1h'::INTERVAL)"
+        ).fetchone()
+
+    monkeypatch.setattr(provider, "embed_document", count_embedding)
+    monkeypatch.setattr(MemoryStore, "_insert_semantic_embedding", force_every_retry)
+
+    with pytest.raises(errors.SerializationFailure):
+        operations.execute_operation(
+            operation_id=operation_id,
+            embedding_provider=provider,
+            worker_id="pytest-serialization-exhaustion",
+            db_url=database_url(),
+        )
+
+    retrying = operations.get_operation(operation_id=operation_id, db_url=database_url())
+    assert retrying["status"] == "retrying"
+    assert retrying["attempt_count"] == 1
+    assert retrying["failure_code"] == "SerializationFailure"
+    assert retrying["effects"] == []
+    assert embedding_calls == 1
+    assert insertion_attempts == operations.MAX_OPERATION_TRANSACTION_ATTEMPTS
+    assert [event["status"] for event in retrying["events"]] == [
+        "queued",
+        "leased",
+        "retrying",
+    ]
+    with connect() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE created_by_operation_id = %s",
+            (operation_id,),
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_operation_effects WHERE operation_id = %s",
+            (operation_id,),
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT count(*) FROM memory_operation_events WHERE operation_id = %s",
+            (operation_id,),
+        ).fetchone() == (3,)
+    with MemoryStore(url=database_url()) as store:
+        assert store.audit_memory(
+            memory_kind="semantic", memory_id=str(root["id"])
+        )["t_invalid"] is None
+
+    monkeypatch.setattr(MemoryStore, "_insert_semantic_embedding", original_insert)
+    completed = operations.execute_operation(
+        operation_id=operation_id,
+        embedding_provider=provider,
+        worker_id="pytest-serialization-exhaustion",
+        db_url=database_url(),
+    )
+    assert completed["status"] == "completed"
+    assert completed["attempt_count"] == 2
+    assert embedding_calls == 2
+
+
+@requires_db
 def test_same_worker_cannot_reenter_and_stale_lease_token_cannot_transition():
     import hindsight.operations as operations
     from hindsight.db import database_url
