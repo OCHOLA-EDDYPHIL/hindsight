@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_scheduled_worker_reaps_expired_memory_operations(monkeypatch):
     import hindsight.worker as worker
@@ -54,6 +56,80 @@ def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypat
     assert captured["embedding_provider_factory"] is not None
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_status", "next_status"),
+    [
+        ("start", "queued", "triaging"),
+        ("resume", "resuming", "reflecting"),
+    ],
+)
+def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
+    monkeypatch, command, expected_status, next_status
+):
+    import hindsight.runtime as runtime
+    import hindsight.worker as worker
+
+    parameter_calls = []
+    settings_calls = []
+    database_calls = []
+
+    class FakeSsm:
+        def get_parameter(self, *, Name, WithDecryption):
+            parameter_calls.append((Name, WithDecryption))
+            return {"Parameter": {"Value": "postgresql://hosted/database"}}
+
+    environ = {
+        runtime.DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
+        "AWS_LAMBDA_FUNCTION_NAME": "hindsight-worker",
+        "LLM_PROVIDER": "deterministic",
+        "EMBEDDING_PROVIDER": "deterministic",
+    }
+
+    def resolve_settings():
+        settings_calls.append(True)
+        return runtime.runtime_settings(
+            environ=environ,
+            ssm_client=FakeSsm(),
+            use_cache=False,
+        )
+
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(worker, "runtime_settings", resolve_settings)
+    monkeypatch.setattr(
+        worker,
+        "claim_run",
+        lambda **kwargs: database_calls.append(("claim", kwargs)) or None,
+    )
+    monkeypatch.setattr(
+        worker,
+        "get_run",
+        lambda **kwargs: (
+            database_calls.append(("get", kwargs)) or {"id": kwargs["run_id"], "status": "existing"}
+        ),
+    )
+
+    result = worker.process_message({"command": command, "run_id": "run-1"})
+
+    assert result == {"id": "run-1", "status": "existing"}
+    assert settings_calls == [True]
+    assert parameter_calls == [("/hindsight/test/database-url", True)]
+    assert database_calls == [
+        (
+            "claim",
+            {
+                "run_id": "run-1",
+                "expected_status": expected_status,
+                "next_status": next_status,
+                "db_url": "postgresql://hosted/database",
+            },
+        ),
+        (
+            "get",
+            {"run_id": "run-1", "db_url": "postgresql://hosted/database"},
+        ),
+    ]
+
+
 def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     import hindsight.worker as worker
     from hindsight.agent import IncidentAgentResult
@@ -69,7 +145,12 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
         "user_input": "checkout p99 is above SLO",
     }
     monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **kwargs: None)
-    monkeypatch.setattr(worker, "claim_run", lambda **kwargs: run)
+    claim_calls = []
+    monkeypatch.setattr(
+        worker,
+        "claim_run",
+        lambda **kwargs: claim_calls.append(kwargs) or run,
+    )
     monkeypatch.setattr(
         worker,
         "runtime_settings",
@@ -92,6 +173,7 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     )
 
     def fake_agent(*args, **kwargs):
+        assert kwargs["db_url"] == "postgresql://db"
         kwargs["progress_callback"](
             "plan",
             "planning",
@@ -116,7 +198,16 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
 
     result = worker.process_message({"command": "start", "run_id": "run-1"})
 
+    assert claim_calls == [
+        {
+            "run_id": "run-1",
+            "expected_status": "queued",
+            "next_status": "triaging",
+            "db_url": "postgresql://db",
+        }
+    ]
     assert [item["status"] for item in transitions] == ["planning", "awaiting_approval"]
+    assert {item["db_url"] for item in transitions} == {"postgresql://db"}
     assert transitions[0]["fields"]["plan"] == "throttle retries"
     assert result["status"] == "awaiting_approval"
 
