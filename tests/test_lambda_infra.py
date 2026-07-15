@@ -65,6 +65,8 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "s3:*" not in bootstrap
     assert "events:PutRule" in bootstrap
     assert "events:PutTargets" in bootstrap
+    assert "lambda:PutFunctionConcurrency" in bootstrap
+    assert "lambda:DeleteFunctionConcurrency" in bootstrap
     assert "bedrock:InvokeModel" in bootstrap
     assert "foundation-model/${var.bedrock_embedding_model}" in bootstrap
     assert "s3:GetBucketAcl" in bootstrap
