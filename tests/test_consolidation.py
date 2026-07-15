@@ -110,6 +110,45 @@ def test_lesson_parser_accepts_bare_or_single_fenced_json_without_prose():
             _parse_lesson_response(invalid)
 
 
+def test_lesson_generation_requests_the_validated_response_schema():
+    from hindsight.consolidation import LESSON_RESPONSE_JSON_SCHEMA, _generate_lesson
+    from hindsight.reasoning import ReasoningResponse
+
+    class CapturingProvider:
+        provider_name = "test-model"
+        model_name = "capture-v1"
+
+        def __init__(self):
+            self.request = None
+
+        def generate(self, request):
+            self.request = request
+            return ReasoningResponse(
+                text=(
+                    '{"schema_version":1,"title":"Retry lesson","claims":'
+                    '[{"kind":"safe_action","text":"Stop retries","citations":'
+                    '[{"evidence_id":"memory:source","quote":"Stop retries"}]}]}'
+                ),
+                provider=self.provider_name,
+                model=self.model_name,
+            )
+
+    provider = CapturingProvider()
+    lesson = _generate_lesson(
+        provider=provider,
+        context={
+            "incident": {"id": "incident-1", "slug": "retry-storm"},
+            "service": {"name": "checkout"},
+        },
+        evidence={"memory:source": "Stop retries"},
+    )
+
+    assert lesson["schema_version"] == 1
+    assert provider.request is not None
+    assert provider.request.response_json_schema == LESSON_RESPONSE_JSON_SCHEMA
+    assert provider.request.thinking_budget == 0
+
+
 @requires_db
 def test_consolidation_writes_idempotent_lesson_with_provenance():
     import hindsight.consolidation as consolidation
@@ -170,36 +209,44 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
 
 
 @requires_db
-def test_invalid_model_citation_publishes_no_lesson_and_records_terminal_reason():
-    import json
-
+@pytest.mark.parametrize(
+    ("model_output", "reason_fragment"),
+    [
+        ("not JSON", "model output is not JSON"),
+        (
+            '{"schema_version":1,"title":"Missing claims","claims":[]}',
+            "at least one claim is required",
+        ),
+        (
+            '{"schema_version":1,"title":"Bad kind","claims":'
+            '[{"kind":"unsupported","text":"Do something","citations":'
+            '[{"evidence_id":"memory:missing","quote":"fabricated"}]}]}',
+            "claim 0 has invalid kind",
+        ),
+        (
+            '{"schema_version":1,"title":"Invalid citation","claims":'
+            '[{"kind":"safe_action","text":"uncited action","citations":'
+            '[{"evidence_id":"memory:missing","quote":"fabricated"}]}]}',
+            "claim 0 cites ineligible evidence",
+        ),
+    ],
+)
+def test_invalid_model_output_publishes_no_lesson_and_records_terminal_reason(
+    model_output, reason_fragment
+):
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
-    from hindsight.db import database_url
+    from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
 
-    class InvalidCitationProvider:
+    class InvalidOutputProvider:
         provider_name = "test-model"
-        model_name = "invalid-citation-v1"
+        model_name = "invalid-output-v1"
 
         def generate(self, request):
             return ReasoningResponse(
-                text=json.dumps(
-                    {
-                        "schema_version": 1,
-                        "title": "Invalid lesson",
-                        "claims": [
-                            {
-                                "kind": "safe_action",
-                                "text": "uncited action",
-                                "citations": [
-                                    {"evidence_id": "memory:missing", "quote": "fabricated"}
-                                ],
-                            }
-                        ],
-                    }
-                ),
+                text=model_output,
                 provider=self.provider_name,
                 model=self.model_name,
             )
@@ -219,12 +266,25 @@ def test_invalid_model_citation_publishes_no_lesson_and_records_terminal_reason(
     result = consolidate_resolved_incident(
         incident_id=str(resolved["id"]),
         db_url=database_url(),
-        reasoning_provider=InvalidCitationProvider(),
+        reasoning_provider=InvalidOutputProvider(),
         embedding_provider=DeterministicEmbeddingProvider(),
     )
     assert result.memory is None
     assert result.created is False
-    assert result.reason.startswith("invalid_lesson:")
+    assert result.reason == f"invalid_lesson:{reason_fragment}"
+    with connect() as conn:
+        job = conn.execute(
+            "SELECT status, reason, decision_id FROM consolidation_jobs WHERE id = %s",
+            (result.job_id,),
+        ).fetchone()
+        assert job[:2] == ("failed", result.reason)
+        assert conn.execute(
+            "SELECT status FROM memory_decisions WHERE id = %s", (job[2],)
+        ).fetchone() == ("failed",)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE producer_decision_id = %s",
+            (job[2],),
+        ).fetchone() == (0,)
 
 
 @requires_db

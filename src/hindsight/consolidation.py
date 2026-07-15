@@ -32,6 +32,49 @@ MAX_CONSOLIDATION_ATTEMPTS = 3
 ELIGIBLE_SOURCE_RELATIONSHIPS = {"summary", "resolution", "root_cause"}
 ELIGIBLE_SOURCE_LINEAGE_STATUSES = {"complete", "legacy_unverified"}
 SOURCE_EVIDENCE_CHANGED_REASON = "source evidence changed during synthesis"
+LESSON_RESPONSE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "title": {"type": "string", "minLength": 1},
+        "claims": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "situation",
+                            "diagnostic_check",
+                            "safe_action",
+                            "avoidance",
+                        ],
+                    },
+                    "text": {"type": "string", "minLength": 1},
+                    "citations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "evidence_id": {"type": "string", "minLength": 1},
+                                "quote": {"type": "string", "minLength": 1},
+                            },
+                            "required": ["evidence_id", "quote"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["kind", "text", "citations"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["schema_version", "title", "claims"],
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -855,6 +898,8 @@ def _generate_lesson(
             temperature=0.0,
             max_output_tokens=2048,
             routing_key=f"consolidation:{context['incident']['id']}",
+            response_json_schema=LESSON_RESPONSE_JSON_SCHEMA,
+            thinking_budget=0,
         )
     )
     return _parse_lesson_response(response.text)
