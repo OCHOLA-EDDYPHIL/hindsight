@@ -123,8 +123,9 @@ def test_live_gemini_database_retrieval_discriminates_paraphrase_and_no_match():
     [
         (
             "cache_stampede",
-            "At a predictable boundary every frontend simultaneously asks the origin "
-            "for the same absent entry.",
+            "Cached objects lapse together and trigger duplicate regeneration across "
+            "the fleet. Find guidance that coalesces refresh ownership and staggers "
+            "future lifetimes.",
             "When synchronized expiry makes many nodes recompute one object, collapse "
             "concurrent refresh work and jitter freshness windows before adding capacity.",
             (
@@ -136,8 +137,9 @@ def test_live_gemini_database_retrieval_discriminates_paraphrase_and_no_match():
         ),
         (
             "connection_leak",
-            "Requests wait forever while database handles only move upward following "
-            "failed work.",
+            "Failed requests retain borrowed SQL sessions. Find guidance that identifies "
+            "the leaking owner and guarantees cleanup on every exit instead of increasing "
+            "capacity.",
             "If error exits retain database sessions, trace ownership, isolate the faulty "
             "cohort, and enforce unconditional resource release instead of enlarging the pool.",
             (
@@ -149,8 +151,9 @@ def test_live_gemini_database_retrieval_discriminates_paraphrase_and_no_match():
         ),
         (
             "hot_partition",
-            "Only one shard burns while its peers idle whenever a dominant customer sends "
-            "events.",
+            "A tenant identifier funnels all mutations into one storage range. Find "
+            "guidance that spreads the keyspace with stable salting and limits that tenant "
+            "instead of expanding unused partitions.",
             "When one routing key concentrates writes on a single range, add deterministic "
             "key entropy and targeted admission control rather than scaling idle peers.",
             (
@@ -175,6 +178,8 @@ def test_live_gemini_cutoff_generalizes_across_calibration_mechanisms(
     embeddings, _reasoning = _providers()
     namespace = f"live-calibration:{simulator_kind}:{uuid4()}"
     with MemoryStore(url=database_url(), embedding_provider=embeddings) as store:
+        profile = store.active_embedding_profile()
+        assert profile.max_distance == pytest.approx(0.35)
         relevant = store.remember(
             memory_kind="semantic",
             namespace=namespace,
@@ -208,8 +213,10 @@ def test_live_gemini_cutoff_generalizes_across_calibration_mechanisms(
         )
         store.seal_decision(decision_id=decision_id)
 
+    assert retrieval.selected_strategy == "semantic_vector"
+    assert retrieval.embedding_profile == profile
     assert [str(hit["id"]) for hit in retrieval.hits] == [str(relevant["id"])]
-    assert retrieval.hits[0]["distance"] < 0.35
+    assert retrieval.hits[0]["distance"] < profile.max_distance
 
 
 @requires_live_gemini
