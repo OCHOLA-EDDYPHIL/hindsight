@@ -82,4 +82,9 @@ run "complete_demo_graph" {
     condition     = length(aws_cloudwatch_metric_alarm.lambda_errors) == 4
     error_message = "Every Lambda surface must have an error alarm."
   }
+
+  assert {
+    condition     = aws_api_gateway_account.cloudwatch.cloudwatch_role_arn == aws_iam_role.apigateway_cloudwatch.arn
+    error_message = "API Gateway access logs require the Terraform-owned account role."
+  }
 }

@@ -190,6 +190,32 @@ data "aws_iam_policy_document" "lambda_assume" {
   }
 }
 
+data "aws_iam_policy_document" "apigateway_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["apigateway.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "apigateway_cloudwatch" {
+  name               = "${local.name}-apigateway-cloudwatch"
+  assume_role_policy = data.aws_iam_policy_document.apigateway_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "apigateway_cloudwatch" {
+  role       = aws_iam_role.apigateway_cloudwatch.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+}
+
+resource "aws_api_gateway_account" "cloudwatch" {
+  cloudwatch_role_arn = aws_iam_role.apigateway_cloudwatch.arn
+
+  depends_on = [aws_iam_role_policy_attachment.apigateway_cloudwatch]
+}
+
 resource "aws_iam_role" "api" {
   name               = "${local.name}-api"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
@@ -524,6 +550,8 @@ resource "aws_apigatewayv2_stage" "http" {
       integrationError = "$context.integrationErrorMessage"
     })
   }
+
+  depends_on = [aws_api_gateway_account.cloudwatch]
 }
 
 resource "aws_lambda_permission" "http_api" {
@@ -587,6 +615,8 @@ resource "aws_apigatewayv2_stage" "websocket" {
       connectionId = "$context.connectionId"
     })
   }
+
+  depends_on = [aws_api_gateway_account.cloudwatch]
 }
 
 resource "aws_lambda_permission" "websocket" {

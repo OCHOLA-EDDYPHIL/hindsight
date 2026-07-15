@@ -24,7 +24,7 @@ The application workflow cannot update its own bootstrap role. Before running li
 
 - `bedrock:InvokeModel` for the configured Titan embedding-model ARN;
 - the EventBridge rule/target lifecycle actions used by the operation reaper;
-- the finite S3 bucket-metadata read set and API Gateway/CloudWatch tag lifecycle actions required by the AWS provider.
+- the finite S3 bucket/object metadata and CloudWatch log-delivery lifecycle actions required by the AWS provider.
 
 Review the bootstrap plan and require it to update only the deployment role's inline policy when the certificate, OIDC provider, state bucket, domain, and Cloudflare records already exist. Do not place local `.env` AWS keys in the application workflow or grant the application role permission to rewrite itself. The live workflow can assume the upgraded role through the existing `repo:OCHOLA-EDDYPHIL/hindsight:environment:demo` OIDC subject after that one-time policy update.
 

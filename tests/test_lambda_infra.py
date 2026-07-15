@@ -38,6 +38,9 @@ def test_api_lambda_can_construct_the_hosted_embedding_provider():
     assert "BEDROCK_EMBEDDING_MODEL" in api_lambda
     assert 'resource "aws_cloudwatch_event_rule" "operation_reaper"' in stack
     assert 'command = "reap_memory_operations"' in stack
+    assert 'resource "aws_api_gateway_account" "cloudwatch"' in stack
+    assert "AmazonAPIGatewayPushToCloudWatchLogs" in stack
+    assert "apigateway.amazonaws.com" in stack
 
 
 def test_destroy_workflow_pauses_changefeed_and_requires_confirmation():
@@ -71,12 +74,22 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "s3:GetBucketWebsite" in bootstrap
     assert "s3:GetLifecycleConfiguration" in bootstrap
     assert "s3:GetReplicationConfiguration" in bootstrap
+    assert "s3:GetObjectTagging" in bootstrap
+    assert "s3:PutObjectTagging" in bootstrap
+    assert "s3:DeleteObjectTagging" in bootstrap
     assert '"s3:Get*"' not in bootstrap
     assert "apigateway:TagResource" in bootstrap
     assert "apigateway:UntagResource" in bootstrap
     assert "cloudwatch:ListTagsForResource" in bootstrap
     assert "cloudwatch:TagResource" in bootstrap
     assert "cloudwatch:UntagResource" in bootstrap
+    assert "logs:CreateLogDelivery" in bootstrap
+    assert "logs:DeleteLogDelivery" in bootstrap
+    assert "logs:GetLogDelivery" in bootstrap
+    assert "logs:ListLogDeliveries" in bootstrap
+    assert "logs:UpdateLogDelivery" in bootstrap
+    assert "iam:ListInstanceProfilesForRole" in bootstrap
+    assert "iam:UpdateAssumeRolePolicy" in bootstrap
 
 
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
