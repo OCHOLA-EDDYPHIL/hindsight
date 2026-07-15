@@ -67,6 +67,18 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "events:PutTargets" in bootstrap
     assert "lambda:PutFunctionConcurrency" in bootstrap
     assert "lambda:DeleteFunctionConcurrency" in bootstrap
+    version_refresh = bootstrap.split('sid       = "LambdaVersionRefresh"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+    application_lifecycle = bootstrap.split('sid = "ApplicationLifecycle"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+    assert bootstrap.count('"lambda:ListVersionsByFunction"') == 1
+    assert 'lambda_version_refresh_actions = ["lambda:ListVersionsByFunction"]' in bootstrap
+    assert "actions   = local.lambda_version_refresh_actions" in version_refresh
+    assert 'resources = local.lambda_function_arns' in version_refresh
+    assert "lambda:ListVersionsByFunction" not in application_lifecycle
+    assert "function:hindsight-${var.stage}-${component}" in bootstrap
     assert "bedrock:InvokeModel" in bootstrap
     assert "foundation-model/${var.bedrock_embedding_model}" in bootstrap
     assert "s3:GetBucketAcl" in bootstrap

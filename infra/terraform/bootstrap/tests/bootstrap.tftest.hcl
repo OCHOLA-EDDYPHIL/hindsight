@@ -67,4 +67,38 @@ run "isolated_bootstrap" {
     condition     = toset(var.github_subjects) == toset(["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"])
     error_message = "OIDC trust must remain scoped to the demo environment."
   }
+
+  assert {
+    condition     = local.lambda_version_refresh_actions == ["lambda:ListVersionsByFunction"]
+    error_message = "Lambda version refresh must grant only ListVersionsByFunction."
+  }
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+      if statement.sid == "LambdaVersionRefresh"
+      ]) == 1 && toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "LambdaVersionRefresh"
+    ]).actions) == toset(local.lambda_version_refresh_actions)
+    error_message = "The deployment policy must bind the scoped action to one LambdaVersionRefresh statement."
+  }
+
+  assert {
+    condition = toset(local.lambda_function_arns) == toset([
+      "arn:aws:lambda:us-east-1:123456789012:function:hindsight-demo-api",
+      "arn:aws:lambda:us-east-1:123456789012:function:hindsight-demo-worker",
+      "arn:aws:lambda:us-east-1:123456789012:function:hindsight-demo-websocket",
+      "arn:aws:lambda:us-east-1:123456789012:function:hindsight-demo-changefeed",
+    ])
+    error_message = "Lambda version refresh must remain scoped to the four application functions."
+  }
+
+  assert {
+    condition = toset(one([
+      for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+      if statement.sid == "LambdaVersionRefresh"
+    ]).resources) == toset(local.lambda_function_arns)
+    error_message = "The LambdaVersionRefresh statement must use only the four scoped function ARNs."
+  }
 }
