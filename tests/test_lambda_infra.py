@@ -65,6 +65,13 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "bedrock:InvokeModel" in bootstrap
     assert "foundation-model/${var.bedrock_embedding_model}" in bootstrap
     assert "s3:GetBucketAcl" in bootstrap
+    assert "s3:GetBucketCORS" in bootstrap
+    assert "s3:GetBucketOwnershipControls" in bootstrap
+    assert "s3:GetBucketPolicyStatus" in bootstrap
+    assert "s3:GetBucketWebsite" in bootstrap
+    assert "s3:GetLifecycleConfiguration" in bootstrap
+    assert "s3:GetReplicationConfiguration" in bootstrap
+    assert '"s3:Get*"' not in bootstrap
     assert "apigateway:TagResource" in bootstrap
     assert "apigateway:UntagResource" in bootstrap
     assert "cloudwatch:ListTagsForResource" in bootstrap
