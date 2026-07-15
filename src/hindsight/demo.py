@@ -93,7 +93,7 @@ def run_poison_rewind_demo(
     keep_existing: bool = False,
     reasoning_provider: ReasoningProvider | None = None,
 ) -> PoisonRewindDemoResult:
-    """Run the full M4 #20 poison, diagnose, and rewind sequence."""
+    """Run the full poison, diagnose, and rewind sequence."""
 
     resolved_db_url = db_url or database_url()
     if not keep_existing:
