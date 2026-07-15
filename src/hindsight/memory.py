@@ -79,17 +79,6 @@ class RewindResult:
 
 
 @dataclass(frozen=True)
-class RewindPreview:
-    """A non-mutating, concurrency-checkable rewind impact preview."""
-
-    target_timestamp: datetime
-    namespace: str | None
-    state_hash: str
-    restored_memories: list[dict[str, Any]]
-    invalidated_memories: list[dict[str, Any]]
-
-
-@dataclass(frozen=True)
 class ReadContext:
     """Identity attached to an auditable retrieval."""
 
@@ -123,10 +112,10 @@ class RetrievalResult:
 class MemoryStore:
     """Product-facing memory API backed by CockroachDB.
 
-    Agent code should use ``remember``, explicit retrieval methods,
-    ``invalidate``, and ``rewind`` instead of issuing raw SQL. Each memory row
-    carries provenance, and corrections are explicit invalidations rather than
-    silent deletes.
+    Agent code should use ``remember`` and explicit retrieval methods instead
+    of issuing raw SQL. Governed corrections run through
+    :mod:`hindsight.operations`; each memory row carries provenance, and
+    corrections create auditable versions or invalidations rather than deletes.
     """
 
     def __init__(
@@ -1087,159 +1076,6 @@ class MemoryStore:
             set_span_attributes(span, {"hindsight.memory.count": 1 if row is not None else 0})
             return row
 
-    def rewind(
-        self,
-        *,
-        timestamp: datetime,
-        reason: str,
-        actor: str,
-        namespace: str | None = None,
-    ) -> RewindResult:
-        """Restore the active belief set to an earlier CockroachDB timestamp.
-
-        Rewind is intentionally a state mutation, not only a historical query.
-        It reconstructs the semantic belief set at ``timestamp``, invalidates
-        current memories written later, follows one or more read-provenance hops
-        to invalidate derived memories, records an auditable operation row, and
-        returns the restored beliefs for immediate replanning.
-        """
-
-        if not actor or not actor.strip():
-            raise ProvenanceError("actor is required")
-        if not reason or not reason.strip():
-            raise ProvenanceError("reason is required")
-
-        with start_span(
-            "hindsight.memory.rewind",
-            {
-                "hindsight.memory.operation": "rewind",
-                "hindsight.memory.kind": "semantic",
-                "hindsight.memory.namespace": namespace,
-                "hindsight.memory.as_of": timestamp,
-                "hindsight.memory.actor": actor,
-            },
-        ) as span:
-            restored = self._semantic_beliefs_as_of(
-                namespace=namespace,
-                as_of=timestamp,
-                limit=None,
-                query=None,
-            )
-
-            with self._conn.transaction():
-                invalidated = self._semantic_rewind_candidates(
-                    timestamp=timestamp,
-                    namespace=namespace,
-                )
-                invalidated_by_id = {str(row["id"]): row for row in invalidated}
-                pending_ids = set(invalidated_by_id)
-
-                while pending_ids:
-                    derived = self._derived_semantic_memories(
-                        memory_ids=sorted(pending_ids),
-                        namespace=namespace,
-                    )
-                    next_ids = {
-                        str(row["id"])
-                        for row in derived
-                        if str(row["id"]) not in invalidated_by_id
-                    }
-                    for row in derived:
-                        invalidated_by_id.setdefault(str(row["id"]), row)
-                    pending_ids = next_ids
-
-                invalidated_rows = []
-                for memory_id in sorted(invalidated_by_id):
-                    memory = invalidated_by_id[memory_id]
-                    invalid_at = timestamp
-                    if memory["t_valid"] > timestamp:
-                        invalid_at = memory["t_valid"]
-                    row = self._invalidate_one(
-                        memory_kind="semantic",
-                        memory_id=memory_id,
-                        invalidated_by=actor,
-                        reason=reason,
-                        t_invalid=invalid_at,
-                    )
-                    if row is not None:
-                        invalidated_rows.append(row)
-
-                operation = self._record_memory_operation(
-                    operation_type="rewind",
-                    actor=actor,
-                    reason=reason,
-                    target_timestamp=timestamp,
-                    namespace=namespace,
-                    invalidated_memory_ids=[str(row["id"]) for row in invalidated_rows],
-                    restored_memory_ids=[str(row["id"]) for row in restored],
-                )
-            set_span_attributes(
-                span,
-                {
-                    "hindsight.memory.operation_id": str(operation["id"]),
-                    "hindsight.memory.restored.ids": memory_ids(restored),
-                    "hindsight.memory.restored.count": len(restored),
-                    "hindsight.memory.invalidated.ids": memory_ids(invalidated_rows),
-                    "hindsight.memory.invalidated.count": len(invalidated_rows),
-                },
-            )
-            return RewindResult(
-                operation=operation,
-                restored_memories=restored,
-                invalidated_memories=invalidated_rows,
-            )
-
-    def preview_rewind(
-        self,
-        *,
-        timestamp: datetime,
-        namespace: str | None = None,
-    ) -> RewindPreview:
-        """Return the exact current candidates and historical beliefs without mutation."""
-
-        restored = self._semantic_beliefs_as_of(
-            namespace=namespace,
-            as_of=timestamp,
-            limit=None,
-            query=None,
-        )
-        invalidated = self._semantic_rewind_candidates(
-            timestamp=timestamp,
-            namespace=namespace,
-        )
-        invalidated_by_id = {str(row["id"]): row for row in invalidated}
-        pending_ids = set(invalidated_by_id)
-        while pending_ids:
-            derived = self._derived_semantic_memories(
-                memory_ids=sorted(pending_ids),
-                namespace=namespace,
-            )
-            next_ids = {
-                str(row["id"])
-                for row in derived
-                if str(row["id"]) not in invalidated_by_id
-            }
-            for row in derived:
-                invalidated_by_id.setdefault(str(row["id"]), row)
-            pending_ids = next_ids
-        invalidated_rows = [invalidated_by_id[key] for key in sorted(invalidated_by_id)]
-        state_payload = {
-            "namespace": namespace,
-            "target_timestamp": timestamp.isoformat(),
-            "restored_memory_ids": sorted(str(row["id"]) for row in restored),
-            "invalidated_memory_ids": sorted(str(row["id"]) for row in invalidated_rows),
-        }
-        state_hash = hashlib.sha256(
-            json.dumps(state_payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        return RewindPreview(
-            target_timestamp=timestamp,
-            namespace=namespace,
-            state_hash=state_hash,
-            restored_memories=restored,
-            invalidated_memories=invalidated_rows,
-        )
-
     def _invalidate_one(
         self,
         *,
@@ -1900,56 +1736,6 @@ class MemoryStore:
             params=tuple(params),
         )
 
-    def _semantic_rewind_candidates(
-        self,
-        *,
-        timestamp: datetime,
-        namespace: str | None,
-    ) -> list[dict[str, Any]]:
-        where = ["written_at > %s"]
-        params: list[Any] = [timestamp]
-        if namespace is not None:
-            where.append("namespace = %s")
-            params.append(namespace)
-        return self._fetch_all(
-            f"""
-                SELECT *
-                FROM current_semantic_memories
-                WHERE {" AND ".join(where)}
-                ORDER BY written_at ASC
-            """,
-            tuple(params),
-        )
-
-    def _derived_semantic_memories(
-        self,
-        *,
-        memory_ids: list[str],
-        namespace: str | None,
-    ) -> list[dict[str, Any]]:
-        if not memory_ids:
-            return []
-        placeholders = ", ".join(["%s"] * len(memory_ids))
-        params: list[Any] = [*memory_ids]
-        namespace_filter = ""
-        if namespace is not None:
-            namespace_filter = "AND m.namespace = %s"
-            params.append(namespace)
-        return self._fetch_all(
-            f"""
-                SELECT DISTINCT m.*
-                FROM memory_lineage_edges AS edge
-                JOIN memory_reads AS r ON r.id = edge.parent_read_id
-                JOIN current_semantic_memories AS m
-                    ON m.id = edge.child_semantic_memory_id
-                WHERE edge.edge_type IN ('derived', 'reasserted_from')
-                    AND r.semantic_memory_id IN ({placeholders})
-                    {namespace_filter}
-                ORDER BY m.written_at ASC
-            """,
-            tuple(params),
-        )
-
     def _ensure_decision(
         self,
         *,
@@ -2071,6 +1857,11 @@ class MemoryStore:
         producer_decision_id: str,
         classified_reads: list[tuple[dict[str, Any], str]],
     ) -> None:
+        justifications = {
+            "derived": "Explicitly declared derivation parent",
+            "context": "Read as context but not declared causal",
+            "reasserted_from": "Reassert exact target logical belief",
+        }
         for read, edge_type in classified_reads:
             self._conn.execute(
                 """
@@ -2086,9 +1877,7 @@ class MemoryStore:
                     read["id"],
                     producer_decision_id,
                     edge_type,
-                    "Explicitly declared derivation parent"
-                    if edge_type == "derived"
-                    else "Read as context but not declared causal",
+                    justifications[edge_type],
                 ),
             )
 
@@ -2130,41 +1919,6 @@ class MemoryStore:
             (ordered,),
         )
         return ordered
-
-    def _record_memory_operation(
-        self,
-        *,
-        operation_type: str,
-        actor: str,
-        reason: str,
-        target_timestamp: datetime,
-        namespace: str | None,
-        invalidated_memory_ids: list[str],
-        restored_memory_ids: list[str],
-    ) -> dict[str, Any]:
-        return self._fetch_one(
-            """
-                INSERT INTO memory_operations (
-                    operation_type, actor, reason, target_timestamp, namespace,
-                    invalidated_memory_ids, restored_memory_ids, status,
-                    request_payload, expected_revisions, applied_revisions,
-                    attempt_count, completed_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed',
-                        %s, '{}'::JSONB, '{}'::JSONB, 1, now())
-                RETURNING *
-            """,
-            (
-                operation_type,
-                actor,
-                reason,
-                target_timestamp,
-                namespace,
-                Jsonb(invalidated_memory_ids),
-                Jsonb(restored_memory_ids),
-                Jsonb({"target_timestamp": target_timestamp.isoformat()}),
-            ),
-        )
 
     def _insert_semantic_embedding(
         self,

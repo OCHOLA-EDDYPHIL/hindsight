@@ -110,6 +110,173 @@ def test_exact_rewind_reasserts_target_version_without_rewriting_history():
         assert [row["version_number"] for row in history] == [1, 2, 3]
 
 
+@requires_db
+def test_exact_rewind_reasserts_a_target_version_invalidated_after_the_target():
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+    from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
+
+    namespace = f"exact-rewind-invalidated-target-{uuid4()}"
+    actor = "pytest.operator"
+    reason = "Restore the belief that was active at the approved target"
+    provider = DeterministicEmbeddingProvider()
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        source = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="retry amplification caused the processor backlog",
+            provenance=Provenance("pytest", "evidence:target", "initial target belief"),
+            content_schema="incident_root_cause.v1",
+            structured_payload={"cause": "retry_amplification"},
+        )
+    with connect() as conn:
+        target = conn.execute("SELECT now()").fetchone()[0]
+    sleep(0.02)
+    with MemoryStore(url=database_url()) as store:
+        store.invalidate(
+            memory_id=str(source["id"]),
+            actor="pytest.correction",
+            reason="Temporarily withdraw the target belief",
+        )
+        invalidated_source = store.audit_memory(
+            memory_kind="semantic", memory_id=str(source["id"])
+        )
+    assert invalidated_source is not None
+    assert invalidated_source["t_invalid"] is not None
+
+    preview = preview_rewind(
+        namespace=namespace,
+        target_timestamp=target,
+        actor=actor,
+        reason=reason,
+        db_url=database_url(),
+    )
+    assert preview["effect_payload"]["close_memory_ids"] == []
+    assert preview["effect_payload"]["reassertions"] == [
+        {
+            "source_memory_id": str(source["id"]),
+            "belief_id": str(source["belief_id"]),
+            "previous_version_id": str(source["id"]),
+        }
+    ]
+    operation, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=preview["fingerprint"],
+        idempotency_key=f"rewind-invalidated-target:{uuid4()}",
+        db_url=database_url(),
+    )
+    result = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=provider,
+        worker_id="pytest",
+        db_url=database_url(),
+    )
+
+    assert result["status"] == "completed"
+    with MemoryStore(url=database_url()) as store:
+        current = store.list_current_semantic(namespace=namespace)
+        history = store._fetch_all(  # noqa: SLF001 - exact version audit
+            "SELECT * FROM semantic_memories WHERE belief_id = %s ORDER BY version_number",
+            (source["belief_id"],),
+        )
+    assert len(current) == 1
+    reasserted = current[0]
+    assert str(reasserted["id"]) != str(source["id"])
+    assert reasserted["belief_id"] == source["belief_id"]
+    assert reasserted["version_number"] == 2
+    assert reasserted["previous_version_id"] == source["id"]
+    assert reasserted["transition_kind"] == "rewind_reassertion"
+    assert str(reasserted["created_by_operation_id"]) == str(operation["id"])
+    assert reasserted["content"] == source["content"]
+    assert reasserted["content_schema"] == source["content_schema"]
+    assert reasserted["structured_payload"] == source["structured_payload"]
+    assert reasserted["source_ref"] == f"memory:{source['id']}"
+    assert reasserted["writer"] == actor
+    assert reasserted["justification"] == reason
+    assert [row["version_number"] for row in history] == [1, 2]
+    historical = history[0]
+    for field in (
+        "id",
+        "belief_id",
+        "version_number",
+        "previous_version_id",
+        "namespace",
+        "content",
+        "metadata",
+        "t_valid",
+        "t_invalid",
+        "writer",
+        "source_ref",
+        "justification",
+        "written_at",
+        "producer_decision_id",
+        "transition_kind",
+        "content_schema",
+        "structured_payload",
+        "payload_digest",
+    ):
+        assert historical[field] == invalidated_source[field]
+
+    decision_id = f"operation:{operation['id']}:reassert:{source['id']}"
+    with connect() as conn:
+        decision = conn.execute(
+            "SELECT status, actor, decision_kind, purpose, namespace "
+            "FROM memory_decisions WHERE id = %s",
+            (decision_id,),
+        ).fetchone()
+        read = conn.execute(
+            "SELECT id, decision_id, semantic_memory_id, reader, purpose "
+            "FROM memory_reads WHERE decision_id = %s",
+            (decision_id,),
+        ).fetchone()
+        edge = conn.execute(
+            "SELECT child_semantic_memory_id, parent_read_id, producer_decision_id, "
+            "edge_type, justification FROM memory_lineage_edges "
+            "WHERE child_semantic_memory_id = %s",
+            (reasserted["id"],),
+        ).fetchone()
+        effect = conn.execute(
+            "SELECT effect_type, source_memory_id, result_memory_id, belief_id "
+            "FROM memory_operation_effects WHERE operation_id = %s",
+            (operation["id"],),
+        ).fetchone()
+        operation_row = conn.execute(
+            "SELECT status, invalidated_memory_ids, restored_memory_ids "
+            "FROM memory_operations WHERE id = %s",
+            (operation["id"],),
+        ).fetchone()
+
+    assert decision == ("sealed", actor, "rewind_reassertion", reason, namespace)
+    assert read[1:] == (
+        decision_id,
+        source["id"],
+        actor,
+        "Reassert exact target logical belief",
+    )
+    assert edge == (
+        reasserted["id"],
+        read[0],
+        decision_id,
+        "reasserted_from",
+        "Reassert exact target logical belief",
+    )
+    assert effect == (
+        "reasserted",
+        source["id"],
+        reasserted["id"],
+        source["belief_id"],
+    )
+    assert operation_row == ("completed", [], [str(reasserted["id"])])
+
+
+def test_memory_store_has_no_direct_rewind_mutation_surface():
+    from hindsight.memory import MemoryStore
+
+    assert not hasattr(MemoryStore, "rewind")
+    assert not hasattr(MemoryStore, "preview_rewind")
+
+
 def test_power_analysis_and_ci_smoke_cannot_authorize_public_claims():
     from hindsight.benchmark import power_analysis
 
