@@ -21,6 +21,7 @@ env:
   GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
   BEDROCK_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_BEDROCK_EMBEDDING_MODEL || 'amazon.titan-embed-text-v2:0' }}
   BENCHMARK_MAX_DISTANCE: "0.35"
+  REQUIRE_BEDROCK_ACCEPTANCE: ${{ vars.HINDSIGHT_REQUIRE_BEDROCK_ACCEPTANCE || '0' }}
 
 jobs:
   authorize:
@@ -149,11 +150,20 @@ jobs:
           tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase
           tests/test_reasoning.py::test_live_gemini_reasoning_provider
       - name: Invoke live Bedrock embedding provider
+        if: env.REQUIRE_BEDROCK_ACCEPTANCE == '1'
         env:
           RUN_LIVE_BEDROCK_EMBEDDINGS: "1"
         run: >-
           uv run pytest -q
           tests/test_embeddings.py::test_live_bedrock_titan_embedding_provider
+      - name: Record deferred Bedrock acceptance
+        if: env.REQUIRE_BEDROCK_ACCEPTANCE != '1'
+        run: |
+          {
+            echo "### Bedrock acceptance deferred"
+            echo
+            echo "Titan live invocation is deferred pending an account quota increase. IAM and model configuration remain covered, but this run does not claim a successful Bedrock invocation."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     needs: verify
@@ -536,6 +546,7 @@ jobs:
           BENCHMARK_RESULT: ${{ needs.benchmark.result }}
           CHANGEFEED_RESULT: ${{ needs.restore_changefeed.result }}
           BROWSER_RESULT: ${{ needs.browser_acceptance.result }}
+          BEDROCK_REQUIRED: ${{ env.REQUIRE_BEDROCK_ACCEPTANCE }}
         shell: bash
         run: |
           [[ "$AUTHORIZED" == "true" ]]
@@ -558,6 +569,7 @@ jobs:
             echo
             echo "All live gates succeeded for \`$HEAD_SHA\`."
             echo
+            echo "- Bedrock live invocation required: $BEDROCK_REQUIRED"
             echo "- UI: $UI_URL"
             echo "- API: $API_URL"
           } >> "$GITHUB_STEP_SUMMARY"

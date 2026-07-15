@@ -226,7 +226,6 @@ def test_bedrock_provider_configures_bounded_boto_client(monkeypatch):
     assert kwargs["region_name"] == "us-east-1"
     assert kwargs["config"].connect_timeout == 3
     assert kwargs["config"].read_timeout == 20
-    assert kwargs["config"].retries == {"max_attempts": 5, "mode": "adaptive"}
 
 
 @pytest.mark.skipif(

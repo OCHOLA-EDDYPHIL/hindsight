@@ -150,6 +150,9 @@ def test_live_acceptance_restores_changefeed_after_benchmark_failure():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     assert "github.triggering_actor" in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
+    assert "HINDSIGHT_REQUIRE_BEDROCK_ACCEPTANCE" in workflow
+    assert "Titan live invocation is deferred pending an account quota increase" in workflow
+    assert "this run does not claim a successful Bedrock invocation" in workflow
     restore_job = workflow.split("  restore_changefeed:\n", 1)[1].split(
         "  browser_acceptance:\n", 1
     )[0]
