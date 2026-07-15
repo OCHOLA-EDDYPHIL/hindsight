@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -274,7 +275,7 @@ def test_queue_failure_leaves_pending_command_for_a_later_sweep(monkeypatch):
 @requires_db
 def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_safe(monkeypatch):
     import hindsight.run_dispatch as run_dispatch
-    from hindsight.runs import claim_run, create_run, get_run
+    from hindsight.runs import claim_run_attempt, create_run, get_run
 
     monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
     run, _ = create_run(
@@ -302,23 +303,25 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
         conn.commit()
 
     swept = run_dispatch.dispatch_run_commands(limit=100, client=client)
-    first_claim = claim_run(
+    first_claim = claim_run_attempt(
         run_id=run["id"],
-        expected_status="queued",
-        next_status="triaging",
+        command="start",
+        lease_ttl=timedelta(minutes=5),
+        max_attempts=3,
     )
-    duplicate_claim = claim_run(
+    duplicate_claim = claim_run_attempt(
         run_id=run["id"],
-        expected_status="queued",
-        next_status="triaging",
+        command="start",
+        lease_ttl=timedelta(minutes=5),
+        max_attempts=3,
     )
 
     assert swept["dispatched"] >= 1
     assert [message["body"] for message in client.messages].count(
         {"command": "start", "run_id": run["id"]}
     ) == 2
-    assert first_claim is not None
-    assert duplicate_claim is None
+    assert first_claim.outcome == "claimed"
+    assert duplicate_claim.outcome == "busy"
     assert [
         event["status"] for event in get_run(run_id=run["id"])["events"]
     ].count("triaging") == 1

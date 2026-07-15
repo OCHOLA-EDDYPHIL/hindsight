@@ -1,5 +1,6 @@
 """Asynchronous run-worker behavior."""
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -125,8 +126,9 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
     monkeypatch.setattr(worker, "runtime_settings", resolve_settings)
     monkeypatch.setattr(
         worker,
-        "claim_run",
-        lambda **kwargs: database_calls.append(("claim", kwargs)) or None,
+        "claim_run_attempt",
+        lambda **kwargs: database_calls.append(("claim", kwargs))
+        or SimpleNamespace(outcome="duplicate", run=None, attempt_id=None),
     )
     monkeypatch.setattr(
         worker,
@@ -146,8 +148,9 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
             "claim",
             {
                 "run_id": "run-1",
-                "expected_status": expected_status,
-                "next_status": next_status,
+                "command": command,
+                "lease_ttl": timedelta(seconds=300),
+                "max_attempts": 3,
                 "db_url": "postgresql://hosted/database",
             },
         ),
@@ -176,8 +179,9 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     claim_calls = []
     monkeypatch.setattr(
         worker,
-        "claim_run",
-        lambda **kwargs: claim_calls.append(kwargs) or run,
+        "claim_run_attempt",
+        lambda **kwargs: claim_calls.append(kwargs)
+        or SimpleNamespace(outcome="claimed", run=run, attempt_id="attempt-1"),
     )
     monkeypatch.setattr(
         worker,
@@ -196,7 +200,12 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     transitions = []
     monkeypatch.setattr(
         worker,
-        "transition_run",
+        "transition_run_attempt",
+        lambda **kwargs: transitions.append(kwargs) or {"id": kwargs["run_id"], **kwargs},
+    )
+    monkeypatch.setattr(
+        worker,
+        "finish_run_attempt",
         lambda **kwargs: transitions.append(kwargs) or {"id": kwargs["run_id"], **kwargs},
     )
 
@@ -229,8 +238,9 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     assert claim_calls == [
         {
             "run_id": "run-1",
-            "expected_status": "queued",
-            "next_status": "triaging",
+            "command": "start",
+            "lease_ttl": timedelta(seconds=300),
+            "max_attempts": 3,
             "db_url": "postgresql://db",
         }
     ]
@@ -240,23 +250,26 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     assert result["status"] == "awaiting_approval"
 
 
-def test_worker_requeues_before_terminal_failure(monkeypatch):
+def test_provider_setup_failure_uses_durable_attempt_retry_path(monkeypatch):
     import hindsight.worker as worker
-    from hindsight.reasoning import DeterministicReasoningProvider
 
     monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **kwargs: None)
     monkeypatch.setattr(
         worker,
-        "claim_run",
-        lambda **kwargs: {
-            "id": "run-1",
-            "thread_id": "thread-1",
-            "decision_id": "agent:run-1:plan",
-            "incident_slug": "incident-1",
-            "namespace": "demo:payments",
-            "service_slug": None,
-            "user_input": "latency",
-        },
+        "claim_run_attempt",
+        lambda **kwargs: SimpleNamespace(
+            outcome="claimed",
+            attempt_id="attempt-1",
+            run={
+                "id": "run-1",
+                "thread_id": "thread-1",
+                "decision_id": "agent:run-1:plan",
+                "incident_slug": "incident-1",
+                "namespace": "demo:payments",
+                "service_slug": None,
+                "user_input": "latency",
+            },
+        ),
     )
     monkeypatch.setattr(
         worker,
@@ -270,20 +283,83 @@ def test_worker_requeues_before_terminal_failure(monkeypatch):
     monkeypatch.setattr(
         worker,
         "reasoning_provider_from_env",
-        lambda env: DeterministicReasoningProvider(),
+        lambda env: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
     )
+    failures = []
     monkeypatch.setattr(
         worker,
-        "run_incident_agent",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+        "record_run_attempt_failure",
+        lambda **kwargs: failures.append(kwargs) or {},
     )
-    transitions = []
-    monkeypatch.setattr(worker, "transition_run", lambda **kwargs: transitions.append(kwargs) or {})
 
     try:
-        worker.process_message({"command": "start", "run_id": "run-1"}, attempt=1)
+        worker.process_message({"command": "start", "run_id": "run-1"})
     except RuntimeError:
         pass
 
-    assert transitions[-1]["status"] == "queued"
-    assert transitions[-1]["phase"] == "retry"
+    assert failures[-1]["attempt_id"] == "attempt-1"
+    assert failures[-1]["error_type"] == "RuntimeError"
+
+
+def test_handler_identifies_dlq_records_by_source_arn(monkeypatch):
+    import hindsight.worker as worker
+
+    calls = []
+    monkeypatch.setenv(worker.RUN_DLQ_ARN_ENV, "arn:aws:sqs:region:account:run-dlq")
+    monkeypatch.setattr(
+        worker,
+        "process_message",
+        lambda message, **kwargs: calls.append((message, kwargs)),
+    )
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "source-message",
+                    "eventSourceARN": "arn:aws:sqs:region:account:runs",
+                    "body": '{"command":"start","run_id":"run-1"}',
+                },
+                {
+                    "messageId": "dlq-message",
+                    "eventSourceARN": "arn:aws:sqs:region:account:run-dlq",
+                    "body": '{"command":"start","run_id":"run-2"}',
+                },
+            ]
+        },
+        None,
+    )
+
+    assert result == {"batchItemFailures": []}
+    assert [kwargs["dead_letter"] for _, kwargs in calls] == [False, True]
+
+
+def test_exhausted_source_retries_and_dlq_finalizes(monkeypatch):
+    import hindsight.worker as worker
+
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: SimpleNamespace(database_url="postgresql://db"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **kwargs: SimpleNamespace(outcome="exhausted", run={}, attempt_id=None),
+    )
+    finalized = []
+    monkeypatch.setattr(
+        worker,
+        "finalize_exhausted_run",
+        lambda **kwargs: finalized.append(kwargs) or {"status": "failed"},
+    )
+
+    with pytest.raises(worker.RunAttemptsExhaustedError):
+        worker.process_message({"command": "start", "run_id": "run-1"})
+    result = worker.process_message(
+        {"command": "start", "run_id": "run-1"}, dead_letter=True
+    )
+
+    assert result == {"status": "failed"}
+    assert finalized[0]["max_attempts"] == 3

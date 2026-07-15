@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -340,6 +341,33 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                     if path.name > "0012_embedding_index_write_fence.sql"
                 ],
             )
+            recovered_runs = conn.execute(
+                """
+                    SELECT id, status, worker_attempt_id, worker_attempt_count,
+                           worker_attempt_command
+                    FROM agent_runs
+                    WHERE id IN (%s, %s)
+                    ORDER BY id
+                """,
+                (run_ids[open_decision], run_ids[terminal_decision]),
+            ).fetchall()
+            assert {row[1] for row in recovered_runs} == {"queued", "resuming"}
+            assert all(row[2:] == (None, 0, None) for row in recovered_runs)
+            assert conn.execute(
+                """
+                    SELECT command, status FROM agent_run_dispatches
+                    WHERE run_id IN (%s, %s)
+                    ORDER BY command
+                """,
+                (run_ids[open_decision], run_ids[terminal_decision]),
+            ).fetchall() == [("resume", "pending"), ("start", "pending")]
+            assert conn.execute(
+                """
+                    SELECT count(*) FROM agent_run_events
+                    WHERE run_id IN (%s, %s) AND phase = 'recovery'
+                """,
+                (run_ids[open_decision], run_ids[terminal_decision]),
+            ).fetchone() == (2,)
             upgrade_privileges = {
                 (table_name, grantee, privilege)
                 for table_name, grantee, privilege in conn.execute(
@@ -521,14 +549,14 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 user_input="verify restricted run persistence",
                 idempotency_key=f"role-request-{uuid4()}",
             )
-            transitioned = runs.transition_run(
+            claim = runs.claim_run_attempt(
                 run_id=role_run["id"],
-                status="triaging",
-                phase="triage",
-                summary="Restricted role entered triage",
+                command="start",
+                lease_ttl=timedelta(minutes=5),
+                max_attempts=3,
             )
             assert created is True
-            assert transitioned["status"] == "triaging"
+            assert claim.run["status"] == "triaging"
             assert conn.execute(
                 "SELECT status FROM agent_run_events WHERE run_id = %s ORDER BY sequence",
                 (role_run["id"],),

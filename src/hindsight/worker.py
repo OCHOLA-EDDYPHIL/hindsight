@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -19,11 +20,22 @@ from hindsight.runtime import (
     runtime_database_url,
     runtime_settings,
 )
-from hindsight.runs import claim_run, fail_run, get_run, transition_run
+from hindsight.runs import (
+    RunAttemptBusyError,
+    RunAttemptsExhaustedError,
+    claim_run_attempt,
+    finalize_exhausted_run,
+    finish_run_attempt,
+    get_run,
+    record_run_attempt_failure,
+    transition_run_attempt,
+)
 from hindsight.security import safe_error_detail
 from hindsight.tracing import configure_tracing_from_env
 
-WORKER_MAX_RECEIVES_ENV = "HINDSIGHT_WORKER_MAX_RECEIVES"
+RUN_MAX_ATTEMPTS_ENV = "HINDSIGHT_RUN_MAX_ATTEMPTS"
+RUN_ATTEMPT_LEASE_SECONDS_ENV = "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS"
+RUN_DLQ_ARN_ENV = "HINDSIGHT_RUN_DLQ_ARN"
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -34,16 +46,21 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     failures = []
     for record in event.get("Records", []):
         message_id = str(record.get("messageId") or "unknown")
-        attempt = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1"))
         try:
             message = json.loads(record.get("body") or "{}")
-            process_message(message, attempt=attempt)
+            source_arn = str(record.get("eventSourceARN") or record.get("eventSourceArn") or "")
+            process_message(
+                message,
+                dead_letter=bool(source_arn and source_arn == os.environ.get(RUN_DLQ_ARN_ENV)),
+            )
         except Exception:
             failures.append({"itemIdentifier": message_id})
     return {"batchItemFailures": failures}
 
 
-def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, Any] | None:
+def process_message(
+    message: dict[str, Any], *, dead_letter: bool = False
+) -> dict[str, Any] | None:
     """Process one start or resume command."""
 
     configure_tracing_from_env(service_name="hindsight-worker")
@@ -112,39 +129,35 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
 
     settings = runtime_settings()
     db_url = settings.database_url
-    expected_status = "queued" if command == "start" else "resuming"
-    claimed_status = "triaging" if command == "start" else "reflecting"
-    run = claim_run(
+    max_attempts = max(1, int(os.environ.get(RUN_MAX_ATTEMPTS_ENV, "3")))
+    lease_seconds = max(1, int(os.environ.get(RUN_ATTEMPT_LEASE_SECONDS_ENV, "300")))
+    claim = claim_run_attempt(
         run_id=run_id,
-        expected_status=expected_status,
-        next_status=claimed_status,
+        command=command,
+        lease_ttl=timedelta(seconds=lease_seconds),
+        max_attempts=max_attempts,
         db_url=db_url,
     )
-    if run is None:
+    if claim.outcome == "busy":
+        raise RunAttemptBusyError(f"agent run attempt is still live: {run_id}")
+    if claim.outcome == "exhausted":
+        if dead_letter:
+            return finalize_exhausted_run(
+                run_id=run_id,
+                command=command,
+                max_attempts=max_attempts,
+                db_url=db_url,
+            )
+        raise RunAttemptsExhaustedError(f"agent run attempts exhausted: {run_id}")
+    if claim.outcome in {"duplicate", "missing"}:
         return get_run(run_id=run_id, db_url=db_url)
-
-    uses_gemini = any(
-        settings.provider_env.get(name, "").strip().lower() == "gemini"
-        for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
-    )
-    gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
-    provider = (
-        reasoning_provider_from_env(settings.provider_env, gemini_pool=gemini_pool)
-        if gemini_pool is not None
-        else reasoning_provider_from_env(settings.provider_env)
-    )
-    if provider.provider_name != "gemini":
-        provider = retrying_reasoning_provider(
-            provider,
-            max_attempts=settings.reasoning_max_attempts,
-        )
-    embedding_provider = embedding_provider_from_env(
-        settings.provider_env,
-        gemini_pool=gemini_pool,
-    )
+    if claim.run is None or claim.attempt_id is None:
+        raise RuntimeError(f"claimed run attempt is incomplete: {run_id}")
+    run = claim.run
+    attempt_id = claim.attempt_id
 
     def progress(phase: str, status: str, state: dict[str, Any]) -> None:
-        if command == "resume" and phase == "approval":
+        if phase == "approval":
             return
         fields: dict[str, Any] = {}
         metadata: dict[str, Any] = {}
@@ -173,8 +186,9 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
         reflected = state.get("reflected_memory") or {}
         if reflected.get("id"):
             fields["reflected_memory_id"] = reflected["id"]
-        transition_run(
+        transition_run_attempt(
             run_id=run_id,
+            attempt_id=attempt_id,
             status=status,
             phase=phase,
             summary=_phase_summary(phase, status),
@@ -184,6 +198,25 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
         )
 
     try:
+        uses_gemini = any(
+            settings.provider_env.get(name, "").strip().lower() == "gemini"
+            for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
+        )
+        gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
+        provider = (
+            reasoning_provider_from_env(settings.provider_env, gemini_pool=gemini_pool)
+            if gemini_pool is not None
+            else reasoning_provider_from_env(settings.provider_env)
+        )
+        if provider.provider_name != "gemini":
+            provider = retrying_reasoning_provider(
+                provider,
+                max_attempts=settings.reasoning_max_attempts,
+            )
+        embedding_provider = embedding_provider_from_env(
+            settings.provider_env,
+            gemini_pool=gemini_pool,
+        )
         if command == "start":
             result = run_incident_agent(
                 IncidentInput(
@@ -215,29 +248,20 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
     except Exception as exc:
         if _caused_by_pool_exhaustion(exc):
             invalidate_runtime_settings_cache()
-        max_receives = max(1, int(os.environ.get(WORKER_MAX_RECEIVES_ENV, "3")))
-        if attempt < max_receives:
-            transition_run(
-                run_id=run_id,
-                status=expected_status,
-                phase="retry",
-                summary=f"Agent run will retry after attempt {attempt}",
-                metadata={"attempt": attempt, "error_type": type(exc).__name__},
-                db_url=db_url,
-            )
-        else:
-            fail_run(
-                run_id=run_id,
-                failure_code=type(exc).__name__,
-                failure_detail=safe_error_detail(exc),
-                db_url=db_url,
-            )
+        record_run_attempt_failure(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            error_type=type(exc).__name__,
+            error_detail=safe_error_detail(exc),
+            db_url=db_url,
+        )
         raise
 
     if result.interrupted:
         interrupt_value = result.interrupt or {}
-        return transition_run(
+        return finish_run_attempt(
             run_id=run_id,
+            attempt_id=attempt_id,
             status="awaiting_approval",
             phase="approval",
             summary="Plan is ready for operator review",
@@ -253,8 +277,9 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
     reasoning = result.state.get("reasoning") or {}
     approved = bool(result.state.get("action_approved", True))
     status = "completed" if approved else "rejected"
-    return transition_run(
+    return finish_run_attempt(
         run_id=run_id,
+        attempt_id=attempt_id,
         status=status,
         phase="completion",
         summary="Agent run completed" if approved else "Agent recommendation was rejected",

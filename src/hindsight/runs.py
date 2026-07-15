@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
-from typing import Any
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from psycopg.rows import dict_row
@@ -34,6 +35,25 @@ class RunConflictError(RuntimeError):
 
 class RunNotFoundError(LookupError):
     """Raised when a run does not exist."""
+
+
+class RunAttemptLeaseLostError(RuntimeError):
+    """Raised when a worker no longer owns the current run attempt."""
+
+
+class RunAttemptBusyError(RuntimeError):
+    """Raised when a duplicate delivery encounters a live worker attempt."""
+
+
+class RunAttemptsExhaustedError(RuntimeError):
+    """Raised when a run command has used all durable worker attempts."""
+
+
+@dataclass(frozen=True)
+class RunAttemptClaim:
+    outcome: Literal["claimed", "busy", "duplicate", "exhausted", "missing"]
+    run: dict[str, Any] | None
+    attempt_id: str | None
 
 
 def create_incident(
@@ -349,41 +369,110 @@ def get_run(*, run_id: str | UUID, db_url: str | None = None) -> dict[str, Any] 
             return _jsonable(run)
 
 
-def claim_run(
+def claim_run_attempt(
     *,
     run_id: str | UUID,
-    expected_status: str,
-    next_status: str,
+    command: str,
+    lease_ttl: timedelta,
+    max_attempts: int,
     db_url: str | None = None,
-) -> dict[str, Any] | None:
-    """Claim a queued/resuming run once; duplicate deliveries return ``None``."""
+) -> RunAttemptClaim:
+    """Claim or recover one database-authoritative worker attempt."""
 
-    _validate_status(next_status)
+    if command not in {"start", "resume"}:
+        raise ValueError(f"unsupported worker command: {command}")
+    if lease_ttl <= timedelta(0):
+        raise ValueError("lease_ttl must be positive")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+
+    expected_status = "queued" if command == "start" else "resuming"
+    initial_status = "triaging" if command == "start" else "reflecting"
+    active_statuses = (
+        {"triaging", "recalling", "planning"}
+        if command == "start"
+        else {"reflecting"}
+    )
     with connect(db_url, application_name="hindsight-worker") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT now() AS current_time")
+                current_time = cur.fetchone()["current_time"]
+                cur.execute("SELECT * FROM agent_runs WHERE id = %s FOR UPDATE", (run_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return RunAttemptClaim("missing", None, None)
+                run = dict(row)
+                same_command = run["worker_attempt_command"] == command
+                count = int(run["worker_attempt_count"] or 0) if same_command else 0
+                active = run["status"] in active_statuses and same_command
+                lease_live = (
+                    active
+                    and run["worker_attempt_id"] is not None
+                    and run["worker_attempt_lease_expires_at"] is not None
+                    and run["worker_attempt_lease_expires_at"] > current_time
+                )
+                if lease_live:
+                    return RunAttemptClaim("busy", _jsonable(run), None)
+
+                reclaiming = active
+                if run["status"] != expected_status and not reclaiming:
+                    return RunAttemptClaim("duplicate", _jsonable(run), None)
+                if count >= max_attempts:
+                    return RunAttemptClaim("exhausted", _jsonable(run), None)
+
+                attempt_id = uuid4()
+                attempt_count = count + 1
+                previous_status = run["status"]
+                previous_attempt_id = run["worker_attempt_id"]
                 cur.execute(
                     """
                         UPDATE agent_runs
                         SET status = %s,
                             started_at = COALESCE(started_at, now()),
-                            updated_at = now()
-                        WHERE id = %s AND status = %s
+                            updated_at = now(),
+                            worker_attempt_id = %s,
+                            worker_attempt_count = %s,
+                            worker_attempt_command = %s,
+                            worker_attempt_lease_expires_at = now() + %s
+                        WHERE id = %s
                         RETURNING *
                     """,
-                    (next_status, run_id, expected_status),
+                    (
+                        initial_status,
+                        attempt_id,
+                        attempt_count,
+                        command,
+                        lease_ttl,
+                        run_id,
+                    ),
                 )
-                row = cur.fetchone()
-                if row is None:
-                    return None
+                claimed = dict(cur.fetchone())
                 _append_event_with_cursor(
                     cur,
                     run_id=run_id,
-                    phase=next_status,
-                    status=next_status,
-                    summary=f"Agent run entered {next_status.replace('_', ' ')}",
+                    phase="recovery" if reclaiming else initial_status,
+                    status=initial_status,
+                    summary=(
+                        "Agent run attempt reclaimed after lease expiry"
+                        if reclaiming
+                        else f"Agent run entered {initial_status.replace('_', ' ')}"
+                    ),
+                    metadata={
+                        "attempt": attempt_count,
+                        "attempt_id": str(attempt_id),
+                        "command": command,
+                        **(
+                            {
+                                "previous_status": previous_status,
+                                "previous_attempt_id": str(previous_attempt_id),
+                            }
+                            if reclaiming
+                            else {}
+                        ),
+                    },
                 )
-                return _jsonable(dict(row))
+                return RunAttemptClaim("claimed", _jsonable(claimed), str(attempt_id))
 
 
 def transition_run(
@@ -399,28 +488,9 @@ def transition_run(
     """Update one run and append its event in the same transaction."""
 
     _validate_status(status)
-    allowed_fields = {
-        "plan",
-        "proposed_action",
-        "action_approved",
-        "provider",
-        "model",
-        "usage",
-        "reflected_memory_id",
-        "failure_code",
-        "failure_detail",
-    }
-    supplied = fields or {}
-    unknown = set(supplied) - allowed_fields
-    if unknown:
-        raise ValueError(f"unsupported run fields: {', '.join(sorted(unknown))}")
-    assignments = ["status = %s", "updated_at = now()"]
-    values: list[Any] = [status]
-    for name, value in supplied.items():
-        assignments.append(f"{name} = %s")
-        values.append(Jsonb(value) if name == "usage" else value)
-    if status in TERMINAL_RUN_STATUSES:
-        assignments.append("completed_at = now()")
+    if status in {"triaging", "recalling", "planning", "reflecting", *TERMINAL_RUN_STATUSES}:
+        raise ValueError(f"worker-owned run status requires an attempt token: {status}")
+    assignments, values = _run_field_assignments(status=status, fields=fields)
     values.append(run_id)
 
     with connect(db_url, application_name="hindsight-worker") as conn:
@@ -442,6 +512,217 @@ def transition_run(
                     metadata=metadata,
                 )
                 return _jsonable(dict(row))
+
+
+def transition_run_attempt(
+    *,
+    run_id: str | UUID,
+    attempt_id: str | UUID,
+    status: str,
+    phase: str,
+    summary: str,
+    metadata: dict[str, Any] | None = None,
+    fields: dict[str, Any] | None = None,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Write progress only while the exact worker attempt owns a live lease."""
+
+    if status not in {"triaging", "recalling", "planning", "reflecting"}:
+        raise ValueError(f"unsupported active run status: {status}")
+    expected_command = "resume" if status == "reflecting" else "start"
+    assignments, values = _run_field_assignments(status=status, fields=fields)
+    values.extend((run_id, attempt_id, expected_command))
+    with connect(db_url, application_name="hindsight-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                        UPDATE agent_runs SET {', '.join(assignments)}
+                        WHERE id = %s
+                            AND worker_attempt_id = %s
+                            AND worker_attempt_command = %s
+                            AND worker_attempt_lease_expires_at > now()
+                        RETURNING *
+                    """,
+                    tuple(values),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RunAttemptLeaseLostError(
+                        f"agent run attempt lease is no longer current: {run_id}"
+                    )
+                _append_event_with_cursor(
+                    cur,
+                    run_id=run_id,
+                    phase=phase,
+                    status=status,
+                    summary=summary,
+                    metadata=metadata,
+                )
+                return _jsonable(dict(row))
+
+
+def finish_run_attempt(
+    *,
+    run_id: str | UUID,
+    attempt_id: str | UUID,
+    status: str,
+    phase: str,
+    summary: str,
+    metadata: dict[str, Any] | None = None,
+    fields: dict[str, Any] | None = None,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Finish the current start or resume attempt and release its lease."""
+
+    if status not in {"awaiting_approval", "completed", "rejected"}:
+        raise ValueError(f"unsupported attempt finish status: {status}")
+    expected_command = "start" if status == "awaiting_approval" else "resume"
+    assignments, values = _run_field_assignments(status=status, fields=fields)
+    assignments.extend(
+        ["worker_attempt_id = NULL", "worker_attempt_lease_expires_at = NULL"]
+    )
+    if status in TERMINAL_RUN_STATUSES:
+        assignments.append("completed_at = now()")
+    values.extend((run_id, attempt_id, expected_command))
+    with connect(db_url, application_name="hindsight-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                        UPDATE agent_runs SET {', '.join(assignments)}
+                        WHERE id = %s
+                            AND worker_attempt_id = %s
+                            AND worker_attempt_command = %s
+                            AND worker_attempt_lease_expires_at > now()
+                        RETURNING *
+                    """,
+                    tuple(values),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RunAttemptLeaseLostError(
+                        f"agent run attempt lease is no longer current: {run_id}"
+                    )
+                _append_event_with_cursor(
+                    cur,
+                    run_id=run_id,
+                    phase=phase,
+                    status=status,
+                    summary=summary,
+                    metadata=metadata,
+                )
+                return _jsonable(dict(row))
+
+
+def record_run_attempt_failure(
+    *,
+    run_id: str | UUID,
+    attempt_id: str | UUID,
+    error_type: str,
+    error_detail: str,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Record a retryable failure without releasing or extending its lease."""
+
+    with connect(db_url, application_name="hindsight-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                        SELECT * FROM agent_runs
+                        WHERE id = %s
+                            AND worker_attempt_id = %s
+                            AND worker_attempt_lease_expires_at > now()
+                        FOR UPDATE
+                    """,
+                    (run_id, attempt_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RunAttemptLeaseLostError(
+                        f"agent run attempt lease is no longer current: {run_id}"
+                    )
+                run = dict(row)
+                _append_event_with_cursor(
+                    cur,
+                    run_id=run_id,
+                    phase="retry",
+                    status=run["status"],
+                    summary=f"Agent run attempt {run['worker_attempt_count']} failed",
+                    metadata={
+                        "attempt": int(run["worker_attempt_count"]),
+                        "attempt_id": str(attempt_id),
+                        "command": run["worker_attempt_command"],
+                        "error_type": error_type,
+                        "error_detail": error_detail[:500],
+                    },
+                )
+                return _jsonable(run)
+
+
+def finalize_exhausted_run(
+    *,
+    run_id: str | UUID,
+    command: str,
+    max_attempts: int,
+    db_url: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically fail and seal a run after its final attempt expires."""
+
+    if command not in {"start", "resume"}:
+        raise ValueError(f"unsupported worker command: {command}")
+    with connect(db_url, application_name="hindsight-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT now() AS current_time")
+                current_time = cur.fetchone()["current_time"]
+                cur.execute("SELECT * FROM agent_runs WHERE id = %s FOR UPDATE", (run_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                run = dict(row)
+                if run["status"] in TERMINAL_RUN_STATUSES:
+                    return _jsonable(run)
+                if run["worker_attempt_command"] != command:
+                    return _jsonable(run)
+                lease_expiry = run["worker_attempt_lease_expires_at"]
+                if lease_expiry is not None and lease_expiry > current_time:
+                    raise RunAttemptBusyError(f"agent run attempt is still live: {run_id}")
+                if int(run["worker_attempt_count"] or 0) < max_attempts:
+                    raise RunAttemptsExhaustedError(
+                        f"agent run has not exhausted its attempts: {run_id}"
+                    )
+                cur.execute(
+                    """
+                        UPDATE agent_runs
+                        SET status = 'failed', failure_code = 'RunAttemptsExhausted',
+                            failure_detail = %s, completed_at = now(), updated_at = now(),
+                            worker_attempt_id = NULL,
+                            worker_attempt_lease_expires_at = NULL
+                        WHERE id = %s
+                        RETURNING *
+                    """,
+                    (f"{command} exhausted {max_attempts} worker attempts", run_id),
+                )
+                failed = dict(cur.fetchone())
+                _append_event_with_cursor(
+                    cur,
+                    run_id=run_id,
+                    phase="failure",
+                    status="failed",
+                    summary="Agent run exhausted its worker attempts",
+                    metadata={"attempts": max_attempts, "command": command},
+                )
+                cur.execute(
+                    """
+                        UPDATE memory_decisions
+                        SET status = 'failed', sealed_at = COALESCE(sealed_at, now())
+                        WHERE id = %s AND status = 'open'
+                    """,
+                    (failed["decision_id"],),
+                )
+                return _jsonable(failed)
 
 
 def prepare_approval(
@@ -492,44 +773,6 @@ def prepare_approval(
                 return _jsonable(dict(row))
 
 
-def fail_run(
-    *,
-    run_id: str | UUID,
-    failure_code: str,
-    failure_detail: str,
-    db_url: str | None = None,
-) -> dict[str, Any]:
-    """Put a non-terminal run into its explicit failed state."""
-
-    existing = get_run(run_id=run_id, db_url=db_url)
-    if existing is None:
-        raise RunNotFoundError(str(run_id))
-    if existing["status"] in TERMINAL_RUN_STATUSES:
-        return existing
-    failed = transition_run(
-        run_id=run_id,
-        status="failed",
-        phase="failure",
-        summary="Agent run failed",
-        fields={
-            "failure_code": failure_code,
-            "failure_detail": failure_detail[:500],
-        },
-        db_url=db_url,
-    )
-    with connect(db_url, application_name="hindsight-worker") as conn:
-        conn.execute(
-            """
-                UPDATE memory_decisions
-                SET status = 'failed', sealed_at = COALESCE(sealed_at, now())
-                WHERE id = %s AND status = 'open'
-            """,
-            (failed["decision_id"],),
-        )
-        conn.commit()
-    return failed
-
-
 def _append_event_with_cursor(
     cur: Any,
     *,
@@ -570,6 +813,32 @@ def _append_dispatch_with_cursor(
         """,
         (run_id, command, Jsonb(payload)),
     )
+
+
+def _run_field_assignments(
+    *, status: str, fields: dict[str, Any] | None
+) -> tuple[list[str], list[Any]]:
+    allowed_fields = {
+        "plan",
+        "proposed_action",
+        "action_approved",
+        "provider",
+        "model",
+        "usage",
+        "reflected_memory_id",
+        "failure_code",
+        "failure_detail",
+    }
+    supplied = fields or {}
+    unknown = set(supplied) - allowed_fields
+    if unknown:
+        raise ValueError(f"unsupported run fields: {', '.join(sorted(unknown))}")
+    assignments = ["status = %s", "updated_at = now()"]
+    values: list[Any] = [status]
+    for name, value in supplied.items():
+        assignments.append(f"{name} = %s")
+        values.append(Jsonb(value) if name == "usage" else value)
+    return assignments, values
 
 
 def _validate_status(status: str) -> None:

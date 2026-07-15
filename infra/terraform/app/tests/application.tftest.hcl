@@ -65,6 +65,28 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
+      aws_lambda_function.worker.timeout < tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) &&
+      tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) < aws_sqs_queue.runs.visibility_timeout_seconds &&
+      aws_sqs_queue.run_dlq.visibility_timeout_seconds == aws_sqs_queue.runs.visibility_timeout_seconds
+    )
+    error_message = "Worker timeout, attempt lease, and both queue visibility windows must remain ordered."
+  }
+
+  assert {
+    condition     = tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == local.run_max_attempts
+    error_message = "The database attempt budget and queue redrive budget must match."
+  }
+
+  assert {
+    condition = (
+      toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"]) &&
+      toset(aws_lambda_event_source_mapping.worker_dlq.function_response_types) == toset(["ReportBatchItemFailures"])
+    )
+    error_message = "Both run queues must use partial batch failure reporting."
+  }
+
+  assert {
+    condition = (
       aws_cloudwatch_event_rule.run_dispatcher.schedule_expression == "rate(1 minute)" &&
       jsondecode(aws_cloudwatch_event_target.run_dispatcher.input).command == "dispatch_run_commands"
     )

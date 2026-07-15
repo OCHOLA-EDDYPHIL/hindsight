@@ -58,8 +58,17 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert api_policy.count('"sqs:SendMessage"') == 1
     assert api_policy.count("aws_sqs_queue.runs.arn") == 1
     assert worker_policy.count('"sqs:SendMessage"') == 1
-    assert worker_policy.count("aws_sqs_queue.runs.arn") == 1
+    assert worker_policy.count("aws_sqs_queue.runs.arn") == 2
+    assert worker_policy.count("aws_sqs_queue.run_dlq.arn") == 1
     assert "HINDSIGHT_RUN_QUEUE_URL" in worker_lambda
+    assert "HINDSIGHT_RUN_DLQ_ARN" in worker_lambda
+    assert "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS" in worker_lambda
+    assert "HINDSIGHT_RUN_MAX_ATTEMPTS" in worker_lambda
+    assert "worker_timeout_seconds       = 180" in stack
+    assert "run_attempt_lease_seconds    = 300" in stack
+    assert "run_queue_visibility_seconds = 360" in stack
+    assert "run_max_attempts             = 3" in stack
+    assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' in stack
     assert 'resource "aws_cloudwatch_event_rule" "run_dispatcher"' in stack
     assert 'command = "dispatch_run_commands"' in stack
     assert 'resource "aws_lambda_permission" "run_dispatcher"' in stack
