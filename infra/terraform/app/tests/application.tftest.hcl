@@ -64,6 +64,14 @@ run "complete_demo_graph" {
   }
 
   assert {
+    condition = (
+      aws_cloudwatch_event_rule.run_dispatcher.schedule_expression == "rate(1 minute)" &&
+      jsondecode(aws_cloudwatch_event_target.run_dispatcher.input).command == "dispatch_run_commands"
+    )
+    error_message = "The worker must sweep durable run commands through the run queue."
+  }
+
+  assert {
     condition     = aws_dynamodb_table.connections.ttl[0].enabled
     error_message = "WebSocket connection records must expire."
   }

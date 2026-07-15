@@ -27,6 +27,34 @@ def test_scheduled_worker_reaps_expired_memory_operations(monkeypatch):
     }
 
 
+def test_scheduled_worker_dispatches_pending_run_commands(monkeypatch):
+    import hindsight.worker as worker
+
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(worker, "runtime_database_url", lambda: "postgresql://db")
+    monkeypatch.setattr(
+        worker,
+        "dispatch_run_commands",
+        lambda **kwargs: {
+            "leased": 2,
+            "dispatched": 2,
+            "failed": 0,
+            "lease_lost": 0,
+            "db_url": kwargs["db_url"],
+            "limit": kwargs["limit"],
+        },
+    )
+
+    assert worker.handler({"command": "dispatch_run_commands"}, None) == {
+        "leased": 2,
+        "dispatched": 2,
+        "failed": 0,
+        "lease_lost": 0,
+        "db_url": "postgresql://db",
+        "limit": 100,
+    }
+
+
 def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypatch):
     import hindsight.worker as worker
 

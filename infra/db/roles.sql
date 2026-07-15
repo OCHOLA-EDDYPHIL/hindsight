@@ -35,6 +35,7 @@ GRANT SELECT ON TABLE
     agent_reflections,
     agent_runs,
     agent_run_events,
+    agent_run_dispatches,
     consolidation_jobs,
     benchmark_actions
 TO hindsight_agent_writer;
@@ -55,6 +56,7 @@ GRANT INSERT ON TABLE
     agent_reflections,
     agent_runs,
     agent_run_events,
+    agent_run_dispatches,
     incidents,
     incident_services,
     incident_events,
@@ -68,6 +70,7 @@ GRANT UPDATE ON TABLE
     memory_decisions,
     agent_runs,
     agent_run_events,
+    agent_run_dispatches,
     incidents
 TO hindsight_agent_writer;
 
@@ -98,6 +101,7 @@ GRANT SELECT ON TABLE
     agent_reflections,
     agent_runs,
     agent_run_events,
+    agent_run_dispatches,
     current_episodic_memories,
     current_semantic_memories,
     services,
@@ -157,6 +161,7 @@ GRANT UPDATE ON TABLE
     consolidation_jobs,
     agent_runs,
     agent_run_events,
+    agent_run_dispatches,
     incident_semantic_beliefs,
     incidents
 TO hindsight_memory_worker;

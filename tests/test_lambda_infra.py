@@ -43,6 +43,28 @@ def test_api_lambda_can_construct_the_hosted_embedding_provider():
     assert "apigateway.amazonaws.com" in stack
 
 
+def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    api_policy = stack.split('data "aws_iam_policy_document" "api"', 1)[1].split(
+        'resource "aws_iam_role_policy" "api"', 1
+    )[0]
+    worker_policy = stack.split('data "aws_iam_policy_document" "worker"', 1)[1].split(
+        'resource "aws_iam_role_policy" "worker"', 1
+    )[0]
+    worker_lambda = stack.split('resource "aws_lambda_function" "worker"', 1)[1].split(
+        'resource "aws_lambda_function" "websocket"', 1
+    )[0]
+
+    assert api_policy.count('"sqs:SendMessage"') == 1
+    assert api_policy.count("aws_sqs_queue.runs.arn") == 1
+    assert worker_policy.count('"sqs:SendMessage"') == 1
+    assert worker_policy.count("aws_sqs_queue.runs.arn") == 1
+    assert "HINDSIGHT_RUN_QUEUE_URL" in worker_lambda
+    assert 'resource "aws_cloudwatch_event_rule" "run_dispatcher"' in stack
+    assert 'command = "dispatch_run_commands"' in stack
+    assert 'resource "aws_lambda_permission" "run_dispatcher"' in stack
+
+
 def test_destroy_workflow_pauses_changefeed_and_requires_confirmation():
     workflow = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
 

@@ -41,6 +41,7 @@ from hindsight.operations import (
     preview_supersession,
 )
 from hindsight.queueing import RunQueueUnavailableError, enqueue_run
+from hindsight.run_dispatch import dispatch_run_commands
 from hindsight.runtime import (
     RuntimeSettings,
     function_auth_token,
@@ -52,15 +53,12 @@ from hindsight.runs import (
     RunNotFoundError,
     create_incident,
     create_run,
-    fail_run,
     get_incident,
     get_run,
     list_incidents,
     prepare_approval,
     resolve_incident,
-    transition_run,
 )
-from hindsight.security import safe_error_detail
 
 API_PREFIX = "/v1"
 OPERATOR_COOKIE = "hindsight_operator_session"
@@ -281,17 +279,12 @@ def runs_create(
         retrieval_policy=payload.retrieval_policy,
         db_url=db_url,
     )
-    if created:
-        try:
-            enqueue_run({"command": "start", "run_id": run["id"]})
-        except RunQueueUnavailableError as exc:
-            fail_run(
-                run_id=run["id"],
-                failure_code="queue_unavailable",
-                failure_detail=safe_error_detail(exc),
-                db_url=db_url,
-            )
-            raise HTTPException(status_code=503, detail="run queue is unavailable") from exc
+    dispatch_run_commands(
+        db_url=db_url,
+        run_id=run["id"],
+        command="start",
+        limit=1,
+    )
     return AcceptedRun(run_id=run["id"], status=run["status"], created=created)
 
 
@@ -322,20 +315,12 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="run not found") from exc
     except RunConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    try:
-        enqueue_run(
-            {"command": "resume", "run_id": run_id, "approved": payload.approved}
-        )
-    except RunQueueUnavailableError as exc:
-        transition_run(
-            run_id=run_id,
-            status="awaiting_approval",
-            phase="queue",
-            summary="Approval could not be queued",
-            fields={"failure_detail": safe_error_detail(exc)},
-            db_url=db_url,
-        )
-        raise HTTPException(status_code=503, detail="run queue is unavailable") from exc
+    dispatch_run_commands(
+        db_url=db_url,
+        run_id=run_id,
+        command="resume",
+        limit=1,
+    )
     return {"run_id": run_id, "status": "resuming", "approved": payload.approved}
 
 

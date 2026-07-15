@@ -56,6 +56,26 @@ def test_lineage_child_producer_constraints_are_staged_for_cockroachdb():
     assert foreign_keys.count("REFERENCES") == 2
 
 
+def test_run_dispatch_outbox_grants_only_required_product_role_access():
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+    migration = (MIGRATIONS / "0017_agent_run_dispatch_outbox.sql").read_text()
+    agent_sections = roles.split("TO hindsight_agent_writer;", 3)
+    agent_select, agent_insert, agent_update = agent_sections[:3]
+    worker_section = roles.split("TO hindsight_agent_writer;", 3)[-1]
+    worker_select, worker_insert, worker_update = worker_section.split(
+        "TO hindsight_memory_worker;", 3
+    )[:3]
+
+    assert "agent_run_dispatches" in agent_select
+    assert "agent_run_dispatches" in agent_insert
+    assert "agent_run_dispatches" in agent_update
+    assert "agent_run_dispatches" in worker_select
+    assert "agent_run_dispatches" not in worker_insert
+    assert "agent_run_dispatches" in worker_update
+    assert "GRANT SELECT, INSERT, UPDATE ON TABLE agent_run_dispatches" in migration
+    assert "GRANT SELECT, UPDATE ON TABLE agent_run_dispatches" in migration
+
+
 def _database_url(name: str) -> str:
     parts = urlsplit(os.environ["DATABASE_URL"])
     return urlunsplit(parts._replace(path=f"/{name}"))
@@ -312,6 +332,14 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
             conn.execute("CREATE ROLE IF NOT EXISTS hindsight_memory_worker LOGIN")
             _apply(conn, [MIGRATIONS / "0012_embedding_index_write_fence.sql"])
             _apply(conn, [MIGRATIONS / "0012_embedding_index_write_fence.sql"])
+            _apply(
+                conn,
+                [
+                    path
+                    for path in all_migrations
+                    if path.name > "0012_embedding_index_write_fence.sql"
+                ],
+            )
             upgrade_privileges = {
                 (table_name, grantee, privilege)
                 for table_name, grantee, privilege in conn.execute(
@@ -367,6 +395,28 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                     "hindsight_memory_worker",
                     "UPDATE",
                 ),
+            }
+            dispatch_privileges = {
+                (grantee, privilege)
+                for grantee, privilege in conn.execute(
+                    """
+                        SELECT grantee, privilege_type
+                        FROM information_schema.table_privileges
+                        WHERE table_schema = 'public'
+                          AND table_name = 'agent_run_dispatches'
+                          AND grantee IN (
+                              'hindsight_agent_writer',
+                              'hindsight_memory_worker'
+                          )
+                    """
+                ).fetchall()
+            }
+            assert dispatch_privileges == {
+                ("hindsight_agent_writer", "SELECT"),
+                ("hindsight_agent_writer", "INSERT"),
+                ("hindsight_agent_writer", "UPDATE"),
+                ("hindsight_memory_worker", "SELECT"),
+                ("hindsight_memory_worker", "UPDATE"),
             }
             repaired = conn.execute(
                 """
@@ -483,6 +533,13 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 "SELECT status FROM agent_run_events WHERE run_id = %s ORDER BY sequence",
                 (role_run["id"],),
             ).fetchall() == [("queued",), ("triaging",)]
+            assert conn.execute(
+                """
+                    SELECT command, status FROM agent_run_dispatches
+                    WHERE run_id = %s
+                """,
+                (role_run["id"],),
+            ).fetchall() == [("start", "pending")]
             conn.commit()
 
             store = MemoryStore(conn=conn, embedding_provider=provider)

@@ -296,7 +296,8 @@ data "aws_iam_policy_document" "worker" {
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
       "sqs:ChangeMessageVisibility",
-      "sqs:GetQueueAttributes"
+      "sqs:GetQueueAttributes",
+      "sqs:SendMessage"
     ]
     resources = [aws_sqs_queue.runs.arn]
   }
@@ -401,6 +402,7 @@ resource "aws_lambda_function" "worker" {
       HINDSIGHT_DATABASE_URL_PARAM      = var.database_url_parameter_name
       HINDSIGHT_GEMINI_API_KEYS_PARAM   = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE = aws_dynamodb_table.gemini_key_health.name
+      HINDSIGHT_RUN_QUEUE_URL           = aws_sqs_queue.runs.url
       HINDSIGHT_WORKER_MAX_RECEIVES     = "3"
       LLM_PROVIDER                      = var.llm_provider
       EMBEDDING_PROVIDER                = var.embedding_provider
@@ -484,6 +486,27 @@ resource "aws_lambda_permission" "operation_reaper" {
   function_name = aws_lambda_function.worker.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.operation_reaper.arn
+}
+
+resource "aws_cloudwatch_event_rule" "run_dispatcher" {
+  name                = "${local.name}-run-dispatcher"
+  description         = "Dispatch pending and expired agent-run outbox commands"
+  schedule_expression = "rate(1 minute)"
+}
+
+resource "aws_cloudwatch_event_target" "run_dispatcher" {
+  rule      = aws_cloudwatch_event_rule.run_dispatcher.name
+  target_id = "agent-run-dispatcher"
+  arn       = aws_lambda_function.worker.arn
+  input     = jsonencode({ command = "dispatch_run_commands" })
+}
+
+resource "aws_lambda_permission" "run_dispatcher" {
+  statement_id  = "AllowRunDispatcher"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.worker.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.run_dispatcher.arn
 }
 
 resource "aws_apigatewayv2_api" "http" {

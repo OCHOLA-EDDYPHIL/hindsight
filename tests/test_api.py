@@ -57,7 +57,7 @@ def test_operator_session_sets_httponly_cookie(monkeypatch):
     assert client.get("/v1/operator/session").json() == {"operator": True}
 
 
-def test_run_creation_returns_accepted_and_enqueues_once(monkeypatch):
+def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatch):
     import hindsight.api as api
 
     settings = SimpleNamespace(
@@ -86,8 +86,13 @@ def test_run_creation_returns_accepted_and_enqueues_once(monkeypatch):
             )
         ),
     )
-    messages = []
-    monkeypatch.setattr(api, "enqueue_run", lambda message: messages.append(message) or "message-1")
+    dispatches = []
+    monkeypatch.setattr(
+        api,
+        "dispatch_run_commands",
+        lambda **kwargs: dispatches.append(kwargs)
+        or {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0},
+    )
     client = TestClient(api.app)
 
     response = client.post(
@@ -104,13 +109,130 @@ def test_run_creation_returns_accepted_and_enqueues_once(monkeypatch):
 
     assert response.status_code == 202
     assert response.json() == {"run_id": "run-1", "status": "queued", "created": True}
-    assert messages == [{"command": "start", "run_id": "run-1"}]
+    assert dispatches == [
+        {
+            "db_url": settings.database_url,
+            "run_id": "run-1",
+            "command": "start",
+            "limit": 1,
+        }
+    ]
     assert database_calls[0] == (
         "get_incident",
         {"slug": "checkout-latency", "db_url": settings.database_url},
     )
     assert database_calls[1][0] == "create_run"
     assert database_calls[1][1]["db_url"] == settings.database_url
+
+
+def test_run_creation_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "get_incident",
+        lambda **_kwargs: {"slug": "checkout-latency", "service_slug": "payments-api"},
+    )
+    monkeypatch.setattr(
+        api,
+        "create_run",
+        lambda **_kwargs: ({"id": "run-pending", "status": "queued"}, True),
+    )
+    monkeypatch.setattr(
+        api,
+        "dispatch_run_commands",
+        lambda **_kwargs: {"leased": 1, "dispatched": 0, "failed": 1, "lease_lost": 0},
+    )
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/v1/incidents/checkout-latency/runs",
+        headers={"Authorization": "Bearer operator-secret"},
+        json={"namespace": "demo:payments", "user_input": "checkout p99 is above SLO"},
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "run_id": "run-pending",
+        "status": "queued",
+        "created": True,
+    }
+
+
+def test_idempotent_run_request_retries_its_pending_dispatch(monkeypatch):
+    import hindsight.api as api
+
+    dispatches = []
+    monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "get_incident",
+        lambda **_kwargs: {"slug": "checkout-latency", "service_slug": "payments-api"},
+    )
+    monkeypatch.setattr(
+        api,
+        "create_run",
+        lambda **_kwargs: ({"id": "run-existing", "status": "queued"}, False),
+    )
+    monkeypatch.setattr(
+        api,
+        "dispatch_run_commands",
+        lambda **kwargs: dispatches.append(kwargs)
+        or {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0},
+    )
+
+    accepted = api.runs_create(
+        "checkout-latency",
+        api.RunCreate(namespace="demo:payments", user_input="checkout p99 is above SLO"),
+        idempotency_key="request-1",
+    )
+
+    assert accepted == api.AcceptedRun(run_id="run-existing", status="queued", created=False)
+    assert dispatches == [
+        {
+            "db_url": "postgresql://resolved/database",
+            "run_id": "run-existing",
+            "command": "start",
+            "limit": 1,
+        }
+    ]
+
+
+def test_approval_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
+    import hindsight.api as api
+
+    transitions = []
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "prepare_approval",
+        lambda **kwargs: transitions.append(kwargs) or {"id": kwargs["run_id"]},
+    )
+    monkeypatch.setattr(
+        api,
+        "dispatch_run_commands",
+        lambda **_kwargs: {"leased": 1, "dispatched": 0, "failed": 1, "lease_lost": 0},
+    )
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/v1/runs/run-pending/approval",
+        headers={"Authorization": "Bearer operator-secret"},
+        json={"approved": True},
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-pending", "status": "resuming", "approved": True}
+    assert transitions == [
+        {
+            "run_id": "run-pending",
+            "approved": True,
+            "db_url": "postgresql://resolved/database",
+        }
+    ]
 
 
 def test_rewind_execute_rejects_stale_preview(monkeypatch):
