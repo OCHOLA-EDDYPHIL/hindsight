@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import sql
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -2210,6 +2211,8 @@ class MemoryStore:
         self._conn.execute(f"SAVEPOINT {savepoint}")
         try:
             result = callback()
+        except SerializationFailure:
+            raise
         except Exception:
             self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")

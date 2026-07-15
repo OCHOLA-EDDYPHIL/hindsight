@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
 
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -23,6 +24,7 @@ SupersessionIntent = Literal["correction", "evolution"]
 ReviewAction = Literal["confirmed", "retracted"]
 PREVIEW_TTL = timedelta(minutes=15)
 MAX_OPERATION_ATTEMPTS = 3
+MAX_OPERATION_TRANSACTION_ATTEMPTS = 3
 OPERATION_LEASE_TTL = timedelta(minutes=4)
 
 
@@ -486,115 +488,21 @@ def execute_operation(
         prepared = _precompute_embeddings(
             preview=preview, provider=provider, db_url=resolved_url
         )
-        with connect(resolved_url, application_name="hindsight-memory-worker") as conn:
-            with conn.transaction():
-                with conn.cursor(row_factory=dict_row) as cur:
-                    leased = _lock_current_operation_lease(
-                        cur,
-                        operation_id=operation_id,
-                        lease_token=lease_token,
-                    )
-                    lock_embedding_index_write_fence(conn)
-                    _verify_preview(cur=cur, operation=leased, preview=preview)
-                    store = MemoryStore(conn=conn, embedding_provider=provider)
-                    if leased["operation_type"] == "rewind":
-                        effects = _apply_rewind(
-                            store=store,
-                            operation=leased,
-                            preview=preview,
-                            embeddings=prepared,
-                        )
-                    elif leased["operation_type"] == "retraction":
-                        effects = _apply_retraction(
-                            store=store, operation=leased, preview=preview
-                        )
-                    elif leased["operation_type"] == "supersession":
-                        effects = _apply_supersession(
-                            store=store,
-                            operation=leased,
-                            preview=preview,
-                            embeddings=prepared,
-                        )
-                    elif leased["operation_type"] == "review_resolution":
-                        effects = _apply_review_resolution(
-                            store=store,
-                            operation=leased,
-                            preview=preview,
-                            embeddings=prepared,
-                        )
-                    else:
-                        raise ValueError(f"unsupported operation type: {leased['operation_type']}")
-                    _apply_review_resolutions(
-                        cur,
-                        operation_id=operation_id,
-                        resolutions=preview["effect_payload"].get(
-                            "review_resolutions", []
-                        ),
-                    )
-                    revisions = _revision_map(cur, list(preview["expected_revisions"]))
-                    invalidated = [
-                        effect["source_memory_id"]
-                        for effect in effects
-                        if effect["effect_type"] == "closed"
-                    ]
-                    restored = [
-                        effect["result_memory_id"]
-                        for effect in effects
-                        if effect["effect_type"] in {"created", "reasserted"}
-                    ]
-                    for sequence, effect in enumerate(effects, start=1):
-                        cur.execute(
-                            """
-                                INSERT INTO memory_operation_effects (
-                                    operation_id, sequence, effect_type,
-                                    source_memory_id, result_memory_id, belief_id,
-                                    namespace, metadata
-                                )
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (
-                                operation_id,
-                                sequence,
-                                effect["effect_type"],
-                                effect.get("source_memory_id"),
-                                effect.get("result_memory_id"),
-                                effect.get("belief_id"),
-                                effect.get("namespace"),
-                                Jsonb(effect.get("metadata") or {}),
-                            ),
-                        )
-                    cur.execute(
-                        """
-                            UPDATE memory_operations
-                            SET status = 'completed', completed_at = now(),
-                                lease_owner = NULL, lease_expires_at = NULL,
-                                failure_code = NULL, failure_detail = NULL,
-                                applied_revisions = %s,
-                                invalidated_memory_ids = %s, restored_memory_ids = %s
-                            WHERE id = %s AND status = 'leased' AND lease_owner = %s
-                            RETURNING id
-                        """,
-                        (
-                            Jsonb(revisions),
-                            Jsonb(invalidated),
-                            Jsonb(restored),
-                            operation_id,
-                            lease_token,
-                        ),
-                    )
-                    if cur.fetchone() is None:
-                        raise _OperationLeaseLostError(
-                            f"memory operation lease is no longer current: {operation_id}"
-                        )
-                    _append_event(
-                        cur,
-                        operation_id,
-                        "completed",
-                        "Memory operation completed",
-                        metadata={
-                            "attempt": int(leased["attempt_count"]),
-                        },
-                    )
+        for transaction_attempt in range(1, MAX_OPERATION_TRANSACTION_ATTEMPTS + 1):
+            try:
+                _execute_operation_transaction(
+                    operation_id=operation_id,
+                    lease_token=lease_token,
+                    preview=preview,
+                    provider=provider,
+                    prepared_embeddings=prepared,
+                    db_url=resolved_url,
+                )
+            except SerializationFailure:
+                if transaction_attempt == MAX_OPERATION_TRANSACTION_ATTEMPTS:
+                    raise
+            else:
+                break
     except OperationConflictError as exc:
         _mark_terminal(
             operation_id=operation_id,
@@ -618,6 +526,124 @@ def execute_operation(
     if result is None:
         raise LookupError(operation_id)
     return result
+
+
+def _execute_operation_transaction(
+    *,
+    operation_id: str,
+    lease_token: str,
+    preview: dict[str, Any],
+    provider: EmbeddingProvider,
+    prepared_embeddings: dict[str, list[float]],
+    db_url: str,
+) -> None:
+    with connect(db_url, application_name="hindsight-memory-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                leased = _lock_current_operation_lease(
+                    cur,
+                    operation_id=operation_id,
+                    lease_token=lease_token,
+                )
+                lock_embedding_index_write_fence(conn)
+                _verify_preview(cur=cur, operation=leased, preview=preview)
+                store = MemoryStore(conn=conn, embedding_provider=provider)
+                if leased["operation_type"] == "rewind":
+                    effects = _apply_rewind(
+                        store=store,
+                        operation=leased,
+                        preview=preview,
+                        embeddings=prepared_embeddings,
+                    )
+                elif leased["operation_type"] == "retraction":
+                    effects = _apply_retraction(
+                        store=store, operation=leased, preview=preview
+                    )
+                elif leased["operation_type"] == "supersession":
+                    effects = _apply_supersession(
+                        store=store,
+                        operation=leased,
+                        preview=preview,
+                        embeddings=prepared_embeddings,
+                    )
+                elif leased["operation_type"] == "review_resolution":
+                    effects = _apply_review_resolution(
+                        store=store,
+                        operation=leased,
+                        preview=preview,
+                        embeddings=prepared_embeddings,
+                    )
+                else:
+                    raise ValueError(f"unsupported operation type: {leased['operation_type']}")
+                _apply_review_resolutions(
+                    cur,
+                    operation_id=operation_id,
+                    resolutions=preview["effect_payload"].get("review_resolutions", []),
+                )
+                revisions = _revision_map(cur, list(preview["expected_revisions"]))
+                invalidated = [
+                    effect["source_memory_id"]
+                    for effect in effects
+                    if effect["effect_type"] == "closed"
+                ]
+                restored = [
+                    effect["result_memory_id"]
+                    for effect in effects
+                    if effect["effect_type"] in {"created", "reasserted"}
+                ]
+                for sequence, effect in enumerate(effects, start=1):
+                    cur.execute(
+                        """
+                            INSERT INTO memory_operation_effects (
+                                operation_id, sequence, effect_type,
+                                source_memory_id, result_memory_id, belief_id,
+                                namespace, metadata
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            operation_id,
+                            sequence,
+                            effect["effect_type"],
+                            effect.get("source_memory_id"),
+                            effect.get("result_memory_id"),
+                            effect.get("belief_id"),
+                            effect.get("namespace"),
+                            Jsonb(effect.get("metadata") or {}),
+                        ),
+                    )
+                cur.execute(
+                    """
+                        UPDATE memory_operations
+                        SET status = 'completed', completed_at = now(),
+                            lease_owner = NULL, lease_expires_at = NULL,
+                            failure_code = NULL, failure_detail = NULL,
+                            applied_revisions = %s,
+                            invalidated_memory_ids = %s, restored_memory_ids = %s
+                        WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        RETURNING id
+                    """,
+                    (
+                        Jsonb(revisions),
+                        Jsonb(invalidated),
+                        Jsonb(restored),
+                        operation_id,
+                        lease_token,
+                    ),
+                )
+                if cur.fetchone() is None:
+                    raise _OperationLeaseLostError(
+                        f"memory operation lease is no longer current: {operation_id}"
+                    )
+                _append_event(
+                    cur,
+                    operation_id,
+                    "completed",
+                    "Memory operation completed",
+                    metadata={
+                        "attempt": int(leased["attempt_count"]),
+                    },
+                )
 
 
 def _persist_preview(
