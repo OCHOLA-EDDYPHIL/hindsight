@@ -1,7 +1,7 @@
 """Embedding providers for semantic memory.
 
 The vector store is provider-pluggable. Tests and local deterministic runs use
-the stable hashing provider; production can opt into Bedrock explicitly.
+the stable hashing provider; production providers are selected explicitly.
 """
 
 from __future__ import annotations

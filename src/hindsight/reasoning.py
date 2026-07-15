@@ -1,8 +1,7 @@
 """Provider-pluggable reasoning backends.
 
-The agent runtime should choose a model provider through configuration, not
-architecture. Live hosted providers are opt-in; tests use deterministic
-responses unless explicitly configured otherwise.
+The agent runtime chooses a model provider through configuration. Live providers
+are opt-in, and tests use deterministic responses unless configured otherwise.
 """
 
 from __future__ import annotations

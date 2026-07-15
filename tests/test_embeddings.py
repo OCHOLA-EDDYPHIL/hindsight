@@ -46,6 +46,24 @@ def test_deterministic_embedding_provider_is_stable():
     assert any(value != 0 for value in first)
 
 
+def test_default_provider_never_constructs_bedrock(monkeypatch):
+    from hindsight.embeddings import (
+        DeterministicEmbeddingProvider,
+        embedding_provider_from_env,
+    )
+
+    def unexpected_bedrock(**_kwargs):
+        pytest.fail("default provider selection constructed Bedrock")
+
+    monkeypatch.setattr(
+        "hindsight.embeddings.BedrockTitanEmbeddingProvider", unexpected_bedrock
+    )
+
+    provider = embedding_provider_from_env({})
+
+    assert isinstance(provider, DeterministicEmbeddingProvider)
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVE_BEDROCK_EMBEDDINGS") != "1",
     reason="live Bedrock embedding invocation is opt-in",

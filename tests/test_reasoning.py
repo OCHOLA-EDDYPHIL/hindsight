@@ -42,6 +42,19 @@ def test_provider_from_env_defaults_to_gemini_and_requires_key():
         reasoning_provider_from_env({})
 
 
+def test_default_provider_never_constructs_bedrock(monkeypatch):
+    from hindsight.reasoning import GeminiReasoningProvider, reasoning_provider_from_env
+
+    def unexpected_bedrock(**_kwargs):
+        pytest.fail("default provider selection constructed Bedrock")
+
+    monkeypatch.setattr("hindsight.reasoning.BedrockReasoningProvider", unexpected_bedrock)
+
+    provider = reasoning_provider_from_env({}, gemini_pool=object())
+
+    assert isinstance(provider, GeminiReasoningProvider)
+
+
 def test_provider_from_env_supports_deterministic():
     from hindsight.reasoning import DeterministicReasoningProvider, reasoning_provider_from_env
 
