@@ -389,6 +389,83 @@ def test_terminal_producer_decisions_reject_all_new_outputs():
 
 
 @requires_db
+@pytest.mark.parametrize("memory_kind", ["semantic", "episodic"])
+def test_lineage_edge_producer_must_own_the_child_memory(memory_kind):
+    from psycopg import errors
+
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    namespace = f"lineage-child-owner-{memory_kind}-{uuid4()}"
+    producer_decision = f"lineage-producer:{uuid4()}"
+    mismatched_decision = f"lineage-mismatch:{uuid4()}"
+    provider = DeterministicEmbeddingProvider()
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        parent = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="processor timeouts amplified retry pressure",
+            provenance=Provenance("pytest", "evidence:parent", "lineage parent"),
+        )
+        store.record_read(
+            decision_id=producer_decision,
+            memory_kind="semantic",
+            memory_id=str(parent["id"]),
+            reader="pytest.producer",
+            purpose="produce the governed child",
+        )
+        child_args = {
+            "memory_kind": memory_kind,
+            "content": "reduce retry fanout before adding capacity",
+            "provenance": Provenance(
+                "pytest.producer", "evidence:child", "derived child"
+            ),
+            "producer_decision_id": producer_decision,
+            "parent_memory_ids": [str(parent["id"])],
+        }
+        if memory_kind == "semantic":
+            child_args["namespace"] = namespace
+        else:
+            child_args.update({"episode_id": namespace, "role": "assistant"})
+        child = store.remember(**child_args)
+        mismatched_read = store.record_read(
+            decision_id=mismatched_decision,
+            memory_kind="semantic",
+            memory_id=str(parent["id"]),
+            reader="pytest.mismatch",
+            purpose="attempt a mismatched lineage edge",
+        )
+
+    child_column = (
+        "child_semantic_memory_id"
+        if memory_kind == "semantic"
+        else "child_episodic_memory_id"
+    )
+    constraint = f"memory_lineage_{memory_kind}_child_producer_fk"
+    with connect() as conn:
+        original_count = conn.execute(
+            f"SELECT count(*) FROM memory_lineage_edges WHERE {child_column} = %s",
+            (child["id"],),
+        ).fetchone()[0]
+        with pytest.raises(errors.ForeignKeyViolation, match=constraint):
+            conn.execute(
+                f"""
+                    INSERT INTO memory_lineage_edges (
+                        {child_column}, parent_read_id, producer_decision_id,
+                        edge_type, justification
+                    ) VALUES (%s, %s, %s, 'context', 'mismatched producer test')
+                """,
+                (child["id"], mismatched_read["id"], mismatched_decision),
+            )
+        conn.rollback()
+        assert conn.execute(
+            f"SELECT count(*) FROM memory_lineage_edges WHERE {child_column} = %s",
+            (child["id"],),
+        ).fetchone() == (original_count,)
+
+
+@requires_db
 def test_evolution_supersession_quarantines_cross_namespace_descendants_for_review():
     from hindsight.db import database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider

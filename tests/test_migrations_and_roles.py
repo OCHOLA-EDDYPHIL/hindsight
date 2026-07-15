@@ -45,6 +45,17 @@ def test_agent_writer_can_fence_and_enqueue_but_cannot_administer_embedding_inde
     assert "GRANT UPDATE ON TABLE incident_semantic_beliefs" in migration
 
 
+def test_lineage_child_producer_constraints_are_staged_for_cockroachdb():
+    keys = (MIGRATIONS / "0015a_lineage_child_producer_keys.sql").read_text()
+    foreign_keys = (MIGRATIONS / "0015b_lineage_child_producer_fks.sql").read_text()
+
+    assert "semantic_memories (id, producer_decision_id)" in keys
+    assert "episodic_memories (id, producer_decision_id)" in keys
+    assert "memory_lineage_semantic_child_producer_fk" in foreign_keys
+    assert "memory_lineage_episodic_child_producer_fk" in foreign_keys
+    assert foreign_keys.count("REFERENCES") == 2
+
+
 def _database_url(name: str) -> str:
     parts = urlsplit(os.environ["DATABASE_URL"])
     return urlunsplit(parts._replace(path=f"/{name}"))
