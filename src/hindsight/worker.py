@@ -13,6 +13,7 @@ from hindsight.embeddings import embedding_provider_from_env
 from hindsight.gemini import GeminiPoolExhaustedError, gemini_pool_from_env
 from hindsight.operations import execute_operation, reap_exhausted_operations
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
+from hindsight.run_dispatch import dispatch_run_commands
 from hindsight.runtime import (
     invalidate_runtime_settings_cache,
     runtime_database_url,
@@ -47,6 +48,8 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
 
     configure_tracing_from_env(service_name="hindsight-worker")
     command = str(message.get("command") or "start").strip().lower()
+    if command == "dispatch_run_commands":
+        return dispatch_run_commands(db_url=runtime_database_url(), limit=100)
     if command == "reap_memory_operations":
         return reap_exhausted_operations(db_url=runtime_database_url())
     if command == "consolidation":

@@ -322,6 +322,12 @@ def create_run(
                     status="queued",
                     summary="Agent run queued",
                 )
+                _append_dispatch_with_cursor(
+                    cur,
+                    run_id=run_id,
+                    command="start",
+                    payload={"command": "start", "run_id": str(run_id)},
+                )
         return _jsonable(run), True
 
 
@@ -477,6 +483,12 @@ def prepare_approval(
                     else "Operator rejected the proposed action",
                     metadata={"approved": approved},
                 )
+                _append_dispatch_with_cursor(
+                    cur,
+                    run_id=run_id,
+                    command="resume",
+                    payload={"command": "resume", "run_id": str(run_id), "approved": approved},
+                )
                 return _jsonable(dict(row))
 
 
@@ -541,6 +553,22 @@ def _append_event_with_cursor(
             VALUES (%s, %s, %s, %s, %s, %s)
         """,
         (run_id, sequence, phase, status, summary, Jsonb(metadata or {})),
+    )
+
+
+def _append_dispatch_with_cursor(
+    cur: Any,
+    *,
+    run_id: str | UUID,
+    command: str,
+    payload: dict[str, Any],
+) -> None:
+    cur.execute(
+        """
+            INSERT INTO agent_run_dispatches (run_id, command, payload)
+            VALUES (%s, %s, %s)
+        """,
+        (run_id, command, Jsonb(payload)),
     )
 
 
