@@ -13,15 +13,55 @@ from langchain_core.messages import AIMessage, HumanMessage, messages_to_dict
 from langchain_cockroachdb import CockroachDBChatMessageHistory, CockroachDBSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from psycopg import errors
 
-from hindsight.db import database_url
+from hindsight.db import connect, database_url
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 AGENT_CHAT_TABLE = "agent_chat_messages"
-_SETUP_DB_URLS: set[str] = set()
+_AGENT_STORAGE_PROBES = (
+    (
+        "checkpoint_migrations",
+        "SELECT v FROM checkpoint_migrations LIMIT 0",
+    ),
+    (
+        "checkpoints",
+        """
+            SELECT thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id,
+                   type, checkpoint, metadata, created_at
+            FROM checkpoints LIMIT 0
+        """,
+    ),
+    (
+        "checkpoint_blobs",
+        """
+            SELECT thread_id, checkpoint_ns, channel, version, type, blob, created_at
+            FROM checkpoint_blobs LIMIT 0
+        """,
+    ),
+    (
+        "checkpoint_writes",
+        """
+            SELECT thread_id, checkpoint_ns, checkpoint_id, task_id, task_path,
+                   idx, channel, type, blob, created_at
+            FROM checkpoint_writes LIMIT 0
+        """,
+    ),
+    (
+        AGENT_CHAT_TABLE,
+        f"""
+            SELECT id, session_id, message, created_at
+            FROM {AGENT_CHAT_TABLE} LIMIT 0
+        """,
+    ),
+)
+
+
+class AgentStorageNotInitializedError(RuntimeError):
+    """Raised when the agent's durable persistence objects are unavailable."""
 
 
 @dataclass(frozen=True)
@@ -428,7 +468,33 @@ def setup_agent_storage(*, db_url: str | None = None) -> None:
     """Create checkpoint and chat-history tables used by the agent runtime."""
 
     resolved_db_url = db_url or database_url()
-    _setup_agent_storage_once(resolved_db_url)
+    with CockroachDBSaver.from_conn_string(resolved_db_url) as checkpointer:
+        checkpointer.setup()
+    history = _chat_history(thread_id="setup", db_url=resolved_db_url)
+    try:
+        history.create_table_if_not_exists()
+    finally:
+        history.close()
+
+
+def validate_agent_storage(*, db_url: str | None = None) -> None:
+    """Verify runtime persistence objects without attempting schema changes."""
+
+    resolved_db_url = db_url or database_url()
+    with connect(
+        resolved_db_url,
+        application_name="hindsight-agent-storage-check",
+    ) as conn:
+        for object_name, query in _AGENT_STORAGE_PROBES:
+            try:
+                conn.execute(query)
+            except (errors.UndefinedColumn, errors.UndefinedTable) as exc:
+                raise AgentStorageNotInitializedError(
+                    "agent persistence storage is not initialized: "
+                    f"{object_name} is missing or incompatible; run "
+                    "scripts/initialize_agent_storage.py with deployment credentials "
+                    "before starting or resuming the agent"
+                ) from exc
 
 
 def _recall_for_state(
@@ -468,19 +534,6 @@ def _recall_for_state(
     return update
 
 
-def _setup_agent_storage_once(resolved_db_url: str) -> None:
-    if resolved_db_url in _SETUP_DB_URLS:
-        return
-    with CockroachDBSaver.from_conn_string(resolved_db_url) as checkpointer:
-        checkpointer.setup()
-    history = _chat_history(thread_id="setup", db_url=resolved_db_url)
-    try:
-        history.create_table_if_not_exists()
-    finally:
-        history.close()
-    _SETUP_DB_URLS.add(resolved_db_url)
-
-
 def _invoke_graph(
     input_or_command: IncidentAgentState | Command,
     *,
@@ -491,7 +544,7 @@ def _invoke_graph(
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     resolved_db_url = db_url or database_url()
-    _setup_agent_storage_once(resolved_db_url)
+    validate_agent_storage(db_url=resolved_db_url)
     with CockroachDBSaver.from_conn_string(resolved_db_url) as checkpointer:
         graph = build_incident_graph(
             db_url=resolved_db_url,

@@ -145,9 +145,10 @@ def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     assert "create-invalidation" in workflow
     assert "environment: demo" in workflow
     assert "CLOUDFLARE_API_TOKEN" in workflow
-    assert workflow.index("scripts/migrate.py") < workflow.index(
-        "terraform -chdir=infra/terraform/app apply"
-    )
+    migration = workflow.index("scripts/migrate.py")
+    persistence = workflow.index("scripts/initialize_agent_storage.py")
+    application = workflow.index("terraform -chdir=infra/terraform/app apply")
+    assert migration < persistence < application
     assert 'export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"' in workflow
     assert "export EMBEDDING_PROVIDER=gemini" not in workflow
     assert "github.triggering_actor" in workflow

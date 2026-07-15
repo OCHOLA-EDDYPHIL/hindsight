@@ -3,9 +3,12 @@
 import os
 import pathlib
 import asyncio
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
+import psycopg
 import pytest
+from psycopg import sql
 
 requires_db = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
@@ -14,6 +17,33 @@ requires_db = pytest.mark.skipif(
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CHECKPOINT_QUERY = ROOT / "queries" / "agent_checkpoint_rows.sql"
 CHAT_QUERY = ROOT / "queries" / "agent_chat_history.sql"
+
+
+def _database_url(name: str, *, user: str | None = None) -> str:
+    parts = urlsplit(os.environ["DATABASE_URL"])
+    if user is None:
+        return urlunsplit(parts._replace(path=f"/{name}"))
+    host = parts.hostname or "localhost"
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{parts.port}" if parts.port is not None else ""
+    return urlunsplit(
+        parts._replace(
+            netloc=f"{quote(user)}@{host}{port}",
+            path=f"/{name}",
+        )
+    )
+
+
+def _create_database(name: str) -> str:
+    with psycopg.connect(_database_url("defaultdb"), autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    return _database_url(name)
+
+
+def _drop_database(name: str) -> None:
+    with psycopg.connect(_database_url("defaultdb"), autocommit=True) as admin:
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(name)))
 
 
 def test_async_sqlalchemy_url_uses_async_psycopg_driver():
@@ -64,7 +94,7 @@ def test_recall_does_not_silently_fall_back_after_vector_error(monkeypatch):
     assert calls == [True]
 
 
-def test_agent_storage_setup_is_cached(monkeypatch):
+def test_agent_storage_initializer_is_idempotent(monkeypatch):
     import hindsight.agent as agent
 
     calls = {"checkpoint": 0, "chat": 0}
@@ -93,12 +123,85 @@ def test_agent_storage_setup_is_cached(monkeypatch):
 
     monkeypatch.setattr(agent, "CockroachDBSaver", FakeSaver)
     monkeypatch.setattr(agent, "_chat_history", lambda **kwargs: FakeHistory())
-    agent._SETUP_DB_URLS.clear()
 
-    agent._setup_agent_storage_once("postgresql://db")
-    agent._setup_agent_storage_once("postgresql://db")
+    agent.setup_agent_storage(db_url="postgresql://db")
+    agent.setup_agent_storage(db_url="postgresql://db")
 
-    assert calls == {"checkpoint": 1, "chat": 1}
+    assert calls == {"checkpoint": 2, "chat": 2}
+
+
+def test_agent_storage_validation_reports_missing_objects_without_ddl(monkeypatch):
+    import hindsight.agent as agent
+    from psycopg import errors
+
+    statements = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def execute(self, statement):
+            statements.append(statement)
+            if "FROM checkpoint_blobs" in statement:
+                raise errors.UndefinedTable("checkpoint_blobs is missing")
+
+    monkeypatch.setattr(agent, "connect", lambda *args, **kwargs: FakeConnection())
+
+    with pytest.raises(
+        agent.AgentStorageNotInitializedError,
+        match="checkpoint_blobs is missing or incompatible",
+    ):
+        agent.validate_agent_storage(db_url="postgresql://db")
+
+    assert statements
+    assert all(
+        not statement.lstrip().upper().startswith(("ALTER", "CREATE", "DROP"))
+        for statement in statements
+    )
+
+
+@requires_db
+def test_start_reports_uninitialized_storage_without_creating_it():
+    from hindsight.agent import (
+        AgentStorageNotInitializedError,
+        IncidentInput,
+        run_incident_agent,
+    )
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.reasoning import DeterministicReasoningProvider
+
+    database_name = f"hindsight_agent_missing_{uuid4().hex}"
+    target_url = _create_database(database_name)
+    try:
+        with pytest.raises(
+            AgentStorageNotInitializedError,
+            match="checkpoint_migrations is missing or incompatible",
+        ):
+            run_incident_agent(
+                IncidentInput(user_input="latency", incident_id="incident-1"),
+                db_url=target_url,
+                reasoning_provider=DeterministicReasoningProvider(response_text="inspect"),
+                embedding_provider=DeterministicEmbeddingProvider(),
+            )
+
+        with psycopg.connect(target_url) as conn:
+            persistence_tables = conn.execute(
+                """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name IN (
+                          'agent_chat_messages', 'checkpoint_blobs',
+                          'checkpoint_migrations', 'checkpoint_writes', 'checkpoints'
+                      )
+                """
+            ).fetchall()
+        assert persistence_tables == []
+    finally:
+        _drop_database(database_name)
 
 
 def test_sync_agent_entrypoint_rejects_running_event_loop():
@@ -370,3 +473,82 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
     assert len(checkpoint_rows) >= 2
     assert [row[1] for row in chat_rows] == ["human", "ai"]
     assert "roll back the deploy candidate" in chat_rows[1][2]
+
+
+@requires_db
+def test_preinitialized_agent_storage_supports_start_and_resume_without_create_privilege():
+    from hindsight.agent import (
+        IncidentInput,
+        resume_incident_agent,
+        run_incident_agent,
+        setup_agent_storage,
+    )
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.reasoning import DeterministicReasoningProvider
+
+    database_name = f"hindsight_agent_runtime_{uuid4().hex}"
+    role_name = f"agent_runtime_{uuid4().hex}"
+    target_url = _create_database(database_name)
+    try:
+        with psycopg.connect(target_url, autocommit=True) as conn:
+            for path in sorted((ROOT / "migrations").glob("[0-9]*.sql")):
+                with conn.transaction():
+                    conn.execute(path.read_text())
+
+        setup_agent_storage(db_url=target_url)
+        setup_agent_storage(db_url=target_url)
+
+        with psycopg.connect(target_url, autocommit=True) as conn:
+            conn.execute("REVOKE CREATE ON SCHEMA public FROM public")
+            conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role_name)))
+            conn.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    sql.Identifier(database_name),
+                    sql.Identifier(role_name),
+                )
+            )
+            conn.execute(
+                sql.SQL(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
+                    "IN SCHEMA public TO {}"
+                ).format(sql.Identifier(role_name))
+            )
+
+        runtime_url = _database_url(database_name, user=role_name)
+        with psycopg.connect(runtime_url, autocommit=True) as runtime_conn:
+            assert runtime_conn.execute("SELECT current_user").fetchone() == (role_name,)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                runtime_conn.execute("CREATE TABLE runtime_schema_change (id INT PRIMARY KEY)")
+
+        thread_id = f"restricted-role-{uuid4()}"
+        first = run_incident_agent(
+            IncidentInput(
+                user_input="search-api error rate spiked after the deploy",
+                incident_id=f"incident-{uuid4()}",
+                namespace=f"restricted-role-{uuid4()}",
+                service_slug="search-api",
+                severity="sev2",
+                title="Search error spike",
+            ),
+            thread_id=thread_id,
+            pause_before_act=True,
+            db_url=runtime_url,
+            reasoning_provider=DeterministicReasoningProvider(
+                response_text="roll back the deploy candidate and verify error rate"
+            ),
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
+        assert first.interrupted
+
+        resumed = resume_incident_agent(
+            thread_id=thread_id,
+            approved=True,
+            db_url=runtime_url,
+            embedding_provider=DeterministicEmbeddingProvider(),
+        )
+        assert not resumed.interrupted
+        assert resumed.reflected_memory_id is not None
+    finally:
+        _drop_database(database_name)
+        with psycopg.connect(_database_url("defaultdb"), autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role_name)))
