@@ -43,9 +43,7 @@ WITH confirmation_candidates AS (
         confirmation.created_at
     FROM benchmark_experiments AS confirmation
     JOIN benchmark_experiments AS pilot
-        ON pilot.id = try_cast(
-            confirmation.preregistration->>'pilot_experiment_id' AS UUID
-        )
+        ON pilot.id::STRING = confirmation.preregistration->>'pilot_experiment_id'
         AND pilot.experiment_kind = 'pilot'
         AND pilot.status = 'completed'
     WHERE confirmation.experiment_kind = 'confirmation'
@@ -93,8 +91,8 @@ SELECT
 FROM benchmark_confirmation_preregistrations AS preregistration
 JOIN benchmark_experiments AS confirmation
     ON confirmation.experiment_kind = 'confirmation'
-    AND try_cast(confirmation.preregistration->>'pilot_experiment_id' AS UUID)
-        = preregistration.pilot_experiment_id
+    AND confirmation.preregistration->>'pilot_experiment_id'
+        = preregistration.pilot_experiment_id::STRING
     AND confirmation.preregistration = preregistration.preregistration
     AND confirmation.preregistration_sha256 = preregistration.preregistration_sha256
 ON CONFLICT DO NOTHING;

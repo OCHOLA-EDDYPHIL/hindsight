@@ -105,7 +105,7 @@ def test_protocol_schema_and_guards_are_split_across_commits():
     assert "benchmark_experiments_study_kind_idx" in guards
     assert "benchmark_experiments_claim_family_kind_active_idx" in guards
     assert "benchmark_confirmation_bindings_pilot_idx" in guards
-    assert "try_cast" in guards
+    assert "pilot.id::STRING = confirmation.preregistration->>'pilot_experiment_id'" in guards
     assert "benchmark_variant_preparation_delete_immutable" in guards
     assert "'scientific_failed', 'infrastructure_failed'" in schema
     assert "(OLD).status IN ('completed', 'scientific_failed', 'infrastructure_failed')" in guards
