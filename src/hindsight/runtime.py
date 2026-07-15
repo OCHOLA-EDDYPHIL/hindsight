@@ -7,11 +7,11 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import boto3
 
 from hindsight.aws import aws_client_config
+from hindsight.db import database_url_with_tls_roots
 
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
 GEMINI_API_KEY_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEY_PARAM"
@@ -236,13 +236,7 @@ def _int_env(env: Mapping[str, str], name: str, *, default: int) -> int:
 
 
 def _database_url_for_lambda(url: str) -> str:
-    parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if query.get("sslmode") == "verify-full" and "sslrootcert" not in query:
-        import certifi
-
-        query["sslrootcert"] = certifi.where()
-    return urlunsplit(parts._replace(query=urlencode(query)))
+    return database_url_with_tls_roots(url)
 
 
 def _ssm_client(env: Mapping[str, str]) -> Any:
