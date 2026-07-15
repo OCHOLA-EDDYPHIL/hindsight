@@ -1,7 +1,12 @@
 locals {
-  state_bucket_arn = data.aws_s3_bucket.state.arn
-  oidc_arn         = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_github_oidc_provider_arn
-  parameter_arn    = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/*"
+  state_bucket_arn               = data.aws_s3_bucket.state.arn
+  oidc_arn                       = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_github_oidc_provider_arn
+  parameter_arn                  = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/*"
+  lambda_version_refresh_actions = ["lambda:ListVersionsByFunction"]
+  lambda_function_arns = [
+    for component in ["api", "worker", "websocket", "changefeed"] :
+    "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:hindsight-${var.stage}-${component}"
+  ]
 }
 
 data "aws_s3_bucket" "state" {
@@ -119,6 +124,12 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = [
       "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
     ]
+  }
+
+  statement {
+    sid       = "LambdaVersionRefresh"
+    actions   = local.lambda_version_refresh_actions
+    resources = local.lambda_function_arns
   }
 
   statement {
