@@ -207,6 +207,24 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert "WebSocket reconnect/resubscribe/unsubscribe" in browser_job
 
 
+def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
+    live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+    destroy = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
+
+    live_concurrency = live.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
+    deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
+    destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
+
+    assert "group: hindsight-demo-environment" in live_concurrency
+    assert "group: hindsight-demo-environment" in destroy_concurrency
+    assert "inputs.validation_mode" in deploy_concurrency
+    assert "format('hindsight-live-deploy-{0}', github.run_id)" in deploy_concurrency
+    assert "|| 'hindsight-demo-environment'" in deploy_concurrency
+    for concurrency in (live_concurrency, deploy_concurrency, destroy_concurrency):
+        assert "cancel-in-progress: false" in concurrency
+
+
 def test_live_acceptance_resolves_one_owner_authorized_revision():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     authorize = workflow.split("  authorize:\n", 1)[1].split("  verify:\n", 1)[0]
