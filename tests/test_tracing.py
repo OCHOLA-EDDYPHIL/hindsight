@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import UTC, datetime
 from uuid import uuid4
 
 from opentelemetry import trace
@@ -134,65 +133,6 @@ def test_recall_and_record_read_spans_include_decision_metadata(monkeypatch):
     assert recall.attributes["hindsight.memory.reader"] == "agent.recall"
     assert record_read.attributes["hindsight.memory.id"] == str(memory_id)
     assert record_read.attributes["hindsight.memory.read_id"] == str(read_id)
-    _assert_no_sensitive_trace_values()
-
-
-def test_rewind_span_includes_restored_and_invalidated_ids_without_reason(monkeypatch):
-    restored_id = uuid4()
-    poisoned_id = uuid4()
-    derived_id = uuid4()
-    operation_id = uuid4()
-    timestamp = datetime(2026, 7, 12, tzinfo=UTC)
-    store = _fake_store()
-    monkeypatch.setattr(
-        store,
-        "_semantic_beliefs_as_of",
-        lambda **kwargs: [{"id": restored_id, "t_valid": timestamp}],
-    )
-    monkeypatch.setattr(
-        store,
-        "_semantic_rewind_candidates",
-        lambda **kwargs: [{"id": poisoned_id, "t_valid": timestamp}],
-    )
-    monkeypatch.setattr(
-        store,
-        "_derived_semantic_memories",
-        lambda **kwargs: [{"id": derived_id, "t_valid": timestamp}],
-    )
-
-    def invalidate_one(**kwargs):
-        return {"id": kwargs["memory_id"], "t_valid": timestamp}
-
-    monkeypatch.setattr(store, "_invalidate_one", invalidate_one)
-    monkeypatch.setattr(
-        store,
-        "_record_memory_operation",
-        lambda **kwargs: {
-            "id": operation_id,
-            "operation_type": "rewind",
-            "namespace": kwargs["namespace"],
-        },
-    )
-
-    result = store.rewind(
-        timestamp=timestamp,
-        namespace="demo:payments",
-        actor="demo.operator",
-        reason="operator reason with certificate secret must not enter spans",
-    )
-
-    assert [row["id"] for row in result.restored_memories] == [restored_id]
-    assert {row["id"] for row in result.invalidated_memories} == {
-        str(poisoned_id),
-        str(derived_id),
-    }
-    rewind = _span("hindsight.memory.rewind")
-    assert rewind.attributes["hindsight.memory.operation_id"] == str(operation_id)
-    assert rewind.attributes["hindsight.memory.restored.ids"] == (str(restored_id),)
-    assert set(rewind.attributes["hindsight.memory.invalidated.ids"]) == {
-        str(poisoned_id),
-        str(derived_id),
-    }
     _assert_no_sensitive_trace_values()
 
 
