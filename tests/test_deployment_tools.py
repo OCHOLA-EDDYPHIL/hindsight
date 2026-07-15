@@ -1,10 +1,13 @@
 """Deployment prerequisite tooling."""
 
 import importlib.util
+import os
 import pathlib
+import subprocess
 import sys
 
 import pytest
+import yaml
 
 
 def _configure_module():
@@ -23,6 +26,30 @@ def _changefeed_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _run_authorization_script(
+    workflow_path: str,
+    *,
+    values: dict[str, str],
+    output_path: pathlib.Path,
+) -> subprocess.CompletedProcess[str]:
+    workflow = yaml.safe_load(pathlib.Path(workflow_path).read_text())
+    script = next(
+        step["run"]
+        for step in workflow["jobs"]["authorize"]["steps"]
+        if step.get("id") in {"authorization", "authorize"}
+    )
+    env = os.environ.copy()
+    env.update(values)
+    env["GITHUB_OUTPUT"] = str(output_path)
+    return subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
 
 
 def test_configure_demo_secrets_dry_run_never_prints_values(monkeypatch, capsys):
@@ -58,9 +85,7 @@ def test_configure_demo_secrets_dry_run_never_prints_values(monkeypatch, capsys)
     assert "secret-" not in output
 
 
-def test_configure_demo_secrets_preserves_generated_tokens_on_overwrite(
-    monkeypatch, capsys
-):
+def test_configure_demo_secrets_preserves_generated_tokens_on_overwrite(monkeypatch, capsys):
     configure = _configure_module()
 
     writes = []
@@ -160,21 +185,194 @@ def test_live_acceptance_restores_changefeed_after_benchmark_failure():
     assert "if: always() && needs.deploy.result == 'success'" in restore_job
     assert "if: needs.benchmark.result != 'success'" in restore_job
     assert "run_learning_benchmark.py finalize-interrupted" in restore_job
-    restore_step = restore_job.split(
-        "- name: Restore and verify the managed changefeed", 1
-    )[1]
+    restore_step = restore_job.split("- name: Restore and verify the managed changefeed", 1)[1]
     assert "if: always()" in restore_step
     assert "configure_changefeed.py apply" in restore_step
     assert "configure_changefeed.py status" in restore_step
+
+
+def test_live_acceptance_resolves_one_owner_authorized_revision():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    authorize = workflow.split("  authorize:\n", 1)[1].split("  verify:\n", 1)[0]
+    operational_jobs = workflow.split("  verify:\n", 1)[1]
+
+    assert "  workflow_dispatch:\n" in workflow
+    assert '"$REF_NAME" == "refs/heads/main"' in authorize
+    assert '"$WORKFLOW_REF" == ' in authorize
+    assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorize
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorize
+    assert "acceptance_sha: ${{ steps.authorization.outputs.acceptance_sha }}" in authorize
+    assert 'echo "acceptance_sha=$ACCEPTANCE_SHA"' in authorize
+    assert "github.event.pull_request.head.sha" not in operational_jobs
+    assert workflow.count("ref: ${{ needs.authorize.outputs.acceptance_sha }}") == 5
+    assert workflow.count("Verify exact acceptance revision") == 5
+    assert (
+        workflow.count(
+            "HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.acceptance_sha }}"
+        )
+        == 2
+    )
+    assert (
+        "name: live-benchmark-${{ needs.authorize.outputs.acceptance_sha }}-"
+        "${{ github.run_attempt }}"
+    ) in workflow
+    assert "source_sha: ${{ needs.authorize.outputs.acceptance_sha }}" in workflow
+
+    for job_name, next_job in (
+        ("deploy", "semantic_acceptance"),
+        ("semantic_acceptance", "benchmark"),
+        ("benchmark", "restore_changefeed"),
+        ("restore_changefeed", "browser_acceptance"),
+        ("browser_acceptance", "acceptance_complete"),
+    ):
+        job = workflow.split(f"  {job_name}:\n", 1)[1].split(f"  {next_job}:\n", 1)[0]
+        assert "- authorize" in job
+
+
+def test_live_acceptance_authorization_fails_closed(tmp_path):
+    repository = "owner/project"
+    owner = "owner"
+    main_sha = "a" * 40
+    base = {
+        "EVENT_NAME": "workflow_dispatch",
+        "REF_NAME": "refs/heads/main",
+        "EVENT_SHA": main_sha,
+        "LABEL_NAME": "",
+        "HEAD_SHA": "",
+        "HEAD_REPOSITORY": "",
+        "REPOSITORY": repository,
+        "WORKFLOW_REF": (f"{repository}/.github/workflows/live-acceptance.yml@refs/heads/main"),
+        "ACTOR": owner,
+        "TRIGGERING_ACTOR": owner,
+        "REPOSITORY_OWNER": owner,
+    }
+
+    accepted_output = tmp_path / "accepted"
+    accepted = _run_authorization_script(
+        ".github/workflows/live-acceptance.yml",
+        values=base,
+        output_path=accepted_output,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert f"acceptance_sha={main_sha}" in accepted_output.read_text()
+
+    for index, overrides in enumerate(
+        (
+            {"REF_NAME": "refs/heads/feature"},
+            {"TRIGGERING_ACTOR": "different-user"},
+            {"WORKFLOW_REF": f"{repository}/.github/workflows/other.yml@refs/heads/main"},
+            {"EVENT_SHA": "not-a-sha"},
+        )
+    ):
+        rejected = _run_authorization_script(
+            ".github/workflows/live-acceptance.yml",
+            values={**base, **overrides},
+            output_path=tmp_path / f"rejected-{index}",
+        )
+        assert rejected.returncode != 0
+
+    pull_ref = "refs/pull/42/merge"
+    head_sha = "b" * 40
+    pull_output = tmp_path / "pull-request"
+    pull_request = _run_authorization_script(
+        ".github/workflows/live-acceptance.yml",
+        values={
+            **base,
+            "EVENT_NAME": "pull_request",
+            "REF_NAME": pull_ref,
+            "LABEL_NAME": "live-acceptance",
+            "HEAD_SHA": head_sha,
+            "HEAD_REPOSITORY": repository,
+            "WORKFLOW_REF": (f"{repository}/.github/workflows/live-acceptance.yml@{pull_ref}"),
+        },
+        output_path=pull_output,
+    )
+
+    assert pull_request.returncode == 0, pull_request.stderr
+    assert f"acceptance_sha={head_sha}" in pull_output.read_text()
+
+
+def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_path):
+    repository = "owner/project"
+    owner = "owner"
+    main_sha = "c" * 40
+    reusable = {
+        "EVENT_NAME": "workflow_dispatch",
+        "REF_NAME": "refs/heads/main",
+        "EVENT_SHA": main_sha,
+        "PR_HEAD_SHA": "",
+        "MANUAL_OPERATION": "",
+        "REQUESTED_APPLY": "true",
+        "REQUESTED_HEALTH_ONLY": "false",
+        "REQUESTED_SOURCE_SHA": main_sha,
+        "VALIDATION_MODE": "true",
+        "CALLER_WORKFLOW": "live acceptance",
+        "CALLER_WORKFLOW_REF": (
+            f"{repository}/.github/workflows/live-acceptance.yml@refs/heads/main"
+        ),
+        "LABEL_NAME": "",
+        "HEAD_REPOSITORY": "",
+        "REPOSITORY": repository,
+        "ACTOR": owner,
+        "TRIGGERING_ACTOR": owner,
+        "REPOSITORY_OWNER": owner,
+        "EMBEDDING_MAX_DISTANCE": "0.35",
+    }
+
+    reusable_output = tmp_path / "reusable"
+    accepted = _run_authorization_script(
+        ".github/workflows/deploy-demo.yml",
+        values=reusable,
+        output_path=reusable_output,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert "should_apply=true" in reusable_output.read_text()
+    assert f"source_sha={main_sha}" in reusable_output.read_text()
+
+    for index, overrides in enumerate(
+        (
+            {"REQUESTED_SOURCE_SHA": "d" * 40},
+            {"REQUESTED_HEALTH_ONLY": "true"},
+            {"CALLER_WORKFLOW_REF": f"{repository}/.github/workflows/other.yml@refs/heads/main"},
+        )
+    ):
+        rejected = _run_authorization_script(
+            ".github/workflows/deploy-demo.yml",
+            values={**reusable, **overrides},
+            output_path=tmp_path / f"reusable-rejected-{index}",
+        )
+        assert rejected.returncode != 0
+
+    direct_output = tmp_path / "direct"
+    direct = _run_authorization_script(
+        ".github/workflows/deploy-demo.yml",
+        values={
+            **reusable,
+            "MANUAL_OPERATION": "plan",
+            "REQUESTED_APPLY": "false",
+            "REQUESTED_HEALTH_ONLY": "true",
+            "REQUESTED_SOURCE_SHA": "",
+            "VALIDATION_MODE": "false",
+            "CALLER_WORKFLOW": "deploy demo",
+            "CALLER_WORKFLOW_REF": (
+                f"{repository}/.github/workflows/deploy-demo.yml@refs/heads/main"
+            ),
+        },
+        output_path=direct_output,
+    )
+
+    assert direct.returncode == 0, direct.stderr
+    assert "should_apply=false" in direct_output.read_text()
+    assert f"source_sha={main_sha}" in direct_output.read_text()
 
 
 def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():
     makefile = pathlib.Path("Makefile").read_text()
 
     dev_up = makefile.split("dev-up:\n", 1)[1].split("\ndev-down:", 1)[0]
-    product_api = makefile.split("product-api-local:\n", 1)[1].split(
-        "\nchangefeed-apply:", 1
-    )[0]
+    product_api = makefile.split("product-api-local:\n", 1)[1].split("\nchangefeed-apply:", 1)[0]
     assert "feature.vector_index.enabled = true" in dev_up
     assert 'HINDSIGHT_DATABASE_URL_PARAM=""' in product_api
     assert 'HINDSIGHT_GEMINI_API_KEY_PARAM=""' in product_api
@@ -184,10 +382,7 @@ def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():
 def test_telemetry_demo_uses_the_configured_local_database_url():
     makefile = pathlib.Path("Makefile").read_text()
 
-    telemetry_demo = makefile.split("telemetry-demo:\n", 1)[1].split(
-        "\npoison-rewind-demo:", 1
-    )[0]
+    telemetry_demo = makefile.split("telemetry-demo:\n", 1)[1].split("\npoison-rewind-demo:", 1)[0]
     assert (
-        'DATABASE_URL="$(LOCAL_DATABASE_URL)" '
-        "uv run python scripts/run_telemetry_demo.py"
+        'DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python scripts/run_telemetry_demo.py'
     ) in telemetry_demo
