@@ -1,6 +1,11 @@
 locals {
   name = "${var.project_name}-${var.stage}"
 
+  worker_timeout_seconds       = 180
+  run_attempt_lease_seconds    = 300
+  run_queue_visibility_seconds = 360
+  run_max_attempts             = 3
+
   api_zip      = var.api_zip_path != null ? abspath(var.api_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-api.zip")
   worker_zip   = var.worker_zip_path != null ? abspath(var.worker_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip")
   realtime_zip = var.realtime_zip_path != null ? abspath(var.realtime_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-realtime.zip")
@@ -127,20 +132,21 @@ resource "aws_s3_object" "ui_config" {
 }
 
 resource "aws_sqs_queue" "run_dlq" {
-  name                      = "${local.name}-run-dlq"
-  message_retention_seconds = 1209600
-  sqs_managed_sse_enabled   = true
+  name                       = "${local.name}-run-dlq"
+  visibility_timeout_seconds = local.run_queue_visibility_seconds
+  message_retention_seconds  = 1209600
+  sqs_managed_sse_enabled    = true
 }
 
 resource "aws_sqs_queue" "runs" {
   name                       = "${local.name}-runs"
-  visibility_timeout_seconds = 360
+  visibility_timeout_seconds = local.run_queue_visibility_seconds
   message_retention_seconds  = 86400
   receive_wait_time_seconds  = 10
   sqs_managed_sse_enabled    = true
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.run_dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = local.run_max_attempts
   })
 }
 
@@ -296,9 +302,12 @@ data "aws_iam_policy_document" "worker" {
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
       "sqs:ChangeMessageVisibility",
-      "sqs:GetQueueAttributes",
-      "sqs:SendMessage"
+      "sqs:GetQueueAttributes"
     ]
+    resources = [aws_sqs_queue.runs.arn, aws_sqs_queue.run_dlq.arn]
+  }
+  statement {
+    actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.runs.arn]
   }
   statement {
@@ -388,7 +397,7 @@ resource "aws_lambda_function" "worker" {
   runtime       = "python3.12"
   handler       = "hindsight.worker.handler"
   memory_size   = 1024
-  timeout       = 180
+  timeout       = local.worker_timeout_seconds
   architectures = ["x86_64"]
 
   s3_bucket        = aws_s3_bucket.artifacts.id
@@ -399,18 +408,20 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM      = var.database_url_parameter_name
-      HINDSIGHT_GEMINI_API_KEYS_PARAM   = var.gemini_api_keys_parameter_name
-      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE = aws_dynamodb_table.gemini_key_health.name
-      HINDSIGHT_RUN_QUEUE_URL           = aws_sqs_queue.runs.url
-      HINDSIGHT_WORKER_MAX_RECEIVES     = "3"
-      LLM_PROVIDER                      = var.llm_provider
-      EMBEDDING_PROVIDER                = var.embedding_provider
-      GEMINI_MODEL                      = var.gemini_model
-      GEMINI_EMBEDDING_MODEL            = var.gemini_embedding_model
-      BEDROCK_MODEL                     = var.bedrock_model
-      BEDROCK_EMBEDDING_MODEL           = var.bedrock_embedding_model
-      REASONING_MAX_ATTEMPTS            = tostring(var.reasoning_max_attempts)
+      HINDSIGHT_DATABASE_URL_PARAM        = var.database_url_parameter_name
+      HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
+      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
+      HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
+      HINDSIGHT_RUN_DLQ_ARN               = aws_sqs_queue.run_dlq.arn
+      HINDSIGHT_RUN_MAX_ATTEMPTS          = tostring(local.run_max_attempts)
+      HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS = tostring(local.run_attempt_lease_seconds)
+      LLM_PROVIDER                        = var.llm_provider
+      EMBEDDING_PROVIDER                  = var.embedding_provider
+      GEMINI_MODEL                        = var.gemini_model
+      GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
+      BEDROCK_MODEL                       = var.bedrock_model
+      BEDROCK_EMBEDDING_MODEL             = var.bedrock_embedding_model
+      REASONING_MAX_ATTEMPTS              = tostring(var.reasoning_max_attempts)
     }
   }
 }
@@ -462,6 +473,13 @@ resource "aws_lambda_function" "changefeed" {
 
 resource "aws_lambda_event_source_mapping" "worker" {
   event_source_arn        = aws_sqs_queue.runs.arn
+  function_name           = aws_lambda_function.worker.arn
+  batch_size              = 5
+  function_response_types = ["ReportBatchItemFailures"]
+}
+
+resource "aws_lambda_event_source_mapping" "worker_dlq" {
+  event_source_arn        = aws_sqs_queue.run_dlq.arn
   function_name           = aws_lambda_function.worker.arn
   batch_size              = 5
   function_response_types = ["ReportBatchItemFailures"]
