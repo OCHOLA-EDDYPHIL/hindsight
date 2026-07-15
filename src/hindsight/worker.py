@@ -107,17 +107,19 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
     if command not in {"start", "resume"}:
         raise ValueError(f"unsupported worker command: {command}")
 
+    settings = runtime_settings()
+    db_url = settings.database_url
     expected_status = "queued" if command == "start" else "resuming"
     claimed_status = "triaging" if command == "start" else "reflecting"
     run = claim_run(
         run_id=run_id,
         expected_status=expected_status,
         next_status=claimed_status,
+        db_url=db_url,
     )
     if run is None:
-        return get_run(run_id=run_id)
+        return get_run(run_id=run_id, db_url=db_url)
 
-    settings = runtime_settings()
     uses_gemini = any(
         settings.provider_env.get(name, "").strip().lower() == "gemini"
         for name in ("LLM_PROVIDER", "EMBEDDING_PROVIDER")
@@ -175,7 +177,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
             summary=_phase_summary(phase, status),
             metadata=metadata,
             fields=fields,
-            db_url=settings.database_url,
+            db_url=db_url,
         )
 
     try:
@@ -193,7 +195,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
                 run_id=run_id,
                 decision_id=run["decision_id"],
                 pause_before_act=True,
-                db_url=settings.database_url,
+                db_url=db_url,
                 reasoning_provider=provider,
                 embedding_provider=embedding_provider,
                 progress_callback=progress,
@@ -202,7 +204,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
             result = resume_incident_agent(
                 thread_id=run["thread_id"],
                 approved=bool(message.get("approved")),
-                db_url=settings.database_url,
+                db_url=db_url,
                 reasoning_provider=provider,
                 embedding_provider=embedding_provider,
                 progress_callback=progress,
@@ -218,14 +220,14 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
                 phase="retry",
                 summary=f"Agent run will retry after attempt {attempt}",
                 metadata={"attempt": attempt, "error_type": type(exc).__name__},
-                db_url=settings.database_url,
+                db_url=db_url,
             )
         else:
             fail_run(
                 run_id=run_id,
                 failure_code=type(exc).__name__,
                 failure_detail=safe_error_detail(exc),
-                db_url=settings.database_url,
+                db_url=db_url,
             )
         raise
 
@@ -242,7 +244,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
                 if isinstance(interrupt_value, dict)
                 else result.proposed_action,
             },
-            db_url=settings.database_url,
+            db_url=db_url,
         )
 
     reasoning = result.state.get("reasoning") or {}
@@ -262,7 +264,7 @@ def process_message(message: dict[str, Any], *, attempt: int = 1) -> dict[str, A
             "usage": reasoning.get("usage") or {},
             "reflected_memory_id": result.reflected_memory_id,
         },
-        db_url=settings.database_url,
+        db_url=db_url,
     )
 
 
