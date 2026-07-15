@@ -282,6 +282,125 @@ def test_semantic_write_creates_embedding_row():
 
 
 @requires_db
+def test_owned_semantic_write_retries_serialization_with_one_prepared_embedding(monkeypatch):
+    from psycopg.errors import SerializationFailure
+
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    class CountingProvider(DeterministicEmbeddingProvider):
+        def __init__(self):
+            super().__init__()
+            self.document_calls = 0
+
+        def embed_document(self, text):
+            self.document_calls += 1
+            return super().embed_document(text)
+
+    provider = CountingProvider()
+    namespace = f"owned-serialization-retry-{uuid4()}"
+    original = MemoryStore._insert_semantic_embedding
+    insert_calls = 0
+
+    def fail_once(self, **kwargs):
+        nonlocal insert_calls
+        insert_calls += 1
+        if insert_calls == 1:
+            raise SerializationFailure("restart transaction")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "_insert_semantic_embedding", fail_once)
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        memory = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="retry fanout overloaded the processor",
+            provenance=Provenance("pytest", "evidence:serialization", "retry owned write"),
+        )
+
+    with connect() as conn:
+        persisted = conn.execute(
+            """
+                SELECT count(*), count(vector.memory_id), count(evidence.id)
+                FROM semantic_memories AS memory
+                LEFT JOIN semantic_memory_vectors AS vector ON vector.memory_id = memory.id
+                LEFT JOIN memory_external_evidence AS evidence
+                    ON evidence.semantic_memory_id = memory.id
+                WHERE memory.namespace = %s
+            """,
+            (namespace,),
+        ).fetchone()
+
+    assert persisted == (1, 1, 1)
+    assert memory["namespace"] == namespace
+    assert insert_calls == 2
+    assert provider.document_calls == 1
+
+
+@requires_db
+def test_serialization_retry_exhaustion_is_owned_and_caller_transactions_propagate(
+    monkeypatch,
+):
+    from psycopg.errors import SerializationFailure
+
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import (
+        MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS,
+        MemoryStore,
+        Provenance,
+    )
+
+    namespaces = {
+        "owned": f"owned-serialization-exhaustion-{uuid4()}",
+        "caller": f"caller-serialization-propagation-{uuid4()}",
+    }
+    insert_calls = 0
+
+    def always_restart(self, **kwargs):
+        nonlocal insert_calls
+        insert_calls += 1
+        raise SerializationFailure("restart transaction")
+
+    monkeypatch.setattr(MemoryStore, "_insert_semantic_embedding", always_restart)
+    with MemoryStore(
+        url=database_url(), embedding_provider=DeterministicEmbeddingProvider()
+    ) as store:
+        with pytest.raises(SerializationFailure):
+            store.remember(
+                memory_kind="semantic",
+                namespace=namespaces["owned"],
+                content="owned retry exhaustion",
+                provenance=Provenance("pytest", "evidence:owned", "exhaust retries"),
+            )
+    assert insert_calls == MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS
+
+    with connect() as caller_connection:
+        with MemoryStore(
+            conn=caller_connection,
+            embedding_provider=DeterministicEmbeddingProvider(),
+        ) as store:
+            with pytest.raises(SerializationFailure):
+                store.remember(
+                    memory_kind="semantic",
+                    namespace=namespaces["caller"],
+                    content="caller retry propagation",
+                    provenance=Provenance(
+                        "pytest", "evidence:caller", "preserve outer transaction fence"
+                    ),
+                )
+        caller_connection.rollback()
+    assert insert_calls == MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS + 1
+
+    with connect() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE namespace = ANY(%s)",
+            (list(namespaces.values()),),
+        ).fetchone() == (0,)
+
+
+@requires_db
 def test_bad_embedding_provider_does_not_leave_semantic_row():
     from hindsight.db import connect
     from hindsight.memory import MemoryStore, Provenance
