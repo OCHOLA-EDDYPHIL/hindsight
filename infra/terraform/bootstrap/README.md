@@ -16,13 +16,12 @@ terraform -chdir=infra/terraform/bootstrap apply -var-file=terraform.tfvars
 
 Record the state bucket, deployment role, ACM certificate, domain, and Cloudflare zone outputs as GitHub repository variables. Set `create_github_oidc_provider = false` and pass the existing provider ARN when the AWS account already trusts GitHub.
 
-When using Bedrock embeddings, keep `bedrock_embedding_model` aligned with the application stack's `HINDSIGHT_BEDROCK_EMBEDDING_MODEL` repository variable so the deployment workflow can build that exact profile without broader model permissions.
+Bedrock-related bootstrap variables and permissions are legacy wiring for the dormant adapter. The adapter is quota-deferred, unhosted, excluded from live acceptance, and not part of the submission; do not configure it for the submission deployment.
 
 ## Upgrading an existing deployment role
 
 The application workflow cannot update its own bootstrap role. Before running live acceptance for a revision that adds AWS services or provider checks, apply the bootstrap plan with a separate trusted bootstrap administrator (or a separately protected bootstrap role). For the governed-memory release, the minimal role-policy delta is:
 
-- `bedrock:InvokeModel` for the configured Titan embedding-model ARN;
 - the EventBridge rule/target lifecycle actions used by the operation reaper;
 - the Lambda reserved-concurrency lifecycle actions used by the hosted functions;
 - the finite S3 bucket/object metadata and CloudWatch log-delivery lifecycle actions required by the AWS provider.

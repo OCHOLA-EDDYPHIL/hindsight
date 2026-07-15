@@ -1,4 +1,4 @@
-"""Reasoning provider tests."""
+"""Reasoning-provider tests, including isolated dormant-adapter coverage."""
 
 import os
 from types import SimpleNamespace
@@ -40,6 +40,19 @@ def test_provider_from_env_defaults_to_gemini_and_requires_key():
 
     with pytest.raises(ReasoningProviderError, match="GEMINI_API_KEY"):
         reasoning_provider_from_env({})
+
+
+def test_default_provider_never_constructs_bedrock(monkeypatch):
+    from hindsight.reasoning import GeminiReasoningProvider, reasoning_provider_from_env
+
+    def unexpected_bedrock(**_kwargs):
+        pytest.fail("default provider selection constructed Bedrock")
+
+    monkeypatch.setattr("hindsight.reasoning.BedrockReasoningProvider", unexpected_bedrock)
+
+    provider = reasoning_provider_from_env({}, gemini_pool=object())
+
+    assert isinstance(provider, GeminiReasoningProvider)
 
 
 def test_provider_from_env_supports_deterministic():
@@ -106,7 +119,7 @@ def test_gemini_provider_reports_pool_slot_without_key_material():
     assert "sensitive-key" not in str(response.usage)
 
 
-def test_bedrock_provider_uses_injected_client_without_network():
+def test_dormant_bedrock_adapter_uses_injected_client_without_network():
     from hindsight.reasoning import BedrockReasoningProvider, ReasoningRequest
 
     calls = []
@@ -178,7 +191,7 @@ def test_retrying_reasoning_provider_records_attempts_after_retry():
     assert response.usage["attempts"] == 2
 
 
-def test_provider_from_env_supports_bedrock(monkeypatch):
+def test_explicit_bedrock_selection_constructs_dormant_adapter(monkeypatch):
     from hindsight.reasoning import BedrockReasoningProvider, reasoning_provider_from_env
 
     class FakeBedrockProvider(BedrockReasoningProvider):
@@ -203,7 +216,7 @@ def test_provider_from_env_supports_bedrock(monkeypatch):
     assert provider.model_name == "bedrock-env"
 
 
-def test_bedrock_provider_configures_bounded_boto_client(monkeypatch):
+def test_dormant_bedrock_adapter_configures_bounded_boto_client(monkeypatch):
     import hindsight.reasoning as reasoning
 
     calls = []
@@ -252,9 +265,9 @@ def test_live_gemini_reasoning_provider():
 
 @pytest.mark.skipif(
     os.environ.get("RUN_LIVE_BEDROCK_REASONING") != "1",
-    reason="live Bedrock reasoning invocation is opt-in",
+    reason="dormant Bedrock adapter check is manual and excluded from live acceptance",
 )
-def test_live_bedrock_reasoning_provider():
+def test_manual_dormant_bedrock_reasoning_adapter():
     from hindsight.reasoning import BedrockReasoningProvider, ReasoningRequest
 
     response = BedrockReasoningProvider(

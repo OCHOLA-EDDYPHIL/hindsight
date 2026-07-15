@@ -1,10 +1,9 @@
-"""Scriptable cross-episode learning demo for M4 #21."""
+"""Scriptable cross-episode mechanism demo for M4 #21."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -65,17 +64,17 @@ class CrossEpisodeRunSummary:
     reflected_memory_id: str | None
     recalled_memory_ids: list[str]
     recalled_lesson_memory_ids: list[str]
-    elapsed_ms: int
 
 
 @dataclass(frozen=True)
 class CrossEpisodeDemoResult:
-    """Complete result for the cross-episode learning demo."""
+    """Complete result for the cross-episode mechanism demo."""
 
     namespace: str
     episode_one: CrossEpisodeRunSummary
     consolidation: ConsolidationResult
     episode_two: CrossEpisodeRunSummary
+
 
 class CrossEpisodeMechanismReasoningProvider:
     """Fixture provider illustrating that recalled lessons enter the next prompt."""
@@ -258,7 +257,7 @@ def open_demo_incident(
                     justification="Store incident telemetry summary for cross-episode demo",
                 ),
                 metadata={
-                    "demo": "cross-episode-learning",
+                    "demo": "cross-episode-mechanism",
                     "role": "incident-summary",
                     "incident_slug": slug,
                     "service_slug": SERVICE_SLUG,
@@ -337,7 +336,6 @@ def _run_episode(
             "hindsight.memory.namespace": namespace,
         },
     ) as span:
-        started = perf_counter()
         result = run_incident_agent(
             IncidentInput(
                 user_input=summary,
@@ -346,19 +344,17 @@ def _run_episode(
                 service_slug=SERVICE_SLUG,
                 severity=incident["severity"],
                 title=incident["title"],
-                metadata={"demo": "cross-episode-learning", "episode": label},
+                metadata={"demo": "cross-episode-mechanism", "episode": label},
             ),
             thread_id=f"{namespace}:{label}",
             db_url=db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider_from_env(),
         )
-        elapsed_ms = int((perf_counter() - started) * 1000)
         summary_result = _episode_summary(
             label=label,
             incident=incident,
             result=result,
-            elapsed_ms=elapsed_ms,
         )
         set_span_attributes(
             span,
@@ -376,7 +372,6 @@ def _episode_summary(
     label: str,
     incident: dict[str, Any],
     result: IncidentAgentResult,
-    elapsed_ms: int,
 ) -> CrossEpisodeRunSummary:
     recalled = result.state.get("recalled_memories") or []
     recalled_ids = [str(row.get("memory_id") or row.get("id")) for row in recalled]
@@ -395,7 +390,6 @@ def _episode_summary(
         reflected_memory_id=result.reflected_memory_id,
         recalled_memory_ids=recalled_ids,
         recalled_lesson_memory_ids=recalled_lesson_ids,
-        elapsed_ms=elapsed_ms,
     )
 
 

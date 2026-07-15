@@ -1,7 +1,10 @@
 """Embedding providers for semantic memory.
 
-The vector store is provider-pluggable. Tests and local deterministic runs use
-the stable hashing provider; production can opt into Bedrock explicitly.
+Gemini is the submission provider; hosted behavior requires separate exact-SHA
+acceptance evidence. Tests and local deterministic runs may use the stable
+hashing fixture. The Bedrock adapter is retained only for explicit development
+work; it is quota-deferred, unhosted, and excluded from the submission and live
+acceptance.
 """
 
 from __future__ import annotations
@@ -189,7 +192,7 @@ class GeminiEmbeddingProvider:
 
 
 class BedrockTitanEmbeddingProvider:
-    """Amazon Bedrock Titan Text Embeddings V2 provider."""
+    """Dormant, unhosted Bedrock adapter excluded from the submission."""
 
     provider_name = "bedrock"
     capability = "semantic"
@@ -246,7 +249,7 @@ def embedding_provider_from_env(
     *,
     gemini_pool: GeminiCredentialPool | None = None,
 ) -> EmbeddingProvider:
-    """Build the configured embedding provider without enabling live calls implicitly."""
+    """Build the provider, defaulting locally to deterministic and never to Bedrock."""
 
     env = os.environ if environ is None else environ
     provider = (env.get("EMBEDDING_PROVIDER") or "deterministic").strip().lower()
