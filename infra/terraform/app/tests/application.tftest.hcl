@@ -84,7 +84,11 @@ run "complete_demo_graph" {
   }
 
   assert {
-    condition     = aws_api_gateway_account.cloudwatch.cloudwatch_role_arn == aws_iam_role.apigateway_cloudwatch.arn
-    error_message = "API Gateway access logs require the Terraform-owned account role."
+    condition = (
+      aws_iam_role.apigateway_cloudwatch.name == "hindsight-demo-apigateway-cloudwatch" &&
+      aws_iam_role_policy_attachment.apigateway_cloudwatch.role == aws_iam_role.apigateway_cloudwatch.name &&
+      endswith(aws_iam_role_policy_attachment.apigateway_cloudwatch.policy_arn, "AmazonAPIGatewayPushToCloudWatchLogs")
+    )
+    error_message = "API Gateway access logs require the Terraform-owned account role and managed policy."
   }
 }
