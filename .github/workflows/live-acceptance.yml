@@ -9,7 +9,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: hindsight-live-acceptance
+  group: hindsight-demo-environment
   cancel-in-progress: false
 
 env:
