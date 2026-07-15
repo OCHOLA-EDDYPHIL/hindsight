@@ -1,5 +1,6 @@
 """Embedding provider tests."""
 
+import math
 import os
 from types import SimpleNamespace
 
@@ -50,11 +51,79 @@ def test_deterministic_embedding_provider_is_stable():
     reason="live Bedrock embedding invocation is opt-in",
 )
 def test_live_bedrock_titan_embedding_provider():
-    from hindsight.embeddings import EMBEDDING_DIMENSIONS, BedrockTitanEmbeddingProvider
+    from hindsight.embeddings import (
+        BEDROCK_TITAN_EMBED_MODEL,
+        EMBEDDING_DIMENSIONS,
+        BedrockTitanEmbeddingProvider,
+    )
 
-    provider = BedrockTitanEmbeddingProvider(region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    configured_model = (
+        os.environ.get("BEDROCK_EMBEDDING_MODEL") or BEDROCK_TITAN_EMBED_MODEL
+    )
+    provider = BedrockTitanEmbeddingProvider(
+        model_id=configured_model,
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+    )
 
-    embedding = provider.embed("payment timeout in worker")
+    assert provider.model_name == configured_model
 
-    assert len(embedding) == EMBEDDING_DIMENSIONS
-    assert any(value != 0 for value in embedding)
+    query = provider.embed_query(
+        "Purchases freeze whenever the remote acquirer hesitates, and every failed "
+        "attempt creates even more work."
+    )
+    relevant = provider.embed_document(
+        "When checkout latency follows downstream processor failures that multiply "
+        "retries, inspect dependency health and reduce retry fanout before adding workers."
+    )
+    distractor = provider.embed_document(
+        "When card gateway certificate expiration breaks checkout, rotate the TLS "
+        "certificate and restart edge connections."
+    )
+
+    assert len(query) == len(relevant) == len(distractor) == EMBEDDING_DIMENSIONS
+    assert any(value != 0 for value in query)
+    assert _cosine_distance(query, relevant) < _cosine_distance(query, distractor)
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_GEMINI_EMBEDDINGS") != "1",
+    reason="live Gemini embedding invocation is opt-in",
+)
+def test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase():
+    from hindsight.embeddings import DEFAULT_GEMINI_EMBEDDING_MODEL, GeminiEmbeddingProvider
+    from hindsight.gemini import gemini_pool_from_env
+
+    configured_model = (
+        os.environ.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
+    )
+    provider = GeminiEmbeddingProvider(
+        credential_pool=gemini_pool_from_env(),
+        model_name=configured_model,
+    )
+
+    assert provider.model_name == configured_model
+    query = provider.embed_query(
+        "Purchases freeze whenever the remote acquirer hesitates, and each failed "
+        "attempt creates even more work."
+    )
+    relevant = provider.embed_document(
+        "When checkout latency follows downstream processor failures that multiply "
+        "retries, inspect dependency health and reduce retry fanout before adding workers."
+    )
+    lexical_distractor = provider.embed_document(
+        "When card gateway certificate expiration breaks checkout, rotate the TLS "
+        "certificate and restart edge connections."
+    )
+
+    relevant_distance = _cosine_distance(query, relevant)
+    distractor_distance = _cosine_distance(query, lexical_distractor)
+
+    assert relevant_distance < distractor_distance
+    assert relevant_distance < 0.35
+
+
+def _cosine_distance(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    return 1 - dot / (left_norm * right_norm)

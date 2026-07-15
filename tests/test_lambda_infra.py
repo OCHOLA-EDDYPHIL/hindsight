@@ -79,3 +79,5 @@ def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     )
     assert 'export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"' in workflow
     assert "export EMBEDDING_PROVIDER=gemini" not in workflow
+    assert "github.triggering_actor" in workflow
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow

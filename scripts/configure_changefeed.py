@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from typing import Any
 
 from psycopg import sql
@@ -22,6 +23,8 @@ WATCHED_TABLES = (
     "agent_run_events",
 )
 CHANGEFEED_SCHEMA_VERSION = 2
+CHANGEFEED_STATE_TIMEOUT_SECONDS = 60.0
+TERMINAL_JOB_STATUSES = frozenset({"canceled", "failed", "succeeded"})
 CHANGEFEED_OPTIONS = {
     "diff": True,
     "updated": True,
@@ -41,6 +44,10 @@ def main() -> None:
         result = pause_changefeed()
     else:
         result = changefeed_status()
+    if args.command in {"apply", "status"} and result["status"] != "running":
+        raise RuntimeError(
+            f"managed changefeed is not running: {result.get('status') or 'absent'}"
+        )
     print(_summary(result))
 
 
@@ -67,48 +74,60 @@ def apply_changefeed(
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    job_id: str
+    changed = False
     with connect(db_url, application_name="hindsight-changefeed-deploy") as conn:
         with conn.transaction():
             existing_job = _app_meta(conn, JOB_KEY)
             existing_fingerprint = _app_meta(conn, FINGERPRINT_KEY)
             existing_status = _job_status(conn, existing_job) if existing_job else None
-            if existing_job and existing_fingerprint == fingerprint and existing_status:
-                if existing_status == "paused":
-                    conn.execute(sql.SQL("RESUME JOB {}").format(sql.Literal(int(existing_job))))
-                    existing_status = "running"
-                return {"job_id": existing_job, "status": existing_status, "changed": False}
-            if existing_job and existing_status not in {None, "canceled", "failed", "succeeded"}:
-                conn.execute(sql.SQL("CANCEL JOB {}").format(sql.Literal(int(existing_job))))
+            same_job = existing_job and existing_fingerprint == fingerprint
+            if same_job and existing_status == "running":
+                return {"job_id": existing_job, "status": "running", "changed": False}
+            if same_job and existing_status == "paused":
+                conn.execute(sql.SQL("RESUME JOB {}").format(sql.Literal(int(existing_job))))
+                job_id = str(existing_job)
+                changed = True
+            else:
+                if existing_job and existing_status not in {None, *TERMINAL_JOB_STATUSES}:
+                    conn.execute(sql.SQL("CANCEL JOB {}").format(sql.Literal(int(existing_job))))
 
-            tables = sql.SQL(", ").join(sql.Identifier(table) for table in WATCHED_TABLES)
-            statement = sql.SQL(
-                """
-                    CREATE CHANGEFEED FOR TABLE {}
-                    INTO {}
-                    WITH diff,
-                         updated,
-                         initial_scan = 'no',
-                         resolved = '10s',
-                         min_checkpoint_frequency = '10s',
-                         webhook_auth_header = {}
-                """
-            ).format(
-                tables,
-                sql.Literal(sink),
-                sql.Literal(f"Bearer {auth_token}"),
-            )
-            row = conn.execute(statement).fetchone()
-            if row is None:
-                raise RuntimeError("CockroachDB did not return a changefeed job id")
-            job_id = str(row[0])
-            _set_app_meta(conn, JOB_KEY, job_id)
-            _set_app_meta(conn, FINGERPRINT_KEY, fingerprint)
-            return {"job_id": job_id, "status": "running", "changed": True}
+                tables = sql.SQL(", ").join(sql.Identifier(table) for table in WATCHED_TABLES)
+                statement = sql.SQL(
+                    """
+                        CREATE CHANGEFEED FOR TABLE {}
+                        INTO {}
+                        WITH diff,
+                             updated,
+                             initial_scan = 'no',
+                             resolved = '10s',
+                             min_checkpoint_frequency = '10s',
+                             webhook_auth_header = {}
+                    """
+                ).format(
+                    tables,
+                    sql.Literal(sink),
+                    sql.Literal(f"Bearer {auth_token}"),
+                )
+                row = conn.execute(statement).fetchone()
+                if row is None:
+                    raise RuntimeError("CockroachDB did not return a changefeed job id")
+                job_id = str(row[0])
+                _set_app_meta(conn, JOB_KEY, job_id)
+                _set_app_meta(conn, FINGERPRINT_KEY, fingerprint)
+                changed = True
+    return _wait_for_job_status(
+        job_id=job_id,
+        expected="running",
+        changed=changed,
+        db_url=db_url,
+    )
 
 
 def pause_changefeed(*, db_url: str | None = None) -> dict[str, Any]:
     """Pause the managed changefeed before its webhook endpoint is destroyed."""
 
+    changed = False
     with connect(db_url, application_name="hindsight-changefeed-deploy") as conn:
         with conn.transaction():
             job_id = _app_meta(conn, JOB_KEY)
@@ -117,8 +136,17 @@ def pause_changefeed(*, db_url: str | None = None) -> dict[str, Any]:
             current = _job_status(conn, job_id)
             if current == "running":
                 conn.execute(sql.SQL("PAUSE JOB {}").format(sql.Literal(int(job_id))))
-                return {"job_id": job_id, "status": "paused", "changed": True}
-            return {"job_id": job_id, "status": current or "absent", "changed": False}
+                changed = True
+            elif current != "paused":
+                raise RuntimeError(
+                    f"managed changefeed cannot be paused from status {current or 'absent'}"
+                )
+    return _wait_for_job_status(
+        job_id=job_id,
+        expected="paused",
+        changed=changed,
+        db_url=db_url,
+    )
 
 
 def changefeed_status(*, db_url: str | None = None) -> dict[str, Any]:
@@ -129,6 +157,37 @@ def changefeed_status(*, db_url: str | None = None) -> dict[str, Any]:
             "status": _job_status(conn, job_id) if job_id else "absent",
             "changed": False,
         }
+
+
+def _wait_for_job_status(
+    *,
+    job_id: str,
+    expected: str,
+    changed: bool,
+    db_url: str | None,
+    timeout_seconds: float = CHANGEFEED_STATE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Wait until CockroachDB observes a requested managed-job transition."""
+
+    deadline = time.monotonic() + timeout_seconds
+    last_status: str | None = None
+    while True:
+        status = changefeed_status(db_url=db_url)
+        if status["job_id"] != job_id:
+            raise RuntimeError("managed changefeed identity changed during state transition")
+        last_status = str(status["status"] or "") or None
+        if last_status == expected:
+            return {"job_id": job_id, "status": expected, "changed": changed}
+        if last_status in TERMINAL_JOB_STATUSES:
+            raise RuntimeError(
+                f"managed changefeed entered terminal status {last_status} while awaiting {expected}"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "managed changefeed did not reach "
+                f"{expected} within {timeout_seconds:g}s (last status: {last_status or 'absent'})"
+            )
+        time.sleep(1)
 
 
 def _app_meta(conn: Any, key: str) -> str | None:

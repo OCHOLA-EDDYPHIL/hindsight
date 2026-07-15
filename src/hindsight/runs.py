@@ -43,9 +43,13 @@ def create_incident(
     severity: str,
     summary: str,
     service_slug: str | None = None,
+    consolidation_policy: str = "managed",
     db_url: str | None = None,
 ) -> dict[str, Any]:
     """Create one open incident and optionally associate its service."""
+
+    if consolidation_policy not in {"managed", "manual"}:
+        raise ValueError("consolidation_policy must be managed or manual")
 
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
@@ -53,12 +57,13 @@ def create_incident(
                 cur.execute(
                     """
                         INSERT INTO incidents (
-                            slug, title, severity, status, started_at, summary
+                            slug, title, severity, status, started_at, summary,
+                            consolidation_policy
                         )
-                        VALUES (%s, %s, %s, 'open', now(), %s)
+                        VALUES (%s, %s, %s, 'open', now(), %s, %s)
                         RETURNING *
                     """,
-                    (slug, title, severity, summary),
+                    (slug, title, severity, summary, consolidation_policy),
                 )
                 incident = dict(cur.fetchone())
                 if service_slug:

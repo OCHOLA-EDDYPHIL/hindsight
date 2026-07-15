@@ -4,10 +4,21 @@ import importlib.util
 import pathlib
 import sys
 
+import pytest
+
 
 def _configure_module():
     path = pathlib.Path("scripts/configure_demo_secrets.py")
     spec = importlib.util.spec_from_file_location("configure_demo_secrets", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _changefeed_module():
+    path = pathlib.Path("scripts/configure_changefeed.py")
+    spec = importlib.util.spec_from_file_location("configure_changefeed", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -82,3 +93,73 @@ def test_configure_demo_secrets_preserves_generated_tokens_on_overwrite(
         "/hindsight/demo/gemini-api-keys",
     }
     assert "operator-token" in capsys.readouterr().out
+
+
+def test_changefeed_wait_observes_requested_database_state(monkeypatch):
+    configure = _changefeed_module()
+    statuses = iter(
+        [
+            {"job_id": "42", "status": "pause-requested"},
+            {"job_id": "42", "status": "paused"},
+        ]
+    )
+    monkeypatch.setattr(configure, "changefeed_status", lambda **_kwargs: next(statuses))
+    monkeypatch.setattr(configure.time, "sleep", lambda _seconds: None)
+
+    result = configure._wait_for_job_status(  # noqa: SLF001 - CLI state-machine test
+        job_id="42",
+        expected="paused",
+        changed=True,
+        db_url="postgresql://db",
+    )
+
+    assert result == {"job_id": "42", "status": "paused", "changed": True}
+
+
+def test_changefeed_wait_rejects_terminal_failure(monkeypatch):
+    configure = _changefeed_module()
+    monkeypatch.setattr(
+        configure,
+        "changefeed_status",
+        lambda **_kwargs: {"job_id": "42", "status": "failed"},
+    )
+
+    with pytest.raises(RuntimeError, match="terminal status failed"):
+        configure._wait_for_job_status(  # noqa: SLF001 - CLI state-machine test
+            job_id="42",
+            expected="running",
+            changed=False,
+            db_url="postgresql://db",
+        )
+
+
+def test_changefeed_status_command_fails_when_not_running(monkeypatch):
+    configure = _changefeed_module()
+    monkeypatch.setattr(
+        configure,
+        "changefeed_status",
+        lambda: {"job_id": "42", "status": "failed", "changed": False},
+    )
+    monkeypatch.setattr(sys, "argv", ["configure_changefeed.py", "status"])
+
+    with pytest.raises(RuntimeError, match="not running: failed"):
+        configure.main()
+
+
+def test_live_acceptance_restores_changefeed_after_benchmark_failure():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    assert "github.triggering_actor" in workflow
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
+    restore_job = workflow.split("  restore_changefeed:\n", 1)[1].split(
+        "  browser_acceptance:\n", 1
+    )[0]
+
+    assert "if: always() && needs.deploy.result == 'success'" in restore_job
+    assert "if: needs.benchmark.result != 'success'" in restore_job
+    assert "run_learning_benchmark.py finalize-interrupted" in restore_job
+    restore_step = restore_job.split(
+        "- name: Restore and verify the managed changefeed", 1
+    )[1]
+    assert "if: always()" in restore_step
+    assert "configure_changefeed.py apply" in restore_step
+    assert "configure_changefeed.py status" in restore_step

@@ -1,5 +1,6 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
 LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
+BENCHMARK_MAX_DISTANCE ?= 0.35
 
 .PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts mcp-server telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local cross-episode-demo cross-episode-demo-local cross-episode-trace-local benchmark-smoke benchmark-pilot memory-dashboard memory-dashboard-local product-api-local changefeed-apply changefeed-pause changefeed-status
 
@@ -61,7 +62,7 @@ benchmark-smoke:
 	uv run python scripts/run_learning_benchmark.py ci-smoke
 
 benchmark-pilot:
-	uv run python scripts/run_learning_benchmark.py pilot
+	HINDSIGHT_BENCHMARK_CODE_SHA="$$(git rev-parse HEAD)" uv run python scripts/run_learning_benchmark.py pilot --max-distance "$(BENCHMARK_MAX_DISTANCE)"
 
 memory-dashboard:
 	uv run python scripts/run_memory_dashboard.py

@@ -87,6 +87,29 @@ def test_incident_changefeed_handler_consolidates_resolved_after_row(monkeypatch
     ]
 
 
+def test_lesson_parser_accepts_bare_or_single_fenced_json_without_prose():
+    from hindsight.consolidation import LessonValidationError, _parse_lesson_response
+
+    payload = '{"schema_version":1,"title":"Retry lesson","claims":[]}'
+    expected = {
+        "schema_version": 1,
+        "title": "Retry lesson",
+        "claims": [],
+    }
+
+    assert _parse_lesson_response(payload) == expected
+    assert _parse_lesson_response(f"```json\n{payload}\n```") == expected
+    assert _parse_lesson_response(f"```\n{payload}\n```") == expected
+
+    for invalid in (
+        f"Here is the lesson:\n{payload}",
+        f"```json\n{payload}\n```\nExtra explanation",
+        "[]",
+    ):
+        with pytest.raises(LessonValidationError):
+            _parse_lesson_response(invalid)
+
+
 @requires_db
 def test_consolidation_writes_idempotent_lesson_with_provenance():
     import hindsight.consolidation as consolidation

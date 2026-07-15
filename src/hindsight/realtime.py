@@ -189,6 +189,10 @@ def _resolved_incident_transition(row: Any) -> dict[str, str] | None:
         return None
     if before.get("status") == "resolved" or after.get("status") != "resolved":
         return None
+    if after.get("consolidation_policy", "managed") != "managed":
+        # Manual producers (including the governed benchmark) own their
+        # consolidation lifecycle and must not receive a second async claimant.
+        return None
     if not after.get("id") or not after.get("resolution_event_id"):
         return None
     return {

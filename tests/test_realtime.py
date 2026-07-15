@@ -160,6 +160,66 @@ def test_changefeed_handler_authenticates_and_accepts_batch(monkeypatch):
     assert delivered[0]["type"] == "run"
 
 
+def test_managed_changefeed_does_not_enqueue_manual_consolidation(monkeypatch):
+    import hindsight.realtime as realtime
+
+    monkeypatch.setattr(realtime, "_CHANGEFEED_TOKEN_CACHE", "webhook-secret")
+    queued = []
+    monkeypatch.setattr(realtime, "enqueue_run", lambda message: queued.append(message))
+    monkeypatch.setattr(realtime, "fanout_event", lambda _envelope: {"delivered": 0, "stale": 0})
+
+    response = realtime.changefeed_handler(
+        {
+            "headers": {"authorization": "Bearer webhook-secret"},
+            "body": json.dumps(
+                {
+                    "payload": [
+                        {
+                            "topic": "incidents",
+                            "value": {
+                                "before": {"status": "open"},
+                                "after": {
+                                    "id": "incident-1",
+                                    "slug": "benchmark:experiment:variant",
+                                    "status": "resolved",
+                                    "resolution_event_id": "event-1",
+                                    "consolidation_policy": "manual",
+                                },
+                            },
+                        }
+                    ]
+                }
+            ),
+        },
+        None,
+    )
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["consolidation_jobs_queued"] == 0
+    assert queued == []
+
+
+def test_resolved_transition_defaults_to_managed_consolidation():
+    import hindsight.realtime as realtime
+
+    transition = realtime._resolved_incident_transition(  # noqa: SLF001 - policy boundary
+        {
+            "topic": "incidents",
+            "value": {
+                "before": {"status": "open"},
+                "after": {
+                    "id": "incident-1",
+                    "slug": "ordinary-incident",
+                    "status": "resolved",
+                    "resolution_event_id": "event-1",
+                },
+            },
+        }
+    )
+
+    assert transition == {"id": "incident-1", "resolution_event_id": "event-1"}
+
+
 def test_websocket_subscribe_updates_ephemeral_registry(monkeypatch):
     import hindsight.realtime as realtime
 

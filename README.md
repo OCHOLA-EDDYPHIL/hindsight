@@ -67,16 +67,30 @@ Run it with the live dashboard open on the printed namespace to watch the consol
 make memory-dashboard-local
 ```
 
-The output includes the typed lesson, its citations and lineage, and the lesson recalled by episode two. Performance claims belong to the separate three-arm benchmark: no lesson, an independently verified gold lesson, and a normally consolidated lesson in an externally scored simulator. Confirmation evidence requires a pilot-derived, hash-pinned power analysis and held-out preregistration.
+The output includes the typed lesson, its citations and lineage, and the lesson recalled by episode two. Performance claims belong to the separate three-arm benchmark: no lesson, a project-curated reference lesson derived from the external simulator specification, and a normally consolidated lesson. The frozen corpus balances six independent failure mechanisms—retry amplification, cache stampedes, connection leaks, hot partitions, poison messages, and lock contention—across pilot and confirmation splits. Source evidence lives outside the tested arm namespaces. Every arm receives identical background and hard lexical distractors, and the claim gate verifies that the model saw the same ordered non-target content in every arm; random memory IDs and mechanism labels are never shown to the model. Recurrence prompts deliberately share little vocabulary with their targets. A live study proceeds only when both reference and consolidated lessons rank first under a precommitted semantic-profile distance cutoff.
 
-Run the frozen pilot, then use its experiment ID to preregister and execute held-out confirmation:
+Live benchmark commands require explicit reasoning and semantic-embedding providers. For Gemini, keep the API key in the local environment or `.env`, select both providers explicitly, and choose the cosine-distance cutoff on a separate calibration corpus before looking at pilot or confirmation outcomes. Profile activation, the pilot manifest, and the durable preregistration must all contain that same cutoff:
 
 ```bash
-uv run python scripts/run_learning_benchmark.py pilot
-uv run python scripts/run_learning_benchmark.py confirmation --pilot-experiment-id <id>
+export LLM_PROVIDER=gemini
+export EMBEDDING_PROVIDER=gemini
+export GEMINI_MODEL=gemini-2.5-flash
+export GEMINI_EMBEDDING_MODEL=gemini-embedding-2
+export BENCHMARK_MAX_DISTANCE=<precommitted-cosine-distance>
+export HINDSIGHT_BENCHMARK_CODE_SHA="$(git rev-parse HEAD)"
+
+uv run python scripts/reembed_memories.py --max-distance "$BENCHMARK_MAX_DISTANCE"
+uv run python scripts/run_learning_benchmark.py pilot \
+  --max-distance "$BENCHMARK_MAX_DISTANCE"
+uv run python scripts/run_learning_benchmark.py preregister \
+  --pilot-experiment-id <pilot-experiment-id>
+uv run python scripts/run_learning_benchmark.py confirmation \
+  --pilot-experiment-id <pilot-experiment-id>
 ```
 
-`ci-smoke` exercises the same trace and scoring machinery with deterministic fixtures, but the report always marks it ineligible for public performance claims.
+`preregister` derives the minimum independent sample from the completed pilot, then commits all twelve pilot-frozen held-out variants rather than outcome-selecting a subset. Two repetitions are aggregated within each incident variant, and same-mechanism variants are then aggregated before inference. Efficacy and reference noninferiority use one-sided exact sign-flip tests over mechanism-level action differences with Bonferroni control, plus an observed one-action minimum-effect gate; the pilot power calculation is explicitly a nominal normal approximation. Six mechanisms support pilot standard deviations up to about 0.755 actions at the frozen alpha, power, and effect target. If either endpoint requires more than six mechanisms, confirmation is not created and the study authorizes no claim; the corpus must be versioned and expanded without retuning against held-out outcomes. The study contract pins the code commit, corpus, providers, active embedding profile, cutoff, simulator, and endpoints, and permits only one outcome-bearing pilot and confirmation for that identity. `confirmation` loads that durable contract and cannot regenerate it. `ci-smoke` uses deterministic fixtures, skips live semantic rank checks, and is never eligible for performance claims.
+
+The owner-authorized `live acceptance` workflow runs provider, migration, hosted deployment, benchmark, and Firefox checks on GitHub-hosted runners. It assumes the demo role through OIDC and reads the encrypted database and Gemini pool from SSM; local `.env` credentials are not copied into GitHub.
 
 ## Live memory dashboard
 

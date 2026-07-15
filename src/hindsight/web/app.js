@@ -636,5 +636,5 @@ $("#liveButton").addEventListener("click", () => loadSnapshot());
 await establishOperatorSession();
 renderIncident();
 renderRun();
-await Promise.all([loadSnapshot(), loadIncidents()]);
+await Promise.all([loadSnapshot(params.get("as_of")), loadIncidents()]);
 connectEvents();

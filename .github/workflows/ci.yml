@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
+      - run: uv sync --frozen
       - run: docker compose up -d crdb
       - run: |
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1' && break
             sleep 1
           done

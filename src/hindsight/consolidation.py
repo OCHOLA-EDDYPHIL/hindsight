@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -856,9 +857,23 @@ def _generate_lesson(
             routing_key=f"consolidation:{context['incident']['id']}",
         )
     )
+    return _parse_lesson_response(response.text)
+
+
+def _parse_lesson_response(text: str) -> dict[str, Any]:
+    """Accept bare JSON or one optional JSON fence, but no surrounding prose."""
+
+    candidate = text.strip()
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```",
+        candidate,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if fenced is not None:
+        candidate = fenced.group(1).strip()
     try:
-        value = json.loads(response.text)
-    except json.JSONDecodeError as exc:
+        value = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError) as exc:
         raise LessonValidationError("model output is not JSON") from exc
     if not isinstance(value, dict):
         raise LessonValidationError("lesson must be a JSON object")
