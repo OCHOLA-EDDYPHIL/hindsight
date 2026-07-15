@@ -185,6 +185,7 @@ def test_readme_distinguishes_submission_tools_and_evidence_status():
     readme = pathlib.Path("README.md").read_text()
 
     assert "Hosted acceptance for the current revision is pending" in readme
+    assert "CockroachDB Distributed Vector Indexing" in readme
     assert "CockroachDB Cloud Managed MCP" in readme
     assert "Custom FastMCP server" in readme
     assert "Non-qualifying; distinct from CockroachDB Cloud Managed MCP" in readme

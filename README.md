@@ -52,7 +52,7 @@ flowchart LR
 
 | Item | Role in Hindsight | Evidence status |
 | --- | --- | --- |
-| CockroachDB Vector Search | `VECTOR(1024)` storage, vector indexes, and distance-ranked semantic retrieval | Intended qualifying CockroachDB tool 1; implementation is DB-tested, current hosted acceptance pending #65 |
+| CockroachDB Distributed Vector Indexing | `VECTOR(1024)` storage, vector indexes, and distance-ranked semantic retrieval | Intended qualifying CockroachDB tool 1; implementation is DB-tested, current hosted acceptance pending #65 |
 | CockroachDB Cloud Managed MCP | Planned official read-only, development-side inspection of identifiers from a future accepted hosted run | Organizer FAQ confirms this usage is eligible; Hindsight-specific transcript pending #72 |
 | CockroachDB changefeeds | Authenticated webhook delivery and WebSocket fanout | Supporting database feature; exact-main hosted evidence pending #65 |
 | `AS OF SYSTEM TIME` | Historical belief-state inspection within the retained MVCC window | Supporting database feature covered by DB-backed tests |
