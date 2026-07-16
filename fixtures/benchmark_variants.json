@@ -151,7 +151,7 @@
       "split": "pilot",
       "simulator_kind": "lock_contention",
       "recurrence_query": "A growing reservation lock queue waits behind one blocking checkout owner; what should happen before timeout changes?",
-      "source_summary": "A booking checkout held row locks during a slow fraud call, causing reservation transactions to accumulate behind it.",
+      "source_summary": "A long-lived booking transaction blocked the reservation lock graph while it held row locks during a slow fraud call, causing later reservations to accumulate behind it.",
       "root_cause": "A long-lived booking transaction blocked the reservation lock graph.",
       "resolution_action": "Inspect lock ownership, terminate the abandoned blocker, and move the remote call outside the transaction.",
       "resolution_observation": "Reservation latency recovered after the blocking transaction ended and waiting writes drained.",
