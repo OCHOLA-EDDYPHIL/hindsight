@@ -79,7 +79,7 @@
         {
           "context_id": "hard-pool-limit",
           "role": "hard_distractor",
-          "content": "When open database sessions rise and pool slots vanish, raise the search connection limit immediately."
+          "content": "Increase the search database pool limit whenever indexing slows, allowing more workers to borrow sessions before investigating cleanup."
         },
         {
           "context_id": "hard-reindex",
