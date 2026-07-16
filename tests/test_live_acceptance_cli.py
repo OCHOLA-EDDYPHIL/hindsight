@@ -104,7 +104,7 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
         )
     )
 
-    assert calls[0][0][-3:] == list(acceptance.SEMANTIC_SELECTORS)
+    assert calls[0][0][-3:] == list(acceptance.LOCAL_SEMANTIC_SELECTORS)
     assert calls[0][1]["RUN_LIVE_GEMINI_ACCEPTANCE"] == "1"
     with pytest.raises(ValueError, match="refuses loopback"):
         acceptance._verify_semantic(
@@ -113,6 +113,23 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
                 database_scope="hosted",
             )
         )
+
+    acceptance._verify_semantic(
+        SimpleNamespace(
+            database_url=(
+                "postgresql://operator@cluster.example:26257/hindsight?sslmode=verify-full"
+            ),
+            database_scope="hosted",
+        )
+    )
+
+    assert calls[1][0][-2:] == list(acceptance.SEMANTIC_RETRIEVAL_SELECTORS)
+    assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in calls[1][0]
+
+
+def test_hosted_product_owns_managed_not_direct_consolidation():
+    assert acceptance.MANAGED_CONSOLIDATION_SELECTOR in acceptance.HOSTED_PRODUCT_SELECTORS
+    assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in acceptance.HOSTED_PRODUCT_SELECTORS
 
 
 def _completed_report(kind: str, experiment_id: str) -> dict[str, object]:

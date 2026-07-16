@@ -28,14 +28,17 @@ PROVIDER_SANITY_SELECTORS = (
     "tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase",
     "tests/test_reasoning.py::test_live_gemini_reasoning_provider",
 )
-SEMANTIC_SELECTORS = (
+SEMANTIC_RETRIEVAL_SELECTORS = (
     "tests/test_live_semantic_acceptance.py::"
     "test_live_gemini_database_retrieval_discriminates_paraphrase_and_no_match",
     "tests/test_live_semantic_acceptance.py::"
     "test_live_gemini_cutoff_generalizes_across_calibration_mechanisms",
-    "tests/test_live_semantic_acceptance.py::"
-    "test_live_gemini_consolidation_publishes_cited_retrievable_lesson",
 )
+DIRECT_CONSOLIDATION_SELECTOR = (
+    "tests/test_live_semantic_acceptance.py::"
+    "test_live_gemini_consolidation_publishes_cited_retrievable_lesson"
+)
+LOCAL_SEMANTIC_SELECTORS = (*SEMANTIC_RETRIEVAL_SELECTORS, DIRECT_CONSOLIDATION_SELECTOR)
 RESILIENCE_SELECTORS = (
     "tests/test_migrations_and_roles.py",
     "tests/test_agent.py::"
@@ -47,8 +50,16 @@ RESILIENCE_SELECTORS = (
     "tests/test_worker.py",
     "tests/test_realtime.py",
 )
+MANAGED_CONSOLIDATION_SELECTOR = (
+    "tests/test_hosted_acceptance.py::"
+    "test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson"
+)
 HOSTED_PRODUCT_SELECTORS = (
-    "tests/test_hosted_acceptance.py",
+    MANAGED_CONSOLIDATION_SELECTOR,
+    "tests/test_hosted_acceptance.py::"
+    "test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq",
+    "tests/test_hosted_acceptance.py::"
+    "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe",
     "tests/test_browser_ui.py",
     "tests/test_hosted_database_roles.py",
 )
@@ -149,8 +160,10 @@ def _verify_semantic(args: argparse.Namespace) -> None:
     database_url = _required_database_url(args.database_url)
     if args.database_scope == "local":
         _validate_local_url(database_url)
+        selectors = LOCAL_SEMANTIC_SELECTORS
     else:
         _require_hosted_database(database_url)
+        selectors = SEMANTIC_RETRIEVAL_SELECTORS
     _require_gemini_credentials()
     env = dict(os.environ)
     env.update(
@@ -161,7 +174,7 @@ def _verify_semantic(args: argparse.Namespace) -> None:
             "RUN_LIVE_GEMINI_ACCEPTANCE": "1",
         }
     )
-    _run([sys.executable, "-m", "pytest", "-q", *SEMANTIC_SELECTORS], env=env)
+    _run([sys.executable, "-m", "pytest", "-q", *selectors], env=env)
 
 
 def _verify_resilience(args: argparse.Namespace) -> None:

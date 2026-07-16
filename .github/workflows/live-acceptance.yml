@@ -231,9 +231,9 @@ jobs:
             printf '%s\n' "$GEMINI_MATERIAL"
             echo "$delimiter"
           } >> "$GITHUB_ENV"
-      - name: Verify semantic retrieval and cited consolidation
+      - name: Verify semantic retrieval and cutoff
         run: uv run python scripts/run_live_acceptance.py hosted-product --phase semantic
-      - name: Verify hosted product behavior
+      - name: Verify managed consolidation and hosted product behavior
         run: uv run python scripts/run_live_acceptance.py hosted-product --phase full
       - name: Record hosted product evidence
         env:
