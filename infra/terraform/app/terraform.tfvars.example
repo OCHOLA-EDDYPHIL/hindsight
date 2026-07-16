@@ -1,7 +1,8 @@
 aws_region = "us-east-1"
 stage      = "demo"
 
-database_url_parameter_name    = "/hindsight/demo/database-url"
+api_database_url_parameter_name    = "/hindsight/demo/api-database-url"
+worker_database_url_parameter_name = "/hindsight/demo/worker-database-url"
 gemini_api_keys_parameter_name = "/hindsight/demo/gemini-api-keys"
 operator_token_parameter_name  = "/hindsight/demo/operator-token"
 changefeed_token_parameter_name = "/hindsight/demo/changefeed-token"

@@ -17,7 +17,7 @@ def test_application_stack_uses_split_artifacts_and_external_secret_references()
     assert 'resource "aws_dynamodb_table" "gemini_key_health"' in stack
 
 
-def test_api_lambda_can_construct_the_hosted_embedding_provider():
+def test_runtime_lambdas_use_distinct_database_parameters_without_bedrock():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
     api_policy = stack.split('data "aws_iam_policy_document" "api"', 1)[1].split(
         'resource "aws_iam_role_policy" "api"', 1
@@ -25,17 +25,25 @@ def test_api_lambda_can_construct_the_hosted_embedding_provider():
     api_lambda = stack.split('resource "aws_lambda_function" "api"', 1)[1].split(
         'resource "aws_lambda_function" "worker"', 1
     )[0]
+    worker_policy = stack.split('data "aws_iam_policy_document" "worker"', 1)[1].split(
+        'resource "aws_iam_role_policy" "worker"', 1
+    )[0]
 
     assert "local.parameter_arns.gemini" in api_policy
     assert "dynamodb:BatchGetItem" in api_policy
     assert "dynamodb:UpdateItem" in api_policy
-    assert "bedrock:InvokeModel" in api_policy
+    assert "local.parameter_arns.api_database" in api_policy
+    assert "local.parameter_arns.worker_database" not in api_policy
+    assert "bedrock:" not in api_policy
+    assert "local.parameter_arns.worker_database" in worker_policy
+    assert "local.parameter_arns.api_database" not in worker_policy
+    assert "bedrock:" not in worker_policy
     assert "HINDSIGHT_GEMINI_API_KEYS_PARAM" in api_lambda
     assert "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE" in api_lambda
     assert "LLM_PROVIDER" in api_lambda
     assert "EMBEDDING_PROVIDER" in api_lambda
     assert "GEMINI_EMBEDDING_MODEL" in api_lambda
-    assert "BEDROCK_EMBEDDING_MODEL" in api_lambda
+    assert "BEDROCK_" not in api_lambda
     assert 'resource "aws_cloudwatch_event_rule" "operation_reaper"' in stack
     assert 'command = "reap_memory_operations"' in stack
     assert 'resource "aws_api_gateway_account" "cloudwatch"' in stack
@@ -110,8 +118,8 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle
     assert "function:hindsight-${var.stage}-${component}" in bootstrap
-    assert "bedrock:InvokeModel" in bootstrap
-    assert "foundation-model/${var.bedrock_embedding_model}" in bootstrap
+    assert "bedrock:" not in bootstrap
+    assert "BEDROCK_" not in bootstrap
     assert "s3:GetBucketAcl" in bootstrap
     assert "s3:GetBucketCORS" in bootstrap
     assert "s3:GetBucketOwnershipControls" in bootstrap
@@ -147,8 +155,14 @@ def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     assert "CLOUDFLARE_API_TOKEN" in workflow
     migration = workflow.index("scripts/migrate.py")
     persistence = workflow.index("scripts/initialize_agent_storage.py")
+    roles = workflow.index("scripts/apply_database_roles.py")
     application = workflow.index("terraform -chdir=infra/terraform/app apply")
-    assert migration < persistence < application
+    assert migration < persistence < roles < application
+    assert "/hindsight/demo/database-url" in workflow
+    assert "/hindsight/demo/api-database-url" in workflow
+    assert "/hindsight/demo/worker-database-url" in workflow
+    assert "TF_VAR_database_url_parameter_name" not in workflow
+    assert "BEDROCK" not in workflow
     assert 'export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"' in workflow
     assert "export EMBEDDING_PROVIDER=gemini" not in workflow
     assert "github.triggering_actor" in workflow

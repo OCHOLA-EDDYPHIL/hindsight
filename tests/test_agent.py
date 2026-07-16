@@ -499,19 +499,18 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
         setup_agent_storage(db_url=target_url)
 
         with psycopg.connect(target_url, autocommit=True) as conn:
-            conn.execute("REVOKE CREATE ON SCHEMA public FROM public")
             conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role_name)))
+            conn.execute((ROOT / "infra/db/roles.sql").read_text())
+            conn.execute(
+                sql.SQL("GRANT hindsight_memory_worker TO {}").format(
+                    sql.Identifier(role_name)
+                )
+            )
             conn.execute(
                 sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
                     sql.Identifier(database_name),
                     sql.Identifier(role_name),
                 )
-            )
-            conn.execute(
-                sql.SQL(
-                    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
-                    "IN SCHEMA public TO {}"
-                ).format(sql.Identifier(role_name))
             )
 
         runtime_url = _database_url(database_name, user=role_name)
@@ -519,6 +518,8 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
             assert runtime_conn.execute("SELECT current_user").fetchone() == (role_name,)
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 runtime_conn.execute("CREATE TABLE runtime_schema_change (id INT PRIMARY KEY)")
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                runtime_conn.execute("DELETE FROM semantic_memories WHERE false")
 
         thread_id = f"restricted-role-{uuid4()}"
         first = run_incident_agent(

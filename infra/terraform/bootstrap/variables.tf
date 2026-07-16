@@ -42,12 +42,6 @@ variable "application_state_key" {
   default     = "hindsight/demo/terraform.tfstate"
 }
 
-variable "bedrock_embedding_model" {
-  description = "Bedrock embedding model the deployment workflow may invoke during profile rotation."
-  type        = string
-  default     = "amazon.titan-embed-text-v2:0"
-}
-
 variable "create_github_oidc_provider" {
   description = "Set false when the AWS account already has the token.actions.githubusercontent.com provider."
   type        = bool

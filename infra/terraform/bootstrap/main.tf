@@ -119,14 +119,6 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   statement {
-    sid     = "EmbeddingProfileBuild"
-    actions = ["bedrock:InvokeModel"]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
-    ]
-  }
-
-  statement {
     sid       = "LambdaVersionRefresh"
     actions   = local.lambda_version_refresh_actions
     resources = local.lambda_function_arns

@@ -24,25 +24,29 @@ def main() -> None:
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--certificate-arn", required=True)
     parser.add_argument("--cloudflare-zone-id", required=True)
-    parser.add_argument("--database-parameter", required=True)
+    parser.add_argument("--deploy-database-parameter", required=True)
+    parser.add_argument("--api-database-parameter", required=True)
+    parser.add_argument("--worker-database-parameter", required=True)
     parser.add_argument("--gemini-parameter")
     parser.add_argument("--operator-parameter", required=True)
     parser.add_argument("--changefeed-parameter", required=True)
     parser.add_argument(
         "--llm-provider",
-        choices=("gemini", "bedrock", "deterministic"),
+        choices=("gemini", "deterministic"),
         default=os.environ.get("LLM_PROVIDER", "gemini"),
     )
     parser.add_argument(
         "--embedding-provider",
-        choices=("gemini", "bedrock"),
+        choices=("gemini",),
         default=os.environ.get("EMBEDDING_PROVIDER", "gemini"),
     )
     args = parser.parse_args()
 
     ssm = boto3.client("ssm", region_name=args.region, config=aws_client_config(read_timeout=10))
     names = [
-        args.database_parameter,
+        args.deploy_database_parameter,
+        args.api_database_parameter,
+        args.worker_database_parameter,
         args.operator_parameter,
         args.changefeed_parameter,
     ]
@@ -85,24 +89,36 @@ def main() -> None:
         raise RuntimeError("Cloudflare zone is not active or accessible")
     print("preflight: Cloudflare zone active")
 
-    settings = runtime_settings(
-        environ={
-            DATABASE_URL_PARAM_ENV: args.database_parameter,
-            "LLM_PROVIDER": "deterministic",
-            "AWS_REGION": args.region,
-        },
-        ssm_client=ssm,
-        use_cache=False,
-    )
-    with psycopg.connect(
-        settings.database_url,
-        connect_timeout=5,
-        application_name="hindsight-deployment-preflight",
-    ) as connection:
-        value = connection.execute("SELECT 1").fetchone()[0]
-    if value != 1:
-        raise RuntimeError("CockroachDB readiness query returned an unexpected result")
-    print("preflight: CockroachDB reachable")
+    database_parameters = {
+        "deploy": args.deploy_database_parameter,
+        "api": args.api_database_parameter,
+        "worker": args.worker_database_parameter,
+    }
+    if len(set(database_parameters.values())) != len(database_parameters):
+        raise RuntimeError("deploy, API, and worker database parameters must be distinct")
+    identities = set()
+    for label, parameter_name in database_parameters.items():
+        settings = runtime_settings(
+            environ={
+                DATABASE_URL_PARAM_ENV: parameter_name,
+                "LLM_PROVIDER": "deterministic",
+                "AWS_REGION": args.region,
+            },
+            ssm_client=ssm,
+            use_cache=False,
+        )
+        with psycopg.connect(
+            settings.database_url,
+            connect_timeout=5,
+            application_name=f"hindsight-{label}-database-preflight",
+        ) as connection:
+            identity, value = connection.execute("SELECT current_user, 1").fetchone()
+        if value != 1:
+            raise RuntimeError(f"{label} CockroachDB readiness query failed")
+        identities.add(identity)
+    if len(identities) != len(database_parameters):
+        raise RuntimeError("deploy, API, and worker database identities must be distinct")
+    print("preflight: deploy, API, and worker CockroachDB identities reachable")
 
 
 if __name__ == "__main__":
