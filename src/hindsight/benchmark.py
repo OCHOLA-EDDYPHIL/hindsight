@@ -1410,7 +1410,12 @@ def _choose_action(
     response = provider.generate(
         ReasoningRequest(
             system=(
-                "Choose exactly one simulator action. Return JSON with only an action key. "
+                "Choose exactly one next simulator action from the incident, current "
+                "observation, and memories. Treat the observation as feedback. If it names a "
+                "previous action and the incident is not recovered, do not repeat that action "
+                "unchanged; choose a different action that advances diagnosis or remediation. "
+                "A diagnostic action may be needed before remediation. Return JSON with only "
+                "an action key. "
                 f"The allowed actions are: {', '.join(allowed_actions)}."
             ),
             prompt=json.dumps(
@@ -1418,6 +1423,7 @@ def _choose_action(
                     "incident": query,
                     "observation": observation,
                     "memories": blinded_memories,
+                    "step": step,
                 },
                 sort_keys=True,
                 default=str,

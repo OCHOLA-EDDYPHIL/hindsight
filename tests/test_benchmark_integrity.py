@@ -444,6 +444,10 @@ def test_action_provider_gets_blinded_memories_and_sufficient_output_budget():
     }
     assert inner.requests[-1].thinking_budget == 0
     assert prompt["memories"] == [{"content": "inspect the dependency"}]
+    assert prompt["step"] == 1
+    assert "Treat the observation as feedback" in inner.requests[-1].system
+    assert "do not repeat that action" in inner.requests[-1].system
+    assert "diagnostic action may be needed" in inner.requests[-1].system
     assert "reference_curator" not in inner.requests[-1].prompt
     assert "consolidated-lesson" not in inner.requests[-1].prompt
     assert "secret-reviewer" not in inner.requests[-1].prompt
