@@ -457,6 +457,7 @@ def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_pat
             {"REQUESTED_SOURCE_SHA": "d" * 40},
             {"REQUESTED_HEALTH_ONLY": "true"},
             {"CALLER_WORKFLOW_REF": f"{repository}/.github/workflows/other.yml@refs/heads/main"},
+            {"EVENT_NAME": "pull_request", "REF_NAME": "refs/pull/42/merge"},
         )
     ):
         rejected = _run_authorization_script(
