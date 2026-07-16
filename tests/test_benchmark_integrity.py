@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hindsight.benchmark import (
+    ACTION_RESPONSE_JSON_SCHEMA,
     ARMS,
     ALL_SIMULATOR_ACTIONS,
     HELD_OUT_SELECTION_METHOD,
@@ -432,6 +433,16 @@ def test_action_provider_gets_blinded_memories_and_sufficient_output_budget():
     assert action == "inspect_dependency"
     assert usage["attempts"] == 2
     assert inner.requests[-1].max_output_tokens == 256
+    assert inner.requests[-1].response_json_schema == ACTION_RESPONSE_JSON_SCHEMA
+    assert inner.requests[-1].response_json_schema == {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": list(ALL_SIMULATOR_ACTIONS)},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+    assert inner.requests[-1].thinking_budget == 0
     assert prompt["memories"] == [{"content": "inspect the dependency"}]
     assert "reference_curator" not in inner.requests[-1].prompt
     assert "consolidated-lesson" not in inner.requests[-1].prompt
