@@ -734,15 +734,24 @@ class MemoryStore:
     def active_embedding_profile(self) -> EmbeddingProfile:
         """Return the single profile currently authorized for retrieval/writes."""
 
-        row = self._fetch_optional(
-            """
-                SELECT profile.*
-                FROM embedding_index_state AS state
-                JOIN embedding_profiles AS profile ON profile.id = state.active_profile_id
-                WHERE state.singleton = true AND profile.status = 'active'
-            """,
-            (),
-        )
+        started_idle = self._conn.info.transaction_status == TransactionStatus.IDLE
+        try:
+            row = self._fetch_optional(
+                """
+                    SELECT profile.*
+                    FROM embedding_index_state AS state
+                    JOIN embedding_profiles AS profile ON profile.id = state.active_profile_id
+                    WHERE state.singleton = true AND profile.status = 'active'
+                """,
+                (),
+            )
+        finally:
+            if (
+                self._owns_connection
+                and started_idle
+                and self._conn.info.transaction_status != TransactionStatus.IDLE
+            ):
+                self._conn.rollback()
         if row is None:
             raise RuntimeError("no active embedding profile is configured")
         if row["capability"] == "lexical_hash" and _hosted_runtime():
