@@ -15,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - run: uv lock --check
       - run: uv sync --frozen
       - run: docker compose up -d crdb
       - run: |
@@ -29,6 +30,8 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest -q
       - run: uv run python scripts/run_learning_benchmark.py ci-smoke
+      - run: uv run python scripts/build_lambda_artifacts.py
+      - run: uv run python scripts/smoke_lambda_artifacts.py
       - run: node --input-type=module --check < src/hindsight/web/app.js
       - uses: hashicorp/setup-terraform@v3
       - run: terraform fmt -check -recursive infra/terraform
