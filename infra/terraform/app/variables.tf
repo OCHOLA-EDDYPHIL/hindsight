@@ -21,10 +21,16 @@ variable "stage" {
   }
 }
 
-variable "database_url_parameter_name" {
-  description = "Existing SecureString parameter containing the CockroachDB URL."
+variable "api_database_url_parameter_name" {
+  description = "Existing SecureString parameter containing the restricted API CockroachDB URL."
   type        = string
-  default     = "/hindsight/demo/database-url"
+  default     = "/hindsight/demo/api-database-url"
+}
+
+variable "worker_database_url_parameter_name" {
+  description = "Existing SecureString parameter containing the restricted worker CockroachDB URL."
+  type        = string
+  default     = "/hindsight/demo/worker-database-url"
 }
 
 variable "gemini_api_keys_parameter_name" {
@@ -51,8 +57,8 @@ variable "llm_provider" {
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "bedrock", "deterministic"], var.llm_provider)
-    error_message = "llm_provider must be gemini, bedrock, or deterministic."
+    condition     = contains(["gemini", "deterministic"], var.llm_provider)
+    error_message = "llm_provider must be gemini or deterministic."
   }
 }
 
@@ -66,24 +72,14 @@ variable "embedding_provider" {
   default = "gemini"
 
   validation {
-    condition     = contains(["gemini", "bedrock"], var.embedding_provider)
-    error_message = "hosted embedding_provider must be gemini or bedrock."
+    condition     = var.embedding_provider == "gemini"
+    error_message = "hosted embedding_provider must be gemini."
   }
 }
 
 variable "gemini_embedding_model" {
   type    = string
   default = "gemini-embedding-2"
-}
-
-variable "bedrock_model" {
-  type    = string
-  default = "anthropic.claude-3-haiku-20240307-v1:0"
-}
-
-variable "bedrock_embedding_model" {
-  type    = string
-  default = "amazon.titan-embed-text-v2:0"
 }
 
 variable "reasoning_max_attempts" {

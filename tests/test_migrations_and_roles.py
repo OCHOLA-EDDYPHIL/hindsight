@@ -91,6 +91,7 @@ def _apply(conn: psycopg.Connection, paths: list[Path]) -> None:
 @requires_db
 def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkeypatch):
     from hindsight import runs
+    from hindsight.agent import setup_agent_storage
     from hindsight.embedding_index import activate_profile, begin_profile_build, run_backfill_batch
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
@@ -528,6 +529,7 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
         )["leased"]:
             pass
         activate_profile(profile_id=str(building["id"]), db_url=target_url)
+        setup_agent_storage(db_url=target_url)
         with psycopg.connect(target_url, autocommit=True) as conn:
             conn.execute((ROOT / "infra/db/roles.sql").read_text())
         rotation = begin_profile_build(
@@ -538,6 +540,12 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
         with psycopg.connect(target_url) as conn:
             conn.execute("SET ROLE hindsight_agent_writer")
             conn.commit()
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("CREATE TABLE forbidden_runtime_ddl (id INT PRIMARY KEY)")
+            conn.rollback()
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("DELETE FROM semantic_memories WHERE false")
+            conn.rollback()
             monkeypatch.setattr(
                 runs,
                 "connect",

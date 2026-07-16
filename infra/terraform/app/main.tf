@@ -18,10 +18,11 @@ locals {
   }
 
   parameter_arns = {
-    database   = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.database_url_parameter_name}"
-    gemini     = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_keys_parameter_name}"
-    operator   = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.operator_token_parameter_name}"
-    changefeed = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.changefeed_token_parameter_name}"
+    api_database    = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.api_database_url_parameter_name}"
+    worker_database = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.worker_database_url_parameter_name}"
+    gemini          = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_keys_parameter_name}"
+    operator        = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.operator_token_parameter_name}"
+    changefeed      = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.changefeed_token_parameter_name}"
   }
 
   content_types = {
@@ -257,7 +258,7 @@ resource "aws_iam_role_policy_attachment" "basic_logs" {
 data "aws_iam_policy_document" "api" {
   statement {
     actions   = ["ssm:GetParameter"]
-    resources = [local.parameter_arns.database, local.parameter_arns.gemini, local.parameter_arns.operator]
+    resources = [local.parameter_arns.api_database, local.parameter_arns.gemini, local.parameter_arns.operator]
   }
   statement {
     actions = [
@@ -271,12 +272,6 @@ data "aws_iam_policy_document" "api" {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.runs.arn]
   }
-  statement {
-    actions = ["bedrock:InvokeModel"]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
-    ]
-  }
 }
 
 resource "aws_iam_role_policy" "api" {
@@ -287,7 +282,7 @@ resource "aws_iam_role_policy" "api" {
 data "aws_iam_policy_document" "worker" {
   statement {
     actions   = ["ssm:GetParameter"]
-    resources = [local.parameter_arns.database, local.parameter_arns.gemini]
+    resources = [local.parameter_arns.worker_database, local.parameter_arns.gemini]
   }
   statement {
     actions = [
@@ -309,13 +304,6 @@ data "aws_iam_policy_document" "worker" {
   statement {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.runs.arn]
-  }
-  statement {
-    actions = ["bedrock:InvokeModel", "bedrock:Converse"]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model}",
-      "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model}"
-    ]
   }
 }
 
@@ -377,7 +365,7 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM        = var.database_url_parameter_name
+      HINDSIGHT_DATABASE_URL_PARAM        = var.api_database_url_parameter_name
       HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM = var.operator_token_parameter_name
       HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
@@ -386,7 +374,6 @@ resource "aws_lambda_function" "api" {
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
-      BEDROCK_EMBEDDING_MODEL             = var.bedrock_embedding_model
     }
   }
 }
@@ -408,7 +395,7 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM        = var.database_url_parameter_name
+      HINDSIGHT_DATABASE_URL_PARAM        = var.worker_database_url_parameter_name
       HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
       HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
@@ -419,8 +406,6 @@ resource "aws_lambda_function" "worker" {
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_MODEL                        = var.gemini_model
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
-      BEDROCK_MODEL                       = var.bedrock_model
-      BEDROCK_EMBEDDING_MODEL             = var.bedrock_embedding_model
       REASONING_MAX_ATTEMPTS              = tostring(var.reasoning_max_attempts)
     }
   }

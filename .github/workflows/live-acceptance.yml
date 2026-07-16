@@ -15,7 +15,9 @@ concurrency:
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-  DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  API_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+  WORKER_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
   GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-2.5-flash' }}
@@ -224,7 +226,7 @@ jobs:
       - name: Load and mask hosted validation settings from SSM
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || {
             echo "Hosted database URL is unavailable." >&2
@@ -298,7 +300,7 @@ jobs:
       - name: Load and mask benchmark settings from SSM
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || {
@@ -443,7 +445,7 @@ jobs:
       - name: Load managed changefeed settings from SSM
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]]
           [[ -n "$CHANGEFEED_TOKEN" && "$CHANGEFEED_TOKEN" != "None" ]]
@@ -487,6 +489,9 @@ jobs:
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
       RUN_HOSTED_ACCEPTANCE: "1"
+      HINDSIGHT_DEPLOY_DATABASE_URL_PARAM: ${{ env.DEPLOY_DATABASE_PARAMETER }}
+      HINDSIGHT_API_DATABASE_URL_PARAM: ${{ env.API_DATABASE_PARAMETER }}
+      HINDSIGHT_WORKER_DATABASE_URL_PARAM: ${{ env.WORKER_DATABASE_PARAMETER }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -506,7 +511,7 @@ jobs:
         shell: bash
         run: |
           OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           [[ -n "$OPERATOR_TOKEN" && "$OPERATOR_TOKEN" != "None" ]] || {
@@ -553,7 +558,9 @@ jobs:
           curl --fail --silent --show-error "$HINDSIGHT_BROWSER_BASE_URL/v1/health/ready"
           curl --fail --silent --show-error "$HOSTED_API_URL/v1/health/ready"
       - name: Run hosted changefeed, WebSocket, worker, and Firefox acceptance
-        run: uv run pytest -q tests/test_hosted_acceptance.py tests/test_browser_ui.py
+        run: >-
+          uv run pytest -q tests/test_hosted_acceptance.py tests/test_browser_ui.py
+          tests/test_hosted_database_roles.py
       - name: Record browser acceptance evidence
         env:
           HEAD_SHA: ${{ needs.authorize.outputs.acceptance_sha }}

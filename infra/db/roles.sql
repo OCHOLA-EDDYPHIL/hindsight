@@ -2,10 +2,15 @@
 -- Credentials are managed outside the repository. No product role receives
 -- DELETE, and ordinary agent/API roles cannot UPDATE immutable memory rows.
 
-CREATE ROLE IF NOT EXISTS hindsight_agent_writer LOGIN;
-CREATE ROLE IF NOT EXISTS hindsight_memory_worker LOGIN;
+CREATE ROLE IF NOT EXISTS hindsight_agent_writer NOLOGIN;
+CREATE ROLE IF NOT EXISTS hindsight_memory_worker NOLOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_mcp_readonly LOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_dashboard_reader LOGIN;
+
+ALTER ROLE hindsight_agent_writer NOLOGIN;
+ALTER ROLE hindsight_memory_worker NOLOGIN;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO hindsight_agent_writer, hindsight_memory_worker;
 
 GRANT SELECT ON TABLE
     episodic_memories,
@@ -32,12 +37,19 @@ GRANT SELECT ON TABLE
     memory_reads,
     memory_retrievals,
     memory_operations,
+    memory_operation_previews,
+    memory_operation_events,
+    memory_operation_effects,
+    memory_review_items,
+    memory_external_evidence,
+    memory_lineage_edges,
     agent_reflections,
     agent_runs,
     agent_run_events,
     agent_run_dispatches,
     consolidation_jobs,
-    benchmark_actions
+    benchmark_actions,
+    demo_sessions
 TO hindsight_agent_writer;
 
 GRANT INSERT ON TABLE
@@ -51,6 +63,9 @@ GRANT INSERT ON TABLE
     memory_decisions,
     memory_reads,
     memory_retrievals,
+    memory_operations,
+    memory_operation_previews,
+    memory_operation_events,
     memory_external_evidence,
     memory_lineage_edges,
     agent_reflections,
@@ -61,7 +76,9 @@ GRANT INSERT ON TABLE
     incident_services,
     incident_events,
     incident_semantic_memories,
-    incident_semantic_beliefs
+    incident_semantic_beliefs,
+    services,
+    demo_sessions
 TO hindsight_agent_writer;
 
 GRANT UPDATE ON TABLE
@@ -71,7 +88,10 @@ GRANT UPDATE ON TABLE
     agent_runs,
     agent_run_events,
     agent_run_dispatches,
-    incidents
+    incidents,
+    services,
+    incident_services,
+    demo_sessions
 TO hindsight_agent_writer;
 
 -- This role is isolated to the queued correction/consolidation worker. It may
@@ -114,7 +134,12 @@ GRANT SELECT ON TABLE
     incident_runbooks,
     benchmark_experiments,
     benchmark_trials,
-    benchmark_actions
+    benchmark_actions,
+    checkpoint_migrations,
+    checkpoints,
+    checkpoint_blobs,
+    checkpoint_writes,
+    agent_chat_messages
 TO hindsight_memory_worker;
 
 GRANT INSERT ON TABLE
@@ -142,8 +167,15 @@ GRANT INSERT ON TABLE
     agent_run_events,
     incident_semantic_memories,
     incident_semantic_beliefs,
-    incident_events
+    incident_events,
+    checkpoints,
+    checkpoint_blobs,
+    checkpoint_writes,
+    agent_chat_messages
 TO hindsight_memory_worker;
+
+REVOKE DELETE ON ALL TABLES IN SCHEMA public
+FROM hindsight_agent_writer, hindsight_memory_worker;
 
 GRANT UPDATE ON TABLE
     episodic_memories,
@@ -163,7 +195,10 @@ GRANT UPDATE ON TABLE
     agent_run_events,
     agent_run_dispatches,
     incident_semantic_beliefs,
-    incidents
+    incidents,
+    checkpoints,
+    checkpoint_blobs,
+    checkpoint_writes
 TO hindsight_memory_worker;
 
 GRANT SELECT ON TABLE

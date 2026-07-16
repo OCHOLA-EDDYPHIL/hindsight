@@ -66,7 +66,9 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_stage: demo
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
-  TF_VAR_database_url_parameter_name: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+  TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
   TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
@@ -74,8 +76,6 @@ env:
   TF_VAR_gemini_model: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-2.5-flash' }}
   TF_VAR_embedding_provider: ${{ inputs.validation_mode && 'gemini' || vars.HINDSIGHT_EMBEDDING_PROVIDER || 'gemini' }}
   TF_VAR_gemini_embedding_model: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
-  TF_VAR_bedrock_model: ${{ vars.HINDSIGHT_BEDROCK_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0' }}
-  TF_VAR_bedrock_embedding_model: ${{ vars.HINDSIGHT_BEDROCK_EMBEDDING_MODEL || 'amazon.titan-embed-text-v2:0' }}
   TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
   TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
   TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
@@ -276,7 +276,9 @@ jobs:
           uv run python scripts/deployment_preflight.py
           --certificate-arn "$TF_VAR_acm_certificate_arn"
           --cloudflare-zone-id "$TF_VAR_cloudflare_zone_id"
-          --database-parameter "$TF_VAR_database_url_parameter_name"
+          --deploy-database-parameter "$DEPLOY_DATABASE_PARAMETER"
+          --api-database-parameter "$TF_VAR_api_database_url_parameter_name"
+          --worker-database-parameter "$TF_VAR_worker_database_url_parameter_name"
           --gemini-parameter "$TF_VAR_gemini_api_keys_parameter_name"
           --llm-provider "$TF_VAR_llm_provider"
           --embedding-provider "$TF_VAR_embedding_provider"
@@ -285,11 +287,14 @@ jobs:
       - name: Apply database migrations and initialize agent persistence
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           echo "::add-mask::$DATABASE_URL"
           export DATABASE_URL
           uv run python scripts/migrate.py
           uv run python scripts/initialize_agent_storage.py
+          uv run python scripts/apply_database_roles.py \
+            --api-parameter "$TF_VAR_api_database_url_parameter_name" \
+            --worker-parameter "$TF_VAR_worker_database_url_parameter_name"
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
@@ -303,7 +308,7 @@ jobs:
         if: inputs.health_only != true
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$TF_VAR_changefeed_token_parameter_name" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_WEBHOOK_URL="$(terraform -chdir=infra/terraform/app output -raw changefeed_webhook_url)"
           echo "::add-mask::$DATABASE_URL"
@@ -311,14 +316,13 @@ jobs:
           export DATABASE_URL
           export HINDSIGHT_CHANGEFEED_AUTH_TOKEN="$CHANGEFEED_TOKEN"
           export HINDSIGHT_CHANGEFEED_WEBHOOK_URL="$CHANGEFEED_WEBHOOK_URL"
-          export HINDSIGHT_DATABASE_URL_PARAM="$TF_VAR_database_url_parameter_name"
+          export HINDSIGHT_DATABASE_URL_PARAM="$DEPLOY_DATABASE_PARAMETER"
           export HINDSIGHT_GEMINI_API_KEYS_PARAM="$TF_VAR_gemini_api_keys_parameter_name"
           HINDSIGHT_GEMINI_KEY_HEALTH_TABLE="$(terraform -chdir=infra/terraform/app output -raw gemini_key_health_table)"
           export HINDSIGHT_GEMINI_KEY_HEALTH_TABLE
           export LLM_PROVIDER="$TF_VAR_llm_provider"
           export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"
           export GEMINI_EMBEDDING_MODEL="$TF_VAR_gemini_embedding_model"
-          export BEDROCK_EMBEDDING_MODEL="$TF_VAR_bedrock_embedding_model"
           uv run python scripts/reembed_memories.py --max-distance "$EMBEDDING_MAX_DISTANCE"
           uv run python scripts/configure_changefeed.py apply
       - name: Invalidate deployed UI

@@ -21,7 +21,9 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_stage: demo
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
-  TF_VAR_database_url_parameter_name: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+  TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
   TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
@@ -60,7 +62,7 @@ jobs:
       - name: Pause CockroachDB delivery before endpoint removal
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$TF_VAR_database_url_parameter_name" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           echo "::add-mask::$DATABASE_URL"
           export DATABASE_URL
           uv run python scripts/configure_changefeed.py pause

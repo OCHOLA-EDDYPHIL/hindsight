@@ -65,6 +65,15 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
+      aws_lambda_function.api.environment[0].variables.HINDSIGHT_DATABASE_URL_PARAM == var.api_database_url_parameter_name &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_DATABASE_URL_PARAM == var.worker_database_url_parameter_name &&
+      var.api_database_url_parameter_name != var.worker_database_url_parameter_name
+    )
+    error_message = "API and worker functions must resolve distinct restricted database parameters."
+  }
+
+  assert {
+    condition = (
       aws_lambda_function.worker.timeout < tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) < aws_sqs_queue.runs.visibility_timeout_seconds &&
       aws_sqs_queue.run_dlq.visibility_timeout_seconds == aws_sqs_queue.runs.visibility_timeout_seconds
