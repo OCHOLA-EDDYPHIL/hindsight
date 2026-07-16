@@ -6,49 +6,119 @@ import argparse
 import json
 import os
 import pathlib
+import secrets
 import subprocess
 import sys
+import time
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib import request
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import psycopg
+from psycopg import sql
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
-PROVIDER_SELECTORS = (
+BENCHMARK_MAX_DISTANCE = 0.35
+PILOT_EMBEDDING_SELECTOR = (
+    "tests/test_embeddings.py::"
+    "test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons"
+)
+PROVIDER_SANITY_SELECTORS = (
     "tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase",
-    "tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons",
     "tests/test_reasoning.py::test_live_gemini_reasoning_provider",
+)
+SEMANTIC_SELECTORS = (
+    "tests/test_live_semantic_acceptance.py::"
+    "test_live_gemini_database_retrieval_discriminates_paraphrase_and_no_match",
+    "tests/test_live_semantic_acceptance.py::"
+    "test_live_gemini_cutoff_generalizes_across_calibration_mechanisms",
+    "tests/test_live_semantic_acceptance.py::"
+    "test_live_gemini_consolidation_publishes_cited_retrievable_lesson",
+)
+RESILIENCE_SELECTORS = (
+    "tests/test_migrations_and_roles.py",
+    "tests/test_agent.py::"
+    "test_preinitialized_agent_storage_supports_start_and_resume_without_create_privilege",
+    "tests/test_run_dispatch.py",
+    "tests/test_run_attempts.py",
+    "tests/test_operation_retries.py",
+    "tests/test_consolidation.py",
+    "tests/test_worker.py",
+    "tests/test_realtime.py",
+)
+HOSTED_PRODUCT_SELECTORS = (
+    "tests/test_hosted_acceptance.py",
+    "tests/test_browser_ui.py",
+    "tests/test_hosted_database_roles.py",
 )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("verify-providers")
 
-    local = subparsers.add_parser("local-pilot")
-    local.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
-    local.add_argument("--max-distance", type=float, default=0.35)
-    local.add_argument("--report", type=pathlib.Path, required=True)
-    local.add_argument("--code-sha")
+    product = subparsers.add_parser("local-product-full")
+    product.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
+    product.add_argument("--base-url", default="http://127.0.0.1:8766")
 
-    hosted = subparsers.add_parser("hosted-benchmark")
-    hosted.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
-    hosted.add_argument("--max-distance", type=float, default=0.35)
-    hosted.add_argument("--report-dir", type=pathlib.Path, required=True)
-    hosted.add_argument("--summary-path", type=pathlib.Path)
+    hosted_product = subparsers.add_parser("hosted-product")
+    hosted_product.add_argument(
+        "--phase",
+        choices=("providers", "semantic", "full"),
+        required=True,
+    )
+    hosted_product.add_argument(
+        "--database-url",
+        default=os.environ.get("DATABASE_URL"),
+    )
+
+    local_pilot = subparsers.add_parser("learning-pilot")
+    _add_local_benchmark_arguments(local_pilot)
+
+    learning_full = subparsers.add_parser("learning-full")
+    _add_local_benchmark_arguments(learning_full)
+    learning_full.add_argument(
+        "--database-scope",
+        choices=("local", "hosted"),
+        required=True,
+    )
+    learning_full.add_argument("--summary-path", type=pathlib.Path)
 
     args = parser.parse_args()
-    if args.command == "verify-providers":
-        _verify_providers()
-    elif args.command == "local-pilot":
-        _run_local_pilot(args)
+    if args.command == "local-product-full":
+        _run_local_product_full(args)
+    elif args.command == "hosted-product":
+        _run_hosted_product(args)
+    elif args.command == "learning-pilot":
+        _preflight_local_learning(args)
+        _verify_learning_providers()
+        _run_local_benchmark(args, include_confirmation=False)
     else:
-        _run_hosted_benchmark(args)
+        if args.database_scope == "local":
+            _preflight_local_learning(args)
+            _verify_learning_providers()
+            _run_local_benchmark(args, include_confirmation=True)
+        else:
+            _verify_learning_providers()
+            _run_hosted_benchmark(args)
 
 
-def _verify_providers() -> None:
+def _add_local_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
+    parser.add_argument("--max-distance", type=float, default=BENCHMARK_MAX_DISTANCE)
+    parser.add_argument("--report-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--code-sha")
+
+
+def _preflight_local_learning(args: argparse.Namespace) -> None:
+    _require_fixed_max_distance(args.max_distance)
+    _validate_local_url(_required_database_url(args.database_url))
+    _require_local_report_path(args.report_dir)
+    _require_local_code_sha(args.code_sha)
+
+
+def _verify_product_providers() -> None:
     _require_gemini_credentials()
     env = dict(os.environ)
     env.update(
@@ -57,16 +127,239 @@ def _verify_providers() -> None:
             "RUN_LIVE_GEMINI_REASONING": "1",
         }
     )
-    _run([sys.executable, "-m", "pytest", "-q", *PROVIDER_SELECTORS], env=env)
+    _add_single_gemini_key(env)
+    _run([sys.executable, "-m", "pytest", "-q", *PROVIDER_SANITY_SELECTORS], env=env)
 
 
-def _run_local_pilot(args: argparse.Namespace) -> None:
-    database_url = _required_database_url(args.database_url)
-    _require_local_database(database_url)
+def _verify_learning_providers() -> None:
     _require_gemini_credentials()
-    code_sha = args.code_sha or _code_sha()
+    env = dict(os.environ)
+    env.update(
+        {
+            "RUN_LIVE_GEMINI_EMBEDDINGS": "1",
+            "RUN_LIVE_GEMINI_REASONING": "1",
+        }
+    )
+    _add_single_gemini_key(env)
+    for _ in range(2):
+        _run([sys.executable, "-m", "pytest", "-q", PILOT_EMBEDDING_SELECTOR], env=env)
+
+
+def _verify_semantic(args: argparse.Namespace) -> None:
+    database_url = _required_database_url(args.database_url)
+    if args.database_scope == "local":
+        _validate_local_url(database_url)
+    else:
+        _require_hosted_database(database_url)
+    _require_gemini_credentials()
+    env = dict(os.environ)
+    env.update(
+        {
+            "DATABASE_URL": database_url,
+            "EMBEDDING_PROVIDER": "gemini",
+            "LLM_PROVIDER": "gemini",
+            "RUN_LIVE_GEMINI_ACCEPTANCE": "1",
+        }
+    )
+    _run([sys.executable, "-m", "pytest", "-q", *SEMANTIC_SELECTORS], env=env)
+
+
+def _verify_resilience(args: argparse.Namespace) -> None:
+    database_url = _required_database_url(args.database_url)
+    _validate_local_url(database_url)
+    env = dict(os.environ)
+    env.update(
+        {
+            "DATABASE_URL": database_url,
+            "EMBEDDING_PROVIDER": "deterministic",
+            "LLM_PROVIDER": "deterministic",
+        }
+    )
+    _run([sys.executable, "-m", "pytest", "-q", *RESILIENCE_SELECTORS], env=env)
+
+
+def _run_local_product_full(args: argparse.Namespace) -> None:
+    database_url = _required_database_url(args.database_url)
+    parts, database_name = _validate_local_url(database_url)
+    semantic_url = _local_database_url(parts, f"{database_name}_semantic")
+    resilience_url = _local_database_url(parts, f"{database_name}_resilience")
+    browser_url = _local_database_url(parts, f"{database_name}_browser")
+    for url in (semantic_url, resilience_url, browser_url):
+        _create_local_database(url)
+
+    _verify_product_providers()
+    semantic_env = _product_environment(semantic_url, live=True)
+    _initialize_product_database(semantic_env, configure_embeddings=True)
+    _verify_semantic(
+        argparse.Namespace(database_url=semantic_url, database_scope="local")
+    )
+
+    resilience_env = _product_environment(resilience_url, live=False)
+    _initialize_product_database(resilience_env, configure_embeddings=False)
+    _verify_resilience(argparse.Namespace(database_url=resilience_url))
+
+    browser_env = _product_environment(browser_url, live=False)
+    _initialize_product_database(browser_env, configure_embeddings=False)
+    _run_local_browser_product(
+        database_url=browser_url,
+        base_url=args.base_url,
+    )
+
+
+def _initialize_product_database(
+    env: dict[str, str], *, configure_embeddings: bool
+) -> None:
+    _run([sys.executable, "scripts/migrate.py"], env=env)
+    _run([sys.executable, "scripts/initialize_agent_storage.py"], env=env)
+    if configure_embeddings:
+        _run(
+            [
+                sys.executable,
+                "scripts/reembed_memories.py",
+                "--max-distance",
+                str(BENCHMARK_MAX_DISTANCE),
+            ],
+            env=env,
+        )
+
+
+def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
+    base_url = str(base_url).rstrip("/")
+    parts = urlsplit(base_url)
+    if parts.scheme != "http" or parts.hostname not in LOCAL_DATABASE_HOSTS or parts.port is None:
+        raise ValueError("local-product-full requires an explicit loopback HTTP port")
+    token = secrets.token_hex(32)
+    env = dict(os.environ)
+    for name in (
+        "RUN_HOSTED_ACCEPTANCE",
+        "HOSTED_API_URL",
+        "HINDSIGHT_WEBSOCKET_URL",
+        "HINDSIGHT_DEPLOY_DATABASE_URL_PARAM",
+        "HINDSIGHT_API_DATABASE_URL_PARAM",
+        "HINDSIGHT_WORKER_DATABASE_URL_PARAM",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "DATABASE_URL": database_url,
+            "EMBEDDING_PROVIDER": "deterministic",
+            "LLM_PROVIDER": "deterministic",
+            "HINDSIGHT_DATABASE_URL_PARAM": "",
+            "HINDSIGHT_GEMINI_API_KEY_PARAM": "",
+            "HINDSIGHT_GEMINI_API_KEYS_PARAM": "",
+            "HINDSIGHT_FUNCTION_AUTH_TOKEN": token,
+            "HINDSIGHT_INLINE_WORKER": "1",
+            "HINDSIGHT_SECURE_COOKIES": "0",
+            "HINDSIGHT_BROWSER_BASE_URL": base_url,
+            "HINDSIGHT_BROWSER_OPERATOR_TOKEN": token,
+        }
+    )
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "hindsight.api:app",
+            "--host",
+            str(parts.hostname),
+            "--port",
+            str(parts.port),
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    try:
+        _wait_for_http_ready(f"{base_url}/v1/health/ready", server=server)
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_api.py",
+                "tests/test_dashboard.py",
+                "tests/test_queueing.py",
+                "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
+                "tests/test_browser_ui.py::"
+                "test_review_required_memory_renders_as_active_in_its_historical_snapshot",
+            ],
+            env=env,
+        )
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=15)
+
+
+def _wait_for_http_ready(url: str, *, server: subprocess.Popen[Any]) -> None:
+    for _ in range(60):
+        if server.poll() is not None:
+            raise RuntimeError("local product server exited before readiness")
+        try:
+            with request.urlopen(url, timeout=2) as response:  # noqa: S310 - loopback URL
+                if response.status == 200:
+                    return
+        except OSError:
+            pass
+        time.sleep(1)
+    raise RuntimeError("local product server did not become ready")
+
+
+def _run_hosted_product(args: argparse.Namespace) -> None:
+    if args.phase == "providers":
+        _verify_product_providers()
+        return
+    if args.phase == "semantic":
+        _verify_semantic(
+            argparse.Namespace(
+                database_url=args.database_url,
+                database_scope="hosted",
+            )
+        )
+        return
+
+    database_url = _required_database_url(args.database_url)
+    _require_hosted_database(database_url)
+    _verify_hosted_endpoints()
+    env = dict(os.environ)
+    env["DATABASE_URL"] = database_url
+    _run(
+        [sys.executable, "scripts/configure_changefeed.py", "status"],
+        env=env,
+    )
+    _run(
+        [sys.executable, "-m", "pytest", "-q", *HOSTED_PRODUCT_SELECTORS],
+        env=env,
+    )
+
+
+def _verify_hosted_endpoints() -> None:
+    ui_url = _required_env("HINDSIGHT_BROWSER_BASE_URL").rstrip("/")
+    api_url = _required_env("HOSTED_API_URL").rstrip("/")
+    websocket_url = _required_env("HINDSIGHT_WEBSOCKET_URL")
+    if not ui_url.startswith("https://") or not api_url.startswith("https://"):
+        raise ValueError("hosted product HTTP endpoints must use HTTPS")
+    if not websocket_url.startswith("wss://"):
+        raise ValueError("hosted product WebSocket endpoint must use WSS")
+    for url in (f"{ui_url}/v1/health/ready", f"{api_url}/v1/health/ready"):
+        with request.urlopen(url, timeout=30) as response:  # noqa: S310 - guarded HTTPS URL
+            if response.status != 200:
+                raise RuntimeError(f"hosted product endpoint is not ready: {url}")
+
+
+def _run_local_benchmark(args: argparse.Namespace, *, include_confirmation: bool) -> None:
+    database_url = _required_database_url(args.database_url)
+    _require_fixed_max_distance(args.max_distance)
+    _validate_local_url(database_url)
+    _require_gemini_credentials()
+    code_sha = _require_local_code_sha(args.code_sha)
+    _require_local_report_path(args.report_dir)
+    _create_local_database(database_url)
+    report_dir = _new_report_dir(args.report_dir)
     env = _live_environment(database_url=database_url, code_sha=code_sha)
-    args.report.parent.mkdir(parents=True, exist_ok=True)
 
     _run([sys.executable, "scripts/migrate.py"], env=env)
     _run([sys.executable, "scripts/initialize_agent_storage.py"], env=env)
@@ -75,68 +368,53 @@ def _run_local_pilot(args: argparse.Namespace) -> None:
             sys.executable,
             "scripts/reembed_memories.py",
             "--max-distance",
-            str(args.max_distance),
+            str(BENCHMARK_MAX_DISTANCE),
         ],
         env=env,
     )
-    _run(
-        [
-            sys.executable,
-            "scripts/run_learning_benchmark.py",
-            "pilot",
-            "--repetitions",
-            "2",
-            "--max-distance",
-            str(args.max_distance),
-        ],
-        env=env,
-        stdout_path=args.report,
-    )
-    report = _load_report(args.report)
-    _validate_local_pilot(
-        database_url=database_url,
-        experiment_id=_experiment_id(report),
-    )
+    if include_confirmation:
+        _run_benchmark_sequence(
+            database_url=database_url,
+            env=env,
+            report_dir=report_dir,
+        )
+    else:
+        _run_pilot_and_preregister(
+            database_url=database_url,
+            env=env,
+            report_dir=report_dir,
+        )
 
 
 def _run_hosted_benchmark(args: argparse.Namespace) -> None:
     database_url = _required_database_url(args.database_url)
     _require_hosted_database(database_url)
+    _require_fixed_max_distance(args.max_distance)
     _require_gemini_credentials()
-    args.report_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = _new_report_dir(args.report_dir)
     env = _live_environment(
         database_url=database_url,
         code_sha=_required_code_sha(),
     )
-    pilot_path = args.report_dir / "pilot.json"
-    preregistration_path = args.report_dir / "preregistration.json"
-    confirmation_path = args.report_dir / "confirmation.json"
+    confirmation = _run_benchmark_sequence(
+        database_url=database_url,
+        env=env,
+        report_dir=report_dir,
+    )
+    if args.summary_path is not None:
+        _append_confirmation_summary(args.summary_path, confirmation)
 
-    _run(
-        [
-            sys.executable,
-            "scripts/run_learning_benchmark.py",
-            "pilot",
-            "--repetitions",
-            "2",
-            "--max-distance",
-            str(args.max_distance),
-        ],
+
+def _run_benchmark_sequence(
+    *, database_url: str, env: dict[str, str], report_dir: pathlib.Path
+) -> dict[str, Any]:
+    pilot, _preregistration = _run_pilot_and_preregister(
+        database_url=database_url,
         env=env,
-        stdout_path=pilot_path,
+        report_dir=report_dir,
     )
-    pilot_id = _experiment_id(_load_report(pilot_path))
-    _run(
-        [
-            sys.executable,
-            "scripts/run_learning_benchmark.py",
-            "preregister",
-            "--pilot-experiment-id",
-            pilot_id,
-        ],
-        env=env,
-        stdout_path=preregistration_path,
-    )
+    pilot_id = _experiment_id(pilot)
+    confirmation_path = report_dir / "confirmation.json"
     _run(
         [
             sys.executable,
@@ -149,9 +427,67 @@ def _run_hosted_benchmark(args: argparse.Namespace) -> None:
         stdout_path=confirmation_path,
     )
     confirmation = _load_report(confirmation_path)
+    confirmation_id = _experiment_id(confirmation)
+    _validate_experiment(
+        database_url=database_url,
+        experiment_id=confirmation_id,
+        experiment_kind="confirmation",
+        expected_preparations=12,
+        expected_trials=72,
+    )
     _require_confirmation_gates(confirmation)
-    if args.summary_path is not None:
-        _append_confirmation_summary(args.summary_path, confirmation)
+    return confirmation
+
+
+def _run_pilot_and_preregister(
+    *, database_url: str, env: dict[str, str], report_dir: pathlib.Path
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    pilot = _run_pilot(database_url=database_url, env=env, report_dir=report_dir)
+    pilot_id = _experiment_id(pilot)
+    _validate_experiment(
+        database_url=database_url,
+        experiment_id=pilot_id,
+        experiment_kind="pilot",
+        expected_preparations=6,
+        expected_trials=36,
+    )
+    preregistration_path = report_dir / "preregistration.json"
+    _run(
+        [
+            sys.executable,
+            "scripts/run_learning_benchmark.py",
+            "preregister",
+            "--pilot-experiment-id",
+            pilot_id,
+        ],
+        env=env,
+        stdout_path=preregistration_path,
+    )
+    preregistration = _load_report(preregistration_path)
+    _require_preregistration(preregistration, pilot_id=pilot_id)
+    return pilot, preregistration
+
+
+def _run_pilot(
+    *, database_url: str, env: dict[str, str], report_dir: pathlib.Path
+) -> dict[str, Any]:
+    pilot_path = report_dir / "pilot.json"
+    _run(
+        [
+            sys.executable,
+            "scripts/run_learning_benchmark.py",
+            "pilot",
+            "--repetitions",
+            "2",
+            "--max-distance",
+            str(BENCHMARK_MAX_DISTANCE),
+        ],
+        env=env,
+        stdout_path=pilot_path,
+    )
+    pilot = _load_report(pilot_path)
+    _require_report_identity(pilot, experiment_kind="pilot")
+    return pilot
 
 
 def _run(
@@ -163,7 +499,7 @@ def _run(
     if stdout_path is None:
         subprocess.run(command, cwd=ROOT, env=env, check=True)
         return
-    with stdout_path.open("w", encoding="utf-8") as output:
+    with stdout_path.open("x", encoding="utf-8") as output:
         subprocess.run(command, cwd=ROOT, env=env, check=True, stdout=output)
 
 
@@ -173,7 +509,7 @@ def _required_database_url(value: str | None) -> str:
     return value
 
 
-def _require_local_database(database_url: str) -> None:
+def _validate_local_url(database_url: str):
     parts = urlsplit(database_url)
     database_name = parts.path.lstrip("/")
     query = parse_qs(parts.query)
@@ -184,29 +520,51 @@ def _require_local_database(database_url: str) -> None:
         or query.get("sslmode") != ["disable"]
     ):
         raise ValueError(
-            "local-pilot requires a named loopback database with sslmode=disable"
+            "local acceptance requires a named loopback database with sslmode=disable"
         )
-    try:
-        with psycopg.connect(database_url) as conn:
-            migrated = conn.execute(
-                """
-                    SELECT EXISTS (
-                        SELECT 1 FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                            AND table_name = 'schema_migrations'
-                    )
-                """
-            ).fetchone()[0]
-    except psycopg.errors.InvalidCatalogName:
-        return
-    if migrated:
-        raise ValueError("local-pilot requires a fresh database without migrations")
+    return parts, database_name
+
+
+def _local_database_url(parts: Any, database_name: str) -> str:
+    return urlunsplit(parts._replace(path=f"/{database_name}"))
+
+
+def _create_local_database(database_url: str) -> None:
+    parts, database_name = _validate_local_url(database_url)
+    admin_url = urlunsplit(parts._replace(path="/defaultdb"))
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        exists = conn.execute(
+            "SELECT count(*) FROM [SHOW DATABASES] WHERE database_name = %s",
+            (database_name,),
+        ).fetchone()[0]
+        if exists:
+            raise ValueError("local acceptance requires a new database name")
+        conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
 
 
 def _require_hosted_database(database_url: str) -> None:
     parts = urlsplit(database_url)
     if parts.hostname in LOCAL_DATABASE_HOSTS:
-        raise ValueError("hosted-benchmark refuses loopback databases")
+        raise ValueError("hosted acceptance refuses loopback databases")
+
+
+def _require_fixed_max_distance(value: float) -> None:
+    if value != BENCHMARK_MAX_DISTANCE:
+        raise ValueError("live acceptance fixes max distance at 0.35")
+
+
+def _new_report_dir(path: pathlib.Path) -> pathlib.Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir()
+    return path
+
+
+def _require_local_report_path(path: pathlib.Path) -> None:
+    resolved = path.resolve()
+    if resolved == ROOT or ROOT in resolved.parents:
+        raise ValueError("local acceptance reports must be outside the repository")
+    if resolved.exists():
+        raise ValueError("local acceptance requires a new report directory")
 
 
 def _require_gemini_credentials() -> None:
@@ -215,6 +573,39 @@ def _require_gemini_credentials() -> None:
         for name in ("GEMINI_API_KEYS", "GEMINI_API_KEY")
     ):
         raise ValueError("Gemini credentials must already be loaded into the environment")
+
+
+def _required_env(name: str) -> str:
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def _product_environment(database_url: str, *, live: bool) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(
+        {
+            "DATABASE_URL": database_url,
+            "EMBEDDING_PROVIDER": "gemini" if live else "deterministic",
+            "LLM_PROVIDER": "gemini" if live else "deterministic",
+            "HINDSIGHT_DATABASE_URL_PARAM": "",
+            "HINDSIGHT_GEMINI_API_KEY_PARAM": "",
+            "HINDSIGHT_GEMINI_API_KEYS_PARAM": "",
+        }
+    )
+    return env
+
+
+def _add_single_gemini_key(env: dict[str, str]) -> None:
+    if (env.get("GEMINI_API_KEY") or "").strip():
+        return
+    from hindsight.gemini import parse_gemini_credentials
+
+    credentials = parse_gemini_credentials(env)
+    if not credentials:
+        raise ValueError("Gemini credential document contains no usable key")
+    env["GEMINI_API_KEY"] = credentials[0].api_key
 
 
 def _live_environment(*, database_url: str, code_sha: str) -> dict[str, str]:
@@ -241,6 +632,23 @@ def _code_sha() -> str:
     return result.stdout.strip()
 
 
+def _require_local_code_sha(value: str | None) -> str:
+    head = _code_sha()
+    resolved = (value or head).strip()
+    if resolved != head:
+        raise ValueError("local benchmark code SHA must equal HEAD")
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if status.stdout.strip():
+        raise ValueError("local benchmark requires a clean exact-HEAD worktree")
+    return resolved
+
+
 def _required_code_sha() -> str:
     value = (os.environ.get("HINDSIGHT_BENCHMARK_CODE_SHA") or "").strip()
     if not value:
@@ -264,13 +672,25 @@ def _experiment_id(report: dict[str, Any]) -> str:
     return value
 
 
-def _validate_local_pilot(*, database_url: str, experiment_id: str) -> None:
+def _require_report_identity(report: dict[str, Any], *, experiment_kind: str) -> None:
+    if report.get("experiment_kind") != experiment_kind or report.get("status") != "completed":
+        raise RuntimeError(f"{experiment_kind} report is not completed")
+    for field in ("raw_trace_digest", "claim_evidence_digest"):
+        if not str(report.get(field) or "").strip():
+            raise RuntimeError(f"{experiment_kind} report has no {field}")
+
+
+def _validate_experiment(
+    *,
+    database_url: str,
+    experiment_id: str,
+    experiment_kind: str,
+    expected_preparations: int,
+    expected_trials: int,
+) -> None:
     with psycopg.connect(database_url) as conn:
         experiment = conn.execute(
-            """
-                SELECT experiment_kind, status
-                FROM benchmark_experiments WHERE id = %s
-            """,
+            "SELECT experiment_kind, status FROM benchmark_experiments WHERE id = %s",
             (experiment_id,),
         ).fetchone()
         preparations = conn.execute(
@@ -280,11 +700,41 @@ def _validate_local_pilot(*, database_url: str, experiment_id: str) -> None:
             """,
             (experiment_id,),
         ).fetchone()
-    if experiment != ("pilot", "completed") or preparations != (6, 6):
-        raise RuntimeError("local pilot did not complete all frozen preparations")
+        trials = conn.execute(
+            """
+                SELECT count(*),
+                    count(*) FILTER (WHERE status = 'completed'),
+                    count(*) FILTER (WHERE recovered IS TRUE),
+                    count(*) FILTER (WHERE failure_code IS NOT NULL),
+                    count(*) FILTER (
+                        WHERE status IN ('invalid', 'infrastructure_failed')
+                    )
+                FROM benchmark_trials WHERE experiment_id = %s
+            """,
+            (experiment_id,),
+        ).fetchone()
+    expected = (expected_trials, expected_trials, expected_trials, 0, 0)
+    if (
+        experiment != (experiment_kind, "completed")
+        or preparations != (expected_preparations, expected_preparations)
+        or trials != expected
+    ):
+        raise RuntimeError(f"{experiment_kind} did not complete every required trial")
+
+
+def _require_preregistration(report: dict[str, Any], *, pilot_id: str) -> None:
+    if (
+        str(report.get("pilot_experiment_id") or "") != pilot_id
+        or not str(report.get("preregistration_sha256") or "").strip()
+        or len(report.get("eligible_held_out_variant_ids") or []) != 12
+        or len(report.get("selected_held_out_variant_ids") or []) != 12
+        or report.get("repetitions_per_variant") != 2
+    ):
+        raise RuntimeError("confirmation preregistration is incomplete")
 
 
 def _require_confirmation_gates(report: dict[str, Any]) -> None:
+    _require_report_identity(report, experiment_kind="confirmation")
     gates = report.get("gates")
     if (
         report.get("claim_authorized") is not True
@@ -306,7 +756,10 @@ def _append_confirmation_summary(path: pathlib.Path, report: dict[str, Any]) -> 
         "",
         "| Gate | Result |",
         "| --- | --- |",
-        *(f"| {name} | {'pass' if value is True else 'fail'} |" for name, value in sorted(gates.items())),
+        *(
+            f"| {name} | {'pass' if value is True else 'fail'} |"
+            for name, value in sorted(gates.items())
+        ),
     ]
     with path.open("a", encoding="utf-8") as summary:
         summary.write("\n".join(lines) + "\n")

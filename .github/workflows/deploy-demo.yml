@@ -24,7 +24,7 @@ on:
         type: boolean
         default: false
       validation_mode:
-        description: Restrict deployment to the owner-authorized PR acceptance caller
+        description: Restrict deployment to the owner-authorized product acceptance caller
         required: false
         type: boolean
         default: false
@@ -95,7 +95,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref }}
           EVENT_SHA: ${{ github.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MANUAL_OPERATION: ${{ inputs.operation }}
           REQUESTED_APPLY: ${{ inputs.apply }}
           REQUESTED_HEALTH_ONLY: ${{ inputs.health_only }}
@@ -103,8 +102,6 @@ jobs:
           VALIDATION_MODE: ${{ inputs.validation_mode }}
           CALLER_WORKFLOW: ${{ github.workflow }}
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
-          LABEL_NAME: ${{ github.event.label.name }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           REPOSITORY: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
@@ -116,29 +113,15 @@ jobs:
               && "$REQUESTED_HEALTH_ONLY" == "false" \
               && "$CALLER_WORKFLOW" == "live acceptance" \
               && "$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME" \
+              && "$EVENT_NAME" == "workflow_dispatch" \
+              && "$REF_NAME" == "refs/heads/main" \
+              && "$REQUESTED_SOURCE_SHA" == "$EVENT_SHA" \
               && "$ACTOR" == "$REPOSITORY_OWNER" \
               && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
               && "$EMBEDDING_MAX_DISTANCE" == "0.35" ]] || {
               echo "Validation deployment requires the owner-authorized live-acceptance workflow." >&2
               exit 1
             }
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              [[ "$LABEL_NAME" == "live-acceptance" \
-                && "$HEAD_REPOSITORY" == "$REPOSITORY" \
-                && "$REQUESTED_SOURCE_SHA" == "$PR_HEAD_SHA" ]] || {
-                echo "PR validation requires the labeled same-repository head revision." >&2
-                exit 1
-              }
-            elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-              [[ "$REF_NAME" == "refs/heads/main" \
-                && "$REQUESTED_SOURCE_SHA" == "$EVENT_SHA" ]] || {
-                echo "Manual validation requires the exact main revision." >&2
-                exit 1
-              }
-            else
-              echo "Unsupported validation deployment event: $EVENT_NAME" >&2
-              exit 1
-            fi
             [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
               echo "Validation deployment did not resolve a commit SHA." >&2
               exit 1

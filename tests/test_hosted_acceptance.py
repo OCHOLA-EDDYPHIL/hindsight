@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import timedelta
 from urllib import error, request
 from uuid import uuid4
 
@@ -169,6 +170,163 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
         store.seal_decision(decision_id=retrieval_decision)
     assert retrieval.selected_strategy == "semantic_vector"
     assert str(job[4]) in {str(hit["id"]) for hit in retrieval.hits}
+
+
+@requires_hosted_acceptance
+def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
+    from hindsight.db import connect
+    from hindsight.runs import claim_run_attempt, create_run, prepare_approval
+    from hindsight.runtime import runtime_database_url
+
+    database_url = runtime_database_url()
+    token = uuid4().hex
+
+    pending, _ = create_run(
+        incident_slug=f"hosted-pending:{token}",
+        namespace=f"hosted-pending:{token}",
+        user_input="Verify scheduled recovery of a deliberately pending command",
+        db_url=database_url,
+    )
+    awaiting = _wait_for_run_status(
+        str(pending["id"]),
+        expected={"awaiting_approval"},
+        database_url=database_url,
+        timeout=300,
+    )
+    assert awaiting["worker_attempt_count"] == 1
+    prepare_approval(run_id=pending["id"], approved=True, db_url=database_url)
+    _wait_for_run_status(
+        str(pending["id"]),
+        expected={"completed"},
+        database_url=database_url,
+        timeout=300,
+    )
+
+    reclaimed, _ = create_run(
+        incident_slug=f"hosted-reclaim:{token}",
+        namespace=f"hosted-reclaim:{token}",
+        user_input="Verify recovery after an expired worker attempt",
+        db_url=database_url,
+    )
+    _delay_dispatch(str(reclaimed["id"]), database_url=database_url)
+    first = claim_run_attempt(
+        run_id=reclaimed["id"],
+        command="start",
+        lease_ttl=timedelta(minutes=5),
+        max_attempts=3,
+        db_url=database_url,
+    )
+    assert first.outcome == "claimed"
+    _expire_attempt(str(reclaimed["id"]), database_url=database_url)
+    _release_dispatch(str(reclaimed["id"]), database_url=database_url)
+    recovered = _wait_for_run_status(
+        str(reclaimed["id"]),
+        expected={"awaiting_approval"},
+        database_url=database_url,
+        timeout=300,
+    )
+    assert recovered["worker_attempt_count"] == 2
+    assert any(event["phase"] == "recovery" for event in recovered["events"])
+
+    exhausted, _ = create_run(
+        incident_slug=f"hosted-dlq:{token}",
+        namespace=f"hosted-dlq:{token}",
+        user_input="Verify exhausted source delivery is finalized from the DLQ",
+        db_url=database_url,
+    )
+    _delay_dispatch(str(exhausted["id"]), database_url=database_url)
+    for expected_attempt in range(1, 4):
+        claim = claim_run_attempt(
+            run_id=exhausted["id"],
+            command="start",
+            lease_ttl=timedelta(minutes=5),
+            max_attempts=3,
+            db_url=database_url,
+        )
+        assert claim.outcome == "claimed"
+        assert claim.run["worker_attempt_count"] == expected_attempt
+        _expire_attempt(str(exhausted["id"]), database_url=database_url)
+    _release_dispatch(str(exhausted["id"]), database_url=database_url)
+    failed = _wait_for_run_status(
+        str(exhausted["id"]),
+        expected={"failed"},
+        database_url=database_url,
+        timeout=1800,
+    )
+    assert failed["failure_code"] == "RunAttemptsExhausted"
+    assert [event["status"] for event in failed["events"]].count("failed") == 1
+    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
+        decision = conn.execute(
+            "SELECT status, sealed_at IS NOT NULL FROM memory_decisions WHERE id = %s",
+            (failed["decision_id"],),
+        ).fetchone()
+    assert decision == ("failed", True)
+
+
+def _delay_dispatch(run_id: str, *, database_url: str) -> None:
+    from hindsight.db import connect
+
+    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
+        conn.execute(
+            """
+                UPDATE agent_run_dispatches
+                SET available_at = now() + INTERVAL '10 minutes'
+                WHERE run_id = %s AND command = 'start' AND status = 'pending'
+            """,
+            (run_id,),
+        )
+        conn.commit()
+
+
+def _release_dispatch(run_id: str, *, database_url: str) -> None:
+    from hindsight.db import connect
+
+    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
+        conn.execute(
+            """
+                UPDATE agent_run_dispatches
+                SET available_at = now()
+                WHERE run_id = %s AND command = 'start' AND status = 'pending'
+            """,
+            (run_id,),
+        )
+        conn.commit()
+
+
+def _expire_attempt(run_id: str, *, database_url: str) -> None:
+    from hindsight.db import connect
+
+    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
+        conn.execute(
+            """
+                UPDATE agent_runs
+                SET worker_attempt_lease_expires_at = now() - INTERVAL '1 second'
+                WHERE id = %s
+            """,
+            (run_id,),
+        )
+        conn.commit()
+
+
+def _wait_for_run_status(
+    run_id: str,
+    *,
+    expected: set[str],
+    database_url: str,
+    timeout: int,
+) -> dict[str, object]:
+    from hindsight.runs import get_run
+
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = get_run(run_id=run_id, db_url=database_url)
+        if last is not None and last["status"] in expected:
+            return last
+        if last is not None and last["status"] in {"completed", "rejected", "failed"}:
+            pytest.fail(f"run reached unexpected terminal status: {last['status']}")
+        time.sleep(2)
+    pytest.fail(f"run did not reach {sorted(expected)} before timeout: {last}")
 
 
 @requires_hosted_acceptance
