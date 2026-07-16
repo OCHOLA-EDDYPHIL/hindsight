@@ -10,11 +10,16 @@ from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
+import psycopg
 import pytest
+from psycopg import sql
 
-CORPUS = Path("fixtures/benchmark_variants.json")
+ROOT = Path(__file__).resolve().parents[1]
+CORPUS = ROOT / "fixtures" / "benchmark_variants.json"
+MIGRATIONS = ROOT / "migrations"
 SIMULATOR_KINDS = {
     "retry_amplification",
     "cache_stampede",
@@ -36,6 +41,20 @@ requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DAT
 
 def _corpus() -> dict:
     return json.loads(CORPUS.read_text(encoding="utf-8"))
+
+
+def _create_preserved_database(prefix: str) -> str:
+    parts = urlsplit(os.environ["DATABASE_URL"])
+    database_name = f"{prefix}_{uuid4().hex}"
+    admin_url = urlunsplit(parts._replace(path="/defaultdb"))
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
+    target_url = urlunsplit(parts._replace(path=f"/{database_name}"))
+    with psycopg.connect(target_url, autocommit=True) as conn:
+        for path in sorted(MIGRATIONS.glob("[0-9]*.sql")):
+            with conn.transaction():
+                conn.execute(path.read_text())
+    return target_url
 
 
 def test_frozen_corpus_has_balanced_curated_low_overlap_retrieval_challenges():
@@ -269,13 +288,14 @@ def test_shared_context_transaction_persists_equal_rows_in_every_arm():
 @requires_db
 def test_preparation_retry_reuses_seeded_context(monkeypatch):
     from hindsight.benchmark import create_experiment
-    from hindsight.db import connect, database_url
+    from hindsight.db import connect
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     row = _corpus()["variants"][0]
+    target_url = _create_preserved_database("hindsight_benchmark_retry")
     provider = DeterministicEmbeddingProvider()
-    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+    with MemoryStore(url=target_url, embedding_provider=provider) as store:
         profile = store.ensure_active_embedding_profile()
     experiment = create_experiment(
         experiment_kind="ci_smoke",
@@ -283,7 +303,7 @@ def test_preparation_retry_reuses_seeded_context(monkeypatch):
         provider=provider.provider_name,
         model=provider.model_name,
         embedding_profile_id=profile.profile_id,
-        db_url=database_url(),
+        db_url=target_url,
     )
     consolidation_calls = 0
 
@@ -323,7 +343,7 @@ def test_preparation_retry_reuses_seeded_context(monkeypatch):
     prepared = benchmark_script._prepare_variant_with_retries(
         row=row,
         experiment_id=str(experiment["id"]),
-        db_url=database_url(),
+        db_url=target_url,
         reasoning=SimpleNamespace(),
         embeddings=provider,
         require_rank_one=False,
@@ -332,7 +352,7 @@ def test_preparation_retry_reuses_seeded_context(monkeypatch):
     namespaces = benchmark_script._variant_namespaces(
         f"benchmark:{experiment['id']}:{row['variant_id']}"
     )
-    with connect(database_url()) as conn:
+    with connect(target_url) as conn:
         counts = dict(
             conn.execute(
                 """
