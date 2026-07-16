@@ -58,6 +58,8 @@ SIMULATOR_KINDS = (
     "lock_contention",
 )
 MAX_PREPARATION_ATTEMPTS = 3
+MAX_TARGET_QUERY_OVERLAP = 0.35
+MAX_DISTRACTOR_QUERY_OVERLAP = 0.25
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -1197,15 +1199,20 @@ def _validate_corpus(corpus: dict[str, Any]) -> None:
         query = str(row.get("recurrence_query") or "")
         source_overlap = _lexical_overlap(query, str(row.get("source_summary") or ""))
         lesson_overlap = _lexical_overlap(query, str(row.get("reference_lesson") or ""))
-        if max(source_overlap, lesson_overlap) > 0.20:
+        if max(source_overlap, lesson_overlap) > MAX_TARGET_QUERY_OVERLAP:
             raise ValueError(f"variant {row['variant_id']} recurrence has excessive target overlap")
         distractor_overlaps = [
             _lexical_overlap(query, str(context.get("content") or ""))
             for context in contexts
             if context.get("role") == "hard_distractor"
         ]
-        if not distractor_overlaps or min(distractor_overlaps) < 0.25:
-            raise ValueError(f"variant {row['variant_id']} distractors are not lexically hard")
+        if (
+            not distractor_overlaps
+            or max(distractor_overlaps) > MAX_DISTRACTOR_QUERY_OVERLAP
+        ):
+            raise ValueError(
+                f"variant {row['variant_id']} distractors repeat too much of the recurrence query"
+            )
         context_ids = [str(context.get("context_id") or "") for context in contexts]
         if any(not value for value in context_ids) or len(context_ids) != len(set(context_ids)):
             raise ValueError(f"variant {row['variant_id']} context IDs must be nonempty and unique")

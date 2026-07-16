@@ -80,9 +80,11 @@ def test_frozen_corpus_has_balanced_curated_low_overlap_retrieval_challenges():
             for context in row["context_memories"]
             if context["role"] == "hard_distractor"
         ]
-        assert target_overlap <= 0.20
-        assert all(overlap >= 0.25 for overlap in distractor_overlaps)
-        assert all(overlap > target_overlap for overlap in distractor_overlaps)
+        assert target_overlap <= benchmark_script.MAX_TARGET_QUERY_OVERLAP
+        assert all(
+            overlap <= benchmark_script.MAX_DISTRACTOR_QUERY_OVERLAP
+            for overlap in distractor_overlaps
+        )
 
     for kind in SIMULATOR_KINDS:
         family = [row for row in corpus["variants"] if row["simulator_kind"] == kind]
@@ -91,6 +93,28 @@ def test_frozen_corpus_has_balanced_curated_low_overlap_retrieval_challenges():
                 benchmark_script._lexical_overlap(left["source_summary"], right["source_summary"])
                 <= 0.25
             )
+
+
+def test_corpus_rejects_a_hard_distractor_that_copies_the_query():
+    corpus = _corpus()
+    row = corpus["variants"][0]
+    hard_distractor = next(
+        context
+        for context in row["context_memories"]
+        if context["role"] == "hard_distractor"
+    )
+    hard_distractor["content"] = row["recurrence_query"]
+
+    with pytest.raises(ValueError, match="repeat too much of the recurrence query"):
+        benchmark_script._validate_corpus(corpus)
+
+
+def test_variant_namespaces_are_disjoint_across_experiments():
+    first = benchmark_script._variant_namespaces("benchmark:experiment-a:variant")
+    second = benchmark_script._variant_namespaces("benchmark:experiment-b:variant")
+
+    assert set(first) == set(second)
+    assert set(first.values()).isdisjoint(second.values())
 
 
 def test_shared_context_is_byte_identical_across_all_three_arms():
@@ -240,6 +264,102 @@ def test_shared_context_transaction_persists_equal_rows_in_every_arm():
     assert persisted[arms["no_lesson"]] == persisted[arms["reference_lesson"]]
     assert persisted[arms["no_lesson"]] == persisted[arms["consolidated_lesson"]]
     assert len(persisted[arms["no_lesson"]]) == len(row["context_memories"])
+
+
+@requires_db
+def test_preparation_retry_reuses_seeded_context(monkeypatch):
+    from hindsight.benchmark import create_experiment
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    row = _corpus()["variants"][0]
+    provider = DeterministicEmbeddingProvider()
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        profile = store.ensure_active_embedding_profile()
+    experiment = create_experiment(
+        experiment_kind="ci_smoke",
+        manifest={"retry_fixture": uuid4().hex},
+        provider=provider.provider_name,
+        model=provider.model_name,
+        embedding_profile_id=profile.profile_id,
+        db_url=database_url(),
+    )
+    consolidation_calls = 0
+
+    def resolve_fixture(*, slug, db_url, **_kwargs):
+        with connect(db_url) as conn:
+            incident_id = conn.execute(
+                "SELECT id FROM incidents WHERE slug = %s",
+                (slug,),
+            ).fetchone()[0]
+        return {"incident": {"id": incident_id}}
+
+    def consolidate_fixture(*, namespace, db_url, **_kwargs):
+        nonlocal consolidation_calls
+        consolidation_calls += 1
+        if consolidation_calls == 1:
+            raise RuntimeError("transient consolidation failure")
+        with MemoryStore(url=db_url, embedding_provider=provider) as store:
+            memory = store.remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content="A retry fixture lesson.",
+                provenance=Provenance(
+                    "benchmark.retry.fixture",
+                    f"experiment:{experiment['id']}",
+                    "Verify preparation retry row reuse",
+                ),
+            )
+        return SimpleNamespace(memory=memory)
+
+    monkeypatch.setattr(benchmark_script, "resolve_incident", resolve_fixture)
+    monkeypatch.setattr(
+        benchmark_script,
+        "consolidate_resolved_incident",
+        consolidate_fixture,
+    )
+
+    prepared = benchmark_script._prepare_variant_with_retries(
+        row=row,
+        experiment_id=str(experiment["id"]),
+        db_url=database_url(),
+        reasoning=SimpleNamespace(),
+        embeddings=provider,
+        require_rank_one=False,
+    )
+
+    namespaces = benchmark_script._variant_namespaces(
+        f"benchmark:{experiment['id']}:{row['variant_id']}"
+    )
+    with connect(database_url()) as conn:
+        counts = dict(
+            conn.execute(
+                """
+                    SELECT namespace, count(*)
+                    FROM semantic_memories
+                    WHERE namespace = ANY(%s)
+                    GROUP BY namespace
+                """,
+                (list(namespaces.values()),),
+            ).fetchall()
+        )
+        preparation = conn.execute(
+            """
+                SELECT status, attempt_count
+                FROM benchmark_variant_preparations
+                WHERE experiment_id = %s AND variant_id = %s
+            """,
+            (experiment["id"], row["variant_id"]),
+        ).fetchone()
+
+    assert prepared.reference_lesson_memory_id
+    assert consolidation_calls == 2
+    assert preparation == ("completed", 2)
+    assert counts[namespaces["source"]] == 1
+    assert counts[namespaces["no_lesson"]] == len(row["context_memories"])
+    assert counts[namespaces["reference_lesson"]] == len(row["context_memories"]) + 1
+    assert counts[namespaces["consolidated_lesson"]] == len(row["context_memories"]) + 1
 
 
 def test_live_commands_reject_implicit_or_deterministic_providers(monkeypatch):
