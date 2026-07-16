@@ -19,6 +19,7 @@ from uuid import uuid4
 import psycopg
 from psycopg import sql
 from psycopg.errors import SerializationFailure
+from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -157,6 +158,7 @@ class MemoryStore:
         structured_payload: dict[str, Any] | None = None,
         producer_decision_id: str | None = None,
         parent_memory_ids: Iterable[str] | None = None,
+        precomputed_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
         """Persist a new belief with provenance.
 
@@ -166,13 +168,19 @@ class MemoryStore:
         reconstructable.
         """
 
+        if memory_kind != "semantic" and precomputed_embedding is not None:
+            raise ValueError("precomputed embeddings are supported only for semantic memory")
+
         prepared_embedding = None
         if memory_kind == "semantic":
             provenance.validate()
             if not namespace or not namespace.strip():
                 raise ProvenanceError("namespace is required for semantic memory")
-            if self._embedding_provider is not None:
-                prepared_embedding, _ = self._prepare_semantic_embedding(content=content)
+            if self._embedding_provider is not None or precomputed_embedding is not None:
+                prepared_embedding, _ = self._prepare_semantic_embedding(
+                    content=content,
+                    precomputed_embedding=precomputed_embedding,
+                )
 
         with start_span(
             "hindsight.memory.remember",
@@ -2214,6 +2222,15 @@ class MemoryStore:
                 raise RuntimeError("precomputed embedding requires an embedding provider")
             return None, None
         self._validate_embedding_provider_dimensions()
+        if (
+            precomputed_embedding is None
+            and getattr(self._embedding_provider, "capability", None) == "semantic"
+            and self._conn.info.transaction_status != TransactionStatus.IDLE
+        ):
+            raise RuntimeError(
+                "semantic document embedding must be precomputed before opening "
+                "a database transaction"
+            )
         embedding = (
             precomputed_embedding
             if precomputed_embedding is not None

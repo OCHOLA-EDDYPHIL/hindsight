@@ -221,6 +221,12 @@ def open_demo_incident(
 
     resolved_db_url = db_url or database_url()
     slug = f"{namespace}:{label}"
+    memory_content = (
+        f"Telemetry summary for {slug}: {summary} "
+        "Signals: checkout p99 above 2s, processor timeouts rising, retry fanout high."
+    )
+    embedding_provider = embedding_provider_from_env()
+    prepared_embedding = embedding_provider.embed_document(memory_content)
     with connect(resolved_db_url) as conn:
         with conn.transaction():
             service = _upsert_service(conn)
@@ -243,14 +249,11 @@ def open_demo_incident(
             )
             memory = MemoryStore(
                 conn=conn,
-                embedding_provider=embedding_provider_from_env(),
+                embedding_provider=embedding_provider,
             ).remember(
                 memory_kind="semantic",
                 namespace=namespace,
-                content=(
-                    f"Telemetry summary for {slug}: {summary} "
-                    "Signals: checkout p99 above 2s, processor timeouts rising, retry fanout high."
-                ),
+                content=memory_content,
                 provenance=Provenance(
                     writer="telemetry.ingest",
                     source_ref=f"telemetry:{slug}",
@@ -263,6 +266,7 @@ def open_demo_incident(
                     "service_slug": SERVICE_SLUG,
                     "label": label,
                 },
+                precomputed_embedding=prepared_embedding,
             )
             conn.execute(
                 """

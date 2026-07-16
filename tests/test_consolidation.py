@@ -209,6 +209,37 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
 
 
 @requires_db
+def test_cross_episode_embedding_failure_writes_no_incident_state(monkeypatch):
+    import hindsight.cross_episode as cross_episode
+    from hindsight.db import connect, database_url
+
+    class FailingProvider:
+        def embed_document(self, _text):
+            raise RuntimeError("document embedding unavailable")
+
+    namespace = f"cross-episode-embedding-failure-{uuid4()}"
+    label = "episode-one"
+    slug = f"{namespace}:{label}"
+    monkeypatch.setattr(cross_episode, "embedding_provider_from_env", FailingProvider)
+
+    with pytest.raises(RuntimeError, match="document embedding unavailable"):
+        cross_episode.open_demo_incident(
+            label=label,
+            namespace=namespace,
+            summary="retry fanout raised checkout latency",
+            db_url=database_url(),
+        )
+
+    with connect(database_url()) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM incidents WHERE slug = %s", (slug,)
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE namespace = %s", (namespace,)
+        ).fetchone() == (0,)
+
+
+@requires_db
 @pytest.mark.parametrize(
     ("model_output", "reason_fragment"),
     [
