@@ -205,6 +205,13 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
     assert "test_hosted_acceptance.py" in browser_job
     assert "WebSocket reconnect/resubscribe/unsubscribe" in browser_job
+    for name, default in (
+        ("HINDSIGHT_DEPLOY_DATABASE_URL_PARAM", "/hindsight/demo/database-url"),
+        ("HINDSIGHT_API_DATABASE_URL_PARAM", "/hindsight/demo/api-database-url"),
+        ("HINDSIGHT_WORKER_DATABASE_URL_PARAM", "/hindsight/demo/worker-database-url"),
+    ):
+        assert f"{name}: ${{{{ env." not in browser_job
+        assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in browser_job
 
 
 def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
