@@ -171,14 +171,7 @@ jobs:
             printf 'GEMINI_API_KEY=%s\n' "$FIRST_GEMINI_KEY"
           } >> "$GITHUB_ENV"
       - name: Invoke live Gemini providers
-        env:
-          RUN_LIVE_GEMINI_EMBEDDINGS: "1"
-          RUN_LIVE_GEMINI_REASONING: "1"
-        run: >-
-          uv run pytest -q
-          tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase
-          tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons
-          tests/test_reasoning.py::test_live_gemini_reasoning_provider
+        run: uv run python scripts/run_live_acceptance.py verify-providers
 
   deploy:
     needs:
@@ -336,68 +329,12 @@ jobs:
       - id: pause_changefeed
         name: Pause and fence the managed changefeed for benchmark isolation
         run: uv run python scripts/configure_changefeed.py pause
-      - name: Run frozen pilot
-        id: pilot
-        shell: bash
-        run: |
-          mkdir -p live-acceptance-reports
-          uv run python scripts/run_learning_benchmark.py pilot \
-            --repetitions 2 \
-            --max-distance "$BENCHMARK_MAX_DISTANCE" \
-            > live-acceptance-reports/pilot.json
-          PILOT_EXPERIMENT_ID="$(
-            uv run python - live-acceptance-reports/pilot.json <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          print(report["experiment_id"])
-          PY
-          )"
-          [[ -n "$PILOT_EXPERIMENT_ID" ]] || exit 1
-          echo "experiment_id=$PILOT_EXPERIMENT_ID" >> "$GITHUB_OUTPUT"
-      - name: Persist confirmation preregistration
+      - name: Run authoritative benchmark
         run: >-
-          uv run python scripts/run_learning_benchmark.py preregister
-          --pilot-experiment-id "${{ steps.pilot.outputs.experiment_id }}"
-          > live-acceptance-reports/preregistration.json
-      - name: Run preregistered confirmation
-        run: >-
-          uv run python scripts/run_learning_benchmark.py confirmation
-          --pilot-experiment-id "${{ steps.pilot.outputs.experiment_id }}"
-          > live-acceptance-reports/confirmation.json
-      - name: Require every confirmation gate
-        shell: bash
-        run: |
-          uv run python - live-acceptance-reports/confirmation.json "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          gates = report.get("gates") or {}
-          lines = [
-              "### Preregistered live benchmark",
-              "",
-              f"- Experiment: `{report.get('experiment_id')}`",
-              f"- Trace digest: `{report.get('raw_trace_digest')}`",
-              f"- Claim authorized: `{report.get('claim_authorized') is True}`",
-              "",
-              "| Gate | Result |",
-              "| --- | --- |",
-          ]
-          lines.extend(
-              f"| {name} | {'pass' if value is True else 'fail'} |"
-              for name, value in sorted(gates.items())
-          )
-          with pathlib.Path(sys.argv[2]).open("a") as summary:
-              summary.write("\n".join(lines) + "\n")
-          if report.get("claim_authorized") is not True or not gates or not all(
-              value is True for value in gates.values()
-          ):
-              raise SystemExit("confirmation did not authorize the semantic-learning claim")
-          PY
+          uv run python scripts/run_live_acceptance.py hosted-benchmark
+          --max-distance "$BENCHMARK_MAX_DISTANCE"
+          --report-dir live-acceptance-reports
+          --summary-path "$GITHUB_STEP_SUMMARY"
       - name: Preserve non-secret benchmark reports
         if: always()
         uses: actions/upload-artifact@v4

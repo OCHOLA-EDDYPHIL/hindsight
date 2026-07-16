@@ -175,7 +175,7 @@ def test_live_acceptance_restores_changefeed_after_benchmark_failure():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     assert "github.triggering_actor" in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
-    assert "test_live_gemini_embedding_provider" in workflow
+    assert "run_live_acceptance.py verify-providers" in workflow
     assert "BEDROCK" not in workflow
     assert "Bedrock" not in workflow
     restore_job = workflow.split("  restore_changefeed:\n", 1)[1].split(
