@@ -5,8 +5,9 @@ from __future__ import annotations
 import pathlib
 import sys
 from types import SimpleNamespace
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
+import certifi
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
@@ -73,9 +74,10 @@ def test_runtime_url_preserves_database_and_encodes_credentials():
 def test_prepare_uses_dala_and_writes_distinct_secure_strings(monkeypatch, capsys):
     import provision_runtime_database_credentials as provision
 
-    deploy_url = "postgresql://deploy@db.example:26257/hindsight?sslmode=require"
+    deploy_url = "postgresql://deploy@db.example:26257/hindsight?sslmode=verify-full"
     ssm = FakeSsm(deploy_url)
     sessions = []
+    connected_urls = []
 
     class FakeSession:
         def __init__(self, *, profile_name, region_name):
@@ -86,11 +88,11 @@ def test_prepare_uses_dala_and_writes_distinct_secure_strings(monkeypatch, capsy
             return ssm
 
     monkeypatch.setattr(provision.boto3, "Session", FakeSession)
-    monkeypatch.setattr(
-        provision.psycopg,
-        "connect",
-        lambda url, **_kwargs: FakeConnection(url),
-    )
+    def connect(url, **_kwargs):
+        connected_urls.append(url)
+        return FakeConnection(url)
+
+    monkeypatch.setattr(provision.psycopg, "connect", connect)
     monkeypatch.setattr(provision.secrets, "token_hex", lambda _size: "abc123def456")
     generated = iter(("api-secret", "worker-secret"))
     monkeypatch.setattr(provision.secrets, "token_urlsafe", lambda _size: next(generated))
@@ -109,10 +111,55 @@ def test_prepare_uses_dala_and_writes_distinct_secure_strings(monkeypatch, capsy
     worker_value, worker_type = ssm.parameters["/worker"]
     assert api_type == worker_type == "SecureString"
     assert api_value != worker_value != deploy_url
+    assert all(
+        parse_qs(urlsplit(url).query)["sslrootcert"] == [certifi.where()]
+        for url in connected_urls
+    )
+    assert "sslrootcert" not in parse_qs(urlsplit(api_value).query)
+    assert "sslrootcert" not in parse_qs(urlsplit(worker_value).query)
     output = capsys.readouterr().out
     assert "api-secret" not in output
     assert "worker-secret" not in output
     assert deploy_url not in output
+
+
+def test_prepare_preserves_explicit_tls_root(monkeypatch):
+    import provision_runtime_database_credentials as provision
+
+    deploy_url = (
+        "postgresql://deploy@db.example:26257/hindsight"
+        "?sslmode=verify-full&sslrootcert=system"
+    )
+    ssm = FakeSsm(deploy_url)
+    connected_urls = []
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        def client(self, _name):
+            return ssm
+
+    monkeypatch.setattr(provision.boto3, "Session", FakeSession)
+
+    def connect(url, **_kwargs):
+        connected_urls.append(url)
+        return FakeConnection(url)
+
+    monkeypatch.setattr(provision.psycopg, "connect", connect)
+    provision.prepare(
+        profile="dala",
+        region="us-east-1",
+        deploy_parameter="/deploy",
+        api_parameter="/api",
+        worker_parameter="/worker",
+        metadata_parameter="/rotation",
+    )
+
+    assert all(
+        parse_qs(urlsplit(url).query)["sslrootcert"] == ["system"]
+        for url in connected_urls
+    )
 
 
 def test_prepare_rejects_reused_parameter_paths_before_aws(monkeypatch):
