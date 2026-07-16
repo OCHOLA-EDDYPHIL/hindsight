@@ -10,6 +10,8 @@ from uuid import uuid4
 import boto3
 import psycopg
 
+from hindsight.db import database_url_with_tls_roots
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
@@ -19,7 +21,9 @@ def _parameter_value(ssm, name: str) -> str:
 
 def _assert_restricted(url: str, *, label: str, deploy_url: str) -> str:
     table_name = f"permission_probe_{uuid4().hex}"
-    with psycopg.connect(url, autocommit=True) as connection:
+    with psycopg.connect(
+        database_url_with_tls_roots(url), autocommit=True
+    ) as connection:
         identity = connection.execute("SELECT current_user").fetchone()[0]
         for statement in (
             f"CREATE TABLE {table_name} (id INT PRIMARY KEY)",
@@ -30,7 +34,9 @@ def _assert_restricted(url: str, *, label: str, deploy_url: str) -> str:
             except psycopg.errors.InsufficientPrivilege:
                 continue
             if statement.startswith("CREATE TABLE"):
-                with psycopg.connect(deploy_url, autocommit=True) as deploy:
+                with psycopg.connect(
+                    database_url_with_tls_roots(deploy_url), autocommit=True
+                ) as deploy:
                     deploy.execute(f"DROP TABLE IF EXISTS {table_name}")
             raise RuntimeError(f"{label} database identity has excessive privileges")
     return identity
@@ -42,7 +48,9 @@ def apply_and_verify(
     ssm = boto3.client("ssm", region_name=region)
     api_url = _parameter_value(ssm, api_parameter)
     worker_url = _parameter_value(ssm, worker_parameter)
-    with psycopg.connect(deploy_url, autocommit=True) as connection:
+    with psycopg.connect(
+        database_url_with_tls_roots(deploy_url), autocommit=True
+    ) as connection:
         deploy_identity = connection.execute("SELECT current_user").fetchone()[0]
         connection.execute((ROOT / "infra/db/roles.sql").read_text())
     api_identity = _assert_restricted(api_url, label="API", deploy_url=deploy_url)

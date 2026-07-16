@@ -12,6 +12,8 @@ import boto3
 import psycopg
 from psycopg import sql
 
+from hindsight.db import database_url_with_tls_roots
+
 
 @dataclass(frozen=True)
 class ParameterSnapshot:
@@ -100,7 +102,9 @@ def prepare(
     }
     created_roles: list[str] = []
     try:
-        with psycopg.connect(deploy_url, autocommit=True) as connection:
+        with psycopg.connect(
+            database_url_with_tls_roots(deploy_url), autocommit=True
+        ) as connection:
             deploy_identity = connection.execute("SELECT current_user").fetchone()[0]
             if deploy_identity in roles.values():
                 raise RuntimeError("deploy identity cannot be a runtime identity")
@@ -123,7 +127,9 @@ def prepare(
                     )
                 )
         for label, url in runtime_urls.items():
-            with psycopg.connect(url, connect_timeout=5) as connection:
+            with psycopg.connect(
+                database_url_with_tls_roots(url), connect_timeout=5
+            ) as connection:
                 identity = connection.execute("SELECT current_user").fetchone()[0]
             if identity != roles[label]:
                 raise RuntimeError("runtime database identity verification failed")
@@ -151,7 +157,9 @@ def prepare(
         _restore(ssm, name=metadata_parameter, snapshot=metadata_snapshot)
         if created_roles:
             try:
-                with psycopg.connect(deploy_url, autocommit=True) as connection:
+                with psycopg.connect(
+                    database_url_with_tls_roots(deploy_url), autocommit=True
+                ) as connection:
                     for role in reversed(created_roles):
                         connection.execute(
                             sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role))
