@@ -177,6 +177,7 @@ jobs:
         run: >-
           uv run pytest -q
           tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase
+          tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons
           tests/test_reasoning.py::test_live_gemini_reasoning_provider
 
   deploy:
