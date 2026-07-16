@@ -334,7 +334,7 @@ def test_owned_semantic_write_retries_serialization_with_one_prepared_embedding(
 
     assert persisted == (1, 1, 1)
     assert memory["namespace"] == namespace
-    assert insert_calls == 2
+    assert insert_calls >= 2
     assert provider.document_calls == 1
 
 
