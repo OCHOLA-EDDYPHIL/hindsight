@@ -951,8 +951,19 @@ def test_preparation_attempts_commit_and_exhaust_without_attempt_four():
                     ON experiment.id = preparation.experiment_id
                 WHERE preparation.experiment_id = %s
             """,
+                (scientific_experiment_id,),
+            ).fetchone() == ("scientific_failed", 1, "scientific", "failed")
+        assert conn.execute(
+            "SELECT count(*) FROM benchmark_trials WHERE experiment_id = %s",
             (scientific_experiment_id,),
-        ).fetchone() == ("scientific_failed", 1, "scientific", "failed")
+        ).fetchone() == (0,)
+        assert conn.execute(
+            """
+                SELECT count(*) FROM benchmark_confirmation_preregistrations
+                WHERE pilot_experiment_id = %s
+            """,
+            (scientific_experiment_id,),
+        ).fetchone() == (0,)
 
 
 @requires_db
