@@ -171,40 +171,44 @@ def test_changefeed_status_command_fails_when_not_running(monkeypatch):
         configure.main()
 
 
-def test_live_acceptance_restores_changefeed_after_benchmark_failure():
+def test_live_acceptance_is_product_only_and_never_fences_changefeed():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     assert "github.triggering_actor" in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
-    assert "run_live_acceptance.py verify-providers" in workflow
+    assert "run_live_acceptance.py hosted-product --phase providers" in workflow
+    assert "run_live_acceptance.py hosted-product --phase semantic" in workflow
+    assert "run_live_acceptance.py hosted-product --phase full" in workflow
     assert "BEDROCK" not in workflow
     assert "Bedrock" not in workflow
-    restore_job = workflow.split("  restore_changefeed:\n", 1)[1].split(
-        "  browser_acceptance:\n", 1
-    )[0]
-
-    assert "if: always() && needs.deploy.result == 'success'" in restore_job
-    assert "if: needs.benchmark.result != 'success'" in restore_job
-    assert "run_learning_benchmark.py finalize-interrupted" in restore_job
-    restore_step = restore_job.split("- name: Restore and verify the managed changefeed", 1)[1]
-    assert "if: always()" in restore_step
-    assert "configure_changefeed.py apply" in restore_step
-    assert "configure_changefeed.py status" in restore_step
+    shared_cli = pathlib.Path("scripts/run_live_acceptance.py").read_text()
+    assert '"scripts/configure_changefeed.py", "status"' in shared_cli
+    for forbidden in (
+        "run_learning_benchmark.py",
+        "hosted-benchmark",
+        "learning-full",
+        "configure_changefeed.py pause",
+        "finalize-interrupted",
+        "benchmark:",
+        "confirmation",
+    ):
+        assert forbidden not in workflow
 
 
 def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    browser_job = workflow.split("  browser_acceptance:\n", 1)[1].split(
-        "  acceptance_complete:\n", 1
+    browser_job = workflow.split("  hosted_product:\n", 1)[1].split(
+        "  product_acceptance_complete:\n", 1
     )[0]
 
     assert (
         "HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}" in browser_job
     )
     assert 'CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER"' in browser_job
-    assert 'echo "::add-mask::$CHANGEFEED_TOKEN"' in browser_job
+    assert 'for value in "$OPERATOR_TOKEN" "$DATABASE_URL" "$GEMINI_MATERIAL" "$CHANGEFEED_TOKEN"' in browser_job
+    assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
-    assert "test_hosted_acceptance.py" in browser_job
-    assert "WebSocket reconnect/resubscribe/unsubscribe" in browser_job
+    assert "run_live_acceptance.py hosted-product --phase full" in browser_job
+    assert "WebSocket" in browser_job
     for name, default in (
         ("HINDSIGHT_DEPLOY_DATABASE_URL_PARAM", "/hindsight/demo/database-url"),
         ("HINDSIGHT_API_DATABASE_URL_PARAM", "/hindsight/demo/api-database-url"),
@@ -216,58 +220,62 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
 
 def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    learning = pathlib.Path(".github/workflows/learning-evidence.yml").read_text()
     deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
     destroy = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
 
     live_concurrency = live.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
+    learning_concurrency = learning.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
 
     assert "group: hindsight-demo-environment" in live_concurrency
+    assert "group: hindsight-demo-environment" in learning_concurrency
     assert "group: hindsight-demo-environment" in destroy_concurrency
     assert "inputs.validation_mode" in deploy_concurrency
     assert "format('hindsight-live-deploy-{0}', github.run_id)" in deploy_concurrency
     assert "|| 'hindsight-demo-environment'" in deploy_concurrency
-    for concurrency in (live_concurrency, deploy_concurrency, destroy_concurrency):
+    for concurrency in (
+        live_concurrency,
+        learning_concurrency,
+        deploy_concurrency,
+        destroy_concurrency,
+    ):
         assert "cancel-in-progress: false" in concurrency
 
 
 def test_live_acceptance_resolves_one_owner_authorized_revision():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    authorize = workflow.split("  authorize:\n", 1)[1].split("  verify:\n", 1)[0]
-    operational_jobs = workflow.split("  verify:\n", 1)[1]
+    parsed = yaml.safe_load(workflow)
+    authorize = workflow.split("  authorize:\n", 1)[1].split(
+        "  product_preflight:\n", 1
+    )[0]
 
     assert "  workflow_dispatch:\n" in workflow
+    assert "pull_request:" not in workflow
     assert '"$REF_NAME" == "refs/heads/main"' in authorize
     assert '"$WORKFLOW_REF" == ' in authorize
     assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorize
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorize
-    assert "acceptance_sha: ${{ steps.authorization.outputs.acceptance_sha }}" in authorize
-    assert 'echo "acceptance_sha=$ACCEPTANCE_SHA"' in authorize
-    assert "github.event.pull_request.head.sha" not in operational_jobs
-    assert workflow.count("ref: ${{ needs.authorize.outputs.acceptance_sha }}") == 5
-    assert workflow.count("Verify exact acceptance revision") == 5
-    assert (
-        workflow.count(
-            "HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.acceptance_sha }}"
-        )
-        == 2
-    )
-    assert (
-        "name: live-benchmark-${{ needs.authorize.outputs.acceptance_sha }}-"
-        "${{ github.run_attempt }}"
-    ) in workflow
-    assert "source_sha: ${{ needs.authorize.outputs.acceptance_sha }}" in workflow
-
-    for job_name, next_job in (
-        ("deploy", "semantic_acceptance"),
-        ("semantic_acceptance", "benchmark"),
-        ("benchmark", "restore_changefeed"),
-        ("restore_changefeed", "browser_acceptance"),
-        ("browser_acceptance", "acceptance_complete"),
-    ):
-        job = workflow.split(f"  {job_name}:\n", 1)[1].split(f"  {next_job}:\n", 1)[0]
-        assert "- authorize" in job
+    assert "product_sha: ${{ steps.authorization.outputs.product_sha }}" in authorize
+    assert 'echo "product_sha=$EVENT_SHA"' in authorize
+    assert "source_sha: ${{ needs.authorize.outputs.product_sha }}" in workflow
+    assert set(parsed["jobs"]) == {
+        "authorize",
+        "product_preflight",
+        "deploy",
+        "hosted_product",
+        "product_acceptance_complete",
+    }
+    assert parsed["jobs"]["product_preflight"]["needs"] == "authorize"
+    assert parsed["jobs"]["deploy"]["needs"] == ["authorize", "product_preflight"]
+    assert parsed["jobs"]["hosted_product"]["needs"] == ["authorize", "deploy"]
+    assert parsed["jobs"]["product_acceptance_complete"]["needs"] == [
+        "authorize",
+        "product_preflight",
+        "deploy",
+        "hosted_product",
+    ]
 
 
 def test_live_acceptance_authorization_fails_closed(tmp_path):
@@ -296,7 +304,7 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
     )
 
     assert accepted.returncode == 0, accepted.stderr
-    assert f"acceptance_sha={main_sha}" in accepted_output.read_text()
+    assert f"product_sha={main_sha}" in accepted_output.read_text()
 
     for index, overrides in enumerate(
         (
@@ -313,25 +321,97 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
         )
         assert rejected.returncode != 0
 
-    pull_ref = "refs/pull/42/merge"
-    head_sha = "b" * 40
-    pull_output = tmp_path / "pull-request"
     pull_request = _run_authorization_script(
         ".github/workflows/live-acceptance.yml",
         values={
             **base,
             "EVENT_NAME": "pull_request",
-            "REF_NAME": pull_ref,
+            "REF_NAME": "refs/pull/42/merge",
             "LABEL_NAME": "live-acceptance",
-            "HEAD_SHA": head_sha,
+            "HEAD_SHA": "b" * 40,
             "HEAD_REPOSITORY": repository,
-            "WORKFLOW_REF": (f"{repository}/.github/workflows/live-acceptance.yml@{pull_ref}"),
+            "WORKFLOW_REF": (
+                f"{repository}/.github/workflows/live-acceptance.yml@refs/pull/42/merge"
+            ),
         },
-        output_path=pull_output,
+        output_path=tmp_path / "pull-request",
     )
 
-    assert pull_request.returncode == 0, pull_request.stderr
-    assert f"acceptance_sha={head_sha}" in pull_output.read_text()
+    assert pull_request.returncode != 0
+
+
+def test_product_completion_ignores_learning_result_but_requires_product_jobs(tmp_path):
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
+    step = workflow["jobs"]["product_acceptance_complete"]["steps"][0]
+    script = step["run"]
+    base = {
+        "AUTHORIZED": "true",
+        "AUTHORIZE_RESULT": "success",
+        "PREFLIGHT_RESULT": "success",
+        "DEPLOY_RESULT": "success",
+        "HOSTED_PRODUCT_RESULT": "success",
+        "LEARNING_RESULT": "failure",
+        "HEAD_SHA": "a" * 40,
+        "UI_URL": "https://ui.example.invalid",
+        "API_URL": "https://api.example.invalid",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+    }
+
+    accepted = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        check=False,
+        capture_output=True,
+        env={**os.environ, **base},
+        text=True,
+    )
+    rejected = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        check=False,
+        capture_output=True,
+        env={**os.environ, **base, "HOSTED_PRODUCT_RESULT": "failure"},
+        text=True,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert rejected.returncode != 0
+
+
+def test_learning_authorization_guards_precede_all_hosted_side_effects(tmp_path):
+    workflow_path = ".github/workflows/learning-evidence.yml"
+    workflow = pathlib.Path(workflow_path).read_text()
+    authorize_job = workflow.split("  authorize:\n", 1)[1].split("  learning:\n", 1)[0]
+
+    assert authorize_job.index("AUTHORIZED_RESET_ID") < authorize_job.index("RUN_JSON")
+    for forbidden in (
+        "configure-aws-credentials",
+        "aws ssm get-parameter",
+        "configure_changefeed.py",
+        "learning-evidence-reports",
+    ):
+        assert forbidden not in authorize_job
+
+    rejected = _run_authorization_script(
+        workflow_path,
+        values={
+            "REF_NAME": "refs/heads/main",
+            "EVENT_SHA": "a" * 40,
+            "REPOSITORY": "owner/project",
+            "WORKFLOW_REF": (
+                "owner/project/.github/workflows/learning-evidence.yml@refs/heads/main"
+            ),
+            "ACTOR": "owner",
+            "TRIGGERING_ACTOR": "owner",
+            "REPOSITORY_OWNER": "owner",
+            "PRODUCT_RUN_ID": "1",
+            "REQUESTED_RESET_ID": "requested",
+            "AUTHORIZED_RESET_ID": "",
+            "GH_TOKEN": "unused",
+        },
+        output_path=tmp_path / "learning-rejected",
+    )
+
+    assert rejected.returncode != 0
+    assert "protocol reset" in rejected.stderr
 
 
 def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_path):

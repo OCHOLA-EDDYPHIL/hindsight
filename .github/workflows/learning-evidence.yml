@@ -1,0 +1,222 @@
+name: learning evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      product_run_id:
+        description: Successful product-acceptance run that established deployed provenance
+        required: true
+        type: string
+      protocol_reset_id:
+        description: Explicitly authorized learning-protocol reset identifier
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: hindsight-demo-environment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+  DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+  CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+  GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+  GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
+  BENCHMARK_MAX_DISTANCE: "0.35"
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      learning_sha: ${{ steps.authorization.outputs.learning_sha }}
+      api_url: ${{ steps.provenance.outputs.api_url }}
+    steps:
+      - id: authorization
+        name: Require protocol reset and matching product run
+        env:
+          REF_NAME: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PRODUCT_RUN_ID: ${{ inputs.product_run_id }}
+          REQUESTED_RESET_ID: ${{ inputs.protocol_reset_id }}
+          AUTHORIZED_RESET_ID: ${{ vars.HINDSIGHT_LEARNING_PROTOCOL_RESET_ID }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          [[ "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/learning-evidence.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Learning evidence requires the repository owner on main." >&2
+            exit 1
+          }
+          [[ -n "$AUTHORIZED_RESET_ID" \
+            && "$REQUESTED_RESET_ID" == "$AUTHORIZED_RESET_ID" ]] || {
+            echo "Learning evidence has no matching authorized protocol reset." >&2
+            exit 1
+          }
+          RUN_JSON="$(GH_TOKEN="$GH_TOKEN" gh api "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID")"
+          jq -e \
+            --arg sha "$EVENT_SHA" \
+            '.name == "live acceptance"
+              and .path == ".github/workflows/live-acceptance.yml"
+              and .event == "workflow_dispatch"
+              and .conclusion == "success"
+              and .head_sha == $sha' \
+            <<<"$RUN_JSON" >/dev/null || {
+              echo "Learning evidence requires a successful same-SHA product run." >&2
+              exit 1
+            }
+          echo "learning_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+      - id: provenance
+        name: Verify product provenance artifact
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PRODUCT_RUN_ID: ${{ inputs.product_run_id }}
+          EXPECTED_SHA: ${{ steps.authorization.outputs.learning_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          ARTIFACT_NAME="$(
+            GH_TOKEN="$GH_TOKEN" gh api \
+              "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID/artifacts" |
+              jq -r --arg sha "$EXPECTED_SHA" '.artifacts
+              | map(select(.expired == false and (.name | startswith("product-provenance-" + $sha + "-"))))
+              | if length == 1 then .[0].name else empty end'
+          )"
+          [[ -n "$ARTIFACT_NAME" ]] || {
+            echo "A unique product provenance artifact is required." >&2
+            exit 1
+          }
+          mkdir product-provenance
+          GH_TOKEN="$GH_TOKEN" gh run download "$PRODUCT_RUN_ID" \
+            --repo "$REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir product-provenance
+          API_URL="$(python - "$EXPECTED_SHA" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path("product-provenance/product-provenance.json").read_text())
+          if payload.get("head_sha") != sys.argv[1]:
+              raise SystemExit("product provenance SHA mismatch")
+          api_url = str(payload.get("api_url") or "")
+          if not api_url.startswith("https://"):
+              raise SystemExit("product provenance API URL is invalid")
+          print(api_url)
+          PY
+          )"
+          echo "api_url=$API_URL" >> "$GITHUB_OUTPUT"
+
+  learning:
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EMBEDDING_PROVIDER: gemini
+      LLM_PROVIDER: gemini
+      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.learning_sha }}
+      HINDSIGHT_CHANGEFEED_WEBHOOK_URL: ${{ needs.authorize.outputs.api_url }}/internal/changefeed
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
+      - name: Verify exact learning revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.learning_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load and mask learning settings from SSM
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$CHANGEFEED_TOKEN"; do
+            [[ -n "$value" && "$value" != "None" ]] || {
+              echo "A learning-evidence setting is unavailable." >&2
+              exit 1
+            }
+            echo "::add-mask::$value"
+          done
+          while IFS= read -r api_key; do
+            [[ -n "$api_key" ]] && echo "::add-mask::$api_key"
+          done < <(
+            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
+              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
+          )
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          {
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+            printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
+            echo "GEMINI_API_KEYS<<$delimiter"
+            printf '%s\n' "$GEMINI_MATERIAL"
+            echo "$delimiter"
+          } >> "$GITHUB_ENV"
+      - id: pause_changefeed
+        name: Pause and fence the managed changefeed
+        run: uv run python scripts/configure_changefeed.py pause
+      - name: Run strict learning evidence
+        run: >-
+          uv run python scripts/run_live_acceptance.py learning-full
+          --database-scope hosted
+          --max-distance "$BENCHMARK_MAX_DISTANCE"
+          --report-dir learning-evidence-reports
+          --summary-path "$GITHUB_STEP_SUMMARY"
+      - name: Preserve learning reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: learning-evidence-${{ needs.authorize.outputs.learning_sha }}-${{ github.run_attempt }}
+          path: learning-evidence-reports/*.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Finalize interrupted learning traces
+        if: failure() && steps.pause_changefeed.outcome == 'success'
+        run: >-
+          uv run python scripts/run_learning_benchmark.py finalize-interrupted
+          --code-sha "$HINDSIGHT_BENCHMARK_CODE_SHA"
+          --reason "Learning-evidence workflow ended before strict completion"
+      - name: Restore and verify the managed changefeed
+        if: always() && steps.pause_changefeed.outcome == 'success'
+        shell: bash
+        run: |
+          uv run python scripts/configure_changefeed.py apply
+          uv run python scripts/configure_changefeed.py status
+
+  learning_evidence_complete:
+    if: always()
+    needs:
+      - authorize
+      - learning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require strict learning completion
+        env:
+          AUTHORIZE_RESULT: ${{ needs.authorize.result }}
+          LEARNING_RESULT: ${{ needs.learning.result }}
+        run: |
+          [[ "$AUTHORIZE_RESULT" == "success" ]]
+          [[ "$LEARNING_RESULT" == "success" ]]

@@ -18,9 +18,9 @@ acceptance = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(acceptance)
 
 
-def test_local_pilot_refuses_non_loopback_and_initialized_databases(monkeypatch):
+def test_local_acceptance_refuses_non_loopback_and_existing_databases(monkeypatch):
     with pytest.raises(ValueError, match="loopback"):
-        acceptance._require_local_database(
+        acceptance._validate_local_url(
             "postgresql://root@example.invalid:26257/pilot?sslmode=disable"
         )
 
@@ -31,62 +31,64 @@ def test_local_pilot_refuses_non_loopback_and_initialized_databases(monkeypatch)
         def __exit__(self, *_args):
             return None
 
-        def execute(self, _query):
-            return SimpleNamespace(fetchone=lambda: (True,))
+        def execute(self, _query, _params=None):
+            return SimpleNamespace(fetchone=lambda: (1,))
 
-    monkeypatch.setattr(acceptance.psycopg, "connect", lambda _url: Connection())
-    with pytest.raises(ValueError, match="fresh database"):
-        acceptance._require_local_database(
+    monkeypatch.setattr(acceptance.psycopg, "connect", lambda *_args, **_kwargs: Connection())
+    with pytest.raises(ValueError, match="new database"):
+        acceptance._create_local_database(
             "postgresql://root@localhost:26257/pilot?sslmode=disable"
         )
+    with pytest.raises(ValueError, match="outside the repository"):
+        acceptance._require_local_report_path(ROOT / "acceptance-reports")
 
 
-def test_local_pilot_runs_only_fresh_pilot_stages(monkeypatch, tmp_path):
-    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
-    commands = []
-    validation = []
-
-    def fake_run(command, *, env, stdout_path=None):
-        commands.append((command, env, stdout_path))
-        if stdout_path is not None:
-            stdout_path.write_text('{"experiment_id":"pilot-id"}')
-
-    monkeypatch.setattr(acceptance, "_run", fake_run)
-    monkeypatch.setattr(acceptance, "_require_local_database", lambda _url: None)
-    monkeypatch.setattr(acceptance, "_code_sha", lambda: "a" * 40)
+def test_product_provider_verification_excludes_frozen_pilot(monkeypatch):
+    monkeypatch.setenv(
+        "GEMINI_API_KEYS",
+        '{"version":1,"keys":[{"id":"one","api_key":"opaque-material"}]}',
+    )
+    calls = []
     monkeypatch.setattr(
         acceptance,
-        "_validate_local_pilot",
-        lambda **kwargs: validation.append(kwargs),
-    )
-    report = tmp_path / "pilot.json"
-
-    acceptance._run_local_pilot(
-        SimpleNamespace(
-            database_url="postgresql://root@localhost:26257/pilot?sslmode=disable",
-            max_distance=0.35,
-            report=report,
-            code_sha=None,
-        )
+        "_run",
+        lambda command, *, env, stdout_path=None: calls.append((command, env)),
     )
 
-    flattened = [part for command, _env, _path in commands for part in command]
-    assert "scripts/migrate.py" in flattened
-    assert "scripts/initialize_agent_storage.py" in flattened
-    assert "scripts/reembed_memories.py" in flattened
-    assert "pilot" in flattened
-    assert "confirmation" not in flattened
-    assert "preregister" not in flattened
-    assert commands[-1][1]["HINDSIGHT_BENCHMARK_CODE_SHA"] == "a" * 40
-    assert validation == [
-        {
-            "database_url": "postgresql://root@localhost:26257/pilot?sslmode=disable",
-            "experiment_id": "pilot-id",
-        }
+    acceptance._verify_product_providers()
+
+    assert len(calls) == 1
+    assert calls[0][0][-2:] == list(acceptance.PROVIDER_SANITY_SELECTORS)
+    assert acceptance.PILOT_EMBEDDING_SELECTOR not in calls[0][0]
+    assert calls[0][1]["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1"
+    assert calls[0][1]["GEMINI_API_KEY"] == "opaque-material"
+
+
+def test_learning_provider_verification_runs_frozen_pilot_twice(monkeypatch):
+    monkeypatch.setenv(
+        "GEMINI_API_KEYS",
+        '{"version":1,"keys":[{"id":"one","api_key":"opaque-material"}]}',
+    )
+    calls = []
+    monkeypatch.setattr(
+        acceptance,
+        "_run",
+        lambda command, *, env, stdout_path=None: calls.append((command, env)),
+    )
+
+    acceptance._verify_learning_providers()
+
+    assert [call[0][-1] for call in calls] == [
+        acceptance.PILOT_EMBEDDING_SELECTOR,
+        acceptance.PILOT_EMBEDDING_SELECTOR,
     ]
+    assert all(call[1]["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1" for call in calls)
+    assert all(call[1]["GEMINI_API_KEY"] == "opaque-material" for call in calls)
 
 
-def test_provider_verification_uses_the_frozen_shared_selectors(monkeypatch):
+def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(monkeypatch):
+    database_url = "postgresql://root@localhost:26257/db?sslmode=disable"
+    monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
     calls = []
     monkeypatch.setattr(
@@ -95,74 +97,360 @@ def test_provider_verification_uses_the_frozen_shared_selectors(monkeypatch):
         lambda command, *, env, stdout_path=None: calls.append((command, env)),
     )
 
-    acceptance._verify_providers()
+    acceptance._verify_semantic(
+        SimpleNamespace(
+            database_url=database_url,
+            database_scope="local",
+        )
+    )
+
+    assert calls[0][0][-3:] == list(acceptance.SEMANTIC_SELECTORS)
+    assert calls[0][1]["RUN_LIVE_GEMINI_ACCEPTANCE"] == "1"
+    with pytest.raises(ValueError, match="refuses loopback"):
+        acceptance._verify_semantic(
+            SimpleNamespace(
+                database_url=database_url,
+                database_scope="hosted",
+            )
+        )
+
+
+def _completed_report(kind: str, experiment_id: str) -> dict[str, object]:
+    return {
+        "experiment_id": experiment_id,
+        "experiment_kind": kind,
+        "status": "completed",
+        "raw_trace_digest": "trace",
+        "claim_evidence_digest": "claim",
+    }
+
+
+def test_local_pilot_runs_setup_and_preregisters_without_confirmation(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
+    commands = []
+    validations = []
+
+    def fake_run(command, *, env, stdout_path=None):
+        commands.append((command, env, stdout_path))
+        if stdout_path is None:
+            return
+        if "pilot" in command:
+            payload = _completed_report("pilot", "pilot-id")
+        else:
+            payload = {
+                "pilot_experiment_id": "pilot-id",
+                "preregistration_sha256": "digest",
+                "eligible_held_out_variant_ids": [f"eligible-{i}" for i in range(12)],
+                "selected_held_out_variant_ids": [f"selected-{i}" for i in range(12)],
+                "repetitions_per_variant": 2,
+            }
+        stdout_path.write_text(acceptance.json.dumps(payload))
+
+    monkeypatch.setattr(acceptance, "_run", fake_run)
+    monkeypatch.setattr(acceptance, "_create_local_database", lambda _url: None)
+    monkeypatch.setattr(acceptance, "_require_local_code_sha", lambda _sha: "a" * 40)
+    monkeypatch.setattr(
+        acceptance,
+        "_validate_experiment",
+        lambda **kwargs: validations.append(kwargs),
+    )
+    report_dir = tmp_path / "reports"
+
+    acceptance._run_local_benchmark(
+        SimpleNamespace(
+            database_url="postgresql://root@localhost:26257/pilot?sslmode=disable",
+            max_distance=0.35,
+            report_dir=report_dir,
+            code_sha=None,
+        ),
+        include_confirmation=False,
+    )
+
+    flattened = [part for command, _env, _path in commands for part in command]
+    assert "scripts/migrate.py" in flattened
+    assert "scripts/initialize_agent_storage.py" in flattened
+    assert "scripts/reembed_memories.py" in flattened
+    assert "pilot" in flattened
+    assert "confirmation" not in flattened
+    assert "preregister" in flattened
+    assert validations[0]["expected_trials"] == 36
+    assert (report_dir / "pilot.json").is_file()
+    assert (report_dir / "preregistration.json").is_file()
+
+
+def test_local_benchmark_checks_clean_sha_before_creating_database(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
+    order = []
+    monkeypatch.setattr(
+        acceptance,
+        "_require_local_code_sha",
+        lambda _sha: order.append("sha") or "a" * 40,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_create_local_database",
+        lambda _url: order.append("database"),
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_run_pilot_and_preregister",
+        lambda **_kwargs: ({}, {}),
+    )
+    monkeypatch.setattr(acceptance, "_run", lambda *_args, **_kwargs: None)
+
+    acceptance._run_local_benchmark(
+        SimpleNamespace(
+            database_url="postgresql://root@localhost:26257/pilot?sslmode=disable",
+            max_distance=0.35,
+            report_dir=tmp_path / "reports",
+            code_sha=None,
+        ),
+        include_confirmation=False,
+    )
+
+    assert order == ["sha", "database"]
+
+
+def test_local_browser_product_sanitizes_hosted_environment_and_runs_history(monkeypatch):
+    monkeypatch.setenv("RUN_HOSTED_ACCEPTANCE", "1")
+    monkeypatch.setenv("HOSTED_API_URL", "https://hosted.invalid")
+    calls = []
+
+    class Server:
+        def terminate(self):
+            return None
+
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(acceptance.subprocess, "Popen", lambda *_args, **_kwargs: Server())
+    monkeypatch.setattr(acceptance, "_wait_for_http_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        acceptance,
+        "_run",
+        lambda command, *, env, stdout_path=None: calls.append((command, env)),
+    )
+
+    acceptance._run_local_browser_product(
+        database_url="postgresql://root@localhost:26257/product?sslmode=disable",
+        base_url="http://127.0.0.1:8766",
+    )
 
     command, env = calls[0]
-    assert command[-3:] == list(acceptance.PROVIDER_SELECTORS)
-    assert env["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1"
-    assert env["RUN_LIVE_GEMINI_REASONING"] == "1"
+    assert "RUN_HOSTED_ACCEPTANCE" not in env
+    assert "HOSTED_API_URL" not in env
+    assert any("historical_snapshot" in part for part in command)
 
 
-def test_hosted_benchmark_owns_reports_and_final_gate_validation(monkeypatch, tmp_path):
-    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
-    monkeypatch.setenv("HINDSIGHT_BENCHMARK_CODE_SHA", "b" * 40)
+def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypatch):
+    created = []
+    initialized = []
+    calls = []
+    monkeypatch.setattr(
+        acceptance,
+        "_create_local_database",
+        lambda database_url: created.append(database_url),
+    )
+    monkeypatch.setattr(acceptance, "_verify_product_providers", lambda: calls.append("providers"))
+    monkeypatch.setattr(
+        acceptance,
+        "_initialize_product_database",
+        lambda env, *, configure_embeddings: initialized.append(
+            (env["DATABASE_URL"], configure_embeddings)
+        ),
+    )
+    monkeypatch.setattr(acceptance, "_verify_semantic", lambda _args: calls.append("semantic"))
+    monkeypatch.setattr(
+        acceptance,
+        "_verify_resilience",
+        lambda _args: calls.append("resilience"),
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_run_local_browser_product",
+        lambda **_kwargs: calls.append("browser"),
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_require_local_code_sha",
+        lambda _value: pytest.fail("product acceptance must not require an exact SHA"),
+    )
+
+    acceptance._run_local_product_full(
+        SimpleNamespace(
+            database_url="postgresql://root@localhost:26257/product?sslmode=disable",
+            base_url="http://127.0.0.1:8766",
+        )
+    )
+
+    assert [parts.path for parts in map(acceptance.urlsplit, created)] == [
+        "/product_semantic",
+        "/product_resilience",
+        "/product_browser",
+    ]
+    assert [configured for _url, configured in initialized] == [True, False, False]
+    assert calls == ["providers", "semantic", "resilience", "browser"]
+
+
+def test_full_benchmark_owns_reports_and_strict_validations(monkeypatch, tmp_path):
     commands = []
+    validations = []
 
     def fake_run(command, *, env, stdout_path=None):
         commands.append(command)
         if stdout_path is None:
             return
         if "pilot" in command:
-            payload = {"experiment_id": "pilot-id"}
+            payload = _completed_report("pilot", "pilot-id")
         elif "confirmation" in command:
             payload = {
-                "experiment_id": "confirmation-id",
-                "raw_trace_digest": "trace",
+                **_completed_report("confirmation", "confirmation-id"),
                 "claim_authorized": True,
                 "gates": {"complete_pairs": True, "retrieval": True},
             }
         else:
-            payload = {"pilot_experiment_id": "pilot-id"}
+            payload = {
+                "pilot_experiment_id": "pilot-id",
+                "preregistration_sha256": "digest",
+                "eligible_held_out_variant_ids": [f"eligible-{i}" for i in range(12)],
+                "selected_held_out_variant_ids": [f"selected-{i}" for i in range(12)],
+                "repetitions_per_variant": 2,
+            }
         stdout_path.write_text(acceptance.json.dumps(payload))
 
     monkeypatch.setattr(acceptance, "_run", fake_run)
+    monkeypatch.setattr(
+        acceptance,
+        "_validate_experiment",
+        lambda **kwargs: validations.append(kwargs),
+    )
     report_dir = tmp_path / "reports"
-    summary = tmp_path / "summary.txt"
+    report_dir.mkdir()
 
-    acceptance._run_hosted_benchmark(
-        SimpleNamespace(
-            database_url="postgresql://operator@cluster.example:26257/hindsight?sslmode=verify-full",
-            max_distance=0.35,
-            report_dir=report_dir,
-            summary_path=summary,
-        )
+    confirmation = acceptance._run_benchmark_sequence(
+        database_url="postgresql://root@localhost/db",
+        env={},
+        report_dir=report_dir,
     )
 
     flattened = [part for command in commands for part in command]
     assert flattened.count("pilot") == 1
     assert flattened.count("preregister") == 1
     assert flattened.count("confirmation") == 1
-    assert (report_dir / "pilot.json").is_file()
-    assert (report_dir / "preregistration.json").is_file()
-    assert (report_dir / "confirmation.json").is_file()
-    assert "Claim authorized: `True`" in summary.read_text()
+    assert [item["expected_trials"] for item in validations] == [36, 72]
+    assert confirmation["claim_authorized"] is True
+    assert all((report_dir / name).stat().st_size > 0 for name in (
+        "pilot.json",
+        "preregistration.json",
+        "confirmation.json",
+    ))
+
+
+def test_learning_failure_is_strict_and_preserves_reports(monkeypatch, tmp_path):
+    def fake_run(command, *, env, stdout_path=None):
+        if stdout_path is None:
+            return
+        if "pilot" in command:
+            payload = _completed_report("pilot", "pilot-id")
+        elif "confirmation" in command:
+            payload = {
+                **_completed_report("confirmation", "confirmation-id"),
+                "claim_authorized": False,
+                "gates": {"complete_pairs": True, "retrieval": False},
+            }
+        else:
+            payload = {
+                "pilot_experiment_id": "pilot-id",
+                "preregistration_sha256": "digest",
+                "eligible_held_out_variant_ids": [f"eligible-{i}" for i in range(12)],
+                "selected_held_out_variant_ids": [f"selected-{i}" for i in range(12)],
+                "repetitions_per_variant": 2,
+            }
+        stdout_path.write_text(acceptance.json.dumps(payload))
+
+    monkeypatch.setattr(acceptance, "_run", fake_run)
+    monkeypatch.setattr(acceptance, "_validate_experiment", lambda **_kwargs: None)
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="did not authorize"):
+        acceptance._run_benchmark_sequence(
+            database_url="postgresql://root@localhost/db",
+            env={},
+            report_dir=report_dir,
+        )
+
+    assert all(
+        (report_dir / name).stat().st_size > 0
+        for name in ("pilot.json", "preregistration.json", "confirmation.json")
+    )
+
+
+def test_experiment_validation_requires_every_trial(monkeypatch):
+    rows = iter(
+        [
+            ("pilot", "completed"),
+            (6, 6),
+            (36, 36, 36, 0, 0),
+        ]
+    )
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, _query, _params):
+            return SimpleNamespace(fetchone=lambda: next(rows))
+
+    monkeypatch.setattr(acceptance.psycopg, "connect", lambda _url: Connection())
+    acceptance._validate_experiment(
+        database_url="postgresql://db",
+        experiment_id="pilot-id",
+        experiment_kind="pilot",
+        expected_preparations=6,
+        expected_trials=36,
+    )
 
 
 def test_confirmation_gate_validation_fails_closed():
+    base = _completed_report("confirmation", "confirmation-id")
     with pytest.raises(RuntimeError, match="did not authorize"):
         acceptance._require_confirmation_gates(
-            {"claim_authorized": False, "gates": {"retrieval": True}}
+            {**base, "claim_authorized": False, "gates": {"retrieval": True}}
         )
     with pytest.raises(RuntimeError, match="did not authorize"):
         acceptance._require_confirmation_gates(
-            {"claim_authorized": True, "gates": {"retrieval": False}}
+            {**base, "claim_authorized": True, "gates": {"retrieval": False}}
         )
 
 
 def test_live_workflow_calls_shared_acceptance_commands():
     workflow = (ROOT / ".github" / "workflows" / "live-acceptance.yml").read_text()
 
-    assert "scripts/run_live_acceptance.py verify-providers" in workflow
-    assert "scripts/run_live_acceptance.py hosted-benchmark" in workflow
-    assert "run_learning_benchmark.py pilot" not in workflow
-    assert "test_live_gemini_embedding_provider_ranks_frozen" not in workflow
+    assert "scripts/run_live_acceptance.py hosted-product --phase providers" in workflow
+    assert "scripts/run_live_acceptance.py hosted-product --phase semantic" in workflow
+    assert "scripts/run_live_acceptance.py hosted-product --phase full" in workflow
+    for forbidden in (
+        "learning-pilot",
+        "learning-full",
+        "run_learning_benchmark.py",
+        "finalize-interrupted",
+        "configure_changefeed.py pause",
+        "live-benchmark-",
+    ):
+        assert forbidden not in workflow
+
+
+def test_learning_workflow_is_manual_guarded_and_never_deploys():
+    workflow = (ROOT / ".github" / "workflows" / "learning-evidence.yml").read_text()
+
+    assert "workflow_dispatch:" in workflow
+    assert "HINDSIGHT_LEARNING_PROTOCOL_RESET_ID" in workflow
+    assert "scripts/run_live_acceptance.py learning-full" in workflow
+    assert "configure_changefeed.py pause" in workflow
+    assert "finalize-interrupted" in workflow
+    assert "deploy-demo.yml" not in workflow
+    assert "pull_request:" not in workflow
