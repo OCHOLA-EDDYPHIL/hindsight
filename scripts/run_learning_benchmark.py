@@ -34,7 +34,10 @@ from hindsight.db import connect  # noqa: E402
 from hindsight.embedding_index import activate_profile, begin_profile_build  # noqa: E402
 from hindsight.embeddings import embedding_profile, embedding_provider_from_env  # noqa: E402
 from hindsight.memory import MemoryStore, Provenance  # noqa: E402
-from hindsight.reasoning import reasoning_provider_from_env  # noqa: E402
+from hindsight.reasoning import (  # noqa: E402
+    reasoning_provider_from_env,
+    retrying_reasoning_provider,
+)
 from hindsight.runs import create_incident, resolve_incident  # noqa: E402
 from hindsight.runtime import runtime_database_url, runtime_settings  # noqa: E402
 
@@ -44,6 +47,7 @@ PROTOCOL_SCHEMA_VERSION = 3
 MIN_PILOT_VARIANTS = 6
 MIN_CONFIRMATION_VARIANTS = 12
 RETRIEVAL_RANK_REQUIREMENT = 1
+BENCHMARK_REASONING_MAX_ATTEMPTS = 4
 ARM_NAMES = ("no_lesson", "reference_lesson", "consolidated_lesson")
 SIMULATOR_KINDS = (
     "retry_amplification",
@@ -106,7 +110,10 @@ def main() -> None:
     _validate_corpus(corpus)
     _require_explicit_live_providers(args.command)
     settings = runtime_settings(use_cache=False)
-    reasoning = reasoning_provider_from_env(settings.provider_env)
+    reasoning = retrying_reasoning_provider(
+        reasoning_provider_from_env(settings.provider_env),
+        max_attempts=BENCHMARK_REASONING_MAX_ATTEMPTS,
+    )
     embeddings = embedding_provider_from_env(settings.provider_env)
     active_profile = _resolve_active_profile(
         command=args.command,

@@ -7,6 +7,7 @@ are opt-in, and tests use deterministic responses unless configured otherwise.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
@@ -22,6 +23,10 @@ LIVE_GEMINI_REASONING_FLAG = "RUN_LIVE_GEMINI_REASONING"
 
 class ReasoningProviderError(RuntimeError):
     """Raised when a reasoning provider cannot be configured or invoked."""
+
+    def __init__(self, message: str, *, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -133,7 +138,10 @@ class GeminiReasoningProvider:
             else:
                 response = invoke(self._client)
         except Exception as exc:  # pragma: no cover - provider SDK details vary.
-            raise ReasoningProviderError(f"Gemini generation failed: {exc}") from exc
+            raise ReasoningProviderError(
+                f"Gemini generation failed: {exc}",
+                retry_after_seconds=getattr(exc, "retry_after_seconds", None),
+            ) from exc
         text = getattr(response, "text", None)
         if not text:
             raise ReasoningProviderError("Gemini returned an empty response")
@@ -211,6 +219,7 @@ class RetryingReasoningProvider:
         *,
         max_attempts: int = 2,
         retryable: Callable[[Exception], bool] | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -219,6 +228,7 @@ class RetryingReasoningProvider:
         self.model_name = provider.model_name
         self._max_attempts = max_attempts
         self._retryable = retryable or (lambda exc: isinstance(exc, ReasoningProviderError))
+        self._sleeper = sleeper
 
     def generate(self, request: ReasoningRequest) -> ReasoningResponse:
         attempts = 0
@@ -231,6 +241,9 @@ class RetryingReasoningProvider:
                 last_error = exc
                 if attempts >= self._max_attempts or not self._retryable(exc):
                     break
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                if retry_after is not None and retry_after > 0:
+                    self._sleeper(float(retry_after))
                 continue
             usage = dict(response.usage)
             usage["attempts"] = attempts
@@ -280,10 +293,15 @@ def retrying_reasoning_provider(
     provider: ReasoningProvider,
     *,
     max_attempts: int = 2,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> ReasoningProvider:
     """Return a provider wrapper that records attempts in usage metadata."""
 
-    return RetryingReasoningProvider(provider, max_attempts=max_attempts)
+    return RetryingReasoningProvider(
+        provider,
+        max_attempts=max_attempts,
+        sleeper=sleeper,
+    )
 
 
 def _usage_dict(usage_metadata: Any) -> dict[str, Any]:

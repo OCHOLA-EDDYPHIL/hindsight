@@ -70,8 +70,41 @@ def test_pool_honours_retry_after_and_reports_exhaustion_without_keys():
             routing_key="run-2",
         )
 
-    assert raised.value.retry_after_seconds == 48
+    assert raised.value.retry_after_seconds == 60
     assert "sensitive-key" not in str(raised.value)
+
+
+def test_pool_honours_google_retry_info_details():
+    from hindsight.gemini import (
+        GeminiCredential,
+        GeminiCredentialPool,
+        GeminiPoolExhaustedError,
+    )
+
+    error = ProviderError(429)
+    error.details = {
+        "error": {
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "22.361672167s",
+                }
+            ]
+        }
+    }
+    pool = GeminiCredentialPool(
+        [GeminiCredential("slot-a", "sensitive-key")],
+        client_factory=lambda key: object(),
+        clock=lambda: 2_000,
+    )
+
+    with pytest.raises(GeminiPoolExhaustedError) as raised:
+        pool.execute(
+            lambda client: (_ for _ in ()).throw(error),
+            routing_key="run-structured-retry",
+        )
+
+    assert raised.value.retry_after_seconds == 23
 
 
 def test_pool_does_not_rotate_invalid_requests():
