@@ -40,7 +40,6 @@ def enqueue_run(message: dict[str, Any], *, client: Any | None = None) -> str:
         thread = threading.Thread(
             target=process_message,
             args=(message,),
-            kwargs={"attempt": 1},
             name=f"hindsight-run-{message.get('run_id', 'unknown')}",
             daemon=True,
         )
