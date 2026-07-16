@@ -2,6 +2,7 @@
 
 import importlib.util
 import pathlib
+import sys
 
 
 def _builder():
@@ -13,6 +14,22 @@ def _builder():
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _smoke():
+    spec = importlib.util.spec_from_file_location(
+        "smoke_lambda_artifacts",
+        pathlib.Path("scripts/smoke_lambda_artifacts.py"),
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
     return module
 
 
@@ -57,3 +74,28 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
         "queueing.py",
         "run_dispatch.py",
     } <= set(worker["modules"])
+
+
+def test_artifact_smoke_uses_every_terraform_configured_handler():
+    smoke = _smoke()
+
+    assert [
+        (handler.function, handler.artifact, handler.handler)
+        for handler in smoke.configured_handlers()
+    ] == [
+        ("api", "api", "hindsight.api.handler"),
+        ("worker", "worker", "hindsight.worker.handler"),
+        ("websocket", "realtime", "hindsight.realtime.websocket_handler"),
+        ("changefeed", "realtime", "hindsight.realtime.changefeed_handler"),
+    ]
+
+
+def test_required_database_job_checks_lock_and_built_lambda_handlers():
+    workflow = pathlib.Path(".github/workflows/ci.yml").read_text()
+    test_job = workflow.split("  test:\n", 1)[1]
+
+    assert "uv lock --check" in test_job
+    assert "docker compose up -d crdb" in test_job
+    assert "uv run pytest -q" in test_job
+    assert "uv run python scripts/build_lambda_artifacts.py" in test_job
+    assert "uv run python scripts/smoke_lambda_artifacts.py" in test_job
