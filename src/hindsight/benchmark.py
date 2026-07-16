@@ -81,6 +81,14 @@ ALL_SIMULATOR_ACTIONS: tuple[str, ...] = (
     ),
     "stop",
 )
+ACTION_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": list(ALL_SIMULATOR_ACTIONS)},
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
 
 
 class ScientificTrialFailure(ValueError):
@@ -1416,6 +1424,8 @@ def _choose_action(
             ),
             temperature=0.0,
             max_output_tokens=256,
+            response_json_schema=ACTION_RESPONSE_JSON_SCHEMA,
+            thinking_budget=0,
         )
     )
     action = _parse_action_response(response.text)
