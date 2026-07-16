@@ -1411,10 +1411,11 @@ def _choose_action(
         ReasoningRequest(
             system=(
                 "Choose exactly one next simulator action from the incident, current "
-                "observation, and memories. Treat the observation as feedback. If it reports "
-                "that the previous action was deferred, ineffective, or did not address the "
-                "active mechanism, do not repeat that action unchanged. A diagnostic action "
-                "may be needed before remediation. Return JSON with only an action key. "
+                "observation, and memories. Treat the observation as feedback. If it names a "
+                "previous action and the incident is not recovered, do not repeat that action "
+                "unchanged; choose a different action that advances diagnosis or remediation. "
+                "A diagnostic action may be needed before remediation. Return JSON with only "
+                "an action key. "
                 f"The allowed actions are: {', '.join(allowed_actions)}."
             ),
             prompt=json.dumps(
