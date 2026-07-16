@@ -488,6 +488,39 @@ def test_live_document_embedding_is_rejected_inside_caller_transaction():
 
 
 @requires_db
+def test_active_profile_read_closes_owned_implicit_transaction():
+    from psycopg.pq import TransactionStatus
+
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore
+
+    with MemoryStore(
+        url=database_url(), embedding_provider=DeterministicEmbeddingProvider()
+    ) as store:
+        store.ensure_active_embedding_profile()
+        assert store._conn.info.transaction_status == TransactionStatus.IDLE
+
+        store.active_embedding_profile()
+
+        assert store._conn.info.transaction_status == TransactionStatus.IDLE
+
+
+@requires_db
+def test_active_profile_read_preserves_caller_transaction():
+    from psycopg.pq import TransactionStatus
+
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore
+
+    with connect(database_url()) as conn:
+        with conn.transaction():
+            store = MemoryStore(conn=conn)
+            store.active_embedding_profile()
+            assert conn.info.transaction_status == TransactionStatus.INTRANS
+
+
+@requires_db
 def test_remember_accepts_precomputed_embedding_inside_caller_transaction():
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider, embedding_profile
