@@ -6,11 +6,11 @@
       "split": "pilot",
       "simulator_kind": "retry_amplification",
       "source_summary": "A sluggish card processor was flooded by exponentially repeated authorization attempts during a checkout incident.",
-      "recurrence_query": "Duplicate purchase attempts create retry amplification against a degraded card acquirer while its backlog grows; which response should lead before local capacity changes?",
+      "recurrence_query": "Duplicate purchase attempts amplify against a degraded card acquirer while its backlog grows; responders must distinguish dependency-driven retry fanout from local worker shortage before intervening.",
       "root_cause": "Unbounded retries amplified load on a degraded payment processor.",
-      "resolution_action": "Measure processor timeouts and queue growth, cap retry fanout, and defer worker scaling until the dependency recovers.",
+      "resolution_action": "Inspect downstream processor behavior to confirm timeout-driven retry fanout, then cap retries and defer worker scaling until the dependency recovers.",
       "resolution_observation": "Authorizations recovered after duplicate attempts were limited and the downstream backlog drained.",
-      "reference_lesson": "When payment authorization degrades, constrain retry fanout after checking downstream latency and backlog; extra consumers otherwise intensify pressure.",
+      "reference_lesson": "When payment authorization degrades, inspect the downstream dependency to confirm latency and retry fanout, then constrain retries; extra consumers otherwise intensify pressure.",
       "reference_source": "project-curated-simulator-spec-v1",
       "context_memories": [
         {
