@@ -199,6 +199,9 @@ class TelemetryIngestor:
 
         namespace = f"telemetry:{signal.signal_id}"
         log_excerpts = _sanitize_log_excerpts(signal.log_excerpts)
+        memory_content = _memory_content(signal, log_excerpts=log_excerpts)
+        embedding_provider = embedding_provider_from_env()
+        prepared_embedding = embedding_provider.embed_document(memory_content)
         with connect(self._db_url) as conn:
             with conn.transaction():
                 service = _upsert_service(conn, signal)
@@ -222,10 +225,13 @@ class TelemetryIngestor:
                     incident_id=incident["id"],
                     log_excerpts=log_excerpts,
                 )
-                memory = MemoryStore(conn=conn, embedding_provider=embedding_provider_from_env()).remember(
+                memory = MemoryStore(
+                    conn=conn,
+                    embedding_provider=embedding_provider,
+                ).remember(
                     memory_kind="semantic",
                     namespace=namespace,
-                    content=_memory_content(signal, log_excerpts=log_excerpts),
+                    content=memory_content,
                     provenance=Provenance(
                         writer="telemetry.ingest",
                         source_ref=f"telemetry:{signal.signal_id}",
@@ -240,6 +246,7 @@ class TelemetryIngestor:
                         "threshold": signal.threshold,
                         "labels": signal.labels,
                     },
+                    precomputed_embedding=prepared_embedding,
                 )
                 conn.execute(
                     """

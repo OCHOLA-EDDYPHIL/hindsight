@@ -1215,8 +1215,9 @@ def _precompute_embeddings(
                     "SELECT id, content FROM semantic_memories WHERE id = ANY(%s)",
                     (source_ids,),
                 )
-                for row in cur.fetchall():
-                    prepared[str(row["id"])] = provider.embed_document(row["content"])
+                source_rows = cur.fetchall()
+        for row in source_rows:
+            prepared[str(row["id"])] = provider.embed_document(row["content"])
     if effect.get("supersede"):
         prepared["supersession"] = provider.embed_document(effect["supersede"]["content"])
     if (

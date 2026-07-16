@@ -132,6 +132,32 @@ def test_telemetry_signal_opens_incident_and_writes_memory():
 
 
 @requires_db
+def test_telemetry_embedding_failure_writes_no_incident_state(monkeypatch):
+    import hindsight.telemetry as telemetry
+    from hindsight.db import connect, database_url
+
+    class FailingProvider:
+        def embed_document(self, _text):
+            raise RuntimeError("document embedding unavailable")
+
+    signal = telemetry.DemoCheckoutService().trigger_retry_fanout_failure()
+    namespace = f"telemetry:{signal.signal_id}"
+    incident_slug = telemetry._incident_slug(signal)  # noqa: SLF001
+    monkeypatch.setattr(telemetry, "embedding_provider_from_env", FailingProvider)
+
+    with pytest.raises(RuntimeError, match="document embedding unavailable"):
+        telemetry.TelemetryIngestor(db_url=database_url()).ingest_signal(signal)
+
+    with connect(database_url()) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM incidents WHERE slug = %s", (incident_slug,)
+        ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE namespace = %s", (namespace,)
+        ).fetchone() == (0,)
+
+
+@requires_db
 def test_telemetry_demo_runs_agent_end_to_end():
     from hindsight.db import database_url
     from hindsight.telemetry import run_telemetry_demo

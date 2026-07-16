@@ -439,6 +439,85 @@ def test_bad_embedding_provider_does_not_leave_semantic_row():
         conn.close()
 
 
+@requires_db
+def test_live_document_embedding_is_rejected_inside_caller_transaction():
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore, Provenance
+
+    class CountingSemanticProvider(DeterministicEmbeddingProvider):
+        provider_name = "test-semantic"
+        model_name = "test-semantic-v1"
+        capability = "semantic"
+        encoder_revision = "test-semantic-v1"
+
+        def __init__(self):
+            super().__init__()
+            self.document_calls = 0
+
+        def embed_document(self, text: str) -> list[float]:
+            self.document_calls += 1
+            return super().embed_document(text)
+
+    namespace = f"transaction-bound-embedding-{uuid4()}"
+    provider = CountingSemanticProvider()
+    with connect(database_url()) as conn:
+        with conn.transaction():
+            store = MemoryStore(conn=conn, embedding_provider=provider)
+            with pytest.raises(
+                RuntimeError,
+                match="must be precomputed before opening a database transaction",
+            ):
+                store.remember(
+                    memory_kind="semantic",
+                    namespace=namespace,
+                    content="a slow document embedding must not hold this transaction",
+                    provenance=Provenance(
+                        "pytest",
+                        "evidence:transaction-bound-embedding",
+                        "enforce external-call transaction boundary",
+                    ),
+                )
+
+    assert provider.document_calls == 0
+    with connect(database_url()) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE namespace = %s",
+            (namespace,),
+        ).fetchone() == (0,)
+
+
+@requires_db
+def test_remember_accepts_precomputed_embedding_inside_caller_transaction():
+    from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider, embedding_profile
+    from hindsight.memory import MemoryStore, Provenance
+
+    provider = DeterministicEmbeddingProvider()
+    content = "document embedding was prepared before the governed write"
+    prepared_embedding = provider.embed_document(content)
+    namespace = f"precomputed-embedding-{uuid4()}"
+    with connect(database_url()) as conn:
+        with conn.transaction():
+            memory = MemoryStore(conn=conn, embedding_provider=provider).remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content=content,
+                provenance=Provenance(
+                    "pytest",
+                    "evidence:precomputed-embedding",
+                    "commit a validated precomputed vector atomically",
+                ),
+                precomputed_embedding=prepared_embedding,
+            )
+            vector = conn.execute(
+                "SELECT profile_id FROM semantic_memory_vectors WHERE memory_id = %s",
+                (memory["id"],),
+            ).fetchone()
+
+    assert vector == (embedding_profile(provider).profile_id,)
+
+
 def test_historical_read_url_uses_caller_connection_when_url_is_not_supplied():
     from hindsight.memory import MemoryStore
 

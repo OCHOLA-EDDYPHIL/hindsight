@@ -8,6 +8,56 @@ import pytest
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
+def test_operation_source_reads_close_before_document_embedding(monkeypatch):
+    import hindsight.operations as operations
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            return None
+
+        def execute(self, _query, _params):
+            return None
+
+        def fetchall(self):
+            return [{"id": "memory-1", "content": "source memory"}]
+
+    class Connection:
+        closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            self.closed = True
+
+        def cursor(self, **_kwargs):
+            return Cursor()
+
+    connection = Connection()
+
+    class Provider:
+        def embed_document(self, _text):
+            assert connection.closed
+            return [0.0]
+
+    monkeypatch.setattr(operations, "connect", lambda *_args, **_kwargs: connection)
+    prepared = operations._precompute_embeddings(  # noqa: SLF001
+        preview={
+            "effect_payload": {
+                "reassertions": [{"source_memory_id": "memory-1"}],
+            },
+            "request_payload": {},
+        },
+        provider=Provider(),
+        db_url="postgresql://unused",
+    )
+
+    assert prepared == {"memory-1": [0.0]}
+
+
 def _enqueue_supersession():
     from hindsight.db import database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
