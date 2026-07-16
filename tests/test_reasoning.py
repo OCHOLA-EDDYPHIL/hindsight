@@ -155,6 +155,32 @@ def test_gemini_provider_reports_pool_slot_without_key_material():
     assert "sensitive-key" not in str(response.usage)
 
 
+def test_gemini_provider_preserves_pool_retry_after():
+    from hindsight.gemini import GeminiPoolExhaustedError
+    from hindsight.reasoning import (
+        GeminiReasoningProvider,
+        ReasoningProviderError,
+        ReasoningRequest,
+    )
+
+    class CoolingPool:
+        def execute(self, operation, *, routing_key):
+            raise GeminiPoolExhaustedError(
+                "all slots cooling down",
+                retry_after_seconds=41,
+            )
+
+    provider = GeminiReasoningProvider(
+        model_name="gemini-test",
+        credential_pool=CoolingPool(),
+    )
+
+    with pytest.raises(ReasoningProviderError) as raised:
+        provider.generate(ReasoningRequest(prompt="triage"))
+
+    assert raised.value.retry_after_seconds == 41
+
+
 def test_bedrock_provider_uses_injected_client_without_network():
     from hindsight.reasoning import BedrockReasoningProvider, ReasoningRequest
 
@@ -224,6 +250,44 @@ def test_retrying_reasoning_provider_records_attempts_after_retry():
     assert provider.calls == 2
     assert response.text == "recovered"
     assert response.usage["tokens"] == 3
+    assert response.usage["attempts"] == 2
+
+
+def test_retrying_reasoning_provider_honors_provider_cooldown():
+    from hindsight.reasoning import (
+        ReasoningProviderError,
+        ReasoningRequest,
+        ReasoningResponse,
+        retrying_reasoning_provider,
+    )
+
+    class CoolingProvider:
+        provider_name = "gemini"
+        model_name = "gemini-test"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                raise ReasoningProviderError("rate limited", retry_after_seconds=37)
+            return ReasoningResponse(
+                text="recovered",
+                provider=self.provider_name,
+                model=self.model_name,
+            )
+
+    provider = CoolingProvider()
+    sleeps = []
+    response = retrying_reasoning_provider(
+        provider,
+        max_attempts=2,
+        sleeper=sleeps.append,
+    ).generate(ReasoningRequest(prompt="recover"))
+
+    assert provider.calls == 2
+    assert sleeps == [37.0]
     assert response.usage["attempts"] == 2
 
 
