@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -385,7 +386,9 @@ def classify_gemini_failure(
     status = _status_code(exc)
     retry_after = _retry_after_seconds(exc)
     if status == 429:
-        base = retry_after or min(900, 30 * (2 ** max(0, failure_count - 1)))
+        if retry_after is not None:
+            return FailureDisposition(True, "rate_limit", retry_after)
+        base = min(900, 30 * (2 ** max(0, failure_count - 1)))
         return FailureDisposition(True, "rate_limit", _with_jitter(base, jitter))
     if status in {401, 403}:
         return FailureDisposition(True, "authentication", 3_600)
@@ -448,11 +451,26 @@ def _status_code(exc: Exception) -> int | None:
 
 
 def _retry_after_seconds(exc: Exception) -> int | None:
+    details = getattr(exc, "details", None)
+    error = details.get("error") if isinstance(details, dict) else None
+    entries = error.get("details") if isinstance(error, dict) else None
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict) or not str(entry.get("@type", "")).endswith(
+                "google.rpc.RetryInfo"
+            ):
+                continue
+            value = str(entry.get("retryDelay") or "")
+            if value.endswith("s"):
+                try:
+                    return max(1, math.ceil(float(value[:-1])))
+                except ValueError:
+                    pass
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}
     value = headers.get("Retry-After") or headers.get("retry-after")
     try:
-        return max(1, int(float(value))) if value is not None else None
+        return max(1, math.ceil(float(value))) if value is not None else None
     except (TypeError, ValueError):
         return None
 
