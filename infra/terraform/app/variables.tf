@@ -64,7 +64,7 @@ variable "llm_provider" {
 
 variable "gemini_model" {
   type    = string
-  default = "gemini-2.5-flash"
+  default = "gemini-3.1-flash-lite"
 }
 
 variable "embedding_provider" {
