@@ -3,6 +3,21 @@
 import pathlib
 
 
+def test_gemini_reasoning_default_is_consistent_across_runtime_and_deployment():
+    from hindsight.reasoning import DEFAULT_GEMINI_MODEL
+
+    assert DEFAULT_GEMINI_MODEL == "gemini-3.1-flash-lite"
+    for path in (
+        pathlib.Path(".env.example"),
+        pathlib.Path("infra/terraform/app/variables.tf"),
+        pathlib.Path(".github/workflows/deploy-demo.yml"),
+        pathlib.Path(".github/workflows/live-acceptance.yml"),
+    ):
+        content = path.read_text()
+        assert DEFAULT_GEMINI_MODEL in content
+        assert "gemini-2.5-flash" not in content
+
+
 def test_application_stack_uses_split_artifacts_and_external_secret_references():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
 

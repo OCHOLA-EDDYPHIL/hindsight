@@ -16,7 +16,7 @@ from hindsight.aws import aws_client_config
 from hindsight.gemini import GeminiCredentialPool, gemini_pool_from_env
 
 DEFAULT_LLM_PROVIDER = "gemini"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_BEDROCK_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
 LIVE_GEMINI_REASONING_FLAG = "RUN_LIVE_GEMINI_REASONING"
 

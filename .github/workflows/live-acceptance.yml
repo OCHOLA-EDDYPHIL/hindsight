@@ -20,7 +20,7 @@ env:
   WORKER_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
-  GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-2.5-flash' }}
+  GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
   GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
   BENCHMARK_MAX_DISTANCE: "0.35"
 
