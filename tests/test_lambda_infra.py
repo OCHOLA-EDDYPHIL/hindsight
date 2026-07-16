@@ -221,8 +221,10 @@ def test_deploy_uses_the_caller_authorized_source_revision():
     assert (
         '"$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME"'
     ) in validation_branch
-    assert '"$REQUESTED_SOURCE_SHA" == "$PR_HEAD_SHA"' in validation_branch
+    assert '"$EVENT_NAME" == "workflow_dispatch"' in validation_branch
+    assert '"$REF_NAME" == "refs/heads/main"' in validation_branch
     assert '"$REQUESTED_SOURCE_SHA" == "$EVENT_SHA"' in validation_branch
+    assert "PR_HEAD_SHA" not in authorization
     assert authorization.count("=~ ^[0-9a-f]{40}$") == 2
     assert (
         '"$CALLER_WORKFLOW_REF" == "$REPOSITORY/.github/workflows/deploy-demo.yml@$REF_NAME"'
