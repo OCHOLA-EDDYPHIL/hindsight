@@ -58,6 +58,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     assert "embedding_index.py" in api["modules"]
     assert "operations.py" in api["modules"]
     assert "run_dispatch.py" in api["modules"]
+    assert "trace_contract.py" in api["modules"]
 
 
 def test_worker_artifact_does_not_include_frontend_or_api_framework():

@@ -40,6 +40,7 @@ ARTIFACTS = {
             "runs.py",
             "runtime.py",
             "security.py",
+            "trace_contract.py",
             "tracing.py",
             "web",
         ],

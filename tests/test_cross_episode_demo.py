@@ -46,4 +46,18 @@ def test_cross_episode_demo_shows_lesson_recall_without_performance_fields():
     assert "steps_saved" not in str(payload)
     assert "improvement_percentage" not in str(payload)
     assert str(result.consolidation.memory["id"]) in result.episode_two.recalled_lesson_memory_ids
+    assert result.episode_two.retrieval_id
+    lesson_trace = next(
+        trace
+        for trace in result.episode_two.recalled_memory_traces
+        if str(trace["memory_id"]) == str(result.consolidation.memory["id"])
+    )
+    assert str(lesson_trace["retrieval_id"]) == result.episode_two.retrieval_id
+    assert lesson_trace["belief_id"] == result.consolidation.memory["belief_id"]
+    assert lesson_trace["version_number"] == result.consolidation.memory["version_number"]
+    assert lesson_trace["embedding_profile_id"]
+    assert lesson_trace["memory_producer_decision_id"] == result.consolidation.memory[
+        "producer_decision_id"
+    ]
+    assert lesson_trace["incoming_lineage_edge_ids"]
     assert "consolidated lesson" in result.episode_two.plan.lower()
