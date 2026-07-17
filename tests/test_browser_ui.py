@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -19,51 +18,65 @@ requires_browser = pytest.mark.skipif(
 
 
 def test_reset_resubscribes_before_loading_the_fresh_namespace():
-    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
-    reset = source.split("async function resetDemo()", 1)[1].split(
-        "async function poisonDemo()", 1
+    source = (
+        Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts"
+    ).read_text()
+    reset = source.split("const resetDemo = useCallback", 1)[1].split(
+        "const poisonDemo = useCallback", 1
     )[0]
 
-    assert re.search(
-        r"state\.namespace = payload\.namespace;\s+subscribeSocket\(\);",
-        reset,
+    assert "updateNamespace(payload.namespace);" in reset
+    assert "subscribeSocket(payload.namespace);" in reset
+    assert reset.index("updateNamespace(payload.namespace);") < reset.index(
+        "subscribeSocket(payload.namespace);"
     )
-    assert reset.index("subscribeSocket();") < reset.index("await loadIncidents(")
+    assert reset.index("subscribeSocket(payload.namespace);") < reset.index(
+        "await loadIncidents("
+    )
 
 
 def test_live_events_from_a_previous_namespace_are_ignored():
-    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
-    handler = source.split("function handleLiveEvent(payload)", 1)[1].split(
-        "function setBusy", 1
+    source = (
+        Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts"
+    ).read_text()
+    handler = source.split("const handleLiveEvent = useCallback", 1)[1].split(
+        "const subscribeSocket", 1
     )[0]
 
-    assert "payload.namespace !== state.namespace" in handler
+    assert "payload.namespace !== namespaceRef.current" in handler
 
 
 def test_explicit_namespace_renders_before_incident_defaults_are_loaded():
-    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
-    startup = source.rsplit("await establishOperatorSession();", 1)[1]
+    source = (
+        Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts"
+    ).read_text()
+    startup = source.split("const retryInitialLoad = useCallback", 1)[1].split(
+        "useEffect(() =>", 1
+    )[0]
 
-    explicit_namespace = startup.split("} else {", 1)[0]
-    assert 'params.has("namespace")' in explicit_namespace
+    explicit_namespace = startup.split("} else if (explicitNamespace) {", 1)[1].split(
+        "} else {", 1
+    )[0]
     assert explicit_namespace.index("await loadSnapshot(") < explicit_namespace.index(
-        "await loadIncidents(null, {select: false});"
+        "await loadIncidents(null, false);"
     )
 
 
 def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status():
-    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
-    polling = source.split("async function waitForOperation(operationId)", 1)[1].split(
-        "function connectEvents()", 1
+    hook = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
+    surface = (
+        Path(__file__).parents[1] / "frontend/src/components/cockpit.tsx"
+    ).read_text()
+    polling = hook.split("const waitForOperation = useCallback", 1)[1].split(
+        "const executeRewind", 1
     )[0]
 
     assert "config.operationPollSeconds" in polling
     assert "last status" in polling
-    assert "data-operation-id" in source
-    assert "data-operation-type" in source
-    assert "data-operation-status" in source
-    assert "renderMemoryPanel" not in source
-    assert "state.rewindAnchor = payload.rewind_anchor" in source
+    assert "data-operation-id" in surface
+    assert "data-operation-type" in surface
+    assert "data-operation-status" in surface
+    assert "setRewindAnchor(payload.rewind_anchor || null)" in hook
 
 
 def test_reset_session_readiness_requires_new_namespace_and_known_good_snapshot():

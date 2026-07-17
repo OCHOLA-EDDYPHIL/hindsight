@@ -15,8 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
       - run: uv lock --check
       - run: uv sync --frozen
+      - run: npm ci
+      - run: npm run check:web
+      - run: npm run test:web
+      - run: npm run build:web
+      - run: git diff --exit-code -- src/hindsight/web
       - run: docker compose up -d crdb
       - run: |
           for _ in $(seq 1 30); do
@@ -32,7 +41,6 @@ jobs:
       - run: uv run python scripts/run_learning_benchmark.py ci-smoke
       - run: uv run python scripts/build_lambda_artifacts.py
       - run: uv run python scripts/smoke_lambda_artifacts.py
-      - run: node --input-type=module --check < src/hindsight/web/app.js
       - uses: hashicorp/setup-terraform@v3
       - run: terraform fmt -check -recursive infra/terraform
       - run: terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false

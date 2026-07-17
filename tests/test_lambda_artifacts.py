@@ -96,6 +96,11 @@ def test_required_database_job_checks_lock_and_built_lambda_handlers():
     test_job = workflow.split("  test:\n", 1)[1]
 
     assert "uv lock --check" in test_job
+    assert "npm ci" in test_job
+    assert "npm run check:web" in test_job
+    assert "npm run test:web" in test_job
+    assert "npm run build:web" in test_job
+    assert "git diff --exit-code -- src/hindsight/web" in test_job
     assert "docker compose up -d crdb" in test_job
     assert "uv run pytest -q" in test_job
     assert "uv run python scripts/build_lambda_artifacts.py" in test_job

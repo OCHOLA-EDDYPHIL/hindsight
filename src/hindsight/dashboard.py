@@ -1258,8 +1258,9 @@ def dashboard_html(*, default_namespace: str = DEMO_NAMESPACE) -> str:
     try:
         web_root = files("hindsight").joinpath("web")
         html = web_root.joinpath("index.html").read_text(encoding="utf-8")
-        styles = web_root.joinpath("styles.css").read_text(encoding="utf-8")
-        script = web_root.joinpath("app.js").read_text(encoding="utf-8")
+        assets = web_root.joinpath("assets")
+        styles = assets.joinpath("styles.css").read_text(encoding="utf-8")
+        script = assets.joinpath("app.js").read_text(encoding="utf-8")
     except (FileNotFoundError, ModuleNotFoundError):
         return _legacy_dashboard_html(default_namespace=default_namespace)
     local_config = {
@@ -1270,13 +1271,16 @@ def dashboard_html(*, default_namespace: str = DEMO_NAMESPACE) -> str:
         "defaultNamespace": default_namespace,
         "pollIntervalMs": 4000,
     }
-    html = html.replace('<link rel="stylesheet" href="/styles.css">', f"<style>{styles}</style>")
+    html = html.replace(
+        '<link rel="stylesheet" crossorigin href="/assets/styles.css">',
+        f"<style>{styles}</style>",
+    )
     html = html.replace(
         '<script src="/config.js"></script>',
         f"<script>window.HINDSIGHT_CONFIG = {json.dumps(local_config)};</script>",
     )
     html = html.replace(
-        '<script type="module" src="/app.js"></script>',
+        '<script type="module" crossorigin src="/assets/app.js"></script>',
         f'<script type="module">{script}</script>',
     )
     return html

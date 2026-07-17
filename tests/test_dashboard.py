@@ -882,12 +882,12 @@ def test_dashboard_html_contains_sse_and_timeline_surface():
 
     html = dashboard_html(default_namespace="demo:payments")
 
-    assert "Memory Dashboard" in html
+    assert "Governed memory replay" in html
     assert "new EventSource" in html
     assert '"eventsBase": "/events"' in html
-    assert 'id="timeline"' in html
+    assert 'id:"timeline"' in html
     assert "Current Beliefs" in html
-    assert "Decision influence" in html
+    assert "Cited memory reads" in html
     assert "Rewind belief state" in html
     assert "Inject poison" in html
     assert "setTimeout" in html
