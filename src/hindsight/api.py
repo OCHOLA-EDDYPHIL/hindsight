@@ -24,6 +24,7 @@ from hindsight.dashboard import memory_snapshot
 from hindsight.db import connect
 from hindsight.demo_state import (
     DEMO_NAMESPACE,
+    current_database_timestamp,
     ensure_poison_rewind_incident,
     poison_demo_memory,
     reset_poison_rewind_state,
@@ -617,10 +618,12 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
         db_url=settings.database_url,
         embedding_provider=embedding_provider,
     )
+    rewind_anchor = current_database_timestamp(db_url=settings.database_url)
     return {
         "namespace": session_namespace,
         "incident": incident,
         "seed_memory": _jsonable(memory),
+        "rewind_anchor": _jsonable(rewind_anchor),
     }
 
 
