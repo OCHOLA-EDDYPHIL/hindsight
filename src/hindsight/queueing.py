@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from typing import Any
+from types import SimpleNamespace
+from uuid import uuid4
 
 import boto3
 
@@ -13,6 +16,10 @@ from hindsight.aws import aws_client_config
 
 RUN_QUEUE_URL_ENV = "HINDSIGHT_RUN_QUEUE_URL"
 INLINE_WORKER_ENV = "HINDSIGHT_INLINE_WORKER"
+INLINE_MAX_ATTEMPTS = 3
+INLINE_RETRY_SECONDS = 0.1
+INLINE_QUEUE_ARN = "local:sqs:hindsight-runs"
+INLINE_DLQ_ARN = "local:sqs:hindsight-run-dlq"
 
 
 class RunQueueUnavailableError(RuntimeError):
@@ -35,12 +42,11 @@ def enqueue_run(message: dict[str, Any], *, client: Any | None = None) -> str:
         )
         return str(response["MessageId"])
     if _truthy(os.environ.get(INLINE_WORKER_ENV)):
-        from hindsight.worker import process_message
-
+        label = message.get("run_id") or message.get("operation_id") or "unknown"
         thread = threading.Thread(
-            target=process_message,
+            target=_run_inline_message,
             args=(message,),
-            name=f"hindsight-run-{message.get('run_id', 'unknown')}",
+            name=f"hindsight-run-{label}",
             daemon=True,
         )
         thread.start()
@@ -48,6 +54,59 @@ def enqueue_run(message: dict[str, Any], *, client: Any | None = None) -> str:
     raise RunQueueUnavailableError(
         f"{RUN_QUEUE_URL_ENV} is not set and {INLINE_WORKER_ENV} is not enabled"
     )
+
+
+def _run_inline_message(message: dict[str, Any]) -> None:
+    from hindsight.worker import handler
+
+    message_id = str(uuid4())
+    for receive_count in range(1, INLINE_MAX_ATTEMPTS + 1):
+        result = handler(
+            _inline_event(
+                message=message,
+                message_id=message_id,
+                receive_count=receive_count,
+                source_arn=INLINE_QUEUE_ARN,
+            ),
+            SimpleNamespace(aws_request_id=f"inline:{uuid4()}"),
+        )
+        failed = {
+            str(item.get("itemIdentifier"))
+            for item in result.get("batchItemFailures", [])
+        }
+        if message_id not in failed:
+            return
+        if receive_count < INLINE_MAX_ATTEMPTS:
+            time.sleep(INLINE_RETRY_SECONDS)
+    handler(
+        _inline_event(
+            message=message,
+            message_id=message_id,
+            receive_count=1,
+            source_arn=os.environ.get("HINDSIGHT_RUN_DLQ_ARN", INLINE_DLQ_ARN),
+        ),
+        SimpleNamespace(aws_request_id=f"inline-dlq:{uuid4()}"),
+    )
+
+
+def _inline_event(
+    *,
+    message: dict[str, Any],
+    message_id: str,
+    receive_count: int,
+    source_arn: str,
+) -> dict[str, Any]:
+    return {
+        "Records": [
+            {
+                "messageId": message_id,
+                "body": json.dumps(message, sort_keys=True),
+                "attributes": {"ApproximateReceiveCount": str(receive_count)},
+                "eventSource": "aws:sqs",
+                "eventSourceARN": source_arn,
+            }
+        ]
+    }
 
 
 def _truthy(value: str | None) -> bool:

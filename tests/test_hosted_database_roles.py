@@ -68,4 +68,14 @@ def test_hosted_runtime_database_identities_are_distinct_and_restricted():
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 with connection.transaction():
                     connection.execute("DELETE FROM semantic_memories WHERE false")
+            if label == "worker":
+                assert connection.execute(
+                    "SELECT count(*) FROM benchmark_variant_preparations"
+                ).fetchone()[0] >= 0
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    with connection.transaction():
+                        connection.execute(
+                            "UPDATE benchmark_variant_preparations "
+                            "SET phase = 'complete' WHERE false"
+                        )
     assert len(set(identities.values())) == 3

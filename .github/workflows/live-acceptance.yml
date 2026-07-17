@@ -315,6 +315,7 @@ jobs:
       HINDSIGHT_BROWSER_BASE_URL: ${{ needs.deploy.outputs.ui_url }}
       HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
       HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}
+      HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR: ${{ runner.temp }}/hindsight-browser-evidence
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
@@ -353,6 +354,13 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_ENV"
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase browser
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hindsight-browser-evidence
+          if-no-files-found: error
+          retention-days: 90
 
   database_roles:
     needs: [authorize, deploy]

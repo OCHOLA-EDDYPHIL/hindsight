@@ -1,5 +1,7 @@
 """Asynchronous run-worker behavior."""
 
+import json
+import logging
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -332,6 +334,48 @@ def test_handler_identifies_dlq_records_by_source_arn(monkeypatch):
 
     assert result == {"batchItemFailures": []}
     assert [kwargs["dead_letter"] for _, kwargs in calls] == [False, True]
+
+
+def test_handler_logs_safe_sqs_failure_context(monkeypatch, caplog):
+    import hindsight.worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "process_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("restricted worker cannot inspect referenced row")
+        ),
+    )
+    caplog.set_level(logging.ERROR, logger=worker.__name__)
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "message-1",
+                    "eventSourceARN": "arn:aws:sqs:region:account:runs",
+                    "attributes": {"ApproximateReceiveCount": "3"},
+                    "body": '{"command":"memory_operation","operation_id":"operation-1"}',
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-1"),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "message-1"}]}
+    record = json.loads(caplog.records[-1].message)
+    assert record == {
+        "command": "memory_operation",
+        "error_code": "PermissionError",
+        "error_detail": "restricted worker cannot inspect referenced row",
+        "event": "worker_record",
+        "lambda_request_id": "request-1",
+        "message_id": "message-1",
+        "operation_id": "operation-1",
+        "receive_count": "3",
+        "source_arn": "arn:aws:sqs:region:account:runs",
+        "status": "failed",
+    }
 
 
 def test_exhausted_source_retries_and_dlq_finalizes(monkeypatch):

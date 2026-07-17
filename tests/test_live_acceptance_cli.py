@@ -49,19 +49,24 @@ def test_product_provider_verification_excludes_frozen_pilot(monkeypatch):
         '{"version":1,"keys":[{"id":"one","api_key":"opaque-material"}]}',
     )
     calls = []
+    artifact_dir = pathlib.Path("/tmp/providers")
+    monkeypatch.setattr(acceptance, "_acceptance_artifact_dir", lambda _phase: artifact_dir)
     monkeypatch.setattr(
         acceptance,
-        "_run",
-        lambda command, *, env, stdout_path=None: calls.append((command, env)),
+        "_run_strict_pytest",
+        lambda selectors, *, env, phase, artifact_dir: calls.append(
+            (selectors, env, phase, artifact_dir)
+        ),
     )
 
     acceptance._verify_product_providers()
 
     assert len(calls) == 1
-    assert calls[0][0][-2:] == list(acceptance.PROVIDER_SANITY_SELECTORS)
+    assert calls[0][0] == acceptance.PROVIDER_SANITY_SELECTORS
     assert acceptance.PILOT_EMBEDDING_SELECTOR not in calls[0][0]
     assert calls[0][1]["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1"
     assert calls[0][1]["GEMINI_API_KEY"] == "opaque-material"
+    assert calls[0][2:] == ("providers", artifact_dir)
 
 
 def test_learning_provider_verification_runs_frozen_pilot_twice(monkeypatch):
@@ -93,8 +98,15 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
     calls = []
     monkeypatch.setattr(
         acceptance,
-        "_run",
-        lambda command, *, env, stdout_path=None: calls.append((command, env)),
+        "_acceptance_artifact_dir",
+        lambda phase: pathlib.Path("/tmp") / phase,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_run_strict_pytest",
+        lambda selectors, *, env, phase, artifact_dir: calls.append(
+            (selectors, env, phase, artifact_dir)
+        ),
     )
 
     acceptance._verify_semantic(
@@ -104,7 +116,7 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
         )
     )
 
-    assert calls[0][0][-3:] == list(acceptance.LOCAL_SEMANTIC_SELECTORS)
+    assert calls[0][0] == acceptance.LOCAL_SEMANTIC_SELECTORS
     assert calls[0][1]["RUN_LIVE_GEMINI_ACCEPTANCE"] == "1"
     with pytest.raises(ValueError, match="refuses loopback"):
         acceptance._verify_semantic(
@@ -123,7 +135,7 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
         )
     )
 
-    assert calls[1][0][-2:] == list(acceptance.SEMANTIC_RETRIEVAL_SELECTORS)
+    assert calls[1][0] == acceptance.SEMANTIC_RETRIEVAL_SELECTORS
     assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in calls[1][0]
 
 
@@ -141,11 +153,13 @@ def test_hosted_product_phases_are_selector_isolated():
 
 
 def test_hosted_pytest_rejects_skipped_gates(monkeypatch, tmp_path):
-    def fake_run(command, *, env, stdout_path=None):
+    def fake_run(command, **_kwargs):
         report = pathlib.Path(next(part.split("=", 1)[1] for part in command if part.startswith("--junitxml=")))
         report.write_text('<testsuites><testsuite tests="1" skipped="1"/></testsuites>')
+        return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(acceptance, "_run", fake_run)
+    monkeypatch.setenv(acceptance.ACCEPTANCE_ARTIFACT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(acceptance.subprocess, "run", fake_run)
 
     with pytest.raises(RuntimeError, match="1 skipped"):
         acceptance._run_hosted_pytest(
@@ -249,9 +263,10 @@ def test_local_benchmark_checks_clean_sha_before_creating_database(monkeypatch, 
     assert order == ["sha", "database"]
 
 
-def test_local_browser_product_sanitizes_hosted_environment_and_runs_history(monkeypatch):
+def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, tmp_path):
     monkeypatch.setenv("RUN_HOSTED_ACCEPTANCE", "1")
     monkeypatch.setenv("HOSTED_API_URL", "https://hosted.invalid")
+    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
     calls = []
 
     class Server:
@@ -263,10 +278,13 @@ def test_local_browser_product_sanitizes_hosted_environment_and_runs_history(mon
 
     monkeypatch.setattr(acceptance.subprocess, "Popen", lambda *_args, **_kwargs: Server())
     monkeypatch.setattr(acceptance, "_wait_for_http_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(acceptance, "_acceptance_artifact_dir", lambda _phase: tmp_path)
     monkeypatch.setattr(
         acceptance,
-        "_run",
-        lambda command, *, env, stdout_path=None: calls.append((command, env)),
+        "_run_strict_pytest",
+        lambda selectors, *, env, phase, artifact_dir: calls.append(
+            (selectors, env, phase, artifact_dir)
+        ),
     )
 
     acceptance._run_local_browser_product(
@@ -274,10 +292,20 @@ def test_local_browser_product_sanitizes_hosted_environment_and_runs_history(mon
         base_url="http://127.0.0.1:8766",
     )
 
-    command, env = calls[0]
+    selectors, env, phase, artifact_dir = calls[0]
     assert "RUN_HOSTED_ACCEPTANCE" not in env
     assert "HOSTED_API_URL" not in env
-    assert any("historical_snapshot" in part for part in command)
+    assert env["EMBEDDING_PROVIDER"] == "gemini"
+    assert env["LLM_PROVIDER"] == "gemini"
+    assert env["HINDSIGHT_INLINE_WORKER"] == "1"
+    assert env["HINDSIGHT_ALLOWED_ORIGINS"] == "http://127.0.0.1:8766"
+    assert (
+        "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow"
+        in selectors
+    )
+    assert acceptance.BROWSER_PRODUCT_SELECTORS[-1] not in selectors
+    assert phase == "local-browser"
+    assert artifact_dir == tmp_path
 
 
 def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypatch):
@@ -313,6 +341,11 @@ def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypa
         "_require_local_code_sha",
         lambda _value: pytest.fail("product acceptance must not require an exact SHA"),
     )
+    monkeypatch.setattr(
+        acceptance,
+        "uuid4",
+        lambda: SimpleNamespace(hex="1234567890abcdef1234567890abcdef"),
+    )
 
     acceptance._run_local_product_full(
         SimpleNamespace(
@@ -322,11 +355,11 @@ def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypa
     )
 
     assert [parts.path for parts in map(acceptance.urlsplit, created)] == [
-        "/product_semantic",
-        "/product_resilience",
-        "/product_browser",
+        "/product_1234567890ab_semantic",
+        "/product_1234567890ab_resilience",
+        "/product_1234567890ab_browser",
     ]
-    assert [configured for _url, configured in initialized] == [True, False, False]
+    assert [configured for _url, configured in initialized] == [True, False, True]
     assert calls == ["providers", "semantic", "resilience", "browser"]
 
 

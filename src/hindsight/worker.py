@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import timedelta
 from typing import Any
@@ -36,6 +37,7 @@ from hindsight.tracing import configure_tracing_from_env
 RUN_MAX_ATTEMPTS_ENV = "HINDSIGHT_RUN_MAX_ATTEMPTS"
 RUN_ATTEMPT_LEASE_SECONDS_ENV = "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS"
 RUN_DLQ_ARN_ENV = "HINDSIGHT_RUN_DLQ_ARN"
+LOGGER = logging.getLogger(__name__)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -46,16 +48,67 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     failures = []
     for record in event.get("Records", []):
         message_id = str(record.get("messageId") or "unknown")
+        source_arn = str(record.get("eventSourceARN") or record.get("eventSourceArn") or "")
+        attributes = record.get("attributes") or {}
+        receive_count = str(attributes.get("ApproximateReceiveCount") or "unknown")
+        message: dict[str, Any] = {}
         try:
             message = json.loads(record.get("body") or "{}")
-            source_arn = str(record.get("eventSourceARN") or record.get("eventSourceArn") or "")
             process_message(
                 message,
                 dead_letter=bool(source_arn and source_arn == os.environ.get(RUN_DLQ_ARN_ENV)),
             )
-        except Exception:
+            _log_record_result(
+                status="completed",
+                message=message,
+                message_id=message_id,
+                receive_count=receive_count,
+                source_arn=source_arn,
+                context=context,
+            )
+        except Exception as exc:
+            _log_record_result(
+                status="failed",
+                message=message,
+                message_id=message_id,
+                receive_count=receive_count,
+                source_arn=source_arn,
+                context=context,
+                error=exc,
+            )
             failures.append({"itemIdentifier": message_id})
     return {"batchItemFailures": failures}
+
+
+def _log_record_result(
+    *,
+    status: str,
+    message: dict[str, Any],
+    message_id: str,
+    receive_count: str,
+    source_arn: str,
+    context: Any,
+    error: Exception | None = None,
+) -> None:
+    record = {
+        "event": "worker_record",
+        "status": status,
+        "command": str(message.get("command") or "start"),
+        "message_id": message_id,
+        "receive_count": receive_count,
+        "source_arn": source_arn,
+        "lambda_request_id": str(getattr(context, "aws_request_id", "local")),
+    }
+    for key in ("operation_id", "run_id", "incident_id"):
+        value = str(message.get(key) or "").strip()
+        if value:
+            record[key] = value
+    if error is not None:
+        record["error_code"] = type(error).__name__
+        record["error_detail"] = safe_error_detail(error, max_chars=1000)
+        LOGGER.error(json.dumps(record, sort_keys=True))
+    else:
+        LOGGER.info(json.dumps(record, sort_keys=True))
 
 
 def process_message(

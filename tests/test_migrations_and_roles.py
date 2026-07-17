@@ -77,15 +77,22 @@ def test_run_dispatch_outbox_grants_only_required_product_role_access():
     assert "GRANT SELECT, UPDATE ON TABLE agent_run_dispatches" in migration
 
 
-def test_agent_writer_has_only_foreign_key_read_access_to_learning_preparations():
+def test_product_writers_have_only_foreign_key_read_access_to_learning_preparations():
     roles = (ROOT / "infra/db/roles.sql").read_text()
     agent_select, agent_insert, agent_update = roles.split(
         "TO hindsight_agent_writer;", 3
+    )[:3]
+    worker_section = roles.split("TO hindsight_agent_writer;", 3)[-1]
+    worker_select, worker_insert, worker_update = worker_section.split(
+        "TO hindsight_memory_worker;", 3
     )[:3]
 
     assert "benchmark_variant_preparations" in agent_select
     assert "benchmark_variant_preparations" not in agent_insert
     assert "benchmark_variant_preparations" not in agent_update
+    assert "benchmark_variant_preparations" in worker_select
+    assert "benchmark_variant_preparations" not in worker_insert
+    assert "benchmark_variant_preparations" not in worker_update
 
 
 def _database_url(name: str) -> str:
@@ -701,6 +708,20 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 (semantic["id"], rotation["id"]),
             ).fetchone()
             assert task == ("pending",)
+            conn.execute("SET ROLE hindsight_memory_worker")
+            assert conn.execute(
+                "SELECT count(*) FROM benchmark_variant_preparations"
+            ).fetchone() == (0,)
+            conn.execute(
+                "UPDATE semantic_memories SET t_invalid = t_invalid WHERE id = %s",
+                (semantic["id"],),
+            )
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    "UPDATE benchmark_variant_preparations "
+                    "SET phase = 'complete' WHERE false"
+                )
+            conn.rollback()
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(
