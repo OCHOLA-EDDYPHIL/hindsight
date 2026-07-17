@@ -44,6 +44,17 @@ def test_live_events_from_a_previous_namespace_are_ignored():
     assert "payload.namespace !== state.namespace" in handler
 
 
+def test_explicit_namespace_renders_before_incident_defaults_are_loaded():
+    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
+    startup = source.rsplit("await establishOperatorSession();", 1)[1]
+
+    explicit_namespace = startup.split("} else {", 1)[0]
+    assert 'params.has("namespace")' in explicit_namespace
+    assert explicit_namespace.index("await loadSnapshot(") < explicit_namespace.index(
+        "await loadIncidents(null, {select: false});"
+    )
+
+
 def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status():
     source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
     polling = source.split("async function waitForOperation(operationId)", 1)[1].split(
