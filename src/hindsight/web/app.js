@@ -16,6 +16,10 @@ const state = {
   rewindAnchor: null,
   socket: null,
   snapshotRequest: 0,
+  incidentRequest: 0,
+  runRequest: 0,
+  influenceRequest: 0,
+  activeRunId: null,
   runPoll: null
 };
 
@@ -137,6 +141,10 @@ async function loadIncidents(preferredSlug = null) {
       ? state.incidents.map((incident) => `<option value="${escapeHtml(incident.slug)}">${escapeHtml(incident.title)}</option>`).join("")
       : '<option value="">No incidents yet</option>';
     const selected = state.incidents.find((item) => item.slug === preferredSlug)
+      || state.incidents.find((item) => (
+        item.slug.startsWith("demo-payments-checkout-latency:")
+        && item.latest_run_status === "completed"
+      ))
       || state.incidents.find((item) => item.slug === "demo-payments-checkout-latency")
       || state.incidents[0];
     if (selected) {
@@ -154,14 +162,33 @@ async function loadIncidents(preferredSlug = null) {
 
 async function selectIncident(slug) {
   if (!slug) return;
+  const requestId = ++state.incidentRequest;
+  clearTimeout(state.runPoll);
+  state.activeRunId = null;
   try {
-    state.incident = await request(`/incidents/${encodeURIComponent(slug)}`);
-    const latestRun = state.incident.runs?.[0];
-    state.run = latestRun ? await request(`/runs/${latestRun.id}`) : null;
+    const incident = await request(`/incidents/${encodeURIComponent(slug)}`);
+    if (requestId !== state.incidentRequest) return;
+    const latestRun = incident.runs?.[0];
+    const run = latestRun ? await request(`/runs/${latestRun.id}`) : null;
+    if (requestId !== state.incidentRequest) return;
+    state.incident = incident;
+    state.run = run;
+    state.activeRunId = run?.id || null;
+    if (run?.namespace) {
+      state.namespace = run.namespace;
+      const url = new URL(window.location.href);
+      url.searchParams.set("namespace", state.namespace);
+      history.replaceState({}, "", url);
+    }
+    elements.incidentInput.value = run?.user_input || incident.summary || "";
     renderIncident();
     renderRun();
-    if (state.run?.decision_id) await loadInfluence(state.run.decision_id);
+    subscribeSocket();
+    await loadSnapshot();
+    if (run?.decision_id) await loadInfluence(run.decision_id);
+    else clearInfluence();
   } catch (error) {
+    if (requestId !== state.incidentRequest) return;
     notify(`Incident could not be loaded: ${error.message}`, "error");
   }
 }
@@ -197,31 +224,47 @@ function renderRun() {
 }
 
 async function loadRun(runId, {poll = false} = {}) {
+  if (state.activeRunId && runId !== state.activeRunId) return;
+  const requestId = ++state.runRequest;
   try {
-    state.run = await request(`/runs/${encodeURIComponent(runId)}`);
+    const run = await request(`/runs/${encodeURIComponent(runId)}`);
+    if (requestId !== state.runRequest || runId !== state.activeRunId) return;
+    state.run = run;
     subscribeSocket();
     renderRun();
-    if (state.run.decision_id) await loadInfluence(state.run.decision_id);
-    if (poll && !["completed", "rejected", "failed", "awaiting_approval"].includes(state.run.status)) {
+    if (run.decision_id) await loadInfluence(run.decision_id);
+    else clearInfluence();
+    if (poll && !["completed", "rejected", "failed", "awaiting_approval"].includes(run.status)) {
       clearTimeout(state.runPoll);
       state.runPoll = setTimeout(() => loadRun(runId, {poll: true}), 1400);
     }
   } catch (error) {
+    if (requestId !== state.runRequest) return;
     notify(`Run status could not be loaded: ${error.message}`, "error");
   }
 }
 
 async function loadInfluence(decisionId) {
+  const requestId = ++state.influenceRequest;
   try {
     const payload = await request(`/decisions/${encodeURIComponent(decisionId)}/influence`);
+    if (requestId !== state.influenceRequest || decisionId !== state.run?.decision_id) return;
     state.influence = payload.memories || [];
     state.memoryDetail = null;
     renderInfluence();
   } catch (error) {
+    if (requestId !== state.influenceRequest) return;
     state.influence = [];
     renderInfluence();
     notify(`Decision influence could not be loaded: ${error.message}`, "error");
   }
+}
+
+function clearInfluence() {
+  state.influenceRequest += 1;
+  state.influence = [];
+  state.memoryDetail = null;
+  renderInfluence();
 }
 
 function renderInfluence() {
@@ -365,6 +408,7 @@ async function startRun() {
         user_input: elements.incidentInput.value.trim()
       })
     });
+    state.activeRunId = result.run_id;
     notify("Agent run queued. Phase events will appear here.");
     await loadRun(result.run_id, {poll: true});
   } catch (error) {
@@ -400,9 +444,10 @@ async function resetDemo() {
     const url = new URL(window.location.href);
     url.searchParams.set("namespace", state.namespace);
     history.replaceState({}, "", url);
-    state.rewindAnchor = new Date().toISOString();
+    state.rewindAnchor = payload.rewind_anchor;
     elements.rewindTimestamp.value = isoToLocalInput(state.rewindAnchor);
-    await Promise.all([loadSnapshot(), loadIncidents(payload.incident?.slug)]);
+    invalidateRewindPreview();
+    await loadIncidents(payload.incident?.slug);
     notify("Known-good payment memory restored. The demo is ready.");
   } catch (error) {
     notify(`Demo reset failed: ${error.message}`, "error");
@@ -413,8 +458,7 @@ async function resetDemo() {
 
 async function poisonDemo() {
   if (!state.rewindAnchor) {
-    state.rewindAnchor = new Date().toISOString();
-    elements.rewindTimestamp.value = isoToLocalInput(state.rewindAnchor);
+    return notify("Reset the demo before inserting poisoned memory.", "error");
   }
   setBusy($("#poisonDemo"), true, "Injecting…");
   try {
@@ -432,7 +476,7 @@ async function poisonDemo() {
 }
 
 async function previewRewind() {
-  const target = localInputToIso(elements.rewindTimestamp.value);
+  const target = state.rewindAnchor || localInputToIso(elements.rewindTimestamp.value);
   if (!target) return notify("Choose a valid rewind timestamp.", "error");
   try {
     const preview = await request(`/namespaces/${encodeURIComponent(state.namespace)}/rewinds/preview`, {
@@ -474,7 +518,7 @@ async function executeRewind() {
       restored_memory_ids: [],
       created_at: new Date().toISOString()
     });
-    renderMemoryPanel();
+    renderBeliefs();
     state.rewindPreview = null;
     notify("Rewind queued. The approved preview will be verified before any memory changes.");
     const operation = await waitForOperation(accepted.operation_id);
@@ -497,7 +541,7 @@ async function waitForOperation(operationId) {
     const operation = await request(`/memory/operations/${encodeURIComponent(operationId)}`);
     lastOperation = operation;
     state.operations.set(operation.id, operation);
-    renderMemoryPanel();
+    renderBeliefs();
     if (["completed", "conflict", "failed"].includes(operation.status)) return operation;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
@@ -575,6 +619,12 @@ function setBusy(button, busy, label) {
   button.setAttribute("aria-busy", String(busy));
 }
 
+function invalidateRewindPreview() {
+  state.rewindPreview = null;
+  elements.rewindPreview.textContent = "Choose a point on the belief timeline to preview its impact.";
+  updateOperatorState();
+}
+
 function formatTime(value) {
   if (!value) return "unknown";
   const date = new Date(value);
@@ -642,6 +692,11 @@ $("#resetDemo").addEventListener("click", resetDemo);
 $("#poisonDemo").addEventListener("click", poisonDemo);
 $("#previewRewind").addEventListener("click", previewRewind);
 elements.executeRewind.addEventListener("click", executeRewind);
+elements.rewindTimestamp.addEventListener("input", () => {
+  state.rewindAnchor = null;
+  invalidateRewindPreview();
+});
+elements.rewindReason.addEventListener("input", invalidateRewindPreview);
 elements.memories.addEventListener("click", (event) => {
   const memory = event.target.closest("[data-memory-id]");
   if (memory) showMemory(memory.dataset.memoryId);
@@ -655,5 +710,6 @@ $("#liveButton").addEventListener("click", () => loadSnapshot());
 await establishOperatorSession();
 renderIncident();
 renderRun();
-await Promise.all([loadSnapshot(params.get("as_of")), loadIncidents()]);
+await loadIncidents();
+if (!state.incident) await loadSnapshot(params.get("as_of"));
 connectEvents();

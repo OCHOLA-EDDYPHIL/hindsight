@@ -32,7 +32,7 @@ def test_reset_resubscribes_before_loading_the_fresh_namespace():
         r"state\.namespace = payload\.namespace;\s+subscribeSocket\(\);",
         reset,
     )
-    assert reset.index("subscribeSocket();") < reset.index("await Promise.all(")
+    assert reset.index("subscribeSocket();") < reset.index("await loadIncidents(")
 
 
 def test_live_events_from_a_previous_namespace_are_ignored():
@@ -55,6 +55,8 @@ def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status(
     assert "data-operation-id" in source
     assert "data-operation-type" in source
     assert "data-operation-status" in source
+    assert "renderMemoryPanel" not in source
+    assert "state.rewindAnchor = payload.rewind_anchor" in source
 
 
 @requires_browser
@@ -71,6 +73,7 @@ def test_operator_can_run_and_explain_signature_workflow():
     driver.set_script_timeout(120)
     wait = WebDriverWait(driver, 90)
     operation_id = None
+    signature = None
     try:
         driver.set_window_size(1440, 1000)
         driver.get(_browser_url(namespace=f"live-browser:{uuid4()}"))
@@ -86,19 +89,7 @@ def test_operator_can_run_and_explain_signature_workflow():
 
         driver.find_element(By.ID, "resetDemo").click()
         wait.until(lambda browser: "1 live" in browser.find_element(By.ID, "memoryCount").text)
-
-        driver.find_element(By.ID, "startRun").click()
-        wait.until(lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text)
-        driver.find_element(By.ID, "approveRun").click()
-        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
-        wait.until(lambda browser: "1 read" in browser.find_element(By.ID, "influenceCount").text)
-        wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text
-            == "2 live · 0 invalid"
-        )
         namespace = driver.find_element(By.ID, "namespace").text
-        if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1":
-            _assert_typed_reflection(namespace)
 
         if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1":
             changefeed_event = _poison_and_wait_for_changefeed_event(driver, namespace)
@@ -110,8 +101,24 @@ def test_operator_can_run_and_explain_signature_workflow():
             driver.find_element(By.ID, "poisonDemo").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text
+            == "2 live · 0 invalid"
+        )
+
+        driver.find_element(By.ID, "startRun").click()
+        wait.until(lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text)
+        wait.until(
+            lambda browser: "Poisoned memory"
+            in browser.find_element(By.ID, "influenceList").text
+        )
+        bad_plan = driver.find_element(By.ID, "planText").text
+        assert "certificate" in bad_plan.lower()
+        driver.find_element(By.ID, "rejectRun").click()
+        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "3 live · 0 invalid"
         )
+
         driver.find_element(By.ID, "previewRewind").click()
         wait.until(lambda browser: "versions will close" in browser.find_element(By.ID, "rewindPreview").text)
         driver.find_element(By.ID, "executeRewind").click()
@@ -127,8 +134,8 @@ def test_operator_can_run_and_explain_signature_workflow():
         )
         _wait_for_completed_operation(driver, timeout=float(operation_poll_seconds) + 30)
         wait.until(
-            lambda browser: "0 invalid"
-            not in browser.find_element(By.ID, "memoryCount").text
+            lambda browser: browser.find_element(By.ID, "memoryCount").text
+            == "1 live · 2 invalid"
         )
 
         timeline = driver.find_element(By.ID, "timeline")
@@ -144,11 +151,30 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.ID, "liveButton").click()
         wait.until(lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Current Beliefs")
         wait.until(
-            lambda browser: "0 invalid"
-            not in browser.find_element(By.ID, "memoryCount").text
+            lambda browser: browser.find_element(By.ID, "memoryCount").text
+            == "1 live · 2 invalid"
         )
+
+        driver.find_element(By.ID, "startRun").click()
+        wait.until(lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text)
+        wait.until(lambda browser: "1 read" in browser.find_element(By.ID, "influenceCount").text)
+        assert "Poisoned memory" not in driver.find_element(By.ID, "influenceList").text
+        corrected_plan = driver.find_element(By.ID, "planText").text
+        assert "retry" in corrected_plan.lower()
+        assert "certificate" not in corrected_plan.lower()
+        driver.find_element(By.ID, "approveRun").click()
+        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "memoryCount").text
+            == "2 live · 2 invalid"
+        )
+        if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1":
+            _assert_typed_reflection(namespace)
+        signature = _assert_signature_trace(namespace=namespace, operation_id=operation_id)
+        assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
+        assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
     finally:
-        _write_browser_evidence(driver, operation_id=operation_id)
+        _write_browser_evidence(driver, operation_id=operation_id, signature=signature)
         driver.quit()
 
 
@@ -176,6 +202,7 @@ def _capture_console_errors(driver) -> None:
     driver.execute_script(
         """
         window.__HINDSIGHT_CONSOLE_ERRORS = [];
+        window.__HINDSIGHT_VISIBLE_ERRORS = [];
         const record = (kind, value) => {
           window.__HINDSIGHT_CONSOLE_ERRORS.push({kind, value: String(value)});
         };
@@ -186,11 +213,22 @@ def _capture_console_errors(driver) -> None:
           record("console.error", values.join(" "));
           originalError(...values);
         };
+        const notice = document.getElementById("notice");
+        new MutationObserver(() => {
+          if (!notice.hidden && notice.classList.contains("error")) {
+            window.__HINDSIGHT_VISIBLE_ERRORS.push(notice.textContent);
+          }
+        }).observe(notice, {attributes: true, childList: true, subtree: true});
         """
     )
 
 
-def _write_browser_evidence(driver, *, operation_id: str | None) -> None:
+def _write_browser_evidence(
+    driver,
+    *,
+    operation_id: str | None,
+    signature: dict | None,
+) -> None:
     from selenium.webdriver.common.by import By
 
     directory_value = (os.environ.get("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR") or "").strip()
@@ -240,6 +278,7 @@ def _write_browser_evidence(driver, *, operation_id: str | None) -> None:
                 "operation_id": operation_id,
                 "observed": observed,
                 "persisted": persisted,
+                "signature": signature,
                 "capture_errors": capture_errors,
             },
             default=str,
@@ -248,6 +287,96 @@ def _write_browser_evidence(driver, *, operation_id: str | None) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore
+
+    with connect(database_url(), application_name="hindsight-browser-signature") as conn:
+        run_rows = conn.execute(
+            """
+                SELECT run.id, run.decision_id, run.status, run.plan,
+                       run.reflected_memory_id, read.id, read.memory_id,
+                       memory.writer, read.rank, read.distance
+                FROM agent_runs AS run
+                LEFT JOIN memory_reads AS read ON read.decision_id = run.decision_id
+                LEFT JOIN semantic_memories AS memory ON memory.id = read.semantic_memory_id
+                WHERE run.namespace = %s
+                ORDER BY run.created_at, read.rank
+            """,
+            (namespace,),
+        ).fetchall()
+        operation = conn.execute(
+            """
+                SELECT invalidated_memory_ids, restored_memory_ids, status
+                FROM memory_operations
+                WHERE id = %s
+            """,
+            (operation_id,),
+        ).fetchone()
+
+    grouped: dict[str, dict] = {}
+    for row in run_rows:
+        run_id = str(row[0])
+        run = grouped.setdefault(
+            run_id,
+            {
+                "run_id": run_id,
+                "decision_id": row[1],
+                "status": row[2],
+                "plan": row[3],
+                "reflected_memory_id": str(row[4]) if row[4] else None,
+                "reads": [],
+            },
+        )
+        if row[5] is not None:
+            run["reads"].append(
+                {
+                    "read_id": str(row[5]),
+                    "memory_id": str(row[6]),
+                    "writer": row[7],
+                    "rank": row[8],
+                    "distance": row[9],
+                }
+            )
+
+    runs = list(grouped.values())
+    assert len(runs) == 2
+    bad, corrected = runs
+    assert bad["status"] == "rejected"
+    assert "certificate" in bad["plan"].lower()
+    assert any(read["writer"] == "demo.poison" for read in bad["reads"])
+    assert corrected["status"] == "completed"
+    assert "retry" in corrected["plan"].lower()
+    assert "certificate" not in corrected["plan"].lower()
+    assert any(read["writer"] == "demo.seed" for read in corrected["reads"])
+    assert all(read["writer"] != "demo.poison" for read in corrected["reads"])
+    assert operation is not None and operation[2] == "completed"
+
+    with MemoryStore(url=database_url()) as store:
+        memories = store.list_current_semantic(namespace=namespace, limit=100)
+        current_writers = {memory["writer"] for memory in memories}
+        poison_id = next(
+            read["memory_id"]
+            for read in bad["reads"]
+            if read["writer"] == "demo.poison"
+        )
+        poison = store.audit_memory(memory_kind="semantic", memory_id=poison_id)
+
+    assert "demo.seed" in current_writers
+    assert poison is not None and poison["t_invalid"] is not None
+    invalidated = {str(value) for value in operation[0]}
+    assert poison_id in invalidated
+    assert bad["reflected_memory_id"] in invalidated
+    assert all(read["memory_id"] not in invalidated for read in corrected["reads"])
+    return {
+        "namespace": namespace,
+        "operation_id": operation_id,
+        "invalidated_memory_ids": sorted(invalidated),
+        "bad": bad,
+        "corrected": corrected,
+    }
 
 
 @requires_browser

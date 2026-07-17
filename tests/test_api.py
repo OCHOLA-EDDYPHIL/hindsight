@@ -516,6 +516,12 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
     )
     monkeypatch.setattr(
         api,
+        "current_database_timestamp",
+        lambda **kwargs: calls.append(("anchor", kwargs))
+        or "2026-07-17T12:00:00.123456+00:00",
+    )
+    monkeypatch.setattr(
+        api,
         "poison_demo_memory",
         lambda **kwargs: calls.append(("poison", kwargs)) or {"id": "poison-1"},
     )
@@ -524,6 +530,7 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
     poison = api.demo_poison(api.DemoPoisonRequest(namespace=reset["namespace"]))
 
     assert reset["seed_memory"] == {"id": "seed-1"}
+    assert reset["rewind_anchor"] == "2026-07-17T12:00:00.123456+00:00"
     assert poison == {"id": "poison-1"}
     assert calls == [
         ("provider", settings.provider_env),
@@ -547,6 +554,7 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
                 "embedding_provider": provider,
             },
         ),
+        ("anchor", {"db_url": settings.database_url}),
         ("provider", settings.provider_env),
         (
             "poison",
