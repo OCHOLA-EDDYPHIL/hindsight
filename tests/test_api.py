@@ -2,7 +2,32 @@
 
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
+
+
+def _operator_request(
+    *, origin: str, host: str = "api.example.test", forwarded_host: str | None = None
+) -> Request:
+    headers = [(b"host", host.encode()), (b"origin", origin.encode())]
+    if forwarded_host is not None:
+        headers.append((b"x-forwarded-host", forwarded_host.encode()))
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "https",
+            "path": "/v1/demo/poison-rewind/reset",
+            "raw_path": b"/v1/demo/poison-rewind/reset",
+            "query_string": b"",
+            "headers": headers,
+            "server": (host, 443),
+            "client": ("127.0.0.1", 12345),
+        }
+    )
 
 
 def test_openapi_exposes_narrow_product_contract():
@@ -55,6 +80,85 @@ def test_operator_session_sets_httponly_cookie(monkeypatch):
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=strict" in response.headers["set-cookie"]
     assert client.get("/v1/operator/session").json() == {"operator": True}
+
+
+def test_operator_cookie_accepts_configured_product_origin(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setenv("HINDSIGHT_ALLOWED_ORIGINS", "https://product.example.test")
+    monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "create_incident",
+        lambda **values: {"id": "incident-1", **values},
+    )
+    client = TestClient(api.app, base_url="https://api.example.test")
+
+    unlocked = client.post(
+        "/v1/operator/session",
+        json={"token": "operator-secret"},
+    )
+    created = client.post(
+        "/v1/incidents",
+        headers={"Origin": "https://product.example.test"},
+        json={
+            "slug": "proxy-session",
+            "title": "Proxy session",
+            "severity": "sev3",
+            "summary": "Validate the configured product origin.",
+        },
+    )
+
+    assert unlocked.status_code == 200
+    assert created.status_code == 201
+    assert created.json()["slug"] == "proxy-session"
+
+
+def test_operator_cookie_accepts_direct_same_origin(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.delenv("HINDSIGHT_ALLOWED_ORIGINS", raising=False)
+
+    api._operator_required_impl(
+        _operator_request(
+            origin="https://api.example.test",
+            host="api.example.test",
+        ),
+        session=api._signed_session("operator-secret"),
+    )
+
+
+def test_operator_cookie_rejects_foreign_origin_and_forwarded_host(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setenv("HINDSIGHT_ALLOWED_ORIGINS", "https://product.example.test")
+
+    with pytest.raises(HTTPException) as raised:
+        api._operator_required_impl(
+            _operator_request(
+                origin="https://foreign.example.test",
+                forwarded_host="foreign.example.test",
+            ),
+            session=api._signed_session("operator-secret"),
+        )
+
+    assert raised.value.status_code == 403
+    assert raised.value.detail == "cross-origin operator request denied"
+
+
+def test_operator_bearer_authorization_does_not_require_origin_match(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+
+    api._operator_required_impl(
+        _operator_request(origin="https://foreign.example.test"),
+        authorization="Bearer operator-secret",
+        session=api._signed_session("operator-secret"),
+    )
 
 
 def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatch):
