@@ -1,6 +1,7 @@
 """Static checks for the Terraform-owned Lambda deployment."""
 
 import pathlib
+import re
 
 
 def test_gemini_reasoning_default_is_consistent_across_runtime_and_deployment():
@@ -87,10 +88,10 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert "HINDSIGHT_RUN_DLQ_ARN" in worker_lambda
     assert "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS" in worker_lambda
     assert "HINDSIGHT_RUN_MAX_ATTEMPTS" in worker_lambda
-    assert "worker_timeout_seconds       = 180" in stack
-    assert "run_attempt_lease_seconds    = 300" in stack
-    assert "run_queue_visibility_seconds = 360" in stack
-    assert "run_max_attempts             = 3" in stack
+    assert "var.validation_mode ? 30 : 180" in stack
+    assert "var.validation_mode ? 60 : 300" in stack
+    assert "var.validation_mode ? 180 : 360" in stack
+    assert re.search(r"run_max_attempts\s*= 3", stack)
     assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' in stack
     assert 'resource "aws_cloudwatch_event_rule" "run_dispatcher"' in stack
     assert 'command = "dispatch_run_commands"' in stack

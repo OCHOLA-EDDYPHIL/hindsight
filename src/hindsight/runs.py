@@ -270,6 +270,7 @@ def create_run(
     thread_id: str | None = None,
     idempotency_key: str | None = None,
     retrieval_policy: str = "semantic_strict",
+    dispatch_available_at: datetime | None = None,
     db_url: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Create a queued run, returning ``(run, created)``."""
@@ -347,6 +348,7 @@ def create_run(
                     run_id=run_id,
                     command="start",
                     payload={"command": "start", "run_id": str(run_id)},
+                    available_at=dispatch_available_at,
                 )
         return _jsonable(run), True
 
@@ -805,13 +807,14 @@ def _append_dispatch_with_cursor(
     run_id: str | UUID,
     command: str,
     payload: dict[str, Any],
+    available_at: datetime | None = None,
 ) -> None:
     cur.execute(
         """
-            INSERT INTO agent_run_dispatches (run_id, command, payload)
-            VALUES (%s, %s, %s)
+            INSERT INTO agent_run_dispatches (run_id, command, payload, available_at)
+            VALUES (%s, %s, %s, COALESCE(%s, now()))
         """,
-        (run_id, command, Jsonb(payload)),
+        (run_id, command, Jsonb(payload), available_at),
     )
 
 

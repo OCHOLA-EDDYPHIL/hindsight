@@ -177,7 +177,8 @@ def test_live_acceptance_is_product_only_and_never_fences_changefeed():
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
     assert "run_live_acceptance.py hosted-product --phase providers" in workflow
     assert "run_live_acceptance.py hosted-product --phase semantic" in workflow
-    assert "run_live_acceptance.py hosted-product --phase full" in workflow
+    for phase in ("semantic", "consolidation", "worker", "browser", "roles"):
+        assert f"run_live_acceptance.py hosted-product --phase {phase}" in workflow
     assert "BEDROCK" not in workflow
     assert "Bedrock" not in workflow
     shared_cli = pathlib.Path("scripts/run_live_acceptance.py").read_text()
@@ -196,7 +197,10 @@ def test_live_acceptance_is_product_only_and_never_fences_changefeed():
 
 def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    browser_job = workflow.split("  hosted_product:\n", 1)[1].split(
+    browser_job = workflow.split("  browser_product:\n", 1)[1].split(
+        "  database_roles:\n", 1
+    )[0]
+    roles_job = workflow.split("  database_roles:\n", 1)[1].split(
         "  product_acceptance_complete:\n", 1
     )[0]
 
@@ -204,18 +208,17 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
         "HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}" in browser_job
     )
     assert 'CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER"' in browser_job
-    assert 'for value in "$OPERATOR_TOKEN" "$DATABASE_URL" "$GEMINI_MATERIAL" "$CHANGEFEED_TOKEN"' in browser_job
+    assert 'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"' in browser_job
     assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
-    assert "run_live_acceptance.py hosted-product --phase full" in browser_job
-    assert "WebSocket" in browser_job
+    assert "run_live_acceptance.py hosted-product --phase browser" in browser_job
     for name, default in (
         ("HINDSIGHT_DEPLOY_DATABASE_URL_PARAM", "/hindsight/demo/database-url"),
         ("HINDSIGHT_API_DATABASE_URL_PARAM", "/hindsight/demo/api-database-url"),
         ("HINDSIGHT_WORKER_DATABASE_URL_PARAM", "/hindsight/demo/worker-database-url"),
     ):
-        assert f"{name}: ${{{{ env." not in browser_job
-        assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in browser_job
+        assert f"{name}: ${{{{ env." not in roles_job
+        assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in roles_job
 
 
 def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
@@ -248,7 +251,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     parsed = yaml.safe_load(workflow)
     authorize = workflow.split("  authorize:\n", 1)[1].split(
-        "  product_preflight:\n", 1
+        "  exact_main_ci:\n", 1
     )[0]
 
     assert "  workflow_dispatch:\n" in workflow
@@ -262,20 +265,87 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
     assert "source_sha: ${{ needs.authorize.outputs.product_sha }}" in workflow
     assert set(parsed["jobs"]) == {
         "authorize",
+        "exact_main_ci",
         "product_preflight",
         "deploy",
-        "hosted_product",
+        "semantic_product",
+        "consolidation_product",
+        "worker_product",
+        "browser_product",
+        "database_roles",
         "product_acceptance_complete",
     }
-    assert parsed["jobs"]["product_preflight"]["needs"] == "authorize"
-    assert parsed["jobs"]["deploy"]["needs"] == ["authorize", "product_preflight"]
-    assert parsed["jobs"]["hosted_product"]["needs"] == ["authorize", "deploy"]
+    assert parsed["jobs"]["exact_main_ci"]["needs"] == "authorize"
+    assert parsed["jobs"]["exact_main_ci"]["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+    }
+    assert parsed["jobs"]["product_preflight"]["needs"] == [
+        "authorize",
+        "exact_main_ci",
+    ]
+    assert parsed["jobs"]["deploy"]["needs"] == [
+        "authorize",
+        "exact_main_ci",
+        "product_preflight",
+    ]
+    for job_name in (
+        "semantic_product",
+        "consolidation_product",
+        "worker_product",
+        "browser_product",
+        "database_roles",
+    ):
+        assert parsed["jobs"][job_name]["needs"] == ["authorize", "deploy"]
     assert parsed["jobs"]["product_acceptance_complete"]["needs"] == [
         "authorize",
+        "exact_main_ci",
         "product_preflight",
         "deploy",
-        "hosted_product",
+        "semantic_product",
+        "consolidation_product",
+        "worker_product",
+        "browser_product",
+        "database_roles",
     ]
+
+
+def test_product_preflight_does_not_repeat_normal_ci():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    preflight = workflow.split("  product_preflight:\n", 1)[1].split(
+        "  deploy:\n", 1
+    )[0]
+
+    assert "scripts/migrate.py" in preflight
+    assert "scripts/initialize_agent_storage.py" in preflight
+    assert "hosted-product --phase providers" in preflight
+    for duplicate in (
+        "uv lock --check",
+        "ruff check",
+        "pytest -q",
+        "build_lambda_artifacts.py",
+        "smoke_lambda_artifacts.py",
+        "node --input-type=module --check",
+        "terraform fmt",
+        "terraform validate",
+        "terraform test",
+    ):
+        assert duplicate not in preflight
+
+
+def test_exact_main_ci_query_does_not_hide_unsuccessful_runs():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    job = workflow.split("  exact_main_ci:\n", 1)[1].split(
+        "  product_preflight:\n", 1
+    )[0]
+
+    assert "actions: read" in job
+    assert "actions/workflows/ci.yml/runs" in job
+    assert "-f branch=main" in job
+    assert "-f event=push" in job
+    assert '-f head_sha="$PRODUCT_SHA"' in job
+    assert "-f status=" not in job
+    assert "scripts/verify_ci_provenance.py" in job
 
 
 def test_live_acceptance_authorization_fails_closed(tmp_path):
@@ -340,16 +410,37 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
     assert pull_request.returncode != 0
 
 
-def test_product_completion_ignores_learning_result_but_requires_product_jobs(tmp_path):
+@pytest.mark.parametrize(
+    "failed_result",
+    (
+        "AUTHORIZE_RESULT",
+        "EXACT_MAIN_CI_RESULT",
+        "PREFLIGHT_RESULT",
+        "DEPLOY_RESULT",
+        "SEMANTIC_RESULT",
+        "CONSOLIDATION_RESULT",
+        "WORKER_RESULT",
+        "BROWSER_RESULT",
+        "DATABASE_ROLES_RESULT",
+    ),
+)
+def test_product_completion_ignores_learning_result_but_requires_every_product_job(
+    tmp_path, failed_result
+):
     workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
     step = workflow["jobs"]["product_acceptance_complete"]["steps"][0]
     script = step["run"]
     base = {
         "AUTHORIZED": "true",
         "AUTHORIZE_RESULT": "success",
+        "EXACT_MAIN_CI_RESULT": "success",
         "PREFLIGHT_RESULT": "success",
         "DEPLOY_RESULT": "success",
-        "HOSTED_PRODUCT_RESULT": "success",
+        "SEMANTIC_RESULT": "success",
+        "CONSOLIDATION_RESULT": "success",
+        "WORKER_RESULT": "success",
+        "BROWSER_RESULT": "success",
+        "DATABASE_ROLES_RESULT": "success",
         "LEARNING_RESULT": "failure",
         "HEAD_SHA": "a" * 40,
         "UI_URL": "https://ui.example.invalid",
@@ -368,7 +459,7 @@ def test_product_completion_ignores_learning_result_but_requires_product_jobs(tm
         ["bash", "-euo", "pipefail", "-c", script],
         check=False,
         capture_output=True,
-        env={**os.environ, **base, "HOSTED_PRODUCT_RESULT": "failure"},
+        env={**os.environ, **base, failed_result: "failure"},
         text=True,
     )
 
@@ -488,6 +579,21 @@ def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_pat
     assert direct.returncode == 0, direct.stderr
     assert "should_apply=false" in direct_output.read_text()
     assert f"source_sha={main_sha}" in direct_output.read_text()
+
+
+def test_validation_deployment_selects_bounded_runtime_timing():
+    workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+
+    assert "TF_VAR_validation_mode: ${{ inputs.validation_mode && 'true' || 'false' }}" in workflow
+    for output in (
+        "worker_timeout_seconds",
+        "run_attempt_lease_seconds",
+        "run_queue_visibility_seconds",
+        "run_max_attempts",
+        "run_dispatch_schedule_seconds",
+    ):
+        assert f'output -raw {output}' in workflow
+        assert f"value: ${{{{ jobs.apply.outputs.{output} }}}}" in workflow
 
 
 def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():

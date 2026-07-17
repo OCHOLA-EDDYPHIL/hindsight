@@ -21,6 +21,12 @@ variable "stage" {
   }
 }
 
+variable "validation_mode" {
+  description = "Use bounded timing for owner-authorized hosted product acceptance."
+  type        = bool
+  default     = false
+}
+
 variable "api_database_url_parameter_name" {
   description = "Existing SecureString parameter containing the restricted API CockroachDB URL."
   type        = string

@@ -58,3 +58,50 @@ def test_poison_rewind_demo_runs_bad_trace_rewind_and_corrected_turn():
     assert poison["invalidation_reason"] == REWIND_REASON
     assert bad_reflection is not None
     assert bad_reflection["invalidation_reason"] == REWIND_REASON
+
+
+@requires_db
+def test_browser_demo_reset_isolates_sessions_and_incidents():
+    from hindsight.db import database_url
+    from hindsight.demo_state import (
+        ensure_poison_rewind_incident,
+        reset_poison_rewind_state,
+    )
+    from hindsight.db import connect
+
+    first_fixture = uuid4()
+    second_fixture = uuid4()
+    first = reset_poison_rewind_state(
+        namespace=f"browser-reset:{uuid4()}",
+        session_id=first_fixture,
+        db_url=database_url(),
+    )
+    second = reset_poison_rewind_state(
+        namespace=f"browser-reset:{uuid4()}",
+        session_id=second_fixture,
+        db_url=database_url(),
+    )
+    replacement = reset_poison_rewind_state(
+        namespace=first,
+        db_url=database_url(),
+    )
+    first_incident = ensure_poison_rewind_incident(
+        fixture_id=first_fixture,
+        db_url=database_url(),
+    )
+    second_incident = ensure_poison_rewind_incident(
+        fixture_id=second_fixture,
+        db_url=database_url(),
+    )
+
+    with connect(database_url()) as conn:
+        statuses = dict(
+            conn.execute(
+                "SELECT namespace, status FROM demo_sessions WHERE namespace IN (%s, %s, %s)",
+                (first, second, replacement),
+            ).fetchall()
+        )
+
+    assert statuses == {first: "archived", second: "active", replacement: "active"}
+    assert first_incident["id"] != second_incident["id"]
+    assert first_incident["slug"] != second_incident["slug"]

@@ -58,7 +58,7 @@ def test_operator_can_run_and_explain_signature_workflow():
     wait = WebDriverWait(driver, 90)
     try:
         driver.set_window_size(1440, 1000)
-        driver.get(BASE_URL)
+        driver.get(_browser_url(namespace=f"live-browser:{uuid4()}"))
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         wait.until(lambda browser: "Live" in browser.find_element(By.ID, "connection").text)
         assert driver.find_element(By.ID, "startRun").get_attribute("disabled")

@@ -60,10 +60,12 @@ def test_hosted_runtime_database_identities_are_distinct_and_restricted():
                 ).fetchone() == (True,)
                 continue
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                connection.execute(
-                    f"CREATE TABLE hosted_permission_probe_{uuid4().hex} "
-                    "(id INT PRIMARY KEY)"
-                )
+                with connection.transaction():
+                    connection.execute(
+                        f"CREATE TABLE hosted_permission_probe_{uuid4().hex} "
+                        "(id INT PRIMARY KEY)"
+                    )
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                connection.execute("DELETE FROM semantic_memories WHERE false")
+                with connection.transaction():
+                    connection.execute("DELETE FROM semantic_memories WHERE false")
     assert len(set(identities.values())) == 3

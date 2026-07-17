@@ -18,6 +18,26 @@ output "run_queue_url" {
   value = aws_sqs_queue.runs.url
 }
 
+output "worker_timeout_seconds" {
+  value = local.worker_timeout_seconds
+}
+
+output "run_attempt_lease_seconds" {
+  value = local.run_attempt_lease_seconds
+}
+
+output "run_queue_visibility_seconds" {
+  value = local.run_queue_visibility_seconds
+}
+
+output "run_max_attempts" {
+  value = local.run_max_attempts
+}
+
+output "run_dispatch_schedule_seconds" {
+  value = local.run_dispatch_schedule_seconds
+}
+
 output "artifact_bucket" {
   value = aws_s3_bucket.artifacts.id
 }

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from hindsight.db import connect, database_url
 from hindsight.embeddings import EmbeddingProvider
@@ -30,21 +30,24 @@ POISONED_MEMORY_CONTENT = (
 
 
 def reset_poison_rewind_state(
-    *, namespace: str = DEMO_NAMESPACE, db_url: str | None = None
+    *,
+    namespace: str = DEMO_NAMESPACE,
+    session_id: UUID | None = None,
+    db_url: str | None = None,
 ) -> str:
-    """Archive matching active sessions and return a fresh session namespace."""
+    """Archive only the supplied session and return a fresh session namespace."""
 
     resolved_db_url = db_url or database_url()
     base_namespace = namespace.split(":session:", 1)[0]
-    session_namespace = f"{base_namespace}:session:{uuid4().hex[:8]}"
+    session_namespace = f"{base_namespace}:session:{(session_id or uuid4()).hex}"
     with connect(resolved_db_url) as conn:
         conn.execute(
             """
                 UPDATE demo_sessions
                 SET status = 'archived', archived_at = COALESCE(archived_at, now())
-                WHERE (namespace = %s OR namespace LIKE %s) AND status = 'active'
+                WHERE namespace = %s AND status = 'active'
             """,
-            (base_namespace, f"{base_namespace}:session:%"),
+            (namespace,),
         )
         conn.execute(
             """
@@ -107,7 +110,13 @@ def poison_demo_memory(
         )
 
 
-def ensure_poison_rewind_incident(*, db_url: str | None = None) -> dict[str, Any]:
+def ensure_poison_rewind_incident(
+    *, fixture_id: UUID | None = None, db_url: str | None = None
+) -> dict[str, Any]:
+    incident_id = fixture_id or UUID("40000000-0000-0000-0000-000000000001")
+    incident_slug = (
+        f"{DEMO_INCIDENT_ID}:{fixture_id.hex}" if fixture_id else DEMO_INCIDENT_ID
+    )
     with connect(db_url or database_url()) as conn:
         with conn.transaction():
             service = conn.execute(
@@ -131,7 +140,7 @@ def ensure_poison_rewind_incident(*, db_url: str | None = None) -> dict[str, Any
                         id, slug, title, severity, status, started_at, summary
                     )
                     VALUES (
-                        '40000000-0000-0000-0000-000000000001',
+                        %s,
                         %s,
                         %s,
                         'sev2',
@@ -149,7 +158,7 @@ def ensure_poison_rewind_incident(*, db_url: str | None = None) -> dict[str, Any
                         root_cause = NULL
                     RETURNING *
                 """,
-                (DEMO_INCIDENT_ID, DEMO_TITLE, DEMO_INPUT),
+                (incident_id, incident_slug, DEMO_TITLE, DEMO_INPUT),
             ).fetchone()
             conn.execute(
                 """
