@@ -84,6 +84,7 @@ export function useCockpit() {
   const [busy, setBusy] = useState<string | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const activeRunId = useRef<string | null>(null);
+  const snapshotView = useRef<"live" | "historical">("live");
   const snapshotRequest = useRef(0);
   const incidentRequest = useRef(0);
   const runRequest = useRef(0);
@@ -113,6 +114,8 @@ export function useCockpit() {
 
   const loadSnapshot = useCallback(
     async (asOf?: string | null, targetNamespace?: string) => {
+      const requestedView = asOf ? "historical" : "live";
+      snapshotView.current = requestedView;
       const requestId = ++snapshotRequest.current;
       const requestedNamespace = targetNamespace || namespaceRef.current;
       try {
@@ -125,9 +128,11 @@ export function useCockpit() {
           return;
         }
         applySnapshot(next);
+        snapshotView.current = next.as_of ? "historical" : requestedView;
         setConnection(asOf ? "historical" : "live");
       } catch (error) {
         if (requestId !== snapshotRequest.current) return;
+        snapshotView.current = snapshotRef.current?.as_of ? "historical" : "live";
         setConnection("disconnected");
         throw error;
       }
@@ -165,7 +170,7 @@ export function useCockpit() {
         runRef.current = next;
         setRun(next);
         if (next.decision_id) void loadInfluence(next.decision_id, runId);
-        if (TERMINAL_RUN_STATES.has(next.status)) {
+        if (TERMINAL_RUN_STATES.has(next.status) && snapshotView.current === "live") {
           await loadSnapshot(null).catch(() => undefined);
         } else if (poll && next.status !== "awaiting_approval") {
           window.setTimeout(() => void loadRun(runId, true), 1400);
@@ -347,6 +352,7 @@ export function useCockpit() {
   const handleLiveEvent = useCallback(
     (payload: Record<string, any>) => {
       if (payload.namespace && payload.namespace !== namespaceRef.current) return;
+      if (snapshotView.current !== "live") return;
       const type = payload.type || payload.event;
       const data = payload.data || payload;
       if (type === "memory" && data.memory) {
@@ -412,7 +418,7 @@ export function useCockpit() {
         socketRef.current = socket;
         socket.addEventListener("open", () => {
           if (disposed) return;
-          setConnection("live");
+          if (snapshotView.current === "live") setConnection("live");
           subscribeSocket(namespaceRef.current);
         });
         socket.addEventListener("message", (event) => {
@@ -424,7 +430,7 @@ export function useCockpit() {
         });
         socket.addEventListener("close", () => {
           if (disposed) return;
-          setConnection("reconnecting");
+          if (snapshotView.current === "live") setConnection("reconnecting");
           if (socketRef.current === socket) socketRef.current = null;
           reconnectTimer = window.setTimeout(connect, 1600);
         });
@@ -434,22 +440,30 @@ export function useCockpit() {
     } else if (config.eventsBase) {
       const url = `${config.eventsBase}?namespace=${encodeURIComponent(namespace)}`;
       events = new EventSource(url);
-      events.addEventListener("open", () => setConnection("live"));
-      events.addEventListener("snapshot", (event) =>
-        applySnapshot(JSON.parse((event as MessageEvent).data)),
-      );
+      events.addEventListener("open", () => {
+        if (snapshotView.current === "live") setConnection("live");
+      });
+      events.addEventListener("snapshot", (event) => {
+        if (snapshotView.current === "live") {
+          applySnapshot(JSON.parse((event as MessageEvent).data));
+        }
+      });
       for (const type of ["memory", "operation"]) {
         events.addEventListener(type, (event) =>
           handleLiveEvent(JSON.parse((event as MessageEvent).data)),
         );
       }
-      events.addEventListener("error", () => setConnection("reconnecting"));
+      events.addEventListener("error", () => {
+        if (snapshotView.current === "live") setConnection("reconnecting");
+      });
     } else {
       const pollMs = Math.max(1500, Number(config.pollIntervalMs || 4000));
       interval = window.setInterval(() => {
-        if (!snapshotRef.current?.as_of) void loadSnapshot(null).catch(() => undefined);
-        const active = runRef.current;
-        if (active && !TERMINAL_RUN_STATES.has(active.status)) void loadRun(active.id);
+        if (snapshotView.current === "live") {
+          void loadSnapshot(null).catch(() => undefined);
+          const active = runRef.current;
+          if (active && !TERMINAL_RUN_STATES.has(active.status)) void loadRun(active.id);
+        }
       }, pollMs);
     }
 
