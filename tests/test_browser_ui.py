@@ -66,6 +66,39 @@ def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status(
     assert "state.rewindAnchor = payload.rewind_anchor" in source
 
 
+def test_reset_session_readiness_requires_new_namespace_and_known_good_snapshot():
+    class Element:
+        def __init__(self, text):
+            self.text = text
+
+    class Browser:
+        def __init__(self, namespace, memory_count):
+            self.values = {
+                "namespace": Element(namespace),
+                "memoryCount": Element(memory_count),
+            }
+
+        def find_element(self, _by, value):
+            return self.values[value]
+
+    previous = "live-browser:root"
+    assert _ready_reset_namespace(Browser(previous, "1 live · 0 invalid"), previous) is False
+    assert (
+        _ready_reset_namespace(
+            Browser("live-browser:root:session:new", "0 live · 0 invalid"),
+            previous,
+        )
+        is False
+    )
+    assert (
+        _ready_reset_namespace(
+            Browser("live-browser:root:session:new", "1 live · 0 invalid"),
+            previous,
+        )
+        == "live-browser:root:session:new"
+    )
+
+
 @requires_browser
 def test_operator_can_run_and_explain_signature_workflow():
     from selenium import webdriver
@@ -94,9 +127,11 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.CSS_SELECTOR, "#operatorForm button[type=submit]").click()
         wait.until_not(lambda browser: browser.find_element(By.ID, "startRun").get_attribute("disabled"))
 
+        previous_namespace = driver.find_element(By.ID, "namespace").text
         driver.find_element(By.ID, "resetDemo").click()
-        wait.until(lambda browser: "1 live" in browser.find_element(By.ID, "memoryCount").text)
-        namespace = driver.find_element(By.ID, "namespace").text
+        namespace = wait.until(
+            lambda browser: _ready_reset_namespace(browser, previous_namespace)
+        )
 
         driver.find_element(By.ID, "poisonDemo").click()
         wait.until(
@@ -175,6 +210,16 @@ def test_operator_can_run_and_explain_signature_workflow():
     finally:
         _write_browser_evidence(driver, operation_id=operation_id, signature=signature)
         driver.quit()
+
+
+def _ready_reset_namespace(driver, previous_namespace: str) -> str | bool:
+    from selenium.webdriver.common.by import By
+
+    namespace = driver.find_element(By.ID, "namespace").text
+    memory_count = driver.find_element(By.ID, "memoryCount").text
+    if namespace == previous_namespace or "1 live" not in memory_count:
+        return False
+    return namespace
 
 
 def _wait_for_completed_operation(driver, *, timeout: float) -> None:
