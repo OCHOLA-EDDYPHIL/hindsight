@@ -636,13 +636,15 @@ export function useCockpit() {
           `/memory/operations/${encodeURIComponent(operationId)}`,
         );
         lastOperation = operation;
+        if (["completed", "conflict", "failed"].includes(operation.status)) {
+          return operation;
+        }
         const previous = snapshotRef.current;
         if (previous) {
           const operations = new Map(previous.operations.map((item) => [item.id, item]));
           operations.set(operation.id, operation);
           applySnapshot({ ...previous, operations: [...operations.values()] });
         }
-        if (["completed", "conflict", "failed"].includes(operation.status)) return operation;
         await new Promise((resolve) => window.setTimeout(resolve, 1000));
       }
       const detail = lastOperation?.failure_detail ? `: ${lastOperation.failure_detail}` : "";

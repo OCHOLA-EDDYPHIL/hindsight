@@ -73,6 +73,9 @@ def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status(
 
     assert "config.operationPollSeconds" in polling
     assert "last status" in polling
+    assert polling.index('includes(operation.status)) {\n          return operation;') < polling.index(
+        "const previous = snapshotRef.current;"
+    )
     assert "data-operation-id" in surface
     assert "data-operation-type" in surface
     assert "data-operation-status" in surface
