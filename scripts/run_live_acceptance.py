@@ -9,10 +9,13 @@ import pathlib
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 from urllib import request
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+from uuid import uuid4
+from xml.etree import ElementTree
 
 import psycopg
 from psycopg import sql
@@ -54,15 +57,28 @@ MANAGED_CONSOLIDATION_SELECTOR = (
     "tests/test_hosted_acceptance.py::"
     "test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson"
 )
-HOSTED_PRODUCT_SELECTORS = (
-    MANAGED_CONSOLIDATION_SELECTOR,
+WORKER_PRODUCT_SELECTORS = (
     "tests/test_hosted_acceptance.py::"
     "test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq",
+)
+BROWSER_PRODUCT_SELECTORS = (
     "tests/test_hosted_acceptance.py::"
     "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe",
-    "tests/test_browser_ui.py",
-    "tests/test_hosted_database_roles.py",
+    "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
+    "tests/test_browser_ui.py::"
+    "test_review_required_memory_renders_as_active_in_its_historical_snapshot",
 )
+ROLE_PRODUCT_SELECTORS = (
+    "tests/test_hosted_database_roles.py::"
+    "test_hosted_runtime_database_identities_are_distinct_and_restricted",
+)
+HOSTED_PHASE_SELECTORS = {
+    "semantic": SEMANTIC_RETRIEVAL_SELECTORS,
+    "consolidation": (MANAGED_CONSOLIDATION_SELECTOR,),
+    "worker": WORKER_PRODUCT_SELECTORS,
+    "browser": BROWSER_PRODUCT_SELECTORS,
+    "roles": ROLE_PRODUCT_SELECTORS,
+}
 
 
 def main() -> None:
@@ -76,7 +92,7 @@ def main() -> None:
     hosted_product = subparsers.add_parser("hosted-product")
     hosted_product.add_argument(
         "--phase",
-        choices=("providers", "semantic", "full"),
+        choices=("providers", *HOSTED_PHASE_SELECTORS),
         required=True,
     )
     hosted_product.add_argument(
@@ -325,36 +341,82 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
     if args.phase == "providers":
         _verify_product_providers()
         return
-    if args.phase == "semantic":
-        _verify_semantic(
-            argparse.Namespace(
-                database_url=args.database_url,
-                database_scope="hosted",
-            )
-        )
+    env = dict(os.environ)
+    env["HINDSIGHT_ACCEPTANCE_PHASE_ID"] = str(uuid4())
+    env["RUN_HOSTED_ACCEPTANCE"] = "1"
+    selectors = HOSTED_PHASE_SELECTORS[args.phase]
+    if args.phase == "roles":
+        for name in (
+            "HINDSIGHT_DEPLOY_DATABASE_URL_PARAM",
+            "HINDSIGHT_API_DATABASE_URL_PARAM",
+            "HINDSIGHT_WORKER_DATABASE_URL_PARAM",
+            "AWS_REGION",
+        ):
+            _required_env(name)
+        _run_hosted_pytest(selectors, env=env, phase=args.phase)
         return
 
     database_url = _required_database_url(args.database_url)
     _require_hosted_database(database_url)
-    _verify_hosted_endpoints()
-    env = dict(os.environ)
     env["DATABASE_URL"] = database_url
-    _run(
-        [sys.executable, "scripts/configure_changefeed.py", "status"],
-        env=env,
-    )
-    _run(
-        [sys.executable, "-m", "pytest", "-q", *HOSTED_PRODUCT_SELECTORS],
-        env=env,
-    )
+    if args.phase in {"semantic", "consolidation", "browser"}:
+        _require_gemini_credentials()
+        env["RUN_LIVE_GEMINI_ACCEPTANCE"] = "1"
+    if args.phase == "consolidation":
+        _required_https_env("HOSTED_API_URL")
+        _required_env("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
+        _verify_changefeed(env)
+    elif args.phase == "worker":
+        for name in (
+            "HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS",
+            "HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS",
+            "HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS",
+            "HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS",
+        ):
+            _required_positive_int_env(name)
+    elif args.phase == "browser":
+        _verify_hosted_endpoints()
+        _required_env("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
+        _required_env("HINDSIGHT_CHANGEFEED_AUTH_TOKEN")
+        _verify_changefeed(env)
+    _run_hosted_pytest(selectors, env=env, phase=args.phase)
+
+
+def _verify_changefeed(env: dict[str, str]) -> None:
+    _run([sys.executable, "scripts/configure_changefeed.py", "status"], env=env)
+
+
+def _run_hosted_pytest(
+    selectors: tuple[str, ...], *, env: dict[str, str], phase: str
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"hindsight-{phase}-") as directory:
+        report = pathlib.Path(directory) / "pytest.xml"
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-x",
+                f"--junitxml={report}",
+                *selectors,
+            ],
+            env=env,
+        )
+        root = ElementTree.parse(report).getroot()
+        suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+        tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+        skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+        if tests < 1 or skipped:
+            raise RuntimeError(
+                f"hosted product phase {phase} ran {tests} tests with {skipped} skipped"
+            )
 
 
 def _verify_hosted_endpoints() -> None:
-    ui_url = _required_env("HINDSIGHT_BROWSER_BASE_URL").rstrip("/")
-    api_url = _required_env("HOSTED_API_URL").rstrip("/")
+    ui_url = _required_https_env("HINDSIGHT_BROWSER_BASE_URL").rstrip("/")
+    api_url = _required_https_env("HOSTED_API_URL").rstrip("/")
     websocket_url = _required_env("HINDSIGHT_WEBSOCKET_URL")
-    if not ui_url.startswith("https://") or not api_url.startswith("https://"):
-        raise ValueError("hosted product HTTP endpoints must use HTTPS")
     if not websocket_url.startswith("wss://"):
         raise ValueError("hosted product WebSocket endpoint must use WSS")
     for url in (f"{ui_url}/v1/health/ready", f"{api_url}/v1/health/ready"):
@@ -593,6 +655,24 @@ def _required_env(name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def _required_https_env(name: str) -> str:
+    value = _required_env(name)
+    if not value.startswith("https://"):
+        raise ValueError(f"{name} must use HTTPS")
+    return value
+
+
+def _required_positive_int_env(name: str) -> int:
+    value = _required_env(name)
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
 
 
 def _product_environment(database_url: str, *, live: bool) -> dict[str, str]:

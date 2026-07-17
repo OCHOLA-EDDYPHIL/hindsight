@@ -74,6 +74,10 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
+      aws_lambda_function.worker.timeout == 180 &&
+      tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) == 300 &&
+      aws_sqs_queue.runs.visibility_timeout_seconds == 360 &&
+      tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == 3 &&
       aws_lambda_function.worker.timeout < tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) < aws_sqs_queue.runs.visibility_timeout_seconds &&
       aws_sqs_queue.run_dlq.visibility_timeout_seconds == aws_sqs_queue.runs.visibility_timeout_seconds
@@ -97,6 +101,7 @@ run "complete_demo_graph" {
   assert {
     condition = (
       aws_cloudwatch_event_rule.run_dispatcher.schedule_expression == "rate(1 minute)" &&
+      aws_cloudwatch_event_rule.operation_reaper.schedule_expression == "rate(1 minute)" &&
       jsondecode(aws_cloudwatch_event_target.run_dispatcher.input).command == "dispatch_run_commands"
     )
     error_message = "The worker must sweep durable run commands through the run queue."
@@ -129,5 +134,38 @@ run "complete_demo_graph" {
       endswith(aws_iam_role_policy_attachment.apigateway_cloudwatch.policy_arn, "AmazonAPIGatewayPushToCloudWatchLogs")
     )
     error_message = "API Gateway access logs require the Terraform-owned account role and managed policy."
+  }
+}
+
+run "validation_timing_profile" {
+  command = plan
+
+  variables {
+    validation_mode   = true
+    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.worker.timeout == 30 &&
+      tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) == 60 &&
+      aws_sqs_queue.runs.visibility_timeout_seconds == 180 &&
+      aws_sqs_queue.run_dlq.visibility_timeout_seconds == 180 &&
+      tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == 3
+    )
+    error_message = "Validation mode must shorten timing without weakening the attempt budget."
+  }
+
+  assert {
+    condition = (
+      aws_sqs_queue.runs.visibility_timeout_seconds >= aws_lambda_function.worker.timeout * 6 &&
+      aws_cloudwatch_event_rule.run_dispatcher.schedule_expression == "rate(1 minute)" &&
+      aws_cloudwatch_event_rule.operation_reaper.schedule_expression == "rate(1 minute)" &&
+      toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"]) &&
+      toset(aws_lambda_event_source_mapping.worker_dlq.function_response_types) == toset(["ReportBatchItemFailures"])
+    )
+    error_message = "Validation mode must preserve scheduler and queue execution boundaries."
   }
 }

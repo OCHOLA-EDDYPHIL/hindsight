@@ -52,6 +52,21 @@ on:
       websocket_url:
         description: Deployed WebSocket endpoint
         value: ${{ jobs.apply.outputs.websocket_url }}
+      worker_timeout_seconds:
+        description: Applied worker timeout
+        value: ${{ jobs.apply.outputs.worker_timeout_seconds }}
+      run_attempt_lease_seconds:
+        description: Applied durable run-attempt lease
+        value: ${{ jobs.apply.outputs.run_attempt_lease_seconds }}
+      run_queue_visibility_seconds:
+        description: Applied source and dead-letter queue visibility
+        value: ${{ jobs.apply.outputs.run_queue_visibility_seconds }}
+      run_max_attempts:
+        description: Applied run-attempt and redrive budget
+        value: ${{ jobs.apply.outputs.run_max_attempts }}
+      run_dispatch_schedule_seconds:
+        description: Applied dispatcher cadence
+        value: ${{ jobs.apply.outputs.run_dispatch_schedule_seconds }}
 
 permissions:
   contents: read
@@ -66,6 +81,7 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_stage: demo
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_VAR_validation_mode: ${{ inputs.validation_mode && 'true' || 'false' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
   TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
   TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
@@ -232,6 +248,11 @@ jobs:
       ui_url: ${{ steps.stack_outputs.outputs.ui_url }}
       api_url: ${{ steps.stack_outputs.outputs.api_url }}
       websocket_url: ${{ steps.stack_outputs.outputs.websocket_url }}
+      worker_timeout_seconds: ${{ steps.stack_outputs.outputs.worker_timeout_seconds }}
+      run_attempt_lease_seconds: ${{ steps.stack_outputs.outputs.run_attempt_lease_seconds }}
+      run_queue_visibility_seconds: ${{ steps.stack_outputs.outputs.run_queue_visibility_seconds }}
+      run_max_attempts: ${{ steps.stack_outputs.outputs.run_max_attempts }}
+      run_dispatch_schedule_seconds: ${{ steps.stack_outputs.outputs.run_dispatch_schedule_seconds }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -320,10 +341,20 @@ jobs:
           UI_URL="$(terraform -chdir=infra/terraform/app output -raw ui_url)"
           API_URL="$(terraform -chdir=infra/terraform/app output -raw api_url)"
           WEBSOCKET_URL="$(terraform -chdir=infra/terraform/app output -raw websocket_url)"
+          WORKER_TIMEOUT_SECONDS="$(terraform -chdir=infra/terraform/app output -raw worker_timeout_seconds)"
+          RUN_ATTEMPT_LEASE_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_attempt_lease_seconds)"
+          RUN_QUEUE_VISIBILITY_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_queue_visibility_seconds)"
+          RUN_MAX_ATTEMPTS="$(terraform -chdir=infra/terraform/app output -raw run_max_attempts)"
+          RUN_DISPATCH_SCHEDULE_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_dispatch_schedule_seconds)"
           {
             echo "ui_url=$UI_URL"
             echo "api_url=$API_URL"
             echo "websocket_url=$WEBSOCKET_URL"
+            echo "worker_timeout_seconds=$WORKER_TIMEOUT_SECONDS"
+            echo "run_attempt_lease_seconds=$RUN_ATTEMPT_LEASE_SECONDS"
+            echo "run_queue_visibility_seconds=$RUN_QUEUE_VISIBILITY_SECONDS"
+            echo "run_max_attempts=$RUN_MAX_ATTEMPTS"
+            echo "run_dispatch_schedule_seconds=$RUN_DISPATCH_SCHEDULE_SECONDS"
           } >> "$GITHUB_OUTPUT"
       - name: Verify deployed HTTP health
         shell: bash

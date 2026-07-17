@@ -13,8 +13,6 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
-  API_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
-  WORKER_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
   GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
@@ -54,11 +52,54 @@ jobs:
             echo "product_sha=$EVENT_SHA"
           } >> "$GITHUB_OUTPUT"
 
-  product_preflight:
+  exact_main_ci:
     needs: authorize
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ci_run_id: ${{ steps.provenance.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.provenance.outputs.ci_run_attempt }}
+      ci_run_url: ${{ steps.provenance.outputs.ci_run_url }}
+      ci_workflow_path: ${{ steps.provenance.outputs.ci_workflow_path }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Verify exact product revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - id: provenance
+        name: Require unique successful exact-main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCT_SHA: ${{ needs.authorize.outputs.product_sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh api --method GET \
+            "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$PRODUCT_SHA" \
+            -f per_page=100 \
+            > "$RUNNER_TEMP/exact-main-ci.json"
+          python scripts/verify_ci_provenance.py \
+            --repository "$REPOSITORY" \
+            --sha "$PRODUCT_SHA" \
+            --github-output "$GITHUB_OUTPUT" \
+            < "$RUNNER_TEMP/exact-main-ci.json"
+
+  product_preflight:
+    needs:
+      - authorize
+      - exact_main_ci
+    runs-on: ubuntu-latest
     environment: demo
-    timeout-minutes: 60
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
@@ -76,7 +117,6 @@ jobs:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
-      - run: uv lock --check
       - run: uv sync --frozen
       - name: Start isolated CockroachDB
         run: docker compose up -d crdb
@@ -93,25 +133,6 @@ jobs:
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
           uv run python scripts/migrate.py
           uv run python scripts/initialize_agent_storage.py
-      - name: Run product verification
-        shell: bash
-        run: |
-          uv run ruff check .
-          uv run pytest -q
-          uv run python scripts/build_lambda_artifacts.py
-          uv run python scripts/smoke_lambda_artifacts.py
-          node --input-type=module --check < src/hindsight/web/app.js
-      - uses: hashicorp/setup-terraform@v3
-      - name: Validate Terraform
-        shell: bash
-        run: |
-          terraform fmt -check -recursive infra/terraform
-          terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false
-          terraform -chdir=infra/terraform/bootstrap validate
-          terraform -chdir=infra/terraform/bootstrap test
-          terraform -chdir=infra/terraform/app init -backend=false -input=false
-          terraform -chdir=infra/terraform/app validate
-          terraform -chdir=infra/terraform/app test
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
@@ -120,26 +141,18 @@ jobs:
         shell: bash
         run: |
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          [[ -n "$GEMINI_MATERIAL" && "$GEMINI_MATERIAL" != "None" ]] || {
-            echo "Gemini credential material is unavailable." >&2
-            exit 1
-          }
+          [[ -n "$GEMINI_MATERIAL" && "$GEMINI_MATERIAL" != "None" ]] || exit 1
           echo "::add-mask::$GEMINI_MATERIAL"
           FIRST_GEMINI_KEY=""
           while IFS= read -r api_key; do
             [[ -n "$api_key" ]] || continue
             echo "::add-mask::$api_key"
-            if [[ -z "$FIRST_GEMINI_KEY" ]]; then
-              FIRST_GEMINI_KEY="$api_key"
-            fi
+            [[ -n "$FIRST_GEMINI_KEY" ]] || FIRST_GEMINI_KEY="$api_key"
           done < <(
             GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
               'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
           )
-          [[ -n "$FIRST_GEMINI_KEY" ]] || {
-            echo "Gemini credential document contains no usable key." >&2
-            exit 1
-          }
+          [[ -n "$FIRST_GEMINI_KEY" ]] || exit 1
           delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
           {
             echo "GEMINI_API_KEYS<<$delimiter"
@@ -153,6 +166,7 @@ jobs:
   deploy:
     needs:
       - authorize
+      - exact_main_ci
       - product_preflight
     permissions:
       contents: read
@@ -165,13 +179,135 @@ jobs:
       embedding_max_distance: "0.35"
       source_sha: ${{ needs.authorize.outputs.product_sha }}
 
-  hosted_product:
-    needs:
-      - authorize
-      - deploy
+  semantic_product:
+    needs: [authorize, deploy]
     runs-on: ubuntu-latest
     environment: demo
-    timeout-minutes: 120
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EMBEDDING_PROVIDER: gemini
+      LLM_PROVIDER: gemini
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load semantic settings
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL"; do
+            [[ -n "$value" && "$value" != "None" ]] || exit 1
+            echo "::add-mask::$value"
+          done
+          while IFS= read -r api_key; do [[ -n "$api_key" ]] && echo "::add-mask::$api_key"; done < <(
+            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
+              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
+          )
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          {
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+            echo "GEMINI_API_KEYS<<$delimiter"
+            printf '%s\n' "$GEMINI_MATERIAL"
+            echo "$delimiter"
+          } >> "$GITHUB_ENV"
+      - run: uv run python scripts/run_live_acceptance.py hosted-product --phase semantic
+
+  consolidation_product:
+    needs: [authorize, deploy]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
+      EMBEDDING_PROVIDER: gemini
+      LLM_PROVIDER: gemini
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load consolidation settings
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN"; do
+            [[ -n "$value" && "$value" != "None" ]] || exit 1
+            echo "::add-mask::$value"
+          done
+          while IFS= read -r api_key; do [[ -n "$api_key" ]] && echo "::add-mask::$api_key"; done < <(
+            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
+              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
+          )
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          {
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+            printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
+            echo "GEMINI_API_KEYS<<$delimiter"
+            printf '%s\n' "$GEMINI_MATERIAL"
+            echo "$delimiter"
+          } >> "$GITHUB_ENV"
+      - run: uv run python scripts/run_live_acceptance.py hosted-product --phase consolidation
+
+  worker_product:
+    needs: [authorize, deploy]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS: ${{ needs.deploy.outputs.run_attempt_lease_seconds }}
+      HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS: ${{ needs.deploy.outputs.run_queue_visibility_seconds }}
+      HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS: ${{ needs.deploy.outputs.run_max_attempts }}
+      HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS: ${{ needs.deploy.outputs.run_dispatch_schedule_seconds }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load worker database setting
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
+          echo "::add-mask::$DATABASE_URL"
+          printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+      - run: uv run python scripts/run_live_acceptance.py hosted-product --phase worker
+
+  browser_product:
+    needs: [authorize, deploy]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
@@ -179,11 +315,54 @@ jobs:
       HINDSIGHT_BROWSER_BASE_URL: ${{ needs.deploy.outputs.ui_url }}
       HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
       HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}
-      HINDSIGHT_CHANGEFEED_WEBHOOK_URL: ${{ needs.deploy.outputs.api_url }}/internal/changefeed
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
-      RUN_LIVE_GEMINI_ACCEPTANCE: "1"
-      RUN_HOSTED_ACCEPTANCE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load browser settings
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"; do
+            [[ -n "$value" && "$value" != "None" ]] || exit 1
+            echo "::add-mask::$value"
+          done
+          while IFS= read -r api_key; do [[ -n "$api_key" ]] && echo "::add-mask::$api_key"; done < <(
+            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
+              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
+          )
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          {
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+            printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
+            printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
+            echo "GEMINI_API_KEYS<<$delimiter"
+            printf '%s\n' "$GEMINI_MATERIAL"
+            echo "$delimiter"
+          } >> "$GITHUB_ENV"
+      - run: uv run python scripts/run_live_acceptance.py hosted-product --phase browser
+
+  database_roles:
+    needs: [authorize, deploy]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
       HINDSIGHT_DEPLOY_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
       HINDSIGHT_API_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       HINDSIGHT_WORKER_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
@@ -192,66 +371,26 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
-      - name: Verify exact product revision
-        env:
-          EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Load and mask hosted product settings from SSM
-        shell: bash
-        run: |
-          OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          for value in "$OPERATOR_TOKEN" "$DATABASE_URL" "$GEMINI_MATERIAL" "$CHANGEFEED_TOKEN"; do
-            [[ -n "$value" && "$value" != "None" ]] || {
-              echo "A hosted product setting is unavailable." >&2
-              exit 1
-            }
-            echo "::add-mask::$value"
-          done
-          while IFS= read -r api_key; do
-            [[ -n "$api_key" ]] && echo "::add-mask::$api_key"
-          done < <(
-            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
-              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
-          )
-          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
-          {
-            printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
-            printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
-            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
-            echo "GEMINI_API_KEYS<<$delimiter"
-            printf '%s\n' "$GEMINI_MATERIAL"
-            echo "$delimiter"
-          } >> "$GITHUB_ENV"
-      - name: Verify semantic retrieval and cutoff
-        run: uv run python scripts/run_live_acceptance.py hosted-product --phase semantic
-      - name: Verify managed consolidation and hosted product behavior
-        run: uv run python scripts/run_live_acceptance.py hosted-product --phase full
-      - name: Record hosted product evidence
-        env:
-          HEAD_SHA: ${{ needs.authorize.outputs.product_sha }}
-        run: |
-          {
-            echo "### Hosted product acceptance"
-            echo
-            echo "Semantic memory, consolidation, governed agent execution, queue recovery, restricted roles, HTTP, WebSocket, Firefox, rewind, and history checks succeeded at `$HEAD_SHA`."
-          } >> "$GITHUB_STEP_SUMMARY"
+      - run: uv run python scripts/run_live_acceptance.py hosted-product --phase roles
 
   product_acceptance_complete:
     if: always()
     needs:
       - authorize
+      - exact_main_ci
       - product_preflight
       - deploy
-      - hosted_product
+      - semantic_product
+      - consolidation_product
+      - worker_product
+      - browser_product
+      - database_roles
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -263,37 +402,43 @@ jobs:
           API_URL: ${{ needs.deploy.outputs.api_url }}
           AUTHORIZED: ${{ needs.authorize.outputs.authorized }}
           AUTHORIZE_RESULT: ${{ needs.authorize.result }}
+          EXACT_MAIN_CI_RESULT: ${{ needs.exact_main_ci.result }}
           PREFLIGHT_RESULT: ${{ needs.product_preflight.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
-          HOSTED_PRODUCT_RESULT: ${{ needs.hosted_product.result }}
+          SEMANTIC_RESULT: ${{ needs.semantic_product.result }}
+          CONSOLIDATION_RESULT: ${{ needs.consolidation_product.result }}
+          WORKER_RESULT: ${{ needs.worker_product.result }}
+          BROWSER_RESULT: ${{ needs.browser_product.result }}
+          DATABASE_ROLES_RESULT: ${{ needs.database_roles.result }}
         shell: bash
         run: |
           [[ "$AUTHORIZED" == "true" ]]
           for result in \
             "$AUTHORIZE_RESULT" \
+            "$EXACT_MAIN_CI_RESULT" \
             "$PREFLIGHT_RESULT" \
             "$DEPLOY_RESULT" \
-            "$HOSTED_PRODUCT_RESULT"; do
+            "$SEMANTIC_RESULT" \
+            "$CONSOLIDATION_RESULT" \
+            "$WORKER_RESULT" \
+            "$BROWSER_RESULT" \
+            "$DATABASE_ROLES_RESULT"; do
             [[ "$result" == "success" ]] || {
               echo "A required product-acceptance job did not succeed: $result" >&2
               exit 1
             }
           done
           [[ "$UI_URL" == https://* && "$API_URL" == https://* ]]
-          {
-            echo "### Product acceptance complete"
-            echo
-            echo "All product gates succeeded for `$HEAD_SHA`."
-            echo
-            echo "- UI: $UI_URL"
-            echo "- API: $API_URL"
-          } >> "$GITHUB_STEP_SUMMARY"
       - name: Build exact-SHA product provenance
         env:
           HEAD_SHA: ${{ needs.authorize.outputs.product_sha }}
           UI_URL: ${{ needs.deploy.outputs.ui_url }}
           API_URL: ${{ needs.deploy.outputs.api_url }}
           WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}
+          CI_RUN_ID: ${{ needs.exact_main_ci.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.exact_main_ci.outputs.ci_run_attempt }}
+          CI_RUN_URL: ${{ needs.exact_main_ci.outputs.ci_run_url }}
+          CI_WORKFLOW_PATH: ${{ needs.exact_main_ci.outputs.ci_workflow_path }}
         run: |
           python - <<'PY'
           import json
@@ -305,6 +450,10 @@ jobs:
               "run_id": os.environ["GITHUB_RUN_ID"],
               "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
               "head_sha": os.environ["HEAD_SHA"],
+              "ci_run_id": os.environ["CI_RUN_ID"],
+              "ci_run_attempt": os.environ["CI_RUN_ATTEMPT"],
+              "ci_run_url": os.environ["CI_RUN_URL"],
+              "ci_workflow_path": os.environ["CI_WORKFLOW_PATH"],
               "ui_url": os.environ["UI_URL"],
               "api_url": os.environ["API_URL"],
               "websocket_url": os.environ["WEBSOCKET_URL"],

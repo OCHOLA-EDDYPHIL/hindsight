@@ -379,13 +379,16 @@ def test_request_validation_precedes_database_resolution(monkeypatch):
 
 def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
     import hindsight.api as api
+    from uuid import UUID
 
     settings = SimpleNamespace(
         database_url="postgresql://hosted/database",
         provider_env={"EMBEDDING_PROVIDER": "gemini"},
     )
     provider = object()
+    fixture_id = UUID("12345678-1234-5678-1234-567812345678")
     calls = []
+    monkeypatch.setattr(api, "uuid4", lambda: fixture_id)
     monkeypatch.setattr(api, "runtime_settings", lambda: settings)
     monkeypatch.setattr(
         api,
@@ -422,9 +425,16 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
         ("provider", settings.provider_env),
         (
             "reset",
-            {"namespace": "demo:hosted", "db_url": settings.database_url},
+            {
+                "namespace": "demo:hosted",
+                "session_id": fixture_id,
+                "db_url": settings.database_url,
+            },
         ),
-        ("incident", {"db_url": settings.database_url}),
+        (
+            "incident",
+            {"fixture_id": fixture_id, "db_url": settings.database_url},
+        ),
         (
             "seed",
             {

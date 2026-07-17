@@ -1,10 +1,12 @@
 locals {
   name = "${var.project_name}-${var.stage}"
 
-  worker_timeout_seconds       = 180
-  run_attempt_lease_seconds    = 300
-  run_queue_visibility_seconds = 360
-  run_max_attempts             = 3
+  worker_timeout_seconds        = var.validation_mode ? 30 : 180
+  run_attempt_lease_seconds     = var.validation_mode ? 60 : 300
+  run_queue_visibility_seconds  = var.validation_mode ? 180 : 360
+  run_max_attempts              = 3
+  run_dispatch_schedule         = "rate(1 minute)"
+  run_dispatch_schedule_seconds = 60
 
   api_zip      = var.api_zip_path != null ? abspath(var.api_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-api.zip")
   worker_zip   = var.worker_zip_path != null ? abspath(var.worker_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip")
@@ -393,6 +395,20 @@ resource "aws_lambda_function" "worker" {
 
   reserved_concurrent_executions = 2
 
+  lifecycle {
+    precondition {
+      condition = (
+        local.worker_timeout_seconds < local.run_attempt_lease_seconds &&
+        local.run_attempt_lease_seconds < local.run_queue_visibility_seconds &&
+        (
+          !var.validation_mode ||
+          local.run_queue_visibility_seconds >= local.worker_timeout_seconds * 6
+        )
+      )
+      error_message = "Worker timeout, attempt lease, and queue visibility must remain safely ordered, with six-times visibility in validation mode."
+    }
+  }
+
   environment {
     variables = {
       HINDSIGHT_DATABASE_URL_PARAM        = var.worker_database_url_parameter_name
@@ -473,7 +489,7 @@ resource "aws_lambda_event_source_mapping" "worker_dlq" {
 resource "aws_cloudwatch_event_rule" "operation_reaper" {
   name                = "${local.name}-operation-reaper"
   description         = "Terminalize expired final governed-memory operation attempts"
-  schedule_expression = "rate(1 minute)"
+  schedule_expression = local.run_dispatch_schedule
 }
 
 resource "aws_cloudwatch_event_target" "operation_reaper" {
@@ -494,7 +510,7 @@ resource "aws_lambda_permission" "operation_reaper" {
 resource "aws_cloudwatch_event_rule" "run_dispatcher" {
   name                = "${local.name}-run-dispatcher"
   description         = "Dispatch pending and expired agent-run outbox commands"
-  schedule_expression = "rate(1 minute)"
+  schedule_expression = local.run_dispatch_schedule
 }
 
 resource "aws_cloudwatch_event_target" "run_dispatcher" {

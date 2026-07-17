@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -143,6 +143,27 @@ def test_run_and_approval_transitions_commit_their_dispatches():
         ("plan", "awaiting_approval"),
         ("approval", "resuming"),
     ]
+
+
+@requires_db
+def test_run_creation_can_atomically_delay_dispatch_availability():
+    from hindsight.runs import create_run
+
+    available_at = datetime.now(UTC) + timedelta(minutes=5)
+    run, _ = create_run(
+        incident_slug=f"dispatch-delayed-{uuid4().hex}",
+        namespace=f"dispatch-delayed-{uuid4().hex}",
+        user_input="validate an atomic future dispatch",
+        dispatch_available_at=available_at,
+    )
+
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        persisted = conn.execute(
+            "SELECT available_at FROM agent_run_dispatches WHERE run_id = %s",
+            (run["id"],),
+        ).fetchone()[0]
+
+    assert persisted == available_at
 
 
 @requires_db

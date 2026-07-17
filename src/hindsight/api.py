@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -568,11 +569,16 @@ def _approve_operation(
 def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
     settings = _api_runtime_settings()
     embedding_provider = embedding_provider_from_env(settings.provider_env)
+    fixture_id = uuid4()
     session_namespace = reset_poison_rewind_state(
         namespace=payload.namespace,
+        session_id=fixture_id,
         db_url=settings.database_url,
     )
-    incident = ensure_poison_rewind_incident(db_url=settings.database_url)
+    incident = ensure_poison_rewind_incident(
+        fixture_id=fixture_id,
+        db_url=settings.database_url,
+    )
     memory = seed_good_demo_memory(
         namespace=session_namespace,
         db_url=settings.database_url,

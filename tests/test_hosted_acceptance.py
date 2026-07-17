@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from urllib import error, request
 from uuid import uuid4
 
@@ -175,14 +175,36 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
 @requires_hosted_acceptance
 def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
     from hindsight.db import connect
-    from hindsight.runs import claim_run_attempt, create_run, prepare_approval
+    from hindsight.runs import (
+        claim_run_attempt,
+        create_incident,
+        create_run,
+        prepare_approval,
+    )
     from hindsight.runtime import runtime_database_url
 
     database_url = runtime_database_url()
-    token = uuid4().hex
+    token = _acceptance_token("worker")
+    lease_seconds = _positive_int_env(
+        "HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS"
+    )
+    visibility_seconds = _positive_int_env(
+        "HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS"
+    )
+    max_attempts = _positive_int_env("HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS")
+    scheduler_seconds = _positive_int_env("HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS")
+    assert max_attempts == 3
 
+    pending_slug = f"hosted-pending:{token}"
+    create_incident(
+        slug=pending_slug,
+        title="Scheduled queue and approval validation",
+        severity="sev3",
+        summary="Verify the hosted dispatcher and approval resume path.",
+        db_url=database_url,
+    )
     pending, _ = create_run(
-        incident_slug=f"hosted-pending:{token}",
+        incident_slug=pending_slug,
         namespace=f"hosted-pending:{token}",
         user_input="Verify scheduled recovery of a deliberately pending command",
         db_url=database_url,
@@ -191,7 +213,7 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
         str(pending["id"]),
         expected={"awaiting_approval"},
         database_url=database_url,
-        timeout=300,
+        timeout=scheduler_seconds * 2 + lease_seconds + 180,
     )
     assert awaiting["worker_attempt_count"] == 1
     prepare_approval(run_id=pending["id"], approved=True, db_url=database_url)
@@ -199,59 +221,79 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
         str(pending["id"]),
         expected={"completed"},
         database_url=database_url,
-        timeout=300,
+        timeout=scheduler_seconds * 2 + lease_seconds + 180,
     )
 
-    reclaimed, _ = create_run(
-        incident_slug=f"hosted-reclaim:{token}",
-        namespace=f"hosted-reclaim:{token}",
-        user_input="Verify recovery after an expired worker attempt",
+    reclaimed_slug = f"hosted-reclaim:{token}"
+    create_incident(
+        slug=reclaimed_slug,
+        title="Expired attempt reclaim validation",
+        severity="sev3",
+        summary="Verify a naturally expired attempt is reclaimed.",
         db_url=database_url,
     )
-    _delay_dispatch(str(reclaimed["id"]), database_url=database_url)
+    reclaimed, _ = create_run(
+        incident_slug=reclaimed_slug,
+        namespace=f"hosted-reclaim:{token}",
+        user_input="Verify recovery after an expired worker attempt",
+        dispatch_available_at=datetime.now(UTC) + timedelta(seconds=5),
+        db_url=database_url,
+    )
     first = claim_run_attempt(
         run_id=reclaimed["id"],
         command="start",
-        lease_ttl=timedelta(minutes=5),
-        max_attempts=3,
+        lease_ttl=timedelta(seconds=1),
+        max_attempts=max_attempts,
         db_url=database_url,
     )
     assert first.outcome == "claimed"
-    _expire_attempt(str(reclaimed["id"]), database_url=database_url)
-    _release_dispatch(str(reclaimed["id"]), database_url=database_url)
+    time.sleep(1.1)
     recovered = _wait_for_run_status(
         str(reclaimed["id"]),
         expected={"awaiting_approval"},
         database_url=database_url,
-        timeout=300,
+        timeout=scheduler_seconds * 2 + lease_seconds + 180,
     )
     assert recovered["worker_attempt_count"] == 2
     assert any(event["phase"] == "recovery" for event in recovered["events"])
 
-    exhausted, _ = create_run(
-        incident_slug=f"hosted-dlq:{token}",
-        namespace=f"hosted-dlq:{token}",
-        user_input="Verify exhausted source delivery is finalized from the DLQ",
+    exhausted_slug = f"hosted-dlq:{token}"
+    create_incident(
+        slug=exhausted_slug,
+        title="Dead-letter finalization validation",
+        severity="sev3",
+        summary="Verify exhausted attempts finalize through the hosted DLQ.",
         db_url=database_url,
     )
-    _delay_dispatch(str(exhausted["id"]), database_url=database_url)
-    for expected_attempt in range(1, 4):
+    exhausted, _ = create_run(
+        incident_slug=exhausted_slug,
+        namespace=f"hosted-dlq:{token}",
+        user_input="Verify exhausted source delivery is finalized from the DLQ",
+        dispatch_available_at=(
+            datetime.now(UTC) + timedelta(seconds=max_attempts * 2 + 5)
+        ),
+        db_url=database_url,
+    )
+    for expected_attempt in range(1, max_attempts + 1):
         claim = claim_run_attempt(
             run_id=exhausted["id"],
             command="start",
-            lease_ttl=timedelta(minutes=5),
-            max_attempts=3,
+            lease_ttl=timedelta(seconds=1),
+            max_attempts=max_attempts,
             db_url=database_url,
         )
         assert claim.outcome == "claimed"
         assert claim.run["worker_attempt_count"] == expected_attempt
-        _expire_attempt(str(exhausted["id"]), database_url=database_url)
-    _release_dispatch(str(exhausted["id"]), database_url=database_url)
+        time.sleep(1.1)
     failed = _wait_for_run_status(
         str(exhausted["id"]),
         expected={"failed"},
         database_url=database_url,
-        timeout=1800,
+        timeout=(
+            scheduler_seconds * 2
+            + visibility_seconds * (max_attempts + 1)
+            + 120
+        ),
     )
     assert failed["failure_code"] == "RunAttemptsExhausted"
     assert [event["status"] for event in failed["events"]].count("failed") == 1
@@ -261,51 +303,6 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
             (failed["decision_id"],),
         ).fetchone()
     assert decision == ("failed", True)
-
-
-def _delay_dispatch(run_id: str, *, database_url: str) -> None:
-    from hindsight.db import connect
-
-    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
-        conn.execute(
-            """
-                UPDATE agent_run_dispatches
-                SET available_at = now() + INTERVAL '10 minutes'
-                WHERE run_id = %s AND command = 'start' AND status = 'pending'
-            """,
-            (run_id,),
-        )
-        conn.commit()
-
-
-def _release_dispatch(run_id: str, *, database_url: str) -> None:
-    from hindsight.db import connect
-
-    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
-        conn.execute(
-            """
-                UPDATE agent_run_dispatches
-                SET available_at = now()
-                WHERE run_id = %s AND command = 'start' AND status = 'pending'
-            """,
-            (run_id,),
-        )
-        conn.commit()
-
-
-def _expire_attempt(run_id: str, *, database_url: str) -> None:
-    from hindsight.db import connect
-
-    with connect(database_url, application_name="hindsight-hosted-acceptance") as conn:
-        conn.execute(
-            """
-                UPDATE agent_runs
-                SET worker_attempt_lease_expires_at = now() - INTERVAL '1 second'
-                WHERE id = %s
-            """,
-            (run_id,),
-        )
-        conn.commit()
 
 
 def _wait_for_run_status(
@@ -327,6 +324,17 @@ def _wait_for_run_status(
             pytest.fail(f"run reached unexpected terminal status: {last['status']}")
         time.sleep(2)
     pytest.fail(f"run did not reach {sorted(expected)} before timeout: {last}")
+
+
+def _acceptance_token(label: str) -> str:
+    phase_id = os.environ.get("HINDSIGHT_ACCEPTANCE_PHASE_ID") or str(uuid4())
+    return f"{label}:{phase_id}:{uuid4()}"
+
+
+def _positive_int_env(name: str) -> int:
+    value = int(_required_env(name))
+    assert value > 0
+    return value
 
 
 @requires_hosted_acceptance

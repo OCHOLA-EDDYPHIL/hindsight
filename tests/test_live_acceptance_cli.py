@@ -127,9 +127,30 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
     assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in calls[1][0]
 
 
-def test_hosted_product_owns_managed_not_direct_consolidation():
-    assert acceptance.MANAGED_CONSOLIDATION_SELECTOR in acceptance.HOSTED_PRODUCT_SELECTORS
-    assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in acceptance.HOSTED_PRODUCT_SELECTORS
+def test_hosted_product_phases_are_selector_isolated():
+    phases = acceptance.HOSTED_PHASE_SELECTORS
+
+    assert set(phases) == {"semantic", "consolidation", "worker", "browser", "roles"}
+    assert phases["semantic"] == acceptance.SEMANTIC_RETRIEVAL_SELECTORS
+    assert phases["consolidation"] == (acceptance.MANAGED_CONSOLIDATION_SELECTOR,)
+    assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in {
+        selector for selectors in phases.values() for selector in selectors
+    }
+    flattened = [selector for selectors in phases.values() for selector in selectors]
+    assert len(flattened) == len(set(flattened))
+
+
+def test_hosted_pytest_rejects_skipped_gates(monkeypatch, tmp_path):
+    def fake_run(command, *, env, stdout_path=None):
+        report = pathlib.Path(next(part.split("=", 1)[1] for part in command if part.startswith("--junitxml=")))
+        report.write_text('<testsuites><testsuite tests="1" skipped="1"/></testsuites>')
+
+    monkeypatch.setattr(acceptance, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="1 skipped"):
+        acceptance._run_hosted_pytest(
+            ("tests/test_example.py::test_gate",), env={}, phase="semantic"
+        )
 
 
 def _completed_report(kind: str, experiment_id: str) -> dict[str, object]:
@@ -448,8 +469,8 @@ def test_live_workflow_calls_shared_acceptance_commands():
     workflow = (ROOT / ".github" / "workflows" / "live-acceptance.yml").read_text()
 
     assert "scripts/run_live_acceptance.py hosted-product --phase providers" in workflow
-    assert "scripts/run_live_acceptance.py hosted-product --phase semantic" in workflow
-    assert "scripts/run_live_acceptance.py hosted-product --phase full" in workflow
+    for phase in ("semantic", "consolidation", "worker", "browser", "roles"):
+        assert f"scripts/run_live_acceptance.py hosted-product --phase {phase}" in workflow
     for forbidden in (
         "learning-pilot",
         "learning-full",
