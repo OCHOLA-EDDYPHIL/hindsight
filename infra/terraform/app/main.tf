@@ -7,6 +7,7 @@ locals {
   run_max_attempts              = 3
   run_dispatch_schedule         = "rate(1 minute)"
   run_dispatch_schedule_seconds = 60
+  operation_poll_seconds        = (local.run_max_attempts - 1) * local.run_queue_visibility_seconds + local.worker_timeout_seconds + 60
 
   api_zip      = var.api_zip_path != null ? abspath(var.api_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-api.zip")
   worker_zip   = var.worker_zip_path != null ? abspath(var.worker_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip")
@@ -124,12 +125,13 @@ resource "aws_s3_object" "ui_config" {
   cache_control = "no-cache"
   content = <<-JS
     window.HINDSIGHT_CONFIG = ${jsonencode({
-  apiBase          = "/v1"
-  snapshotBase     = null
-  eventsBase       = null
-  websocketUrl     = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "https://", "wss://")}/${aws_apigatewayv2_stage.websocket.name}"
-  defaultNamespace = "demo:payments-poison-rewind"
-  pollIntervalMs   = 4000
+  apiBase              = "/v1"
+  snapshotBase         = null
+  eventsBase           = null
+  websocketUrl         = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "https://", "wss://")}/${aws_apigatewayv2_stage.websocket.name}"
+  defaultNamespace     = "demo:payments-poison-rewind"
+  pollIntervalMs       = 4000
+  operationPollSeconds = local.operation_poll_seconds
 })};
   JS
 }

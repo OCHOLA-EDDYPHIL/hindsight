@@ -1,5 +1,6 @@
 """Opt-in browser acceptance test for the deployed or local incident cockpit."""
 
+import json
 import os
 import re
 from pathlib import Path
@@ -43,6 +44,19 @@ def test_live_events_from_a_previous_namespace_are_ignored():
     assert "payload.namespace !== state.namespace" in handler
 
 
+def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status():
+    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
+    polling = source.split("async function waitForOperation(operationId)", 1)[1].split(
+        "function connectEvents()", 1
+    )[0]
+
+    assert "config.operationPollSeconds" in polling
+    assert "last status" in polling
+    assert "data-operation-id" in source
+    assert "data-operation-type" in source
+    assert "data-operation-status" in source
+
+
 @requires_browser
 def test_operator_can_run_and_explain_signature_workflow():
     from selenium import webdriver
@@ -56,10 +70,12 @@ def test_operator_can_run_and_explain_signature_workflow():
     driver = webdriver.Firefox(options=options)
     driver.set_script_timeout(120)
     wait = WebDriverWait(driver, 90)
+    operation_id = None
     try:
         driver.set_window_size(1440, 1000)
         driver.get(_browser_url(namespace=f"live-browser:{uuid4()}"))
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
+        _capture_console_errors(driver)
         wait.until(lambda browser: "Live" in browser.find_element(By.ID, "connection").text)
         assert driver.find_element(By.ID, "startRun").get_attribute("disabled")
 
@@ -99,7 +115,17 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.ID, "previewRewind").click()
         wait.until(lambda browser: "versions will close" in browser.find_element(By.ID, "rewindPreview").text)
         driver.find_element(By.ID, "executeRewind").click()
-        wait.until(lambda browser: "completed" in browser.find_element(By.ID, "operations").text)
+        operation = wait.until(
+            expected.presence_of_element_located(
+                (By.CSS_SELECTOR, '#operations [data-operation-type="rewind"]')
+            )
+        )
+        operation_id = operation.get_attribute("data-operation-id")
+        assert operation_id
+        operation_poll_seconds = driver.execute_script(
+            "return Number(window.HINDSIGHT_CONFIG.operationPollSeconds || 600);"
+        )
+        _wait_for_completed_operation(driver, timeout=float(operation_poll_seconds) + 30)
         wait.until(
             lambda browser: "0 invalid"
             not in browser.find_element(By.ID, "memoryCount").text
@@ -122,7 +148,106 @@ def test_operator_can_run_and_explain_signature_workflow():
             not in browser.find_element(By.ID, "memoryCount").text
         )
     finally:
+        _write_browser_evidence(driver, operation_id=operation_id)
         driver.quit()
+
+
+def _wait_for_completed_operation(driver, *, timeout: float) -> None:
+    from selenium.common.exceptions import TimeoutException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    observed = ""
+
+    def completed(browser):
+        nonlocal observed
+        observed = browser.find_element(By.ID, "operations").text
+        if " · conflict" in observed or " · failed" in observed:
+            raise AssertionError(f"rewind reached a non-success terminal state: {observed}")
+        return " · completed" in observed
+
+    try:
+        WebDriverWait(driver, timeout).until(completed)
+    except TimeoutException as exc:
+        raise AssertionError(f"rewind did not complete before its retry budget: {observed}") from exc
+
+
+def _capture_console_errors(driver) -> None:
+    driver.execute_script(
+        """
+        window.__HINDSIGHT_CONSOLE_ERRORS = [];
+        const record = (kind, value) => {
+          window.__HINDSIGHT_CONSOLE_ERRORS.push({kind, value: String(value)});
+        };
+        window.addEventListener("error", (event) => record("error", event.message));
+        window.addEventListener("unhandledrejection", (event) => record("rejection", event.reason));
+        const originalError = console.error.bind(console);
+        console.error = (...values) => {
+          record("console.error", values.join(" "));
+          originalError(...values);
+        };
+        """
+    )
+
+
+def _write_browser_evidence(driver, *, operation_id: str | None) -> None:
+    from selenium.webdriver.common.by import By
+
+    directory_value = (os.environ.get("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR") or "").strip()
+    if not directory_value:
+        return
+    directory = Path(directory_value)
+    directory.mkdir(parents=True, exist_ok=True)
+    capture_errors = []
+    try:
+        driver.save_screenshot(str(directory / "operator-workflow.png"))
+    except Exception as exc:  # noqa: BLE001 - evidence capture must not mask the test failure
+        capture_errors.append(f"screenshot: {type(exc).__name__}: {exc}")
+    try:
+        console_errors = driver.execute_script(
+            "return window.__HINDSIGHT_CONSOLE_ERRORS || [];"
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence capture must not mask the test failure
+        capture_errors.append(f"console: {type(exc).__name__}: {exc}")
+        console_errors = []
+    (directory / "browser-console.json").write_text(
+        json.dumps(console_errors, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    observed = []
+    try:
+        for element in driver.find_elements(By.CSS_SELECTOR, "#operations [data-operation-id]"):
+            observed.append(
+                {
+                    "id": element.get_attribute("data-operation-id"),
+                    "status": element.get_attribute("data-operation-status"),
+                    "text": element.text,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 - evidence capture must not mask the test failure
+        capture_errors.append(f"operations: {type(exc).__name__}: {exc}")
+    persisted = None
+    if operation_id and os.environ.get("DATABASE_URL"):
+        from hindsight.operations import get_operation
+
+        try:
+            persisted = get_operation(operation_id=operation_id)
+        except Exception as exc:  # noqa: BLE001 - evidence capture must not mask the test failure
+            capture_errors.append(f"database: {type(exc).__name__}: {exc}")
+    (directory / "operation.json").write_text(
+        json.dumps(
+            {
+                "operation_id": operation_id,
+                "observed": observed,
+                "persisted": persisted,
+                "capture_errors": capture_errors,
+            },
+            default=str,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 @requires_browser

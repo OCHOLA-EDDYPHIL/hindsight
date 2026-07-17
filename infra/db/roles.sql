@@ -136,6 +136,7 @@ GRANT SELECT ON TABLE
     benchmark_experiments,
     benchmark_trials,
     benchmark_actions,
+    benchmark_variant_preparations,
     checkpoint_migrations,
     checkpoints,
     checkpoint_blobs,

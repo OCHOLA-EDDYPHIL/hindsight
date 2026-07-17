@@ -4,5 +4,6 @@ window.HINDSIGHT_CONFIG = {
   eventsBase: null,
   websocketUrl: null,
   defaultNamespace: "demo:payments-poison-rewind",
-  pollIntervalMs: 4000
+  pollIntervalMs: 4000,
+  operationPollSeconds: 60
 };

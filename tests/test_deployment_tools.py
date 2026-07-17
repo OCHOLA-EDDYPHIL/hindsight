@@ -596,6 +596,20 @@ def test_validation_deployment_selects_bounded_runtime_timing():
         assert f"value: ${{{{ jobs.apply.outputs.{output} }}}}" in workflow
 
 
+def test_hosted_browser_preserves_failure_evidence_without_learning_dependency():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    browser = workflow.split("  browser_product:\n", 1)[1].split(
+        "  database_roles:\n", 1
+    )[0]
+
+    assert "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR" in browser
+    assert "if: always()" in browser
+    assert "browser-evidence-" in browser
+    assert "if-no-files-found: error" in browser
+    for forbidden in ("benchmark", "pilot", "preregister", "confirmation", "learning"):
+        assert forbidden not in browser
+
+
 def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():
     makefile = pathlib.Path("Makefile").read_text()
 

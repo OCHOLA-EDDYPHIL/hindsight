@@ -338,7 +338,9 @@ function renderMemory(memory) {
 function renderOperation(operation) {
   const effects = operation.effects || [];
   const reviewCount = effects.filter((effect) => effect.effect_type === "review_required").length;
-  return `<article class="operation"><strong>${escapeHtml(operation.operation_type)} · ${escapeHtml(operation.status || "completed")}</strong><span>${escapeHtml(operation.reason)} · closed ${(operation.invalidated_memory_ids || []).length} · created ${(operation.restored_memory_ids || []).length}${reviewCount ? ` · review ${reviewCount}` : ""} · ${escapeHtml(formatTime(operation.created_at))}</span>${operation.failure_detail ? `<span>${escapeHtml(operation.failure_detail)}</span>` : ""}</article>`;
+  const operationType = operation.operation_type || "operation";
+  const status = operation.status || "completed";
+  return `<article class="operation operation-${escapeHtml(status)}" data-operation-id="${escapeHtml(operation.id || "")}" data-operation-type="${escapeHtml(operationType)}" data-operation-status="${escapeHtml(status)}"><strong>${escapeHtml(operationType)} · ${escapeHtml(status)}</strong><span>${escapeHtml(operation.reason)} · closed ${(operation.invalidated_memory_ids || []).length} · created ${(operation.restored_memory_ids || []).length}${reviewCount ? ` · review ${reviewCount}` : ""} · ${escapeHtml(formatTime(operation.created_at))}</span>${operation.failure_detail ? `<span>${escapeHtml(operation.failure_detail)}</span>` : ""}</article>`;
 }
 
 async function showMemory(memoryId) {
@@ -463,6 +465,16 @@ async function executeRewind() {
         fingerprint: state.rewindPreview.fingerprint
       })
     });
+    state.operations.set(accepted.operation_id, {
+      id: accepted.operation_id,
+      operation_type: "rewind",
+      status: accepted.status || "queued",
+      reason: elements.rewindReason.value.trim() || "Operator-requested rewind",
+      invalidated_memory_ids: [],
+      restored_memory_ids: [],
+      created_at: new Date().toISOString()
+    });
+    renderMemoryPanel();
     state.rewindPreview = null;
     notify("Rewind queued. The approved preview will be verified before any memory changes.");
     const operation = await waitForOperation(accepted.operation_id);
@@ -478,14 +490,19 @@ async function executeRewind() {
 }
 
 async function waitForOperation(operationId) {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  const pollSeconds = Math.max(60, Number(config.operationPollSeconds || 600));
+  const deadline = Date.now() + pollSeconds * 1000;
+  let lastOperation = null;
+  while (Date.now() < deadline) {
     const operation = await request(`/memory/operations/${encodeURIComponent(operationId)}`);
+    lastOperation = operation;
     state.operations.set(operation.id, operation);
     renderMemoryPanel();
     if (["completed", "conflict", "failed"].includes(operation.status)) return operation;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
-  throw new Error("operation did not reach a terminal state in time");
+  const detail = lastOperation?.failure_detail ? `: ${lastOperation.failure_detail}` : "";
+  throw new Error(`operation did not reach a terminal state; last status ${lastOperation?.status || "unknown"}${detail}`);
 }
 
 function connectEvents() {

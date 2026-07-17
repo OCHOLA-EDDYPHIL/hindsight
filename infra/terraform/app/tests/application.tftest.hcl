@@ -123,6 +123,11 @@ run "complete_demo_graph" {
   }
 
   assert {
+    condition     = local.operation_poll_seconds == 960
+    error_message = "The deployed UI must wait through the complete production retry budget."
+  }
+
+  assert {
     condition     = cloudflare_dns_record.ui[0].proxied == false
     error_message = "CloudFront must use a DNS-only Cloudflare alias."
   }
@@ -172,5 +177,10 @@ run "validation_timing_profile" {
       toset(aws_lambda_event_source_mapping.worker_dlq.function_response_types) == toset(["ReportBatchItemFailures"])
     )
     error_message = "Validation mode must preserve scheduler and queue execution boundaries."
+  }
+
+  assert {
+    condition     = local.operation_poll_seconds == 450
+    error_message = "The deployed UI must wait through the complete validation retry budget."
   }
 }

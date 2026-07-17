@@ -23,6 +23,7 @@ from psycopg import sql
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
 BENCHMARK_MAX_DISTANCE = 0.35
+ACCEPTANCE_ARTIFACT_DIR_ENV = "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR"
 PILOT_EMBEDDING_SELECTOR = (
     "tests/test_embeddings.py::"
     "test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons"
@@ -155,7 +156,13 @@ def _verify_product_providers() -> None:
         }
     )
     _add_single_gemini_key(env)
-    _run([sys.executable, "-m", "pytest", "-q", *PROVIDER_SANITY_SELECTORS], env=env)
+    artifact_dir = _acceptance_artifact_dir("providers")
+    _run_strict_pytest(
+        PROVIDER_SANITY_SELECTORS,
+        env=env,
+        phase="providers",
+        artifact_dir=artifact_dir,
+    )
 
 
 def _verify_learning_providers() -> None:
@@ -190,7 +197,14 @@ def _verify_semantic(args: argparse.Namespace) -> None:
             "RUN_LIVE_GEMINI_ACCEPTANCE": "1",
         }
     )
-    _run([sys.executable, "-m", "pytest", "-q", *selectors], env=env)
+    phase = f"semantic-{args.database_scope}"
+    artifact_dir = _acceptance_artifact_dir(phase)
+    _run_strict_pytest(
+        selectors,
+        env=env,
+        phase=phase,
+        artifact_dir=artifact_dir,
+    )
 
 
 def _verify_resilience(args: argparse.Namespace) -> None:
@@ -204,15 +218,22 @@ def _verify_resilience(args: argparse.Namespace) -> None:
             "LLM_PROVIDER": "deterministic",
         }
     )
-    _run([sys.executable, "-m", "pytest", "-q", *RESILIENCE_SELECTORS], env=env)
+    artifact_dir = _acceptance_artifact_dir("resilience")
+    _run_strict_pytest(
+        RESILIENCE_SELECTORS,
+        env=env,
+        phase="resilience",
+        artifact_dir=artifact_dir,
+    )
 
 
 def _run_local_product_full(args: argparse.Namespace) -> None:
     database_url = _required_database_url(args.database_url)
     parts, database_name = _validate_local_url(database_url)
-    semantic_url = _local_database_url(parts, f"{database_name}_semantic")
-    resilience_url = _local_database_url(parts, f"{database_name}_resilience")
-    browser_url = _local_database_url(parts, f"{database_name}_browser")
+    run_token = uuid4().hex[:12]
+    semantic_url = _local_database_url(parts, f"{database_name}_{run_token}_semantic")
+    resilience_url = _local_database_url(parts, f"{database_name}_{run_token}_resilience")
+    browser_url = _local_database_url(parts, f"{database_name}_{run_token}_browser")
     for url in (semantic_url, resilience_url, browser_url):
         _create_local_database(url)
 
@@ -227,8 +248,8 @@ def _run_local_product_full(args: argparse.Namespace) -> None:
     _initialize_product_database(resilience_env, configure_embeddings=False)
     _verify_resilience(argparse.Namespace(database_url=resilience_url))
 
-    browser_env = _product_environment(browser_url, live=False)
-    _initialize_product_database(browser_env, configure_embeddings=False)
+    browser_env = _product_environment(browser_url, live=True)
+    _initialize_product_database(browser_env, configure_embeddings=True)
     _run_local_browser_product(
         database_url=browser_url,
         base_url=args.base_url,
@@ -257,8 +278,9 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
     parts = urlsplit(base_url)
     if parts.scheme != "http" or parts.hostname not in LOCAL_DATABASE_HOSTS or parts.port is None:
         raise ValueError("local-product-full requires an explicit loopback HTTP port")
+    _require_gemini_credentials()
     token = secrets.token_hex(32)
-    env = dict(os.environ)
+    env = _product_environment(database_url, live=True)
     for name in (
         "RUN_HOSTED_ACCEPTANCE",
         "HOSTED_API_URL",
@@ -271,18 +293,20 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
     env.update(
         {
             "DATABASE_URL": database_url,
-            "EMBEDDING_PROVIDER": "deterministic",
-            "LLM_PROVIDER": "deterministic",
             "HINDSIGHT_DATABASE_URL_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEY_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEYS_PARAM": "",
             "HINDSIGHT_FUNCTION_AUTH_TOKEN": token,
             "HINDSIGHT_INLINE_WORKER": "1",
+            "HINDSIGHT_RUN_DLQ_ARN": "local:sqs:hindsight-run-dlq",
             "HINDSIGHT_SECURE_COOKIES": "0",
+            "HINDSIGHT_ALLOWED_ORIGINS": base_url,
             "HINDSIGHT_BROWSER_BASE_URL": base_url,
             "HINDSIGHT_BROWSER_OPERATOR_TOKEN": token,
         }
     )
+    artifact_dir = _acceptance_artifact_dir("local-browser")
+    env[ACCEPTANCE_ARTIFACT_DIR_ENV] = str(artifact_dir)
     server = subprocess.Popen(
         [
             sys.executable,
@@ -299,20 +323,16 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
     )
     try:
         _wait_for_http_ready(f"{base_url}/v1/health/ready", server=server)
-        _run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
+        _run_strict_pytest(
+            (
                 "tests/test_api.py",
                 "tests/test_dashboard.py",
                 "tests/test_queueing.py",
                 "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
-                "tests/test_browser_ui.py::"
-                "test_review_required_memory_renders_as_active_in_its_historical_snapshot",
-            ],
+            ),
             env=env,
+            phase="local-browser",
+            artifact_dir=artifact_dir,
         )
     finally:
         server.terminate()
@@ -389,28 +409,57 @@ def _verify_changefeed(env: dict[str, str]) -> None:
 def _run_hosted_pytest(
     selectors: tuple[str, ...], *, env: dict[str, str], phase: str
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"hindsight-{phase}-") as directory:
-        report = pathlib.Path(directory) / "pytest.xml"
-        _run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "-x",
-                f"--junitxml={report}",
-                *selectors,
-            ],
-            env=env,
-        )
-        root = ElementTree.parse(report).getroot()
-        suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-        tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
-        skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-        if tests < 1 or skipped:
-            raise RuntimeError(
-                f"hosted product phase {phase} ran {tests} tests with {skipped} skipped"
-            )
+    artifact_dir = _acceptance_artifact_dir(phase)
+    env[ACCEPTANCE_ARTIFACT_DIR_ENV] = str(artifact_dir)
+    _run_strict_pytest(
+        selectors,
+        env=env,
+        phase=phase,
+        artifact_dir=artifact_dir,
+    )
+
+
+def _acceptance_artifact_dir(phase: str) -> pathlib.Path:
+    configured = (os.environ.get(ACCEPTANCE_ARTIFACT_DIR_ENV) or "").strip()
+    if configured:
+        directory = pathlib.Path(configured).resolve()
+        if directory == ROOT or ROOT in directory.parents:
+            raise ValueError("acceptance artifacts must be outside the repository")
+        directory.mkdir(parents=True, exist_ok=True)
+    else:
+        directory = pathlib.Path(tempfile.mkdtemp(prefix=f"hindsight-{phase}-"))
+    print(f"{phase} acceptance artifacts: {directory}")
+    return directory
+
+
+def _run_strict_pytest(
+    selectors: tuple[str, ...],
+    *,
+    env: dict[str, str],
+    phase: str,
+    artifact_dir: pathlib.Path,
+) -> None:
+    report = artifact_dir / "pytest.xml"
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-x",
+        f"--junitxml={report}",
+        *selectors,
+    ]
+    completed = subprocess.run(command, cwd=ROOT, env=env, check=False)
+    if not report.is_file() or report.stat().st_size == 0:
+        raise RuntimeError(f"{phase} acceptance did not produce JUnit evidence")
+    root = ElementTree.parse(report).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+    skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+    if completed.returncode:
+        raise subprocess.CalledProcessError(completed.returncode, command)
+    if tests < 1 or skipped:
+        raise RuntimeError(f"{phase} acceptance ran {tests} tests with {skipped} skipped")
 
 
 def _verify_hosted_endpoints() -> None:
