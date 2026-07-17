@@ -603,6 +603,13 @@ def test_hosted_browser_preserves_failure_evidence_without_learning_dependency()
     )[0]
 
     assert "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR" in browser
+    job_environment = browser.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
+    assert "runner.temp" not in job_environment
+    assert (
+        'HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence'
+        in browser
+    )
+    assert '>> "$GITHUB_ENV"' in browser
     assert "if: always()" in browser
     assert "browser-evidence-" in browser
     assert "if-no-files-found: error" in browser
