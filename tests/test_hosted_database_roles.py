@@ -9,6 +9,8 @@ import boto3
 import psycopg
 import pytest
 
+from hindsight.db import database_url_with_tls_roots
+
 requires_hosted = pytest.mark.skipif(
     os.environ.get("RUN_HOSTED_ACCEPTANCE") != "1",
     reason="hosted acceptance is opt-in",
@@ -17,7 +19,26 @@ requires_hosted = pytest.mark.skipif(
 
 def _database_url(ssm, env_name: str) -> str:
     parameter_name = os.environ[env_name]
-    return ssm.get_parameter(Name=parameter_name, WithDecryption=True)["Parameter"]["Value"]
+    value = ssm.get_parameter(Name=parameter_name, WithDecryption=True)["Parameter"]["Value"]
+    return database_url_with_tls_roots(value)
+
+
+def test_database_url_adds_a_tls_root_for_verified_ssm_urls(monkeypatch):
+    class Ssm:
+        def get_parameter(self, **kwargs):
+            assert kwargs == {"Name": "/database/api", "WithDecryption": True}
+            return {
+                "Parameter": {
+                    "Value": "postgresql://api@example.test:26257/app?sslmode=verify-full"
+                }
+            }
+
+    monkeypatch.setenv("API_DATABASE_PARAMETER", "/database/api")
+
+    url = _database_url(Ssm(), "API_DATABASE_PARAMETER")
+
+    assert "sslmode=verify-full" in url
+    assert "sslrootcert=" in url
 
 
 @requires_hosted
