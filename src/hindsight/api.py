@@ -50,6 +50,7 @@ from hindsight.runtime import (
     runtime_database_url,
     runtime_settings,
 )
+from hindsight.trace_contract import governed_decision_trace, signature_scenario_trace
 from hindsight.runs import (
     RunConflictError,
     RunNotFoundError,
@@ -433,7 +434,44 @@ def decisions_influence(decision_id: str) -> dict[str, Any]:
                     else "current",
                 }
             )
-    return {"decision_id": decision_id, "count": len(memories), "memories": _jsonable(memories)}
+    trace = governed_decision_trace(decision_id=decision_id, db_url=db_url)
+    return {
+        "decision_id": decision_id,
+        "count": len(memories),
+        "memories": _jsonable(memories),
+        "decision": _jsonable(trace["decision"]) if trace else None,
+        "retrievals": _jsonable(trace["retrievals"]) if trace else [],
+        "trace": _jsonable(trace) if trace else None,
+    }
+
+
+@app.get(f"{API_PREFIX}/signature-scenarios", tags=["memory"])
+def signature_scenarios_get(
+    decision_id: str | None = None,
+    namespace: str | None = None,
+) -> dict[str, Any]:
+    try:
+        scenario = signature_scenario_trace(
+            decision_id=decision_id,
+            namespace=namespace,
+            db_url=_api_database_url(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if scenario is None:
+        raise HTTPException(status_code=404, detail="signature scenario not found")
+    return _jsonable(scenario)
+
+
+@app.get(f"{API_PREFIX}/signature-scenarios/{{scenario_id}}", tags=["memory"])
+def signature_scenarios_get_by_id(scenario_id: str) -> dict[str, Any]:
+    scenario = signature_scenario_trace(
+        scenario_id=scenario_id,
+        db_url=_api_database_url(),
+    )
+    if scenario is None:
+        raise HTTPException(status_code=404, detail="signature scenario not found")
+    return _jsonable(scenario)
 
 
 @app.post(

@@ -21,6 +21,7 @@ from hindsight.embeddings import embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
 from hindsight.runs import resolve_incident
+from hindsight.trace_contract import governed_decision_trace
 from hindsight.tracing import set_span_attributes, start_span
 
 CROSS_EPISODE_NAMESPACE = "demo:cross-episode-payments"
@@ -62,8 +63,10 @@ class CrossEpisodeRunSummary:
     plan: str | None
     proposed_action: str | None
     reflected_memory_id: str | None
+    retrieval_id: str | None
     recalled_memory_ids: list[str]
     recalled_lesson_memory_ids: list[str]
+    recalled_memory_traces: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -359,6 +362,7 @@ def _run_episode(
             label=label,
             incident=incident,
             result=result,
+            db_url=db_url,
         )
         set_span_attributes(
             span,
@@ -376,6 +380,7 @@ def _episode_summary(
     label: str,
     incident: dict[str, Any],
     result: IncidentAgentResult,
+    db_url: str,
 ) -> CrossEpisodeRunSummary:
     recalled = result.state.get("recalled_memories") or []
     recalled_ids = [str(row.get("memory_id") or row.get("id")) for row in recalled]
@@ -384,6 +389,10 @@ def _episode_summary(
         for row in recalled
         if row.get("content_schema") == "procedural_lesson.v1"
     ]
+    decision_trace = governed_decision_trace(
+        decision_id=str(result.state["decision_id"]),
+        db_url=db_url,
+    )
     return CrossEpisodeRunSummary(
         label=label,
         incident_slug=incident["slug"],
@@ -392,8 +401,10 @@ def _episode_summary(
         plan=result.plan,
         proposed_action=result.proposed_action,
         reflected_memory_id=result.reflected_memory_id,
+        retrieval_id=result.state.get("retrieval_id"),
         recalled_memory_ids=recalled_ids,
         recalled_lesson_memory_ids=recalled_lesson_ids,
+        recalled_memory_traces=list(decision_trace["reads"]) if decision_trace else [],
     )
 
 
