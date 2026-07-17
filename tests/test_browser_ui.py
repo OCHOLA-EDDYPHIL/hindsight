@@ -16,10 +16,6 @@ requires_browser = pytest.mark.skipif(
     not BASE_URL or not OPERATOR_TOKEN,
     reason="browser URL and operator token are not configured",
 )
-requires_hosted_acceptance = pytest.mark.skipif(
-    os.environ.get("RUN_HOSTED_ACCEPTANCE") != "1",
-    reason="hosted database acceptance is opt-in",
-)
 
 
 def test_reset_resubscribes_before_loading_the_fresh_namespace():
@@ -102,14 +98,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(lambda browser: "1 live" in browser.find_element(By.ID, "memoryCount").text)
         namespace = driver.find_element(By.ID, "namespace").text
 
-        if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1":
-            changefeed_event = _poison_and_wait_for_changefeed_event(driver, namespace)
-            assert changefeed_event["type"] == "memory"
-            assert changefeed_event["namespace"] == namespace
-            assert changefeed_event["data"]["memory"]["writer"] == "demo.poison"
-            driver.find_element(By.ID, "liveButton").click()
-        else:
-            driver.find_element(By.ID, "poisonDemo").click()
+        driver.find_element(By.ID, "poisonDemo").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "2 live · 0 invalid"
@@ -179,8 +168,7 @@ def test_operator_can_run_and_explain_signature_workflow():
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "2 live · 2 invalid"
         )
-        if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1":
-            _assert_typed_reflection(namespace)
+        _assert_typed_reflection(namespace)
         signature = _assert_signature_trace(namespace=namespace, operation_id=operation_id)
         assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
         assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
@@ -391,7 +379,6 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
 
 
 @requires_browser
-@requires_hosted_acceptance
 def test_review_required_memory_renders_as_active_in_its_historical_snapshot():
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -426,58 +413,10 @@ def test_review_required_memory_renders_as_active_in_its_historical_snapshot():
         driver.quit()
 
 
-def _poison_and_wait_for_changefeed_event(driver, namespace: str) -> dict:
-    result = driver.execute_async_script(
-        """
-        const namespace = arguments[0];
-        const done = arguments[arguments.length - 1];
-        const socket = new WebSocket(window.HINDSIGHT_CONFIG.websocketUrl);
-        let settled = false;
-        const finish = (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timeout);
-          socket.close();
-          done(value);
-        };
-        const timeout = setTimeout(
-          () => finish({error: "managed changefeed event timed out"}),
-          90000
-        );
-        socket.addEventListener("open", () => {
-          socket.send(JSON.stringify({type: "subscribe", namespace, run_id: null}));
-          setTimeout(async () => {
-            try {
-              const response = await fetch("/v1/demo/poison-rewind/poison", {
-                method: "POST",
-                credentials: "same-origin",
-                headers: {"content-type": "application/json"},
-                body: JSON.stringify({namespace})
-              });
-              if (!response.ok) finish({error: await response.text()});
-            } catch (error) {
-              finish({error: String(error)});
-            }
-          }, 1500);
-        });
-        socket.addEventListener("message", (event) => {
-          const payload = JSON.parse(event.data);
-          const memory = payload.data?.memory;
-          if (payload.type === "memory" && payload.namespace === namespace
-              && memory?.writer === "demo.poison") finish(payload);
-        });
-        socket.addEventListener("error", () => finish({error: "websocket delivery failed"}));
-        """,
-        namespace,
-    )
-    assert "error" not in result, result.get("error")
-    return result
-
-
 def _assert_typed_reflection(namespace: str) -> None:
     from hindsight.db import connect, database_url
 
-    with connect(database_url(), application_name="hindsight-hosted-browser-acceptance") as conn:
+    with connect(database_url(), application_name="hindsight-browser-acceptance") as conn:
         row = conn.execute(
             """
                 SELECT run.decision_id, run.plan, run.proposed_action,
@@ -532,14 +471,14 @@ def _prepare_review_required_fixture() -> tuple[str, str]:
             namespace=root_namespace,
             content="Processor timeout policy begins remediation at twenty percent.",
             provenance=Provenance(
-                "live.hosted_acceptance",
+                "live.browser_acceptance",
                 f"policy:{token}",
                 "Seed the governed evolution fixture",
             ),
         )
         store.open_decision(
             decision_id=decision_id,
-            actor="live.hosted_acceptance",
+            actor="live.browser_acceptance",
             decision_kind="policy_derivation",
             purpose="Derive a remediation from the policy",
             namespace=child_namespace,
@@ -548,7 +487,7 @@ def _prepare_review_required_fixture() -> tuple[str, str]:
             decision_id=decision_id,
             memory_kind="semantic",
             memory_id=str(root["id"]),
-            reader="live.hosted_acceptance",
+            reader="live.browser_acceptance",
             purpose="Derive a remediation from the policy",
         )
         child = store.remember(
@@ -556,14 +495,14 @@ def _prepare_review_required_fixture() -> tuple[str, str]:
             namespace=child_namespace,
             content="Scale retry workers when the processor threshold is reached.",
             provenance=Provenance(
-                "live.hosted_acceptance",
+                "live.browser_acceptance",
                 f"derived:{token}",
                 "Create a descendant requiring review after policy evolution",
             ),
             producer_decision_id=decision_id,
             parent_memory_ids=[str(root["id"])],
         )
-    with connect(database_url(), application_name="hindsight-hosted-browser-acceptance") as conn:
+    with connect(database_url(), application_name="hindsight-browser-acceptance") as conn:
         producer_status = conn.execute(
             "SELECT status FROM memory_decisions WHERE id = %s",
             (decision_id,),
@@ -576,7 +515,7 @@ def _prepare_review_required_fixture() -> tuple[str, str]:
         intent="evolution",
         content="Processor timeout policy begins remediation at ten percent.",
         structured_payload={"threshold_percent": 10},
-        actor="live.hosted_acceptance",
+        actor="live.browser_acceptance",
         reason="Exercise review-required historical rendering",
         authorized_namespaces=[root_namespace, child_namespace],
         db_url=database_url(),
@@ -590,7 +529,7 @@ def _prepare_review_required_fixture() -> tuple[str, str]:
     result = execute_operation(
         operation_id=str(operation["id"]),
         embedding_provider=provider,
-        worker_id="live-hosted-browser-acceptance",
+        worker_id="live-browser-acceptance",
         db_url=database_url(),
     )
     assert result["status"] == "completed"

@@ -144,12 +144,46 @@ def test_hosted_product_phases_are_selector_isolated():
 
     assert set(phases) == {"semantic", "consolidation", "worker", "browser", "roles"}
     assert phases["semantic"] == acceptance.SEMANTIC_RETRIEVAL_SELECTORS
-    assert phases["consolidation"] == (acceptance.MANAGED_CONSOLIDATION_SELECTOR,)
+    assert (
+        phases["consolidation"]
+        == acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["consolidation"]
+    )
+    assert phases["browser"] == acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS
     assert acceptance.DIRECT_CONSOLIDATION_SELECTOR not in {
         selector for selectors in phases.values() for selector in selectors
     }
     flattened = [selector for selectors in phases.values() for selector in selectors]
     assert len(flattened) == len(set(flattened))
+
+
+def test_browser_contract_inventories_have_explicit_local_hosted_parity():
+    expected_shared = (
+        "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
+        "tests/test_browser_ui.py::"
+        "test_review_required_memory_renders_as_active_in_its_historical_snapshot",
+    )
+    expected_infrastructure = (
+        "tests/test_hosted_acceptance.py::"
+        "test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson",
+        "tests/test_hosted_acceptance.py::"
+        "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe",
+    )
+
+    assert acceptance.SHARED_BROWSER_CONTRACT_SELECTORS == expected_shared
+    assert acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS == expected_infrastructure
+    assert set(expected_shared).issubset(acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS)
+    assert set(expected_shared).issubset(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
+    assert set(expected_shared).isdisjoint(expected_infrastructure)
+    assert (
+        set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
+        - set(acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS)
+        == set(acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"])
+    )
+    assert (
+        set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
+        - set(acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"])
+        == set(expected_shared)
+    )
 
 
 def test_hosted_pytest_rejects_skipped_gates(monkeypatch, tmp_path):
@@ -164,6 +198,31 @@ def test_hosted_pytest_rejects_skipped_gates(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="1 skipped"):
         acceptance._run_hosted_pytest(
             ("tests/test_example.py::test_gate",), env={}, phase="semantic"
+        )
+
+
+def test_local_browser_rejects_skipped_shared_contract(monkeypatch, tmp_path):
+    def fake_run(command, **_kwargs):
+        report = pathlib.Path(
+            next(
+                part.split("=", 1)[1]
+                for part in command
+                if part.startswith("--junitxml=")
+            )
+        )
+        report.write_text(
+            '<testsuites><testsuite tests="2" skipped="1"/></testsuites>'
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(acceptance.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="2 tests with 1 skipped"):
+        acceptance._run_strict_pytest(
+            acceptance.SHARED_BROWSER_CONTRACT_SELECTORS,
+            env={},
+            phase="local-browser",
+            artifact_dir=tmp_path,
         )
 
 
@@ -299,11 +358,8 @@ def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, t
     assert env["LLM_PROVIDER"] == "gemini"
     assert env["HINDSIGHT_INLINE_WORKER"] == "1"
     assert env["HINDSIGHT_ALLOWED_ORIGINS"] == "http://127.0.0.1:8766"
-    assert (
-        "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow"
-        in selectors
-    )
-    assert acceptance.BROWSER_PRODUCT_SELECTORS[-1] not in selectors
+    assert selectors == acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS
+    assert set(acceptance.SHARED_BROWSER_CONTRACT_SELECTORS).issubset(selectors)
     assert phase == "local-browser"
     assert artifact_dir == tmp_path
 
