@@ -58,16 +58,43 @@ MANAGED_CONSOLIDATION_SELECTOR = (
     "tests/test_hosted_acceptance.py::"
     "test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson"
 )
+WEBSOCKET_RECONNECT_SELECTOR = (
+    "tests/test_hosted_acceptance.py::"
+    "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe"
+)
+SIGNATURE_BROWSER_CONTRACT_SELECTOR = (
+    "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow"
+)
+HISTORICAL_NAMESPACE_BROWSER_CONTRACT_SELECTOR = (
+    "tests/test_browser_ui.py::"
+    "test_review_required_memory_renders_as_active_in_its_historical_snapshot"
+)
+SHARED_BROWSER_CONTRACT_SELECTORS = (
+    SIGNATURE_BROWSER_CONTRACT_SELECTOR,
+    HISTORICAL_NAMESPACE_BROWSER_CONTRACT_SELECTOR,
+)
+HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE = {
+    "consolidation": (MANAGED_CONSOLIDATION_SELECTOR,),
+    "browser": (WEBSOCKET_RECONNECT_SELECTOR,),
+}
+HOSTED_ONLY_INFRASTRUCTURE_SELECTORS = tuple(
+    selector
+    for selectors in HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE.values()
+    for selector in selectors
+)
+LOCAL_BROWSER_PRODUCT_SELECTORS = (
+    "tests/test_api.py",
+    "tests/test_dashboard.py",
+    "tests/test_queueing.py",
+    *SHARED_BROWSER_CONTRACT_SELECTORS,
+)
+HOSTED_BROWSER_PRODUCT_SELECTORS = (
+    *SHARED_BROWSER_CONTRACT_SELECTORS,
+    *HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"],
+)
 WORKER_PRODUCT_SELECTORS = (
     "tests/test_hosted_acceptance.py::"
     "test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq",
-)
-BROWSER_PRODUCT_SELECTORS = (
-    "tests/test_hosted_acceptance.py::"
-    "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe",
-    "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
-    "tests/test_browser_ui.py::"
-    "test_review_required_memory_renders_as_active_in_its_historical_snapshot",
 )
 ROLE_PRODUCT_SELECTORS = (
     "tests/test_hosted_database_roles.py::"
@@ -75,9 +102,9 @@ ROLE_PRODUCT_SELECTORS = (
 )
 HOSTED_PHASE_SELECTORS = {
     "semantic": SEMANTIC_RETRIEVAL_SELECTORS,
-    "consolidation": (MANAGED_CONSOLIDATION_SELECTOR,),
+    "consolidation": HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["consolidation"],
     "worker": WORKER_PRODUCT_SELECTORS,
-    "browser": BROWSER_PRODUCT_SELECTORS,
+    "browser": HOSTED_BROWSER_PRODUCT_SELECTORS,
     "roles": ROLE_PRODUCT_SELECTORS,
 }
 
@@ -324,12 +351,7 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
     try:
         _wait_for_http_ready(f"{base_url}/v1/health/ready", server=server)
         _run_strict_pytest(
-            (
-                "tests/test_api.py",
-                "tests/test_dashboard.py",
-                "tests/test_queueing.py",
-                "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
-            ),
+            LOCAL_BROWSER_PRODUCT_SELECTORS,
             env=env,
             phase="local-browser",
             artifact_dir=artifact_dir,
