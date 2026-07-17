@@ -65,6 +65,43 @@ API_PREFIX = "/v1"
 OPERATOR_COOKIE = "hindsight_operator_session"
 OPERATOR_SESSION_TTL_SECONDS = 4 * 60 * 60
 
+
+def _normalize_origin(value: str) -> str | None:
+    parsed = urlparse(value.strip())
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _configured_allowed_origins() -> set[str]:
+    return {
+        normalized
+        for value in os.environ.get("HINDSIGHT_ALLOWED_ORIGINS", "").split(",")
+        if (normalized := _normalize_origin(value)) is not None
+    }
+
+
 app = FastAPI(
     title="Hindsight product API",
     summary="Incident runs and inspectable, rewindable agent memory",
@@ -75,11 +112,7 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin
-        for origin in os.environ.get("HINDSIGHT_ALLOWED_ORIGINS", "").split(",")
-        if origin
-    ],
+    allow_origins=sorted(_configured_allowed_origins()),
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["authorization", "content-type", "idempotency-key"],
@@ -648,8 +681,17 @@ def _operator_required_impl(
         raise HTTPException(status_code=403, detail="operator authorization required")
     if session and not authorization:
         origin = request.headers.get("origin")
-        if origin and urlparse(origin).netloc != request.url.netloc:
+        if origin and not _operator_origin_allowed(request=request, origin=origin):
             raise HTTPException(status_code=403, detail="cross-origin operator request denied")
+
+
+def _operator_origin_allowed(*, request: Request, origin: str) -> bool:
+    supplied_origin = _normalize_origin(origin)
+    request_origin = _normalize_origin(f"{request.url.scheme}://{request.url.netloc}")
+    return supplied_origin is not None and (
+        supplied_origin == request_origin
+        or supplied_origin in _configured_allowed_origins()
+    )
 
 
 def _operator_valid(*, authorization: str | None, session: str | None) -> bool:

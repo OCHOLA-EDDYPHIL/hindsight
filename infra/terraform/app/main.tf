@@ -372,6 +372,7 @@ resource "aws_lambda_function" "api" {
       HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
       HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
+      HINDSIGHT_ALLOWED_ORIGINS           = var.domain_name == null ? "" : "https://${var.domain_name}"
       HINDSIGHT_SECURE_COOKIES            = "1"
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider

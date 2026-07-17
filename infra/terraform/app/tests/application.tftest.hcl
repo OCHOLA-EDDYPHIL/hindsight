@@ -73,6 +73,11 @@ run "complete_demo_graph" {
   }
 
   assert {
+    condition     = aws_lambda_function.api.environment[0].variables.HINDSIGHT_ALLOWED_ORIGINS == "https://hindsight.example.com"
+    error_message = "The API must authorize cookie sessions from the configured CloudFront product origin."
+  }
+
+  assert {
     condition = (
       aws_lambda_function.worker.timeout == 180 &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) == 300 &&
