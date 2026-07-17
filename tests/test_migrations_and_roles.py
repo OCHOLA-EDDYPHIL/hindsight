@@ -77,6 +77,17 @@ def test_run_dispatch_outbox_grants_only_required_product_role_access():
     assert "GRANT SELECT, UPDATE ON TABLE agent_run_dispatches" in migration
 
 
+def test_agent_writer_has_only_foreign_key_read_access_to_learning_preparations():
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+    agent_select, agent_insert, agent_update = roles.split(
+        "TO hindsight_agent_writer;", 3
+    )[:3]
+
+    assert "benchmark_variant_preparations" in agent_select
+    assert "benchmark_variant_preparations" not in agent_insert
+    assert "benchmark_variant_preparations" not in agent_update
+
+
 def _database_url(name: str) -> str:
     parts = urlsplit(os.environ["DATABASE_URL"])
     return urlunsplit(parts._replace(path=f"/{name}"))
@@ -551,8 +562,15 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 "connect",
                 lambda *_args, **_kwargs: nullcontext(conn),
             )
+            role_incident_slug = f"role-incident-{uuid4()}"
+            runs.create_incident(
+                slug=role_incident_slug,
+                title="Restricted role incident",
+                severity="sev2",
+                summary="Verify product incident resolution",
+            )
             role_run, created = runs.create_run(
-                incident_slug=f"role-run-{uuid4()}",
+                incident_slug=role_incident_slug,
                 namespace="role-test",
                 user_input="verify restricted run persistence",
                 idempotency_key=f"role-request-{uuid4()}",
@@ -577,6 +595,25 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 (role_run["id"],),
             ).fetchall() == [("start", "pending")]
             conn.commit()
+
+            resolution = runs.resolve_incident(
+                slug=role_incident_slug,
+                root_cause="A bounded product failure",
+                action="Restore the product boundary",
+                observation="The restricted API path recovered",
+                recovered=True,
+                actor="pytest.agent",
+            )
+            assert resolution["incident"]["status"] == "resolved"
+            assert conn.execute(
+                "SELECT count(*) FROM benchmark_variant_preparations"
+            ).fetchone() == (0,)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    "UPDATE benchmark_variant_preparations "
+                    "SET phase = 'complete' WHERE false"
+                )
+            conn.rollback()
 
             store = MemoryStore(conn=conn, embedding_provider=provider)
             semantic = store.remember(

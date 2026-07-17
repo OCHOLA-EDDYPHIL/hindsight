@@ -48,6 +48,7 @@ GRANT SELECT ON TABLE
     agent_run_events,
     agent_run_dispatches,
     consolidation_jobs,
+    benchmark_variant_preparations,
     benchmark_actions,
     demo_sessions
 TO hindsight_agent_writer;

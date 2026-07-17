@@ -1,6 +1,8 @@
 """Opt-in browser acceptance test for the deployed or local incident cockpit."""
 
 import os
+import re
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -17,6 +19,28 @@ requires_hosted_acceptance = pytest.mark.skipif(
     os.environ.get("RUN_HOSTED_ACCEPTANCE") != "1",
     reason="hosted database acceptance is opt-in",
 )
+
+
+def test_reset_resubscribes_before_loading_the_fresh_namespace():
+    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
+    reset = source.split("async function resetDemo()", 1)[1].split(
+        "async function poisonDemo()", 1
+    )[0]
+
+    assert re.search(
+        r"state\.namespace = payload\.namespace;\s+subscribeSocket\(\);",
+        reset,
+    )
+    assert reset.index("subscribeSocket();") < reset.index("await Promise.all(")
+
+
+def test_live_events_from_a_previous_namespace_are_ignored():
+    source = (Path(__file__).parents[1] / "src/hindsight/web/app.js").read_text()
+    handler = source.split("function handleLiveEvent(payload)", 1)[1].split(
+        "function setBusy", 1
+    )[0]
+
+    assert "payload.namespace !== state.namespace" in handler
 
 
 @requires_browser

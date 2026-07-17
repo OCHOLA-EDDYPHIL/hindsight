@@ -394,6 +394,7 @@ async function resetDemo() {
       body: JSON.stringify({namespace: state.namespace})
     });
     state.namespace = payload.namespace;
+    subscribeSocket();
     const url = new URL(window.location.href);
     url.searchParams.set("namespace", state.namespace);
     history.replaceState({}, "", url);
@@ -533,6 +534,7 @@ function subscribeSocket() {
 }
 
 function handleLiveEvent(payload) {
+  if (payload.namespace && payload.namespace !== state.namespace) return;
   const type = payload.type || payload.event;
   const data = payload.data || payload;
   if (type === "memory" && data.memory) {
