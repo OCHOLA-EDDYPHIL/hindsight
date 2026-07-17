@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -136,7 +136,9 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText("invalidated")).toBeVisible();
     expect(screen.getByText("rewind · completed")).toBeVisible();
     expect(screen.getByText("1 read")).toBeVisible();
-    fireEvent.input(screen.getByRole("slider"), { target: { value: "0" } });
+    const slider = screen.getByRole("slider") as HTMLInputElement;
+    slider.value = "0";
+    act(() => slider.dispatchEvent(new Event("input")));
     expect(onSelect).toHaveBeenCalledWith(snapshot.timeline[0]);
 
     rerender(<BeliefLedger snapshot={historical} />);

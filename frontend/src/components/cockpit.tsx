@@ -11,7 +11,7 @@ import {
   ShieldCheck,
   Warning,
 } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -351,9 +351,20 @@ export function Timeline({
   onSelect: (value?: string | null) => void;
 }) {
   const timeline = snapshot?.timeline || [];
+  const timelineRef = useRef<HTMLInputElement>(null);
   const selectedIndex = snapshot?.as_of
     ? Math.max(timeline.indexOf(snapshot.as_of), 0)
     : Math.max(timeline.length - 1, 0);
+  useEffect(() => {
+    const element = timelineRef.current;
+    if (!element) return;
+    const select = () => {
+      const value = timeline[Number(element.value)];
+      if (value) onSelect(value);
+    };
+    element.addEventListener("input", select);
+    return () => element.removeEventListener("input", select);
+  }, [onSelect, timeline]);
   return (
     <section className="timeline" aria-label="Belief history">
       <div className="timeline-label">
@@ -366,16 +377,14 @@ export function Timeline({
         </div>
       </div>
       <input
+        ref={timelineRef}
         id="timeline"
         type="range"
         min={0}
         max={Math.max(timeline.length - 1, 0)}
         value={selectedIndex}
+        onChange={() => undefined}
         disabled={!timeline.length}
-        onInput={(event) => {
-          const value = timeline[Number((event.target as HTMLInputElement).value)];
-          if (value) onSelect(value);
-        }}
         aria-label="Inspect a historical belief state"
       />
       <Button id="liveButton" type="button" size="compact" variant="ghost" onClick={() => onSelect(null)}>
