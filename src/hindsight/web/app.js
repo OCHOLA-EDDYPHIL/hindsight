@@ -133,13 +133,17 @@ async function establishOperatorSession() {
   updateOperatorState();
 }
 
-async function loadIncidents(preferredSlug = null) {
+async function loadIncidents(preferredSlug = null, {select = true} = {}) {
   try {
     const payload = await request("/incidents");
     state.incidents = payload.items || [];
     elements.incidentSelect.innerHTML = state.incidents.length
       ? state.incidents.map((incident) => `<option value="${escapeHtml(incident.slug)}">${escapeHtml(incident.title)}</option>`).join("")
       : '<option value="">No incidents yet</option>';
+    if (!select) {
+      elements.incidentSelect.value = "";
+      return;
+    }
     const selected = state.incidents.find((item) => item.slug === preferredSlug)
       || state.incidents.find((item) => (
         item.slug.startsWith("demo-payments-checkout-latency:")
@@ -710,6 +714,11 @@ $("#liveButton").addEventListener("click", () => loadSnapshot());
 await establishOperatorSession();
 renderIncident();
 renderRun();
-await loadIncidents();
-if (!state.incident) await loadSnapshot(params.get("as_of"));
+if (params.has("namespace")) {
+  await loadSnapshot(params.get("as_of"));
+  await loadIncidents(null, {select: false});
+} else {
+  await loadIncidents();
+  if (!state.incident) await loadSnapshot(params.get("as_of"));
+}
 connectEvents();
