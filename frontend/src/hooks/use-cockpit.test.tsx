@@ -71,6 +71,9 @@ describe("cockpit historical snapshot selection", () => {
         if (url.pathname === "/v1/incidents") {
           return Promise.resolve(jsonResponse({ items: [] }));
         }
+        if (url.pathname === "/v1/lesson-traces") {
+          return Promise.resolve(jsonResponse({ count: 0, traces: [] }));
+        }
         if (url.pathname === "/snapshot" && url.searchParams.has("as_of")) {
           return pendingHistorical;
         }

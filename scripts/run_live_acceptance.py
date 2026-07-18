@@ -65,12 +65,16 @@ WEBSOCKET_RECONNECT_SELECTOR = (
 SIGNATURE_BROWSER_CONTRACT_SELECTOR = (
     "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow"
 )
+LESSON_IDENTITY_BROWSER_CONTRACT_SELECTOR = (
+    "tests/test_browser_ui.py::test_cross_episode_lesson_identity_chain_is_inspectable"
+)
 HISTORICAL_NAMESPACE_BROWSER_CONTRACT_SELECTOR = (
     "tests/test_browser_ui.py::"
     "test_review_required_memory_renders_as_active_in_its_historical_snapshot"
 )
 SHARED_BROWSER_CONTRACT_SELECTORS = (
     SIGNATURE_BROWSER_CONTRACT_SELECTOR,
+    LESSON_IDENTITY_BROWSER_CONTRACT_SELECTOR,
     HISTORICAL_NAMESPACE_BROWSER_CONTRACT_SELECTOR,
 )
 HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE = {

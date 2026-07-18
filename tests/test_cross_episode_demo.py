@@ -61,3 +61,46 @@ def test_cross_episode_demo_shows_lesson_recall_without_performance_fields():
     ]
     assert lesson_trace["incoming_lineage_edge_ids"]
     assert "consolidated lesson" in result.episode_two.plan.lower()
+
+    identity = result.lesson_trace
+    assert str(identity["source_incident"]["id"]) == str(result.consolidation.incident["id"])
+    assert str(identity["consolidation"]["job_id"]) == result.consolidation.job_id
+    assert identity["consolidation"]["producer_decision_id"] == result.consolidation.memory[
+        "producer_decision_id"
+    ]
+    assert identity["lesson"] == {
+        "memory_id": result.consolidation.memory["id"],
+        "belief_id": result.consolidation.memory["belief_id"],
+        "version_number": result.consolidation.memory["version_number"],
+        "embedding_profile_id": identity["retrieval"]["embedding_profile_id"],
+    }
+    assert str(identity["retrieval"]["retrieval_id"]) == result.episode_two.retrieval_id
+    assert identity["embedding_profile"]["id"] == identity["lesson"][
+        "embedding_profile_id"
+    ]
+    assert identity["lineage_edges"]
+    assert identity["consumer_decision"]["decision_id"] == result.episode_two.decision_id
+    def field_names(value):
+        if isinstance(value, dict):
+            return set(value).union(*(field_names(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(field_names(item) for item in value))
+        return set()
+
+    identity_fields = field_names(identity)
+    for excluded in ("content", "plan", "prompt", "elapsed", "duration", "improvement"):
+        assert excluded not in identity_fields
+
+    from fastapi.testclient import TestClient
+    from hindsight.api import app
+
+    client = TestClient(app)
+    by_decision = client.get(f"/v1/lesson-traces/{result.episode_two.decision_id}")
+    assert by_decision.status_code == 200
+    assert by_decision.json()["lesson"]["memory_id"] == str(result.consolidation.memory["id"])
+    recent = client.get("/v1/lesson-traces", params={"limit": 1})
+    assert recent.status_code == 200
+    assert recent.json()["count"] == 1
+    assert recent.json()["traces"][0]["consumer_decision"]["decision_id"] == (
+        result.episode_two.decision_id
+    )
