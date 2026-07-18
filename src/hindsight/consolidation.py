@@ -98,6 +98,10 @@ class ConsolidationLeaseLostError(RuntimeError):
     """Raised when an attempt no longer owns a live consolidation lease."""
 
 
+class ConsolidationLeaseBusyError(RuntimeError):
+    """Raised when another attempt still owns a live consolidation lease."""
+
+
 class ConsolidationEvidenceChangedError(RuntimeError):
     """Raised when selected source evidence is no longer eligible or linked."""
 
@@ -484,7 +488,9 @@ def _claim_job(*, job_id: str, db_url: str) -> dict[str, Any]:
                     and row["lease_expires_at"] is not None
                     and row["lease_expires_at"] > current_time
                 ):
-                    raise RuntimeError("consolidation job already has an active lease")
+                    raise ConsolidationLeaseBusyError(
+                        "consolidation job already has an active lease"
+                    )
                 if row["attempt_count"] >= MAX_CONSOLIDATION_ATTEMPTS:
                     cur.execute(
                         """
