@@ -143,6 +143,15 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.CSS_SELECTOR, "#operatorForm button[type=submit]").click()
         wait.until_not(lambda browser: browser.find_element(By.ID, "startRun").get_attribute("disabled"))
 
+        walkthrough = driver.find_element(By.ID, "operatorWalkthrough")
+        assert not walkthrough.is_displayed()
+        driver.find_element(By.ID, "walkthroughToggle").click()
+        wait.until(lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed())
+        assert "Reset the replay" in walkthrough.text
+        assert "Inspect history" in walkthrough.text
+        driver.find_element(By.ID, "walkthroughToggle").click()
+        wait.until_not(lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed())
+
         previous_namespace = driver.find_element(By.ID, "namespace").text
         driver.find_element(By.ID, "resetDemo").click()
         namespace = wait.until(

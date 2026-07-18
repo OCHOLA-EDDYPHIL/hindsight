@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { SafeMarkdown } from "@/components/safe-markdown";
 import { humanStatus, formatTime, shortId, structurePlan } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type {
@@ -156,23 +157,24 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
   return (
     <div id={primary ? "planText" : undefined} className="plan-sections">
       <div>
-        <span>Cause</span>
-        <p>{plan.cause}</p>
+        <span className="plan-label">Cause</span>
+        <SafeMarkdown>{plan.cause}</SafeMarkdown>
       </div>
       <div>
-        <span>Checks</span>
-        <ul>
-          {plan.checks.map((check) => (
-            <li key={check}>{check}</li>
-          ))}
-        </ul>
+        <span className="plan-label">Checks</span>
+        <SafeMarkdown>{plan.checks}</SafeMarkdown>
       </div>
       <div>
-        <span>Action</span>
-        <p id={primary ? "proposedAction" : undefined}>{plan.action}</p>
+        <span className="plan-label">Action</span>
+        <SafeMarkdown
+          id={primary ? "proposedAction" : undefined}
+          className="proposed-action"
+        >
+          {plan.action}
+        </SafeMarkdown>
       </div>
       <div>
-        <span>Safety</span>
+        <span className="plan-label">Safety</span>
         <p>{plan.safety}</p>
       </div>
     </div>
