@@ -27,6 +27,41 @@ def test_cross_episode_output_schema_contains_no_performance_metrics():
     )
 
 
+def test_cross_episode_waits_when_managed_consolidation_owns_the_lease(monkeypatch):
+    import hindsight.cross_episode as cross_episode
+    from hindsight.consolidation import ConsolidationLeaseBusyError
+
+    expected = [object()]
+    calls = 0
+
+    def contended_handler(_event, *, db_url):
+        nonlocal calls
+        calls += 1
+        assert db_url == "postgresql://fixture"
+        if calls == 1:
+            raise ConsolidationLeaseBusyError("managed worker owns the lease")
+        return expected
+
+    monkeypatch.setattr(
+        cross_episode,
+        "handle_incident_changefeed_event",
+        contended_handler,
+    )
+    monkeypatch.setattr(cross_episode.time, "sleep", lambda _seconds: None)
+
+    result = cross_episode._complete_consolidation(
+        resolved_incident={
+            "id": str(uuid4()),
+            "status": "resolved",
+            "resolution_event_id": str(uuid4()),
+        },
+        db_url="postgresql://fixture",
+    )
+
+    assert result is expected
+    assert calls == 2
+
+
 @requires_db
 def test_cross_episode_demo_shows_lesson_recall_without_performance_fields():
     from hindsight.cross_episode import run_cross_episode_demo

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from psycopg.types.json import Jsonb
 
 from hindsight.agent import IncidentInput, IncidentAgentResult, run_incident_agent
 from hindsight.consolidation import (
+    ConsolidationLeaseBusyError,
     ConsolidationResult,
     handle_incident_changefeed_event,
     incident_closed_changefeed_event,
@@ -50,6 +52,8 @@ RESOLUTION_SUMMARY = (
     "until downstream processor health recovers."
 )
 ROOT_CAUSE = "Retry fanout amplified downstream payment processor timeouts."
+CONSOLIDATION_WAIT_SECONDS = 600
+CONSOLIDATION_POLL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -143,11 +147,8 @@ def run_cross_episode_demo(
             reflected_memory_id=episode_one.reflected_memory_id,
             db_url=resolved_db_url,
         )
-        consolidation_results = handle_incident_changefeed_event(
-            incident_closed_changefeed_event(
-                resolved_incident,
-                source_event_id=str(resolved_incident["resolution_event_id"]),
-            ),
+        consolidation_results = _complete_consolidation(
+            resolved_incident=resolved_incident,
             db_url=resolved_db_url,
         )
         if not consolidation_results:
@@ -189,6 +190,25 @@ def run_cross_episode_demo(
         episode_two=episode_two,
         lesson_trace=lesson_trace,
     )
+
+
+def _complete_consolidation(
+    *, resolved_incident: dict[str, Any], db_url: str
+) -> list[ConsolidationResult]:
+    event = incident_closed_changefeed_event(
+        resolved_incident,
+        source_event_id=str(resolved_incident["resolution_event_id"]),
+    )
+    deadline = time.monotonic() + CONSOLIDATION_WAIT_SECONDS
+    while True:
+        try:
+            return handle_incident_changefeed_event(event, db_url=db_url)
+        except ConsolidationLeaseBusyError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "managed consolidation did not release its active lease"
+                ) from None
+            time.sleep(CONSOLIDATION_POLL_SECONDS)
 
 
 def reset_cross_episode_demo(*, namespace: str, db_url: str | None = None) -> None:
