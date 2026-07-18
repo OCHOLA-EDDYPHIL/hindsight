@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -27,6 +28,7 @@ RUN_STATUSES = frozenset(
         *TERMINAL_RUN_STATUSES,
     }
 )
+GET_RUN_READ_ATTEMPTS = 3
 
 
 class RunConflictError(RuntimeError):
@@ -356,6 +358,16 @@ def create_run(
 def get_run(*, run_id: str | UUID, db_url: str | None = None) -> dict[str, Any] | None:
     """Return one run and its ordered phase events."""
 
+    for attempt in range(GET_RUN_READ_ATTEMPTS):
+        try:
+            return _read_run(run_id=run_id, db_url=db_url)
+        except SerializationFailure:
+            if attempt + 1 == GET_RUN_READ_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable run read retry state")
+
+
+def _read_run(*, run_id: str | UUID, db_url: str | None) -> dict[str, Any] | None:
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT * FROM agent_runs WHERE id = %s", (run_id,))
