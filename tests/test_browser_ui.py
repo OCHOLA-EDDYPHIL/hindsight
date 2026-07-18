@@ -188,6 +188,10 @@ def test_operator_can_run_and_explain_signature_workflow():
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "1 live · 2 invalid"
         )
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "executeRewind").text
+            == "Execute rewind"
+        )
 
         timeline = driver.find_element(By.ID, "timeline")
         assert not timeline.get_attribute("disabled")
