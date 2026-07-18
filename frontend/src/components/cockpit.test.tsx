@@ -112,6 +112,40 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
   });
 
+  it("renders model Markdown without exposing syntax as the primary presentation", () => {
+    const markdownScenario: SignatureScenario = {
+      ...scenario,
+      runs: scenario.runs.map((run) =>
+        run.status === "completed"
+          ? {
+              ...run,
+              plan: `## Suspected Cause
+### Evidence
+**Retry fanout** amplified processor timeouts.
+
+## Checks
+- Inspect \`queue_depth\`
+- Compare current processor health
+
+## Safe Next Action
+[Throttle retries](https://example.com/runbook) before scaling.`,
+              proposed_action: "[Throttle retries](https://example.com/runbook) before scaling.",
+            }
+          : run,
+      ),
+    };
+    const { container } = render(
+      <OutcomeComparison scenario={markdownScenario} activeRun={null} />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Evidence", level: 4 })).toBeVisible();
+    expect(screen.getByText("Retry fanout").tagName).toBe("STRONG");
+    expect(screen.getByText("queue_depth").tagName).toBe("CODE");
+    expect(screen.getAllByRole("link", { name: /Throttle retries/ })).not.toHaveLength(0);
+    expect(container.querySelector("#planText")?.textContent).not.toContain("##");
+    expect(container.querySelector("#proposedAction")).toHaveTextContent("Throttle retries");
+  });
+
   it("exposes current, invalidated, historical, operation, and influence states semantically", () => {
     const historical = { ...snapshot, mode: "as_of" as const, as_of: snapshot.timeline[0] };
     const onSelect = vi.fn();

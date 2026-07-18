@@ -10,6 +10,7 @@ const visibleSources = [
   "src/App.tsx",
   "src/components/cockpit.tsx",
   "src/components/operator-console.tsx",
+  "src/components/safe-markdown.tsx",
 ].map((file) => fs.readFileSync(path.join(root, file), "utf8"));
 
 describe("responsive and motion design contracts", () => {
@@ -17,6 +18,8 @@ describe("responsive and motion design contracts", () => {
     expect(styles).toContain("overflow-x: hidden");
     expect(styles).toContain("@media (max-width: 800px)");
     expect(styles).toMatch(/\.outcome-grid,[\s\S]*grid-template-columns: minmax\(0, 1fr\)/);
+    expect(styles).toMatch(/\.operator-walkthrough \{[\s\S]*grid-template-columns: minmax\(0, 1fr\)/);
+    expect(styles).toContain("overflow-wrap: anywhere");
   });
 
   it("removes chronology motion for reduced-motion users", () => {
