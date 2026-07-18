@@ -40,6 +40,8 @@ def test_openapi_exposes_narrow_product_contract():
     assert "/v1/incidents/{slug}/runs" in paths
     assert "/v1/runs/{run_id}/approval" in paths
     assert "/v1/decisions/{decision_id}/influence" in paths
+    assert "/v1/lesson-traces" in paths
+    assert "/v1/lesson-traces/{decision_id}" in paths
     assert "/v1/signature-scenarios" in paths
     assert "/v1/signature-scenarios/{scenario_id}" in paths
     assert "/v1/namespaces/{namespace}/rewinds/preview" in paths

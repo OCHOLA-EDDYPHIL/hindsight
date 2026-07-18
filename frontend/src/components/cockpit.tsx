@@ -21,6 +21,7 @@ import { cn } from "@/lib/utils";
 import type {
   Incident,
   InfluenceItem,
+  LessonIdentityTrace,
   MemoryOperation,
   MemoryRecord,
   Run,
@@ -148,6 +149,114 @@ export function CausalRail({ scenario }: { scenario: SignatureScenario | null })
           );
         })}
       </ol>
+    </section>
+  );
+}
+
+export function LessonIdentityChain({
+  trace,
+  state,
+}: {
+  trace: LessonIdentityTrace | null;
+  state: "loading" | "ready" | "empty" | "error";
+}) {
+  const edgeIds = trace?.lineage_edges.map((edge) => edge.id) || [];
+  return (
+    <section
+      id="lessonIdentityChain"
+      className="lesson-identity-chain"
+      aria-labelledby="lessonIdentityHeading"
+      data-incident-id={trace?.source_incident.id || undefined}
+      data-consolidation-id={trace?.consolidation.job_id || undefined}
+      data-producer-decision-id={trace?.consolidation.producer_decision_id || undefined}
+      data-lesson-memory-id={trace?.lesson.memory_id || undefined}
+      data-lesson-belief-id={trace?.lesson.belief_id || undefined}
+      data-retrieval-id={trace?.retrieval.retrieval_id || undefined}
+      data-read-id={trace?.retrieval.read_id || undefined}
+      data-embedding-profile-id={trace?.embedding_profile?.id || undefined}
+      data-lineage-edge-ids={edgeIds.join(",") || undefined}
+      data-consumer-decision-id={trace?.consumer_decision.decision_id || undefined}
+    >
+      <header className="pane-heading">
+        <div>
+          <p className="section-kicker">Cross-episode lineage</p>
+          <h2 id="lessonIdentityHeading">A lesson from incident to decision</h2>
+        </div>
+        <span id="lessonTraceStatus" className="metric">
+          {state === "loading"
+            ? "Loading"
+            : state === "error"
+              ? "Unavailable"
+              : trace
+                ? "Identity complete"
+                : "No lesson trace"}
+        </span>
+      </header>
+      {trace ? (
+        <div className="lesson-chain" role="list" aria-label="Lesson identity chain">
+          <article role="listitem">
+            <span>Source incident</span>
+            <strong>{trace.source_incident.slug || "Incident identity"}</strong>
+            <IdentifierValue value={trace.source_incident.id} label="source incident identity" />
+          </article>
+          <article role="listitem">
+            <span>Consolidation</span>
+            <strong>Job and producer decision</strong>
+            <IdentifierValue value={trace.consolidation.job_id} label="consolidation job identity" />
+            <IdentifierValue
+              value={trace.consolidation.producer_decision_id}
+              label="lesson producer decision identity"
+              quiet
+            />
+          </article>
+          <article role="listitem">
+            <span>Lesson belief</span>
+            <strong>Version {trace.lesson.version_number}</strong>
+            <IdentifierValue value={trace.lesson.memory_id} label="lesson memory identity" />
+            <IdentifierValue value={trace.lesson.belief_id} label="lesson belief identity" quiet />
+          </article>
+          <article role="listitem">
+            <span>Retrieval read</span>
+            <strong>Selected lesson evidence</strong>
+            <IdentifierValue value={trace.retrieval.retrieval_id} label="retrieval identity" />
+            <IdentifierValue value={trace.retrieval.read_id} label="memory read identity" quiet />
+          </article>
+          <article role="listitem">
+            <span>Embedding profile</span>
+            <strong>
+              {trace.embedding_profile?.provider || "Provider"} / {trace.embedding_profile?.model || "model"}
+            </strong>
+            <IdentifierValue value={trace.embedding_profile?.id} label="embedding profile identity" />
+          </article>
+          <article role="listitem">
+            <span>Lineage</span>
+            <strong>{edgeIds.length} verified edge{edgeIds.length === 1 ? "" : "s"}</strong>
+            {edgeIds.map((edgeId) => (
+              <IdentifierValue key={edgeId} value={edgeId} label="lineage edge identity" quiet />
+            ))}
+          </article>
+          <article role="listitem">
+            <span>Consumer decision</span>
+            <strong>{trace.consumer_decision.incident_slug || "Later decision"}</strong>
+            <IdentifierValue
+              value={trace.consumer_decision.decision_id}
+              label="consumer decision identity"
+            />
+          </article>
+        </div>
+      ) : (
+        <div className="empty-inline compact">
+          <Fingerprint aria-hidden="true" size={20} />
+          <div>
+            <strong>{state === "error" ? "Lesson trace unavailable" : "No lesson trace yet"}</strong>
+            <p>
+              {state === "error"
+                ? "The identity-only trace could not be loaded."
+                : "A retrieved procedural lesson will populate this identity chain."}
+            </p>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

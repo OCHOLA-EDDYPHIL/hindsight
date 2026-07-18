@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from mangum import Mangum
@@ -50,7 +50,6 @@ from hindsight.runtime import (
     runtime_database_url,
     runtime_settings,
 )
-from hindsight.trace_contract import governed_decision_trace, signature_scenario_trace
 from hindsight.runs import (
     RunConflictError,
     RunNotFoundError,
@@ -61,6 +60,12 @@ from hindsight.runs import (
     list_incidents,
     prepare_approval,
     resolve_incident,
+)
+from hindsight.trace_contract import (
+    governed_decision_trace,
+    lesson_identity_trace,
+    lesson_identity_traces,
+    signature_scenario_trace,
 )
 
 API_PREFIX = "/v1"
@@ -443,6 +448,25 @@ def decisions_influence(decision_id: str) -> dict[str, Any]:
         "retrievals": _jsonable(trace["retrievals"]) if trace else [],
         "trace": _jsonable(trace) if trace else None,
     }
+
+
+@app.get(f"{API_PREFIX}/lesson-traces", tags=["memory"])
+def lessons_traces_list(
+    limit: Annotated[int, Query(ge=1, le=20)] = 10,
+) -> dict[str, Any]:
+    traces = lesson_identity_traces(db_url=_api_database_url(), limit=limit)
+    return {"count": len(traces), "traces": _jsonable(traces)}
+
+
+@app.get(f"{API_PREFIX}/lesson-traces/{{decision_id}}", tags=["memory"])
+def lessons_traces_get(decision_id: str) -> dict[str, Any]:
+    trace = lesson_identity_trace(
+        decision_id=decision_id,
+        db_url=_api_database_url(),
+    )
+    if trace is None:
+        raise HTTPException(status_code=404, detail="lesson identity trace not found")
+    return _jsonable(trace)
 
 
 @app.get(f"{API_PREFIX}/signature-scenarios", tags=["memory"])

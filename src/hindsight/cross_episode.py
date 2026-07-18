@@ -21,7 +21,7 @@ from hindsight.embeddings import embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
 from hindsight.runs import resolve_incident
-from hindsight.trace_contract import governed_decision_trace
+from hindsight.trace_contract import governed_decision_trace, lesson_identity_trace
 from hindsight.tracing import set_span_attributes, start_span
 
 CROSS_EPISODE_NAMESPACE = "demo:cross-episode-payments"
@@ -77,6 +77,7 @@ class CrossEpisodeDemoResult:
     episode_one: CrossEpisodeRunSummary
     consolidation: ConsolidationResult
     episode_two: CrossEpisodeRunSummary
+    lesson_trace: dict[str, Any]
 
 
 class CrossEpisodeMechanismReasoningProvider:
@@ -166,6 +167,12 @@ def run_cross_episode_demo(
             db_url=resolved_db_url,
             reasoning_provider=provider,
         )
+        lesson_trace = lesson_identity_trace(
+            decision_id=episode_two.decision_id,
+            db_url=resolved_db_url,
+        )
+        if lesson_trace is None:
+            raise RuntimeError("second episode did not produce a lesson identity trace")
         set_span_attributes(
             span,
             {
@@ -180,6 +187,7 @@ def run_cross_episode_demo(
         episode_one=episode_one,
         consolidation=consolidation_results[0],
         episode_two=episode_two,
+        lesson_trace=lesson_trace,
     )
 
 

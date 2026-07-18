@@ -8,6 +8,7 @@ import {
   EmptySurface,
   ErrorSurface,
   InfluenceLedger,
+  LessonIdentityChain,
   LoadingSurface,
   OperationLedger,
   OutcomeComparison,
@@ -62,6 +63,10 @@ export default function App() {
               run={cockpit.run}
             />
             <CausalRail scenario={cockpit.scenario} />
+            <LessonIdentityChain
+              trace={cockpit.lessonTrace}
+              state={cockpit.lessonTraceState}
+            />
             <OutcomeComparison scenario={cockpit.scenario} activeRun={cockpit.run} />
             <Timeline snapshot={cockpit.snapshot} onSelect={cockpit.selectHistorical} />
             <div className="evidence-grid">
