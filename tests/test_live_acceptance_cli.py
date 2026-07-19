@@ -156,12 +156,26 @@ def test_hosted_product_phases_are_selector_isolated():
     assert len(flattened) == len(set(flattened))
 
 
-def test_hosted_product_binds_server_owned_acceptance_tenant(monkeypatch):
+@pytest.mark.parametrize(
+    ("phase", "expected_tenant"),
+    (
+        ("semantic", acceptance.ACCEPTANCE_TENANT_ID),
+        ("worker", acceptance.PUBLIC_DEMO_TENANT_ID),
+        ("browser", acceptance.PUBLIC_DEMO_TENANT_ID),
+    ),
+)
+def test_hosted_product_binds_server_owned_phase_tenant(
+    monkeypatch, phase, expected_tenant
+):
     database_url = (
         "postgresql://runtime@cluster.example:26257/hindsight?sslmode=verify-full"
     )
     monkeypatch.setenv("PGOPTIONS", "-c hindsight.tenant_id=untrusted")
     monkeypatch.setattr(acceptance, "_require_gemini_credentials", lambda: None)
+    monkeypatch.setattr(acceptance, "_verify_hosted_endpoints", lambda: None)
+    monkeypatch.setattr(acceptance, "_verify_changefeed", lambda _env: None)
+    monkeypatch.setattr(acceptance, "_required_env", lambda _name: "configured")
+    monkeypatch.setattr(acceptance, "_required_positive_int_env", lambda _name: 1)
     calls = []
     monkeypatch.setattr(
         acceptance,
@@ -170,15 +184,13 @@ def test_hosted_product_binds_server_owned_acceptance_tenant(monkeypatch):
     )
 
     acceptance._run_hosted_product(
-        SimpleNamespace(phase="semantic", database_url=database_url)
+        SimpleNamespace(phase=phase, database_url=database_url)
     )
 
-    selectors, env, phase = calls[0]
-    assert selectors == acceptance.SEMANTIC_RETRIEVAL_SELECTORS
-    assert phase == "semantic"
-    assert env["PGOPTIONS"] == (
-        f"-c hindsight.tenant_id={acceptance.ACCEPTANCE_TENANT_ID}"
-    )
+    selectors, env, selected_phase = calls[0]
+    assert selectors == acceptance.HOSTED_PHASE_SELECTORS[phase]
+    assert selected_phase == phase
+    assert env["PGOPTIONS"] == f"-c hindsight.tenant_id={expected_tenant}"
 
 
 def test_browser_contract_inventories_have_explicit_local_hosted_parity():

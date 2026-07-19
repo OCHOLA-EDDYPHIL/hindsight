@@ -2,6 +2,27 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_future_tenant_natural_key_migration_is_restart_safe():
+    migration = (ROOT / "migrations" / "0022_tenant_natural_keys.sql").read_text()
+
+    for index in (
+        "services@services_slug_key",
+        "incidents@incidents_slug_key",
+        "runbooks@runbooks_slug_key",
+        "demo_sessions@demo_sessions_namespace_key",
+    ):
+        assert f"DROP INDEX IF EXISTS {index} CASCADE" in migration
+    for index in (
+        "services_tenant_slug_idx",
+        "incidents_tenant_slug_idx",
+        "runbooks_tenant_slug_idx",
+        "demo_sessions_tenant_namespace_idx",
+    ):
+        assert f"CREATE UNIQUE INDEX IF NOT EXISTS {index}" in migration
+
+
 TENANT_TABLES = {
     "episodic_memories",
     "semantic_memories",

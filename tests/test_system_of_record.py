@@ -163,7 +163,7 @@ def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_
                 'Coordinate communication and command roles for any incident.',
                 '["Assign incident commander", "Open status channel"]'::JSONB
             )
-            ON CONFLICT (slug) DO UPDATE SET
+            ON CONFLICT (tenant_id, slug) DO UPDATE SET
                 service_id = excluded.service_id,
                 title = excluded.title,
                 summary = excluded.summary,

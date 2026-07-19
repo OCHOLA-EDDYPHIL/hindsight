@@ -472,6 +472,15 @@ def incidents_resolve(slug: str, payload: IncidentResolutionRequest) -> dict[str
 
 
 @app.post(
+    f"{V2_PREFIX}/incidents/{{slug}}/resolution",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
+)
+def v2_incidents_resolve(slug: str, payload: IncidentResolutionRequest) -> dict[str, Any]:
+    return incidents_resolve(slug, payload)
+
+
+@app.post(
     f"{API_PREFIX}/incidents/{{slug}}/runs",
     tags=["runs"],
     status_code=status.HTTP_202_ACCEPTED,

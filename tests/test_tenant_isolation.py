@@ -34,8 +34,8 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
     second_service = uuid4()
     first_incident = uuid4()
     suffix = uuid4().hex
-    first_service_slug = f"service-a-{suffix}"
-    second_service_slug = f"service-b-{suffix}"
+    first_service_slug = f"shared-service-{suffix}"
+    second_service_slug = first_service_slug
     first_incident_slug = f"incident-a-{suffix}"
 
     try:

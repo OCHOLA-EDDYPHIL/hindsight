@@ -222,7 +222,7 @@ def _record_poison_demo_session(*, namespace: str, db_url: str) -> None:
             """
                 INSERT INTO demo_sessions (demo_kind, namespace, created_by)
                 VALUES ('poison_rewind', %s, 'demo.runner')
-                ON CONFLICT (namespace) DO NOTHING
+                ON CONFLICT (tenant_id, namespace) DO NOTHING
             """,
             (namespace,),
         )
@@ -268,7 +268,7 @@ def ensure_poison_rewind_incident(*, db_url: str | None = None) -> dict[str, Any
                         'revenue-platform',
                         'critical'
                     )
-                    ON CONFLICT (slug) DO UPDATE SET name = excluded.name
+                    ON CONFLICT (tenant_id, slug) DO UPDATE SET name = excluded.name
                     RETURNING id
                 """,
                 (DEMO_SERVICE_SLUG,),
@@ -287,7 +287,7 @@ def ensure_poison_rewind_incident(*, db_url: str | None = None) -> dict[str, Any
                         now(),
                         %s
                     )
-                    ON CONFLICT (slug) DO UPDATE SET
+                    ON CONFLICT (tenant_id, slug) DO UPDATE SET
                         title = excluded.title,
                         severity = excluded.severity,
                         status = excluded.status,

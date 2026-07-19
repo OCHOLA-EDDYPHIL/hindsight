@@ -21,7 +21,7 @@ VALUES
         'fulfillment',
         'core'
     )
-ON CONFLICT (slug) DO UPDATE SET
+ON CONFLICT (tenant_id, slug) DO UPDATE SET
     name = excluded.name,
     owner_team = excluded.owner_team,
     tier = excluded.tier;
@@ -67,7 +67,7 @@ VALUES
             "Restart the worker and resume consumption."
         ]'::JSONB
     )
-ON CONFLICT (slug) DO UPDATE SET
+ON CONFLICT (tenant_id, slug) DO UPDATE SET
     service_id = excluded.service_id,
     title = excluded.title,
     summary = excluded.summary,
@@ -110,7 +110,7 @@ VALUES
         'A malformed fulfillment event caused repeated worker crashes until the message was quarantined.',
         'A poison message bypassed schema validation and crashed the worker on deserialization.'
     )
-ON CONFLICT (slug) DO UPDATE SET
+ON CONFLICT (tenant_id, slug) DO UPDATE SET
     title = excluded.title,
     severity = excluded.severity,
     status = excluded.status,

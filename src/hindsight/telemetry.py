@@ -316,7 +316,7 @@ def _upsert_service(conn: psycopg.Connection, signal: DemoTelemetrySignal) -> di
             """
                 INSERT INTO services (slug, name, owner_team, tier)
                 VALUES (%s, %s, %s, 'critical')
-                ON CONFLICT (slug) DO UPDATE SET
+                ON CONFLICT (tenant_id, slug) DO UPDATE SET
                     name = excluded.name,
                     owner_team = excluded.owner_team,
                     tier = excluded.tier
@@ -339,7 +339,7 @@ def _upsert_incident(conn: psycopg.Connection, signal: DemoTelemetrySignal) -> d
                     slug, title, severity, status, started_at, summary
                 )
                 VALUES (%s, %s, %s, 'open', %s, %s)
-                ON CONFLICT (slug) DO UPDATE SET
+                ON CONFLICT (tenant_id, slug) DO UPDATE SET
                     title = excluded.title,
                     severity = excluded.severity,
                     status = excluded.status,
