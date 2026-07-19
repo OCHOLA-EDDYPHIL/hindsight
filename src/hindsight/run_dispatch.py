@@ -42,7 +42,11 @@ def dispatch_run_commands(
     lease_lost = 0
     for dispatch in dispatches:
         try:
-            message_id = enqueue_run(dict(dispatch["payload"]), client=client)
+            payload = {
+                **dict(dispatch["payload"]),
+                "tenant_id": str(dispatch["tenant_id"]),
+            }
+            message_id = enqueue_run(payload, client=client)
         except Exception as exc:
             _release_run_dispatch(
                 dispatch_id=dispatch["id"],
