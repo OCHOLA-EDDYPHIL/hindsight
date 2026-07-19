@@ -97,17 +97,34 @@ def test_artifact_smoke_uses_every_terraform_configured_handler():
     ]
 
 
-def test_required_database_job_checks_lock_and_built_lambda_handlers():
+def test_required_ci_status_aggregates_lock_web_database_and_lambda_checks():
     workflow = pathlib.Path(".github/workflows/ci.yml").read_text()
-    test_job = workflow.split("  test:\n", 1)[1]
+    static_job = workflow.split("  python_static:\n", 1)[1].split("  database:\n", 1)[0]
+    database_job = workflow.split("  database:\n", 1)[1].split(
+        "  migration_replay:\n", 1
+    )[0]
+    frontend_job = workflow.split("  frontend:\n", 1)[1].split(
+        "  lambda_artifacts:\n", 1
+    )[0]
+    lambda_job = workflow.split("  lambda_artifacts:\n", 1)[1].split(
+        "  terraform:\n", 1
+    )[0]
+    aggregate_job = workflow.split("  test:\n", 1)[1]
 
-    assert "uv lock --check" in test_job
-    assert "npm ci" in test_job
-    assert "npm run check:web" in test_job
-    assert "npm run test:web" in test_job
-    assert "npm run build:web" in test_job
-    assert "git diff --exit-code -- src/hindsight/web" in test_job
-    assert "docker compose up -d crdb" in test_job
-    assert "uv run pytest -q" in test_job
-    assert "uv run python scripts/build_lambda_artifacts.py" in test_job
-    assert "uv run python scripts/smoke_lambda_artifacts.py" in test_job
+    assert "uv lock --check" in static_job
+    assert "scripts/ci_test_groups.py run unit" in static_job
+    assert "docker compose up -d crdb" in database_job
+    assert 'scripts/ci_test_groups.py run "${{ matrix.group }}"' in database_job
+    for command in (
+        "npm ci",
+        "npm run check:web",
+        "npm run test:web",
+        "npm run build:web",
+        "git diff --exit-code -- src/hindsight/web",
+    ):
+        assert command in frontend_job
+    assert "uv run python scripts/build_lambda_artifacts.py" in lambda_job
+    assert "uv run python scripts/smoke_lambda_artifacts.py" in lambda_job
+    for dependency in ("python_static", "database", "frontend", "lambda_artifacts"):
+        assert f"      - {dependency}" in aggregate_job
+    assert "python scripts/verify_ci_components.py" in aggregate_job

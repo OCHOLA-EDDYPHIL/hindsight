@@ -114,6 +114,7 @@ def test_protocol_schema_and_guards_are_split_across_commits():
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_upgrade_from_0012_backfills_the_first_confirmation_after_schema_commit():
     target_url = _create_preserved_database("hindsight_benchmark_upgrade")
     all_migrations = sorted(MIGRATIONS.glob("[0-9]*.sql"))
@@ -304,6 +305,7 @@ def test_upgrade_from_0012_backfills_the_first_confirmation_after_schema_commit(
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_fresh_protocol_enforces_binding_study_and_preparation_invariants():
     target_url = _create_preserved_database("hindsight_benchmark_fresh")
     with psycopg.connect(target_url, autocommit=True) as conn:
@@ -812,6 +814,7 @@ def test_fresh_protocol_enforces_binding_study_and_preparation_invariants():
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_preparation_attempts_commit_and_exhaust_without_attempt_four():
     benchmark_script = _load_benchmark_script()
     target_url = _create_preserved_database("hindsight_benchmark_attempts")
@@ -967,6 +970,7 @@ def test_preparation_attempts_commit_and_exhaust_without_attempt_four():
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_interrupted_benchmark_finalizer_closes_children_before_parents():
     benchmark_script = _load_benchmark_script()
     target_url = _create_preserved_database("hindsight_benchmark_finalizer")
