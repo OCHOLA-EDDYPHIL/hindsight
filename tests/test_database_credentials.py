@@ -52,7 +52,9 @@ class FakeConnection:
         return None
 
     def execute(self, statement, params=None):
-        del statement, params
+        del params
+        if "rolsuper, rolbypassrls" in str(statement):
+            return SimpleNamespace(fetchone=lambda: (False, False))
         return SimpleNamespace(fetchone=lambda: (self.identity,))
 
 
@@ -88,6 +90,7 @@ def test_prepare_uses_dala_and_writes_distinct_secure_strings(monkeypatch, capsy
             return ssm
 
     monkeypatch.setattr(provision.boto3, "Session", FakeSession)
+
     def connect(url, **_kwargs):
         connected_urls.append(url)
         return FakeConnection(url)

@@ -6,13 +6,28 @@ CREATE ROLE IF NOT EXISTS hindsight_agent_writer NOLOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_memory_worker NOLOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_mcp_readonly LOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_dashboard_reader LOGIN;
+CREATE ROLE IF NOT EXISTS hindsight_archive NOLOGIN;
+CREATE ROLE IF NOT EXISTS hindsight_cdc NOLOGIN;
 
 ALTER ROLE hindsight_agent_writer NOLOGIN;
 ALTER ROLE hindsight_memory_worker NOLOGIN;
+ALTER ROLE hindsight_archive NOLOGIN;
+ALTER ROLE hindsight_cdc NOLOGIN;
+ALTER ROLE hindsight_agent_writer NOBYPASSRLS;
+ALTER ROLE hindsight_memory_worker NOBYPASSRLS;
+ALTER ROLE hindsight_mcp_readonly NOBYPASSRLS;
+ALTER ROLE hindsight_dashboard_reader NOBYPASSRLS;
+ALTER ROLE hindsight_archive NOBYPASSRLS;
+ALTER ROLE hindsight_cdc NOBYPASSRLS;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-GRANT USAGE ON SCHEMA public TO hindsight_agent_writer, hindsight_memory_worker;
+GRANT USAGE ON SCHEMA public TO
+    hindsight_agent_writer,
+    hindsight_memory_worker,
+    hindsight_archive,
+    hindsight_cdc;
 
 GRANT SELECT ON TABLE
+    tenants,
     episodic_memories,
     semantic_memories,
     current_episodic_memories,
@@ -98,6 +113,7 @@ TO hindsight_agent_writer;
 -- This role is isolated to the queued correction/consolidation worker. It may
 -- close versions and manage derivative indexes, but still receives no DELETE.
 GRANT SELECT ON TABLE
+    tenants,
     episodic_memories,
     semantic_memories,
     semantic_beliefs,
@@ -177,7 +193,7 @@ GRANT INSERT ON TABLE
 TO hindsight_memory_worker;
 
 REVOKE DELETE ON ALL TABLES IN SCHEMA public
-FROM hindsight_agent_writer, hindsight_memory_worker;
+FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive, hindsight_cdc;
 
 GRANT UPDATE ON TABLE
     episodic_memories,
@@ -251,3 +267,53 @@ GRANT SELECT ON TABLE
     benchmark_trials,
     benchmark_actions
 TO hindsight_dashboard_reader;
+
+GRANT SELECT ON TABLE
+    tenants,
+    episodic_memories,
+    semantic_memories,
+    memory_reads,
+    semantic_memory_embeddings,
+    services,
+    incidents,
+    incident_services,
+    incident_events,
+    runbooks,
+    incident_runbooks,
+    incident_semantic_memories,
+    memory_operations,
+    mcp_audit_events,
+    agent_runs,
+    agent_run_events,
+    memory_decisions,
+    memory_namespaces,
+    semantic_beliefs,
+    memory_external_evidence,
+    incident_semantic_beliefs,
+    semantic_memory_vectors,
+    embedding_backfill_tasks,
+    memory_retrievals,
+    memory_lineage_edges,
+    agent_reflections,
+    memory_operation_previews,
+    memory_operation_events,
+    memory_operation_effects,
+    memory_review_items,
+    consolidation_jobs,
+    demo_sessions,
+    benchmark_experiments,
+    benchmark_trials,
+    benchmark_actions,
+    benchmark_confirmation_preregistrations,
+    benchmark_confirmation_bindings,
+    benchmark_variant_preparations,
+    agent_run_dispatches,
+    checkpoints,
+    checkpoint_blobs,
+    checkpoint_writes,
+    agent_chat_messages
+TO hindsight_archive;
+
+GRANT SELECT, CHANGEFEED ON TABLE tenant_event_outbox TO hindsight_cdc;
+REVOKE INSERT, UPDATE, DELETE ON TABLE tenant_event_outbox
+FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive, hindsight_cdc;
