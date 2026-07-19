@@ -38,6 +38,19 @@ jobs:
           uv run python scripts/initialize_agent_storage.py
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - name: Run outcome-free vector ordering diagnostic
+        env:
+          DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
+        run: |
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'CREATE DATABASE IF NOT EXISTS hindsight_diagnostic_ci'
+          DATABASE_URL="$DIAGNOSTIC_DATABASE_URL" uv run python scripts/migrate.py
+          DATABASE_URL="$DIAGNOSTIC_DATABASE_URL" \
+            EMBEDDING_PROVIDER=deterministic \
+            uv run python scripts/run_rank_diagnostics.py synthetic \
+              --code-sha "$GITHUB_SHA" \
+              --max-distance 0.35 \
+              --require-target-rank-one
       - run: uv run python scripts/run_learning_benchmark.py ci-smoke
       - run: uv run python scripts/build_lambda_artifacts.py
       - run: uv run python scripts/smoke_lambda_artifacts.py

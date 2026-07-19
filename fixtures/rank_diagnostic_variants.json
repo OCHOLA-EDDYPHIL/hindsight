@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "variants": [
+    {
+      "diagnostic_id": "connection-pool-leak",
+      "query": "database connections remain checked out until the pool is exhausted",
+      "target": "Database connections remain checked out until the pool is exhausted. Trace connection ownership and release every checked-out database connection before increasing pool capacity.",
+      "candidates": [
+        {
+          "candidate_id": "hard-capacity",
+          "role": "hard_distractor",
+          "content": "Increase database connection pool capacity whenever requests wait for a connection."
+        },
+        {
+          "candidate_id": "background-timeout",
+          "role": "background",
+          "content": "The request timeout and retry policy remained unchanged during the incident."
+        }
+      ]
+    },
+    {
+      "diagnostic_id": "retry-backpressure",
+      "query": "encoder retries multiply while the downstream provider is degraded",
+      "target": "Encoder retries multiply while the downstream provider is degraded. Deduplicate submissions and bound retry concurrency while the encoder backlog drains.",
+      "candidates": [
+        {
+          "candidate_id": "hard-workers",
+          "role": "hard_distractor",
+          "content": "Add more retry workers immediately when the downstream encoder becomes slow."
+        },
+        {
+          "candidate_id": "background-cache",
+          "role": "background",
+          "content": "Cache retention settings were unchanged during the provider incident."
+        }
+      ]
+    }
+  ]
+}
