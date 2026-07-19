@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import pytest
 
+from hindsight.server_tenants import PUBLIC_DEMO_TENANT_ID
+
 
 requires_hosted_acceptance = pytest.mark.skipif(
     os.environ.get("RUN_HOSTED_ACCEPTANCE") != "1",
@@ -416,8 +418,11 @@ async def _wait_for_websocket_delivery(
         if result["delivered"] == 1:
             message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
             assert message["type"] == "run"
-            assert message["namespace"] == namespace
-            assert message["data"]["run"]["id"] == result["event_id"]
+            assert message["tenant_id"] == PUBLIC_DEMO_TENANT_ID
+            assert message["topic_keys"] == [
+                f"tenant:{PUBLIC_DEMO_TENANT_ID}:namespace:{namespace}"
+            ]
+            assert message["data"]["reference"]["run_id"] == result["event_id"]
             return
         assert result["delivered"] == 0
         await asyncio.sleep(0.5)
@@ -438,7 +443,7 @@ async def _wait_for_websocket_silence(
             break
         assert result["delivered"] == 1
         message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
-        assert message["data"]["run"]["id"] == result["event_id"]
+        assert message["data"]["reference"]["run_id"] == result["event_id"]
         await asyncio.sleep(0.5)
     else:
         pytest.fail("WebSocket unsubscribe did not become active")
@@ -468,11 +473,15 @@ def _inject_changefeed_event(
         payload={
             "payload": [
                 {
-                    "topic": "agent_runs",
+                    "topic": "tenant_event_outbox",
                     "after": {
                         "id": event_id,
-                        "namespace": namespace,
-                        "status": "triaging",
+                        "tenant_id": PUBLIC_DEMO_TENANT_ID,
+                        "aggregate_type": "agent_runs",
+                        "topics": [
+                            f"tenant:{PUBLIC_DEMO_TENANT_ID}:namespace:{namespace}"
+                        ],
+                        "payload": {"run_id": event_id, "status": "triaging"},
                     },
                 }
             ]
