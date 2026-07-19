@@ -1,5 +1,20 @@
 -- Backfill existing single-tenant rows before enforcing context-derived defaults.
 
+-- Benchmark traces are intentionally immutable after they carry outcomes. Remove
+-- only their UPDATE hooks while assigning the one-time legacy tenant, then restore
+-- every hook before enforcing the tenant constraints below.
+DROP TRIGGER IF EXISTS benchmark_experiment_contract_immutable ON benchmark_experiments;
+DROP TRIGGER IF EXISTS benchmark_trial_trace_immutable ON benchmark_trials;
+DROP TRIGGER IF EXISTS benchmark_action_trace_immutable ON benchmark_actions;
+DROP TRIGGER IF EXISTS benchmark_preregistration_update_immutable
+    ON benchmark_confirmation_preregistrations;
+DROP TRIGGER IF EXISTS benchmark_confirmation_binding_recorded
+    ON benchmark_confirmation_preregistrations;
+DROP TRIGGER IF EXISTS benchmark_confirmation_binding_update_immutable
+    ON benchmark_confirmation_bindings;
+DROP TRIGGER IF EXISTS benchmark_variant_preparation_update_immutable
+    ON benchmark_variant_preparations;
+
 INSERT INTO tenants (id, slug, tenant_kind)
 VALUES ('00000000-0000-0000-0000-000000000001', 'legacy', 'legacy')
 ON CONFLICT (id) DO NOTHING;
@@ -46,6 +61,41 @@ UPDATE checkpoints SET tenant_id = '00000000-0000-0000-0000-000000000001' WHERE 
 UPDATE checkpoint_blobs SET tenant_id = '00000000-0000-0000-0000-000000000001' WHERE tenant_id IS NULL;
 UPDATE checkpoint_writes SET tenant_id = '00000000-0000-0000-0000-000000000001' WHERE tenant_id IS NULL;
 UPDATE agent_chat_messages SET tenant_id = '00000000-0000-0000-0000-000000000001' WHERE tenant_id IS NULL;
+
+CREATE TRIGGER benchmark_experiment_contract_immutable
+BEFORE UPDATE ON benchmark_experiments
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_experiment_contract();
+
+CREATE TRIGGER benchmark_trial_trace_immutable
+BEFORE UPDATE ON benchmark_trials
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_trial_trace();
+
+CREATE TRIGGER benchmark_action_trace_immutable
+BEFORE UPDATE ON benchmark_actions
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_action_immutable();
+
+CREATE TRIGGER benchmark_preregistration_update_immutable
+BEFORE UPDATE ON benchmark_confirmation_preregistrations
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_preregistration_mutation();
+
+CREATE TRIGGER benchmark_confirmation_binding_recorded
+AFTER UPDATE ON benchmark_confirmation_preregistrations
+FOR EACH ROW
+EXECUTE FUNCTION record_benchmark_confirmation_binding();
+
+CREATE TRIGGER benchmark_confirmation_binding_update_immutable
+BEFORE UPDATE ON benchmark_confirmation_bindings
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_confirmation_binding_history();
+
+CREATE TRIGGER benchmark_variant_preparation_update_immutable
+BEFORE UPDATE ON benchmark_variant_preparations
+FOR EACH ROW
+EXECUTE FUNCTION guard_benchmark_variant_preparation_mutation();
 
 ALTER TABLE episodic_memories ALTER COLUMN tenant_id SET NOT NULL;
 ALTER TABLE semantic_memories ALTER COLUMN tenant_id SET NOT NULL;

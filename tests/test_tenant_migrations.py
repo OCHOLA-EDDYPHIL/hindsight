@@ -110,3 +110,36 @@ def test_realtime_outbox_upgrade_recreates_active_triggers_around_function_chang
         create = f"CREATE TRIGGER {trigger}"
         assert migration.index(drop) < function_position
         assert migration.index(create) > function_position
+
+
+def test_tenant_backfill_restores_benchmark_update_guards_after_legacy_assignment():
+    migration = (ROOT / "migrations/0019b_tenant_backfill_and_keys.sql").read_text()
+    trigger_tables = {
+        "benchmark_experiment_contract_immutable": "benchmark_experiments",
+        "benchmark_trial_trace_immutable": "benchmark_trials",
+        "benchmark_action_trace_immutable": "benchmark_actions",
+        "benchmark_preregistration_update_immutable": (
+            "benchmark_confirmation_preregistrations"
+        ),
+        "benchmark_confirmation_binding_recorded": (
+            "benchmark_confirmation_preregistrations"
+        ),
+        "benchmark_confirmation_binding_update_immutable": (
+            "benchmark_confirmation_bindings"
+        ),
+        "benchmark_variant_preparation_update_immutable": (
+            "benchmark_variant_preparations"
+        ),
+    }
+
+    first_backfill = migration.index("UPDATE episodic_memories SET tenant_id")
+    last_backfill = migration.index("UPDATE agent_chat_messages SET tenant_id")
+    first_constraint = migration.index(
+        "ALTER TABLE episodic_memories ALTER COLUMN tenant_id SET NOT NULL"
+    )
+    for trigger, table in trigger_tables.items():
+        drop = f"DROP TRIGGER IF EXISTS {trigger}"
+        create = f"CREATE TRIGGER {trigger}"
+        assert migration.index(drop) < first_backfill
+        assert last_backfill < migration.index(create) < first_constraint
+        assert f"ON {table};" in migration[migration.index(drop) : first_backfill]
