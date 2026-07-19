@@ -584,14 +584,13 @@ def test_historical_read_url_prefers_explicit_store_url():
 
 
 @requires_db
-def test_direct_semantic_write_supports_autocommit_connections():
+def test_direct_semantic_write_supports_tenant_bound_transactions():
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     conn = connect(database_url())
     namespace = f"incident-{uuid4()}"
-    conn.autocommit = True
     try:
         store = MemoryStore(
             conn,
@@ -607,6 +606,7 @@ def test_direct_semantic_write_supports_autocommit_connections():
                 justification="Direct autocommit semantic write remains supported",
             ),
         )
+        conn.commit()
 
         assert conn.execute(
             "SELECT count(*) FROM semantic_memories WHERE id = %s",
