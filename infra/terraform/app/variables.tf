@@ -140,6 +140,12 @@ variable "log_retention_days" {
   default = 14
 }
 
+variable "deployed_revision" {
+  description = "Exact source revision exposed by product health responses."
+  type        = string
+  default     = "unknown"
+}
+
 variable "alarm_actions" {
   description = "Optional SNS topic ARNs for operational alarms."
   type        = list(string)

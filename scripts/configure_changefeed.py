@@ -15,14 +15,8 @@ from hindsight.db import connect
 
 JOB_KEY = "realtime_changefeed_job_id"
 FINGERPRINT_KEY = "realtime_changefeed_fingerprint"
-WATCHED_TABLES = (
-    "incidents",
-    "semantic_memories",
-    "memory_operations",
-    "agent_runs",
-    "agent_run_events",
-)
-CHANGEFEED_SCHEMA_VERSION = 2
+WATCHED_TABLES = ("tenant_event_outbox",)
+CHANGEFEED_SCHEMA_VERSION = 3
 CHANGEFEED_STATE_TIMEOUT_SECONDS = 60.0
 TERMINAL_JOB_STATUSES = frozenset({"canceled", "failed", "succeeded"})
 CHANGEFEED_OPTIONS = {

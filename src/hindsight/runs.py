@@ -186,13 +186,27 @@ def resolve_incident(
                 return _jsonable({"incident": incident, "event": event, "created": True})
 
 
-def list_incidents(*, limit: int = 30, db_url: str | None = None) -> list[dict[str, Any]]:
+def list_incidents(
+    *,
+    limit: int = 30,
+    before_started_at: str | None = None,
+    before_id: str | None = None,
+    db_url: str | None = None,
+) -> list[dict[str, Any]]:
     """Return recent incidents with their newest run state."""
 
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            cursor_clause = ""
+            params: list[Any] = []
+            if before_started_at is not None or before_id is not None:
+                if before_started_at is None or before_id is None:
+                    raise ValueError("incident cursor requires timestamp and identifier")
+                cursor_clause = "WHERE (i.started_at, i.id) < (%s, %s)"
+                params.extend((before_started_at, before_id))
+            params.append(limit)
             cur.execute(
-                """
+                f"""
                     SELECT
                         i.*,
                         s.slug AS service_slug,
@@ -216,10 +230,11 @@ def list_incidents(*, limit: int = 30, db_url: str | None = None) -> list[dict[s
                         ORDER BY created_at DESC
                         LIMIT 1
                     ) AS r ON true
-                    ORDER BY i.started_at DESC, i.created_at DESC
+                    {cursor_clause}
+                    ORDER BY i.started_at DESC, i.id DESC
                     LIMIT %s
                 """,
-                (limit,),
+                params,
             )
             return _jsonable([dict(row) for row in cur.fetchall()])
 

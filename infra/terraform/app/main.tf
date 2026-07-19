@@ -173,6 +173,54 @@ resource "aws_dynamodb_table" "connections" {
   server_side_encryption { enabled = true }
 }
 
+resource "aws_dynamodb_table" "subscriptions" {
+  name         = "${local.name}-websocket-subscriptions"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "topic_key"
+  range_key    = "connection_id"
+
+  attribute {
+    name = "topic_key"
+    type = "S"
+  }
+
+  attribute {
+    name = "connection_id"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "connection-id-index"
+    hash_key        = "connection_id"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption { enabled = true }
+}
+
+resource "aws_dynamodb_table" "changefeed_idempotency" {
+  name         = "${local.name}-changefeed-idempotency"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "event_id"
+
+  attribute {
+    name = "event_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption { enabled = true }
+}
+
 resource "aws_dynamodb_table" "gemini_key_health" {
   name         = "${local.name}-gemini-key-health"
   billing_mode = "PAY_PER_REQUEST"
@@ -318,8 +366,24 @@ resource "aws_iam_role_policy" "worker" {
 
 data "aws_iam_policy_document" "websocket" {
   statement {
-    actions   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+    actions   = ["ssm:GetParameter"]
+    resources = [local.parameter_arns.operator]
+  }
+  statement {
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem"
+    ]
     resources = [aws_dynamodb_table.connections.arn]
+  }
+  statement {
+    actions = ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+    resources = [
+      aws_dynamodb_table.subscriptions.arn,
+      "${aws_dynamodb_table.subscriptions.arn}/index/connection-id-index"
+    ]
   }
 }
 
@@ -334,8 +398,21 @@ data "aws_iam_policy_document" "changefeed" {
     resources = [local.parameter_arns.changefeed]
   }
   statement {
-    actions   = ["dynamodb:Scan", "dynamodb:DeleteItem"]
+    actions   = ["dynamodb:DeleteItem"]
     resources = [aws_dynamodb_table.connections.arn]
+  }
+  statement {
+    actions = ["dynamodb:Query", "dynamodb:DeleteItem"]
+    resources = [
+      aws_dynamodb_table.subscriptions.arn,
+      "${aws_dynamodb_table.subscriptions.arn}/index/connection-id-index"
+    ]
+  }
+  statement {
+    actions = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+    resources = [
+      aws_dynamodb_table.changefeed_idempotency.arn
+    ]
   }
   statement {
     actions   = ["execute-api:ManageConnections"]
@@ -370,11 +447,13 @@ resource "aws_lambda_function" "api" {
   environment {
     variables = {
       HINDSIGHT_DATABASE_URL_PARAM        = var.api_database_url_parameter_name
+      HINDSIGHT_DEPLOYED_REVISION         = var.deployed_revision
       HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM = var.operator_token_parameter_name
       HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
       HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
       HINDSIGHT_ALLOWED_ORIGINS           = var.domain_name == null ? "" : "https://${var.domain_name}"
+      HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
       HINDSIGHT_SECURE_COOKIES            = "1"
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider
@@ -421,6 +500,8 @@ resource "aws_lambda_function" "worker" {
       HINDSIGHT_RUN_DLQ_ARN               = aws_sqs_queue.run_dlq.arn
       HINDSIGHT_RUN_MAX_ATTEMPTS          = tostring(local.run_max_attempts)
       HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS = tostring(local.run_attempt_lease_seconds)
+      HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
+      HINDSIGHT_WORKER_TENANT_ID          = "00000000-0000-0000-0000-000000000002"
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_MODEL                        = var.gemini_model
@@ -446,7 +527,9 @@ resource "aws_lambda_function" "websocket" {
 
   environment {
     variables = {
-      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE = aws_dynamodb_table.connections.name
+      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE   = aws_dynamodb_table.connections.name
+      HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE = aws_dynamodb_table.subscriptions.name
+      HINDSIGHT_REALTIME_TICKET_SECRET_PARAM = var.operator_token_parameter_name
     }
   }
 }
@@ -468,8 +551,10 @@ resource "aws_lambda_function" "changefeed" {
   environment {
     variables = {
       HINDSIGHT_WEBSOCKET_CONNECTION_TABLE    = aws_dynamodb_table.connections.name
+      HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE  = aws_dynamodb_table.subscriptions.name
       HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT = "https://${aws_apigatewayv2_api.websocket.id}.execute-api.${var.aws_region}.amazonaws.com/${var.stage}"
       HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM   = var.changefeed_token_parameter_name
+      HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE  = aws_dynamodb_table.changefeed_idempotency.name
       HINDSIGHT_RUN_QUEUE_URL                 = aws_sqs_queue.runs.url
     }
   }
@@ -564,6 +649,18 @@ resource "aws_apigatewayv2_route" "api_proxy" {
   target    = "integrations/${aws_apigatewayv2_integration.api.id}"
 }
 
+resource "aws_apigatewayv2_route" "api_v2_root" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "ANY /v2"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_apigatewayv2_route" "api_v2_proxy" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "ANY /v2/{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
 resource "aws_apigatewayv2_route" "changefeed" {
   api_id    = aws_apigatewayv2_api.http.id
   route_key = "POST /internal/changefeed"
@@ -605,6 +702,14 @@ resource "aws_lambda_permission" "http_api" {
   function_name = aws_lambda_function.api.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/*/v1*"
+}
+
+resource "aws_lambda_permission" "http_api_v2" {
+  statement_id  = "AllowHttpApiV2"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/*/v2*"
 }
 
 resource "aws_lambda_permission" "http_changefeed" {
@@ -733,6 +838,17 @@ resource "aws_cloudfront_distribution" "ui" {
 
   ordered_cache_behavior {
     path_pattern             = "/v1/*"
+    target_origin_id         = "http-api"
+    viewer_protocol_policy   = "https-only"
+    allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods           = ["GET", "HEAD", "OPTIONS"]
+    compress                 = true
+    cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
+    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer_except_host.id
+  }
+
+  ordered_cache_behavior {
+    path_pattern             = "/v2/*"
     target_origin_id         = "http-api"
     viewer_protocol_policy   = "https-only"
     allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]

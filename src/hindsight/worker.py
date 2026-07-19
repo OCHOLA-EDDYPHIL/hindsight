@@ -32,6 +32,8 @@ from hindsight.runs import (
     transition_run_attempt,
 )
 from hindsight.security import safe_error_detail
+from hindsight.server_tenants import public_demo_tenant_id, worker_tenant_id
+from hindsight.tenant import current_tenant_id, tenant_scope
 from hindsight.tracing import configure_tracing_from_env
 
 RUN_MAX_ATTEMPTS_ENV = "HINDSIGHT_RUN_MAX_ATTEMPTS"
@@ -111,11 +113,23 @@ def _log_record_result(
         LOGGER.info(json.dumps(record, sort_keys=True))
 
 
-def process_message(
-    message: dict[str, Any], *, dead_letter: bool = False
-) -> dict[str, Any] | None:
+def process_message(message: dict[str, Any], *, dead_letter: bool = False) -> dict[str, Any] | None:
     """Process one start or resume command."""
 
+    supplied_tenant = message.get("tenant_id")
+    tenant_id = (
+        worker_tenant_id(supplied_tenant)
+        if supplied_tenant is not None
+        else current_tenant_id()
+        or worker_tenant_id(os.environ.get("HINDSIGHT_WORKER_TENANT_ID", public_demo_tenant_id()))
+    )
+    with tenant_scope(tenant_id):
+        return _process_tenant_message(message, dead_letter=dead_letter)
+
+
+def _process_tenant_message(
+    message: dict[str, Any], *, dead_letter: bool = False
+) -> dict[str, Any] | None:
     configure_tracing_from_env(service_name="hindsight-worker")
     command = str(message.get("command") or "start").strip().lower()
     if command == "dispatch_run_commands":
@@ -158,8 +172,7 @@ def process_message(
         def provider_factory():
             settings = runtime_settings()
             uses_gemini = (
-                settings.provider_env.get("EMBEDDING_PROVIDER", "").strip().lower()
-                == "gemini"
+                settings.provider_env.get("EMBEDDING_PROVIDER", "").strip().lower() == "gemini"
             )
             gemini_pool = gemini_pool_from_env(settings.provider_env) if uses_gemini else None
             return embedding_provider_from_env(

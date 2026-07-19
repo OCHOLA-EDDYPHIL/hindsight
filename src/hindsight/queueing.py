@@ -13,6 +13,8 @@ from uuid import uuid4
 import boto3
 
 from hindsight.aws import aws_client_config
+from hindsight.server_tenants import public_demo_tenant_id
+from hindsight.tenant import current_tenant_id, normalize_tenant_id
 
 RUN_QUEUE_URL_ENV = "HINDSIGHT_RUN_QUEUE_URL"
 INLINE_WORKER_ENV = "HINDSIGHT_INLINE_WORKER"
@@ -29,6 +31,17 @@ class RunQueueUnavailableError(RuntimeError):
 def enqueue_run(message: dict[str, Any], *, client: Any | None = None) -> str:
     """Enqueue one run command, or execute it in a local background thread."""
 
+    bound_tenant = current_tenant_id()
+    supplied_tenant = message.get("tenant_id")
+    normalized_supplied = (
+        normalize_tenant_id(str(supplied_tenant)) if supplied_tenant is not None else None
+    )
+    if bound_tenant is not None and normalized_supplied not in {None, bound_tenant}:
+        raise RuntimeError("internal queue tenant differs from the bound tenant")
+    message = {
+        **message,
+        "tenant_id": bound_tenant or normalized_supplied or public_demo_tenant_id(),
+    }
     queue_url = os.environ.get(RUN_QUEUE_URL_ENV)
     if queue_url:
         resolved_client = client or boto3.client(
@@ -70,10 +83,7 @@ def _run_inline_message(message: dict[str, Any]) -> None:
             ),
             SimpleNamespace(aws_request_id=f"inline:{uuid4()}"),
         )
-        failed = {
-            str(item.get("itemIdentifier"))
-            for item in result.get("batchItemFailures", [])
-        }
+        failed = {str(item.get("itemIdentifier")) for item in result.get("batchItemFailures", [])}
         if message_id not in failed:
             return
         if receive_count < INLINE_MAX_ATTEMPTS:

@@ -189,6 +189,7 @@ jobs:
     environment: demo
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_deployed_revision: ${{ needs.authorize.outputs.source_sha }}
     outputs:
       artifact_name: ${{ steps.plan_name.outputs.name }}
     steps:

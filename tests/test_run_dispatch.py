@@ -339,7 +339,10 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
 
     assert swept["dispatched"] >= 1
     assert [message["body"] for message in client.messages].count(
-        {"command": "start", "run_id": run["id"]}
+        {
+            **dict(leased[0]["payload"]),
+            "tenant_id": str(leased[0]["tenant_id"]),
+        }
     ) == 2
     assert first_claim.outcome == "claimed"
     assert duplicate_claim.outcome == "busy"

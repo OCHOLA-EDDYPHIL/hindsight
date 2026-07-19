@@ -42,7 +42,10 @@ def test_realtime_artifact_has_no_third_party_dependency_bundle():
         "aws.py",
         "queueing.py",
         "realtime.py",
+        "realtime_ticket.py",
         "security.py",
+        "server_tenants.py",
+        "tenant.py",
     ]
 
 
@@ -59,6 +62,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     assert "operations.py" in api["modules"]
     assert "run_dispatch.py" in api["modules"]
     assert "trace_contract.py" in api["modules"]
+    assert {"realtime_ticket.py", "server_tenants.py", "tenant.py"} <= set(api["modules"])
 
 
 def test_worker_artifact_does_not_include_frontend_or_api_framework():
@@ -74,6 +78,8 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
         "embedding_index.py",
         "queueing.py",
         "run_dispatch.py",
+        "server_tenants.py",
+        "tenant.py",
     } <= set(worker["modules"])
 
 
