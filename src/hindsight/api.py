@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
 import hmac
+import json
 import os
 import time
 from datetime import datetime
@@ -13,8 +15,19 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from mangum import Mangum
 from psycopg import errors as psycopg_errors
@@ -50,6 +63,9 @@ from hindsight.runtime import (
     runtime_database_url,
     runtime_settings,
 )
+from hindsight.realtime_ticket import issue_realtime_ticket
+from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, public_demo_tenant_id
+from hindsight.tenant import current_tenant_id, tenant_scope
 from hindsight.runs import (
     RunConflictError,
     RunNotFoundError,
@@ -69,6 +85,7 @@ from hindsight.trace_contract import (
 )
 
 API_PREFIX = "/v1"
+V2_PREFIX = "/v2"
 OPERATOR_COOKIE = "hindsight_operator_session"
 OPERATOR_SESSION_TTL_SECONDS = 4 * 60 * 60
 
@@ -124,6 +141,55 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["authorization", "content-type", "idempotency-key"],
 )
+
+
+@app.middleware("http")
+async def bind_server_tenant(request: Request, call_next):
+    """Bind product routes without accepting a tenant selector."""
+
+    if request.url.path.startswith(f"{API_PREFIX}/"):
+        with tenant_scope(public_demo_tenant_id()):
+            return await call_next(request)
+    if request.url.path.startswith(f"{V2_PREFIX}/"):
+        try:
+            identity = _v2_identity(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        request.state.v2_scopes = identity.scopes
+        with tenant_scope(identity.tenant_id):
+            return await call_next(request)
+    return await call_next(request)
+
+
+@dataclasses.dataclass(frozen=True)
+class V2Identity:
+    tenant_id: str
+    scopes: frozenset[str]
+
+
+def _v2_identity(request: Request) -> V2Identity:
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="protected bearer credential required")
+    try:
+        expected = _operator_secret()
+    except HTTPException as exc:
+        raise HTTPException(status_code=503, detail=exc.detail) from exc
+    if not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="invalid protected credential")
+    return V2Identity(
+        tenant_id=ACCEPTANCE_TENANT_ID,
+        scopes=frozenset({"read", "write", "realtime"}),
+    )
+
+
+def _v2_scope(scope: str):
+    def required(request: Request) -> None:
+        if scope not in getattr(request.state, "v2_scopes", frozenset()):
+            raise HTTPException(status_code=403, detail="credential scope is insufficient")
+
+    return required
 
 
 class IncidentCreate(BaseModel):
@@ -202,6 +268,42 @@ class AcceptedRun(BaseModel):
     created: bool
 
 
+def _revision() -> str:
+    return os.environ.get("HINDSIGHT_DEPLOYED_REVISION", "unknown").strip() or "unknown"
+
+
+def _encode_incident_cursor(row: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {"started_at": str(row["started_at"]), "id": str(row["id"])},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    signature = hmac.new(_operator_secret().encode(), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(payload + signature).decode().rstrip("=")
+
+
+def _decode_incident_cursor(value: str | None) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    if len(value) > 1024:
+        raise HTTPException(status_code=422, detail="cursor is too long")
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(value + padding)
+        payload, signature = decoded[:-32], decoded[-32:]
+        expected = hmac.new(_operator_secret().encode(), payload, hashlib.sha256).digest()
+        if len(signature) != 32 or not hmac.compare_digest(signature, expected):
+            raise ValueError("signature")
+        parsed = json.loads(payload)
+        started_at = str(parsed["started_at"])
+        incident_id = str(parsed["id"])
+        if not started_at or not incident_id:
+            raise ValueError("empty")
+        return started_at, incident_id
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="cursor is invalid") from exc
+
+
 def _api_runtime_settings() -> RuntimeSettings:
     try:
         return runtime_settings()
@@ -232,7 +334,7 @@ def _operator_required(
 
 @app.get(f"{API_PREFIX}/health/live", tags=["health"])
 def health_live() -> dict[str, str]:
-    return {"status": "live"}
+    return {"status": "live", "revision": _revision()}
 
 
 @app.get(f"{API_PREFIX}/health/ready", tags=["health"])
@@ -243,7 +345,82 @@ def health_ready() -> dict[str, str]:
             conn.execute("SELECT 1").fetchone()
     except Exception as exc:
         raise HTTPException(status_code=503, detail="database is unavailable") from exc
-    return {"status": "ready"}
+    return {"status": "ready", "revision": _revision()}
+
+
+@app.get(
+    f"{V2_PREFIX}/health/ready",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
+def v2_health_ready() -> dict[str, str]:
+    return health_ready()
+
+
+@app.post(f"{API_PREFIX}/realtime/ticket", tags=["realtime"])
+def public_realtime_ticket() -> dict[str, Any]:
+    return {
+        "ticket": issue_realtime_ticket(
+            tenant_id=current_tenant_id(required=True),
+            secret=_operator_secret(),
+        ),
+        "expires_in": 60,
+    }
+
+
+@app.post(
+    f"{V2_PREFIX}/realtime/ticket",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("realtime"))],
+)
+def v2_realtime_ticket() -> dict[str, Any]:
+    return public_realtime_ticket()
+
+
+@app.get(
+    f"{V2_PREFIX}/incidents",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
+def v2_incidents_index(
+    limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> dict[str, Any]:
+    before_started_at, before_id = _decode_incident_cursor(cursor)
+    rows = list_incidents(
+        limit=limit + 1,
+        before_started_at=before_started_at,
+        before_id=before_id,
+        db_url=_api_database_url(),
+    )
+    page = rows[:limit]
+    next_cursor = _encode_incident_cursor(page[-1]) if len(rows) > limit and page else None
+    return {"items": page, "next_cursor": next_cursor}
+
+
+@app.get(
+    f"{V2_PREFIX}/incidents/{{slug}}",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
+def v2_incidents_get(slug: str) -> dict[str, Any]:
+    incident = get_incident(slug=slug, db_url=_api_database_url())
+    if incident is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+    return incident
+
+
+@app.post(
+    f"{V2_PREFIX}/incidents",
+    tags=["v2"],
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_v2_scope("write"))],
+)
+def v2_incidents_create(payload: IncidentCreate) -> dict[str, Any]:
+    try:
+        return create_incident(**payload.model_dump(), db_url=_api_database_url())
+    except psycopg_errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="incident slug already exists") from exc
 
 
 @app.get(f"{API_PREFIX}/incidents", tags=["incidents"])
@@ -754,8 +931,7 @@ def _operator_origin_allowed(*, request: Request, origin: str) -> bool:
     supplied_origin = _normalize_origin(origin)
     request_origin = _normalize_origin(f"{request.url.scheme}://{request.url.netloc}")
     return supplied_origin is not None and (
-        supplied_origin == request_origin
-        or supplied_origin in _configured_allowed_origins()
+        supplied_origin == request_origin or supplied_origin in _configured_allowed_origins()
     )
 
 
@@ -778,7 +954,9 @@ def _operator_secret() -> str:
     try:
         return function_auth_token()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="operator authorization is not configured") from exc
+        raise HTTPException(
+            status_code=503, detail="operator authorization is not configured"
+        ) from exc
 
 
 def _signed_session(secret: str) -> str:

@@ -118,6 +118,38 @@ run "complete_demo_graph" {
   }
 
   assert {
+    condition = (
+      aws_dynamodb_table.subscriptions.hash_key == "topic_key" &&
+      aws_dynamodb_table.subscriptions.range_key == "connection_id" &&
+      anytrue([
+        for index in aws_dynamodb_table.subscriptions.global_secondary_index :
+        index.hash_key == "connection_id" && index.name == "connection-id-index"
+      ]) &&
+      aws_dynamodb_table.subscriptions.ttl[0].enabled
+    )
+    error_message = "Realtime fanout must use expiring exact-topic subscriptions with indexed connection cleanup."
+  }
+
+  assert {
+    condition = (
+      aws_dynamodb_table.changefeed_idempotency.hash_key == "event_id" &&
+      aws_dynamodb_table.changefeed_idempotency.ttl[0].enabled &&
+      aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE == aws_dynamodb_table.changefeed_idempotency.name
+    )
+    error_message = "Changefeed delivery must use bounded event-id claims."
+  }
+
+  assert {
+    condition = (
+      aws_apigatewayv2_route.api_v2_root.route_key == "ANY /v2" &&
+      aws_apigatewayv2_route.api_v2_proxy.route_key == "ANY /v2/{proxy+}" &&
+      aws_lambda_function.api.environment[0].variables.HINDSIGHT_REQUIRE_TENANT_CONTEXT == "1" &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_REQUIRE_TENANT_CONTEXT == "1"
+    )
+    error_message = "Both API versions and workers must reach tenant-bound runtime paths."
+  }
+
+  assert {
     condition     = aws_dynamodb_table.gemini_key_health.ttl[0].enabled
     error_message = "Gemini cooldown records must expire."
   }

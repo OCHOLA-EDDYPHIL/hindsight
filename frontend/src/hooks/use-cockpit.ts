@@ -77,6 +77,7 @@ export function useCockpit() {
   const [operator, setOperator] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const noticeTimer = useRef<number>();
+  const snapshotRefreshTimer = useRef<number>();
   const [incidentInput, setIncidentInput] = useState(DEFAULT_REPORT);
   const [rewindAnchor, setRewindAnchor] = useState<string | null>(null);
   const [rewindTimestamp, setRewindTimestamp] = useState("");
@@ -374,6 +375,14 @@ export function useCockpit() {
       if (snapshotView.current !== "live") return;
       const type = payload.type || payload.event;
       const data = payload.data || payload;
+      if (["memory", "operation"].includes(type) && data.reference) {
+        window.clearTimeout(snapshotRefreshTimer.current);
+        snapshotRefreshTimer.current = window.setTimeout(
+          () => void loadSnapshot(null).catch(() => undefined),
+          100,
+        );
+        return;
+      }
       if (type === "memory" && data.memory) {
         const previous = snapshotRef.current;
         if (previous && !previous.as_of) {
@@ -408,7 +417,7 @@ export function useCockpit() {
         if (runId) void loadRun(runId);
       }
     },
-    [applySnapshot, loadRun],
+    [applySnapshot, loadRun, loadSnapshot],
   );
 
   const subscribeSocket = useCallback((targetNamespace = namespaceRef.current) => {
@@ -431,31 +440,43 @@ export function useCockpit() {
     let events: EventSource | undefined;
 
     if (config.websocketUrl) {
-      const connect = () => {
+      const connect = async () => {
         if (disposed) return;
-        const socket = new WebSocket(config.websocketUrl as string);
-        socketRef.current = socket;
-        socket.addEventListener("open", () => {
+        try {
+          const ticket = await requestJson<{ ticket: string }>(config, "/realtime/ticket", {
+            method: "POST",
+          });
           if (disposed) return;
-          if (snapshotView.current === "live") setConnection("live");
-          subscribeSocket(namespaceRef.current);
-        });
-        socket.addEventListener("message", (event) => {
-          try {
-            handleLiveEvent(JSON.parse(event.data));
-          } catch {
-            announce("A live update could not be decoded.", "error");
-          }
-        });
-        socket.addEventListener("close", () => {
+          const url = new URL(config.websocketUrl as string);
+          url.searchParams.set("ticket", ticket.ticket);
+          const socket = new WebSocket(url);
+          socketRef.current = socket;
+          socket.addEventListener("open", () => {
+            if (disposed) return;
+            if (snapshotView.current === "live") setConnection("live");
+            subscribeSocket(namespaceRef.current);
+          });
+          socket.addEventListener("message", (event) => {
+            try {
+              handleLiveEvent(JSON.parse(event.data));
+            } catch {
+              announce("A live update could not be decoded.", "error");
+            }
+          });
+          socket.addEventListener("close", () => {
+            if (disposed) return;
+            if (snapshotView.current === "live") setConnection("reconnecting");
+            if (socketRef.current === socket) socketRef.current = null;
+            reconnectTimer = window.setTimeout(() => void connect(), 1600);
+          });
+          socket.addEventListener("error", () => socket.close());
+        } catch {
           if (disposed) return;
           if (snapshotView.current === "live") setConnection("reconnecting");
-          if (socketRef.current === socket) socketRef.current = null;
-          reconnectTimer = window.setTimeout(connect, 1600);
-        });
-        socket.addEventListener("error", () => socket.close());
+          reconnectTimer = window.setTimeout(() => void connect(), 1600);
+        }
       };
-      connect();
+      void connect();
     } else if (config.eventsBase) {
       const url = `${config.eventsBase}?namespace=${encodeURIComponent(namespace)}`;
       events = new EventSource(url);
@@ -489,6 +510,7 @@ export function useCockpit() {
     return () => {
       disposed = true;
       window.clearTimeout(reconnectTimer);
+      window.clearTimeout(snapshotRefreshTimer.current);
       window.clearInterval(interval);
       events?.close();
       if (socketRef.current) {

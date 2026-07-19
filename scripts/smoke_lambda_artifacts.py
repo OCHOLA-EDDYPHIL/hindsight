@@ -54,8 +54,12 @@ if not (artifact_root / "boto3").exists():
         raise RuntimeError("AWS client access is unavailable during artifact import")
 
     boto3 = types.ModuleType("boto3")
+    boto3.__path__ = []
     boto3.client = unavailable
     boto3.resource = unavailable
+    dynamodb = types.ModuleType("boto3.dynamodb")
+    dynamodb.__path__ = []
+    conditions = types.ModuleType("boto3.dynamodb.conditions")
     botocore = types.ModuleType("botocore")
     botocore.__path__ = []
     config = types.ModuleType("botocore.config")
@@ -69,11 +73,31 @@ if not (artifact_root / "boto3").exists():
     class ClientError(Exception):
         pass
 
+    class Condition:
+        def __init__(self, *args):
+            self.args = args
+
+        def eq(self, value):
+            return Condition(self, value)
+
+        def lt(self, value):
+            return Condition(self, value)
+
+        def not_exists(self):
+            return Condition(self)
+
+        def __or__(self, other):
+            return Condition(self, other)
+
     config.Config = Config
     exceptions.ClientError = ClientError
+    conditions.Attr = Condition
+    conditions.Key = Condition
     sys.modules.update(
         {
             "boto3": boto3,
+            "boto3.dynamodb": dynamodb,
+            "boto3.dynamodb.conditions": conditions,
             "botocore": botocore,
             "botocore.config": config,
             "botocore.exceptions": exceptions,

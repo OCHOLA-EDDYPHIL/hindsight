@@ -54,7 +54,10 @@ def test_public_health_and_guarded_mutation(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
     client = TestClient(app)
 
-    assert client.get("/v1/health/live").json() == {"status": "live"}
+    assert client.get("/v1/health/live").json() == {
+        "status": "live",
+        "revision": "unknown",
+    }
     denied = client.post(
         "/v1/incidents",
         json={
@@ -66,6 +69,151 @@ def test_public_health_and_guarded_mutation(monkeypatch):
     )
 
     assert denied.status_code == 403
+
+
+def test_server_binds_v1_and_v2_without_tenant_request_selectors(monkeypatch):
+    import hindsight.api as api
+    from hindsight.realtime_ticket import verify_realtime_ticket
+    from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, PUBLIC_DEMO_TENANT_ID
+    from hindsight.tenant import current_tenant_id
+
+    calls = []
+    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "protected-secret")
+    monkeypatch.setenv("HINDSIGHT_DEPLOYED_REVISION", "a" * 40)
+    monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+
+    def incidents(**kwargs):
+        calls.append((current_tenant_id(required=True), kwargs))
+        if kwargs["limit"] == 2:
+            return [
+                {
+                    "id": "00000000-0000-0000-0000-000000000010",
+                    "started_at": "2026-07-19T00:00:00+00:00",
+                },
+                {
+                    "id": "00000000-0000-0000-0000-000000000009",
+                    "started_at": "2026-07-18T00:00:00+00:00",
+                },
+            ]
+        return []
+
+    monkeypatch.setattr(api, "list_incidents", incidents)
+
+    def incident(*, slug, db_url):
+        calls.append((current_tenant_id(required=True), {"slug": slug, "db_url": db_url}))
+        if current_tenant_id(required=True) == ACCEPTANCE_TENANT_ID:
+            return {"slug": slug}
+        return None
+
+    created = []
+
+    def create(**kwargs):
+        created.append((current_tenant_id(required=True), kwargs))
+        return {"slug": kwargs["slug"]}
+
+    monkeypatch.setattr(api, "get_incident", incident)
+    monkeypatch.setattr(api, "create_incident", create)
+    client = TestClient(api.app)
+
+    public = client.get(
+        "/v1/incidents?limit=1&tenant_id=00000000-0000-0000-0000-000000000003",
+        headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
+    )
+    assert public.status_code == 200
+    assert calls[0][0] == PUBLIC_DEMO_TENANT_ID
+    hidden = client.get(
+        "/v1/incidents/hidden",
+        headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
+    )
+    assert hidden.status_code == 404
+
+    public_create = client.post(
+        "/v1/incidents",
+        headers={
+            "Authorization": "Bearer protected-secret",
+            "X-Tenant-Id": ACCEPTANCE_TENANT_ID,
+        },
+        json={
+            "slug": "public-incident",
+            "title": "Public incident",
+            "severity": "sev3",
+            "summary": "Public tenant write",
+            "tenant_id": ACCEPTANCE_TENANT_ID,
+        },
+    )
+    assert public_create.status_code == 201
+    assert created[-1][0] == PUBLIC_DEMO_TENANT_ID
+    assert "tenant_id" not in created[-1][1]
+
+    assert client.get("/v2/incidents").status_code == 401
+    assert (
+        client.get("/v2/incidents", headers={"Authorization": "Bearer invalid"}).status_code == 401
+    )
+    protected = client.get(
+        "/v2/incidents?limit=1",
+        headers={
+            "Authorization": "Bearer protected-secret",
+            "X-Tenant-Id": PUBLIC_DEMO_TENANT_ID,
+        },
+    )
+    assert protected.status_code == 200
+    next_cursor = protected.json()["next_cursor"]
+    assert next_cursor
+    assert calls[-1][0] == ACCEPTANCE_TENANT_ID
+    assert calls[-1][1] == {
+        "limit": 2,
+        "before_started_at": None,
+        "before_id": None,
+        "db_url": "postgresql://resolved/database",
+    }
+    protected_hidden = client.get(
+        "/v2/incidents/hidden",
+        headers={"Authorization": "Bearer protected-secret"},
+    )
+    assert protected_hidden.status_code == 200
+    assert calls[-1][0] == ACCEPTANCE_TENANT_ID
+    assert (
+        client.get(
+            f"/v2/incidents?limit=1&cursor={next_cursor}x",
+            headers={"Authorization": "Bearer protected-secret"},
+        ).status_code
+        == 422
+    )
+
+    public_ticket = client.post("/v1/realtime/ticket").json()["ticket"]
+    protected_ticket = client.post(
+        "/v2/realtime/ticket",
+        headers={"Authorization": "Bearer protected-secret"},
+    ).json()["ticket"]
+    assert verify_realtime_ticket(public_ticket, secret="protected-secret") == PUBLIC_DEMO_TENANT_ID
+    assert (
+        verify_realtime_ticket(protected_ticket, secret="protected-secret") == ACCEPTANCE_TENANT_ID
+    )
+    health = client.get(
+        "/v2/health/ready",
+        headers={"Authorization": "Bearer protected-secret"},
+    )
+    assert health.status_code in {200, 503}
+
+    monkeypatch.setattr(
+        api,
+        "_v2_identity",
+        lambda _request: api.V2Identity(
+            tenant_id=ACCEPTANCE_TENANT_ID,
+            scopes=frozenset({"read"}),
+        ),
+    )
+    forbidden = client.post(
+        "/v2/incidents",
+        headers={"Authorization": "Bearer protected-secret"},
+        json={
+            "slug": "forbidden-write",
+            "title": "Forbidden write",
+            "severity": "sev3",
+            "summary": "Read-only credential",
+        },
+    )
+    assert forbidden.status_code == 403
 
 
 def test_operator_session_sets_httponly_cookie(monkeypatch):
@@ -198,8 +346,10 @@ def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatc
     monkeypatch.setattr(
         api,
         "dispatch_run_commands",
-        lambda **kwargs: dispatches.append(kwargs)
-        or {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0},
+        lambda **kwargs: (
+            dispatches.append(kwargs)
+            or {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+        ),
     )
     client = TestClient(api.app)
 
@@ -287,8 +437,10 @@ def test_idempotent_run_request_retries_its_pending_dispatch(monkeypatch):
     monkeypatch.setattr(
         api,
         "dispatch_run_commands",
-        lambda **kwargs: dispatches.append(kwargs)
-        or {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0},
+        lambda **kwargs: (
+            dispatches.append(kwargs)
+            or {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+        ),
     )
 
     accepted = api.runs_create(
@@ -521,8 +673,7 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
     monkeypatch.setattr(
         api,
         "current_database_timestamp",
-        lambda **kwargs: calls.append(("anchor", kwargs))
-        or "2026-07-17T12:00:00.123456+00:00",
+        lambda **kwargs: calls.append(("anchor", kwargs)) or "2026-07-17T12:00:00.123456+00:00",
     )
     monkeypatch.setattr(
         api,

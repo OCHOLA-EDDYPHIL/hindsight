@@ -92,3 +92,21 @@ def test_tenant_foreign_keys_rls_and_cdc_roles_are_explicit():
     assert "ALTER ROLE hindsight_memory_worker NOBYPASSRLS" in roles
     assert "GRANT INSERT ON TABLE tenant_event_outbox" in roles
     assert "GRANT SELECT, CHANGEFEED ON TABLE tenant_event_outbox TO hindsight_cdc" in roles
+
+
+def test_realtime_outbox_upgrade_recreates_active_triggers_around_function_change():
+    migration = (ROOT / "migrations/0021_outbox_realtime_payload.sql").read_text()
+    trigger_names = {
+        "incidents_tenant_event_outbox": "incidents",
+        "semantic_memories_tenant_event_outbox": "semantic_memories",
+        "memory_operations_tenant_event_outbox": "memory_operations",
+        "agent_runs_tenant_event_outbox": "agent_runs",
+        "agent_run_events_tenant_event_outbox": "agent_run_events",
+    }
+
+    function_position = migration.index("CREATE OR REPLACE FUNCTION")
+    for trigger, table in trigger_names.items():
+        drop = f"DROP TRIGGER IF EXISTS {trigger} ON {table};"
+        create = f"CREATE TRIGGER {trigger}"
+        assert migration.index(drop) < function_position
+        assert migration.index(create) > function_position

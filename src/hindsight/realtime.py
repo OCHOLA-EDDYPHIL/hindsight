@@ -12,19 +12,26 @@ from decimal import Decimal
 from typing import Any
 
 import boto3
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from hindsight.aws import aws_client_config
 from hindsight.queueing import enqueue_run
+from hindsight.realtime_ticket import verify_realtime_ticket
 from hindsight.security import safe_error_detail
 
 CONNECTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
+SUBSCRIPTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE"
+IDEMPOTENCY_TABLE_ENV = "HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE"
 MANAGEMENT_ENDPOINT_ENV = "HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT"
 CHANGEFEED_TOKEN_ENV = "HINDSIGHT_CHANGEFEED_AUTH_TOKEN"
 CHANGEFEED_TOKEN_PARAM_ENV = "HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM"
+TICKET_SECRET_PARAM_ENV = "HINDSIGHT_REALTIME_TICKET_SECRET_PARAM"
 CONNECTION_TTL_SECONDS = 24 * 60 * 60
+EVENT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 EVENT_VERSION = 1
 _CHANGEFEED_TOKEN_CACHE: str | None = None
+_TICKET_SECRET_CACHE: str | None = None
 
 
 def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -36,25 +43,35 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not connection_id:
         return _response(400, {"error": "connection id is required"})
     table_name = os.environ.get(CONNECTION_TABLE_ENV)
-    if not table_name:
+    subscription_table_name = os.environ.get(SUBSCRIPTION_TABLE_ENV)
+    if not table_name or not subscription_table_name:
         return _response(503, {"error": "connection registry is not configured"})
-    table = boto3.resource(
+    dynamodb = boto3.resource(
         "dynamodb",
         region_name=os.environ.get("AWS_REGION"),
         config=aws_client_config(read_timeout=10),
-    ).Table(table_name)
+    )
+    table = dynamodb.Table(table_name)
+    subscriptions = dynamodb.Table(subscription_table_name)
     try:
         if route == "$connect":
+            ticket = str((event.get("queryStringParameters") or {}).get("ticket") or "")
+            try:
+                tenant_id = verify_realtime_ticket(ticket, secret=_ticket_secret())
+            except ValueError as exc:
+                return _response(401, {"error": str(exc)})
             table.put_item(
                 Item={
                     "connection_id": connection_id,
                     "namespace": "",
                     "run_id": "",
+                    "tenant_id": tenant_id,
                     "expires_at": int(time.time()) + CONNECTION_TTL_SECONDS,
                 }
             )
             return _response(200, {"connected": True})
         if route == "$disconnect":
+            _delete_subscriptions(subscriptions, connection_id)
             table.delete_item(Key={"connection_id": connection_id})
             return _response(200, {"connected": False})
 
@@ -69,6 +86,31 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if message_type == "unsubscribe":
             namespace = ""
             run_id = ""
+        connection = table.get_item(
+            Key={"connection_id": connection_id},
+            ConsistentRead=True,
+        ).get("Item")
+        if not connection:
+            return _response(404, {"error": "connection is not registered"})
+        tenant_id = str(connection.get("tenant_id") or "")
+        if not tenant_id:
+            return _response(403, {"error": "connection tenant is unavailable"})
+        _delete_subscriptions(subscriptions, connection_id)
+        expires_at = int(time.time()) + CONNECTION_TTL_SECONDS
+        if message_type == "subscribe":
+            topic_keys = []
+            if namespace:
+                topic_keys.append(f"tenant:{tenant_id}:namespace:{namespace}")
+            if run_id:
+                topic_keys.append(f"tenant:{tenant_id}:run:{run_id}")
+            for topic_key in topic_keys:
+                subscriptions.put_item(
+                    Item={
+                        "topic_key": topic_key,
+                        "connection_id": connection_id,
+                        "expires_at": expires_at,
+                    }
+                )
         table.update_item(
             Key={"connection_id": connection_id},
             UpdateExpression=(
@@ -78,7 +120,7 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             ExpressionAttributeValues={
                 ":namespace": namespace or "",
                 ":run_id": run_id or "",
-                ":expires_at": int(time.time()) + CONNECTION_TTL_SECONDS,
+                ":expires_at": expires_at,
             },
             ConditionExpression="attribute_exists(connection_id)",
         )
@@ -102,31 +144,48 @@ def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         rows = body.get("payload", []) if isinstance(body, dict) else body
         if not isinstance(rows, list):
             raise ValueError("changefeed payload must be a list")
-        envelopes = [envelope for row in rows if (envelope := normalize_changefeed_row(row))]
-        consolidation_jobs = 0
-        for row in rows:
-            transition = _resolved_incident_transition(row)
-            if transition is None:
-                continue
-            enqueue_run(
-                {
-                    "command": "consolidation",
-                    "incident_id": transition["id"],
-                    "source_event_id": transition["resolution_event_id"],
-                }
-            )
-            consolidation_jobs += 1
+        accepted = 0
         delivered = 0
         stale = 0
-        for envelope in envelopes:
-            result = fanout_event(envelope)
-            delivered += result["delivered"]
-            stale += result["stale"]
+        duplicates_ignored = 0
+        consolidation_jobs = 0
+        for row in rows:
+            event_id = _outbox_event_id(row)
+            if event_id is not None and not _claim_outbox_event(event_id):
+                duplicates_ignored += 1
+                continue
+            try:
+                transition = _resolved_incident_transition(row)
+                if transition is not None:
+                    enqueue_run(
+                        {
+                            "command": "consolidation",
+                            "incident_id": transition["id"],
+                            "source_event_id": transition["resolution_event_id"],
+                            **(
+                                {"tenant_id": transition["tenant_id"]}
+                                if transition.get("tenant_id")
+                                else {}
+                            ),
+                        }
+                    )
+                    consolidation_jobs += 1
+                envelope = normalize_changefeed_row(row)
+                if envelope is not None:
+                    result = fanout_event(envelope)
+                    accepted += 1
+                    delivered += result["delivered"]
+                    stale += result["stale"]
+            except Exception:
+                if event_id is not None:
+                    _release_outbox_event(event_id)
+                raise
         return _response(
             200,
             {
-                "accepted": len(envelopes),
+                "accepted": accepted,
                 "delivered": delivered,
+                "duplicates_ignored": duplicates_ignored,
                 "stale_connections_removed": stale,
                 "consolidation_jobs_queued": consolidation_jobs,
             },
@@ -149,6 +208,36 @@ def normalize_changefeed_row(row: Any) -> dict[str, Any] | None:
         return None
     topic = str(row.get("topic") or row.get("table") or "").split(".")[-1]
     updated = row.get("updated") or after.get("updated_at") or datetime.now(UTC).isoformat()
+    if topic == "tenant_event_outbox":
+        aggregate_type = str(after.get("aggregate_type") or "")
+        event_type = {
+            "semantic_memories": "memory",
+            "memory_operations": "operation",
+            "agent_runs": "run",
+            "agent_run_events": "run_event",
+        }.get(aggregate_type)
+        if event_type is None:
+            return None
+        event_id = str(after.get("id") or "")
+        tenant_id = str(after.get("tenant_id") or "")
+        if not event_id or not tenant_id:
+            raise ValueError("outbox event identity is required")
+        payload = after.get("payload") if isinstance(after.get("payload"), dict) else {}
+        topics = after.get("topics") if isinstance(after.get("topics"), list) else []
+        topic_keys = [str(value) for value in topics]
+        if any(not value.startswith(f"tenant:{tenant_id}:") for value in topic_keys):
+            raise ValueError("outbox topic tenant does not match event tenant")
+        return {
+            "version": EVENT_VERSION,
+            "event_id": event_id,
+            "tenant_id": tenant_id,
+            "topic_keys": topic_keys,
+            "type": event_type,
+            "namespace": None,
+            "run_id": str(payload.get("run_id")) if payload.get("run_id") else None,
+            "occurred_at": str(updated),
+            "data": {"reference": _jsonable(payload)},
+        }
     namespace = after.get("namespace")
     run_id = after.get("run_id") or (after.get("id") if topic == "agent_runs" else None)
 
@@ -180,6 +269,26 @@ def _resolved_incident_transition(row: Any) -> dict[str, str] | None:
     if not isinstance(row, dict):
         return None
     topic = str(row.get("topic") or row.get("table") or "").split(".")[-1]
+    if topic == "tenant_event_outbox":
+        after = row.get("after")
+        if after is None and isinstance(row.get("value"), dict):
+            after = row["value"].get("after", row["value"])
+        if not isinstance(after, dict) or after.get("aggregate_type") != "incidents":
+            return None
+        payload = after.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("previous_status") == "resolved" or payload.get("status") != "resolved":
+            return None
+        if payload.get("consolidation_policy", "managed") != "managed":
+            return None
+        if not payload.get("incident_id") or not payload.get("resolution_event_id"):
+            return None
+        return {
+            "id": str(payload["incident_id"]),
+            "resolution_event_id": str(payload["resolution_event_id"]),
+            "tenant_id": str(after.get("tenant_id") or ""),
+        }
     if topic != "incidents":
         return None
     value = row.get("value") if isinstance(row.get("value"), dict) else row
@@ -201,22 +310,48 @@ def _resolved_incident_transition(row: Any) -> dict[str, str] | None:
     }
 
 
+def _outbox_event_id(row: Any) -> str | None:
+    if not isinstance(row, dict) or row.get("resolved"):
+        return None
+    topic = str(row.get("topic") or row.get("table") or "").split(".")[-1]
+    if topic != "tenant_event_outbox":
+        return None
+    after = row.get("after")
+    if after is None and isinstance(row.get("value"), dict):
+        after = row["value"].get("after", row["value"])
+    if not isinstance(after, dict) or not after.get("id"):
+        raise ValueError("outbox event identity is required")
+    return str(after["id"])
+
+
 def fanout_event(
     envelope: dict[str, Any],
     *,
     table: Any | None = None,
+    connection_table: Any | None = None,
     management_client: Any | None = None,
 ) -> dict[str, int]:
     """Send an event to matching subscriptions and remove HTTP 410 connections."""
 
-    table = table or _connection_table()
+    table = table or _subscription_table()
+    connection_table = connection_table or _connection_table()
     management_client = management_client or _management_client()
     delivered = 0
     stale = 0
-    for connection in _scan_connections(table):
-        if not _subscription_matches(connection, envelope):
+    subscriptions: dict[str, dict[str, Any]] = {}
+    for topic_key in envelope.get("topic_keys") or []:
+        response = table.query(KeyConditionExpression=Key("topic_key").eq(str(topic_key)))
+        for subscription in response.get("Items", []):
+            subscriptions[str(subscription["connection_id"])] = subscription
+    for connection_id, subscription in subscriptions.items():
+        if int(subscription.get("expires_at") or 0) <= int(time.time()):
+            table.delete_item(
+                Key={
+                    "topic_key": subscription["topic_key"],
+                    "connection_id": connection_id,
+                }
+            )
             continue
-        connection_id = str(connection["connection_id"])
         try:
             management_client.post_to_connection(
                 ConnectionId=connection_id,
@@ -226,36 +361,24 @@ def fanout_event(
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") not in {"GoneException", "410"}:
                 raise
-            table.delete_item(Key={"connection_id": connection_id})
+            _delete_subscriptions(table, connection_id)
+            connection_table.delete_item(Key={"connection_id": connection_id})
             stale += 1
     return {"delivered": delivered, "stale": stale}
 
 
-def _scan_connections(table: Any):
-    start_key = None
-    while True:
-        kwargs = {
-            "ProjectionExpression": "connection_id, #namespace, run_id, expires_at",
-            "ExpressionAttributeNames": {"#namespace": "namespace"},
-        }
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        response = table.scan(**kwargs)
-        yield from response.get("Items", [])
-        start_key = response.get("LastEvaluatedKey")
-        if not start_key:
-            return
-
-
-def _subscription_matches(connection: dict[str, Any], envelope: dict[str, Any]) -> bool:
-    if int(connection.get("expires_at") or 0) <= int(time.time()):
-        return False
-    namespace = str(connection.get("namespace") or "")
-    run_id = str(connection.get("run_id") or "")
-    return bool(
-        (namespace and namespace == str(envelope.get("namespace") or ""))
-        or (run_id and run_id == str(envelope.get("run_id") or ""))
+def _delete_subscriptions(table: Any, connection_id: str) -> None:
+    response = table.query(
+        IndexName="connection-id-index",
+        KeyConditionExpression=Key("connection_id").eq(connection_id),
     )
+    for item in response.get("Items", []):
+        table.delete_item(
+            Key={
+                "topic_key": item["topic_key"],
+                "connection_id": connection_id,
+            }
+        )
 
 
 def _normalize_memory(row: dict[str, Any]) -> dict[str, Any]:
@@ -299,6 +422,22 @@ def _changefeed_token() -> str | None:
     return _CHANGEFEED_TOKEN_CACHE
 
 
+def _ticket_secret() -> str:
+    global _TICKET_SECRET_CACHE
+    if _TICKET_SECRET_CACHE is not None:
+        return _TICKET_SECRET_CACHE
+    parameter = os.environ.get(TICKET_SECRET_PARAM_ENV)
+    if not parameter:
+        raise ValueError("realtime ticket verification is not configured")
+    response = boto3.client(
+        "ssm",
+        region_name=os.environ.get("AWS_REGION"),
+        config=aws_client_config(read_timeout=10),
+    ).get_parameter(Name=parameter, WithDecryption=True)
+    _TICKET_SECRET_CACHE = str(response["Parameter"]["Value"])
+    return _TICKET_SECRET_CACHE
+
+
 def _connection_table() -> Any:
     table_name = os.environ.get(CONNECTION_TABLE_ENV)
     if not table_name:
@@ -308,6 +447,48 @@ def _connection_table() -> Any:
         region_name=os.environ.get("AWS_REGION"),
         config=aws_client_config(read_timeout=10),
     ).Table(table_name)
+
+
+def _subscription_table() -> Any:
+    table_name = os.environ.get(SUBSCRIPTION_TABLE_ENV)
+    if not table_name:
+        raise RuntimeError(f"{SUBSCRIPTION_TABLE_ENV} is required")
+    return boto3.resource(
+        "dynamodb",
+        region_name=os.environ.get("AWS_REGION"),
+        config=aws_client_config(read_timeout=10),
+    ).Table(table_name)
+
+
+def _idempotency_table() -> Any:
+    table_name = os.environ.get(IDEMPOTENCY_TABLE_ENV)
+    if not table_name:
+        raise RuntimeError(f"{IDEMPOTENCY_TABLE_ENV} is required")
+    return boto3.resource(
+        "dynamodb",
+        region_name=os.environ.get("AWS_REGION"),
+        config=aws_client_config(read_timeout=10),
+    ).Table(table_name)
+
+
+def _claim_outbox_event(event_id: str, *, table: Any | None = None) -> bool:
+    resolved_table = table or _idempotency_table()
+    now = int(time.time())
+    try:
+        resolved_table.put_item(
+            Item={
+                "event_id": event_id,
+                "expires_at": now + EVENT_IDEMPOTENCY_TTL_SECONDS,
+            },
+            ConditionExpression=(Attr("event_id").not_exists() | Attr("expires_at").lt(now)),
+        )
+    except resolved_table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    return True
+
+
+def _release_outbox_event(event_id: str, *, table: Any | None = None) -> None:
+    (table or _idempotency_table()).delete_item(Key={"event_id": event_id})
 
 
 def _management_client() -> Any:

@@ -106,4 +106,72 @@ describe("cockpit historical snapshot selection", () => {
     expect(result.current.snapshot?.as_of).toBe(currentSnapshot.timeline[0]);
     expect(result.current.connection).toBe("historical");
   });
+
+  it("refetches a live snapshot for sanitized realtime references", async () => {
+    window.HINDSIGHT_CONFIG = {
+      ...window.HINDSIGHT_CONFIG,
+      websocketUrl: "wss://socket.example.test/demo",
+    };
+    let snapshotRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/operator/session") {
+          return Promise.resolve(jsonResponse({ operator: false }));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/lesson-traces") {
+          return Promise.resolve(jsonResponse({ count: 0, traces: [] }));
+        }
+        if (url.pathname === "/v1/realtime/ticket") {
+          return Promise.resolve(jsonResponse({ ticket: "signed-ticket" }));
+        }
+        if (url.pathname === "/snapshot") {
+          snapshotRequests += 1;
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    let latestSocket: FakeWebSocket | undefined;
+    class FakeWebSocket {
+      readyState = 1;
+      listeners = new Map<string, (event: any) => void>();
+
+      constructor(public url: string) {
+        latestSocket = this;
+      }
+
+      addEventListener(type: string, listener: (event: any) => void) {
+        this.listeners.set(type, listener);
+      }
+
+      send() {}
+
+      close() {}
+    }
+    Object.assign(FakeWebSocket, { OPEN: 1 });
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await waitFor(() => expect(latestSocket).toBeDefined());
+    expect(String(latestSocket?.url)).toContain("ticket=signed-ticket");
+    expect(snapshotRequests).toBe(1);
+
+    act(() => {
+      latestSocket?.listeners.get("message")?.({
+        data: JSON.stringify({
+          type: "memory",
+          data: { reference: { id: "memory-1", status: "active" } },
+        }),
+      });
+    });
+
+    await waitFor(() => expect(snapshotRequests).toBe(2));
+  });
 });
