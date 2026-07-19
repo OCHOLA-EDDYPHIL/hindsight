@@ -310,6 +310,98 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
     ]
 
 
+def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_path):
+    workflow_path = ".github/workflows/verify-deployed.yml"
+    workflow = pathlib.Path(workflow_path).read_text()
+    parsed = yaml.safe_load(workflow)
+    authorize = workflow.split("  authorize:\n", 1)[1].split("  verify:\n", 1)[0]
+    verify = workflow.split("  verify:\n", 1)[1]
+
+    assert "  workflow_dispatch:\n" in workflow
+    assert "pull_request:" not in workflow
+    assert set(parsed["jobs"]) == {"authorize", "verify"}
+    assert parsed["jobs"]["verify"]["needs"] == "authorize"
+    assert parsed["jobs"]["verify"]["permissions"] == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert '"$REF_NAME" == "refs/heads/main"' in authorize
+    assert '"$WORKFLOW_REF" == ' in authorize
+    assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorize
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorize
+    assert "=~ ^[0-9a-f]{40}$" in authorize
+
+    output = tmp_path / "authorized-output"
+    result = _run_authorization_script(
+        workflow_path,
+        values={
+            "EVENT_NAME": "workflow_dispatch",
+            "REF_NAME": "refs/heads/main",
+            "WORKFLOW_REF": (
+                "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
+            ),
+            "REPOSITORY": "owner/project",
+            "ACTOR": "owner",
+            "TRIGGERING_ACTOR": "owner",
+            "REPOSITORY_OWNER": "owner",
+            "REQUESTED_SHA": "a" * 40,
+        },
+        output_path=output,
+    )
+    assert result.returncode == 0
+    assert output.read_text().strip() == f"expected_sha={'a' * 40}"
+    rejected = _run_authorization_script(
+        workflow_path,
+        values={
+            "EVENT_NAME": "workflow_dispatch",
+            "REF_NAME": "refs/heads/main",
+            "WORKFLOW_REF": (
+                "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
+            ),
+            "REPOSITORY": "owner/project",
+            "ACTOR": "owner",
+            "TRIGGERING_ACTOR": "maintainer",
+            "REPOSITORY_OWNER": "owner",
+            "REQUESTED_SHA": "a" * 40,
+        },
+        output_path=tmp_path / "rejected-output",
+    )
+    assert rejected.returncode != 0
+
+    assert "ref: ${{ needs.authorize.outputs.expected_sha }}" in verify
+    assert "Verify exact source revision" in verify
+    assert "aws apigatewayv2 get-apis" in verify
+    assert "hindsight-demo-http" in verify
+    assert "hindsight-demo-websocket" in verify
+    assert 'f"{api_url}/v1/health/live"' in verify
+    assert 'f"{api_url}/v1/health/ready"' in verify
+    assert 'f"{api_url}/v1/incidents?limit=1"' in verify
+    assert 'f"{ui_url}/v1/health/ready"' in verify
+    assert "revision\": expected_sha" in verify
+    assert "/v1/realtime/ticket" in verify
+    assert "urlencode({'ticket': ticket})" in verify
+    assert "from websockets.asyncio.client import connect" in verify
+    assert 'RuntimeError("ticketed WebSocket verification failed")' in verify
+    python_steps = [
+        step["run"]
+        for step in parsed["jobs"]["verify"]["steps"]
+        if "uv run python - <<'PY'" in step.get("run", "")
+    ]
+    assert len(python_steps) == 2
+    for run in python_steps:
+        source = run.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        compile(source, workflow_path, "exec")
+    for forbidden in (
+        "terraform",
+        "scripts/migrate.py",
+        "initialize_agent_storage.py",
+        "apply_database_roles.py",
+        "deployment_preflight.py",
+        "configure_changefeed.py",
+    ):
+        assert forbidden not in workflow
+
+
 def test_product_preflight_does_not_repeat_normal_ci():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     preflight = workflow.split("  product_preflight:\n", 1)[1].split(
