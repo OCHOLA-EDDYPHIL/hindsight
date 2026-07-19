@@ -43,10 +43,10 @@ ALTER TABLE incident_semantic_memories
 ALTER TABLE agent_runs
     ADD CONSTRAINT agent_runs_tenant_incident_fk
         FOREIGN KEY (tenant_id, incident_id)
-        REFERENCES incidents (tenant_id, id) ON DELETE SET NULL,
+        REFERENCES incidents (tenant_id, id),
     ADD CONSTRAINT agent_runs_tenant_reflected_memory_fk
         FOREIGN KEY (tenant_id, reflected_memory_id)
-        REFERENCES semantic_memories (tenant_id, id) ON DELETE SET NULL,
+        REFERENCES semantic_memories (tenant_id, id),
     ADD CONSTRAINT agent_runs_tenant_decision_fk
         FOREIGN KEY (tenant_id, decision_id)
         REFERENCES memory_decisions (tenant_id, id);
@@ -59,7 +59,7 @@ ALTER TABLE agent_run_events
 ALTER TABLE memory_decisions
     ADD CONSTRAINT memory_decisions_tenant_run_fk
     FOREIGN KEY (tenant_id, run_id)
-    REFERENCES agent_runs (tenant_id, id) ON DELETE SET NULL;
+    REFERENCES agent_runs (tenant_id, id);
 
 ALTER TABLE semantic_memories
     ADD CONSTRAINT semantic_memories_tenant_belief_fk
@@ -142,7 +142,7 @@ ALTER TABLE agent_reflections
         REFERENCES memory_decisions (tenant_id, id),
     ADD CONSTRAINT agent_reflections_tenant_run_fk
         FOREIGN KEY (tenant_id, run_id)
-        REFERENCES agent_runs (tenant_id, id) ON DELETE SET NULL,
+        REFERENCES agent_runs (tenant_id, id),
     ADD CONSTRAINT agent_reflections_tenant_memory_fk
         FOREIGN KEY (tenant_id, semantic_memory_id)
         REFERENCES semantic_memories (tenant_id, id),
@@ -177,7 +177,7 @@ ALTER TABLE memory_review_items
 ALTER TABLE incidents
     ADD CONSTRAINT incidents_tenant_resolution_event_fk
     FOREIGN KEY (tenant_id, resolution_event_id)
-    REFERENCES incident_events (tenant_id, id) ON DELETE SET NULL;
+    REFERENCES incident_events (tenant_id, id);
 
 ALTER TABLE consolidation_jobs
     ADD CONSTRAINT consolidation_jobs_tenant_incident_fk
