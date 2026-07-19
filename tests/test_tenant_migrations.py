@@ -94,6 +94,17 @@ def test_tenant_foreign_keys_rls_and_cdc_roles_are_explicit():
     assert "GRANT SELECT, CHANGEFEED ON TABLE tenant_event_outbox TO hindsight_cdc" in roles
 
 
+def test_relationship_foreign_keys_are_restart_safe_after_schema_retries():
+    relationships = (ROOT / "migrations/0019d_tenant_relationship_foreign_keys.sql").read_text()
+
+    assert "ADD CONSTRAINT " not in relationships.replace(
+        "ADD CONSTRAINT IF NOT EXISTS ", ""
+    )
+    assert relationships.count("ADD CONSTRAINT IF NOT EXISTS") == relationships.count(
+        "FOREIGN KEY"
+    )
+
+
 def test_realtime_outbox_upgrade_recreates_active_triggers_around_function_change():
     migration = (ROOT / "migrations/0021_outbox_realtime_payload.sql").read_text()
     trigger_names = {
