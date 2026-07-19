@@ -5,7 +5,6 @@ CREATE OR REPLACE FUNCTION emit_tenant_event_outbox()
 RETURNS TRIGGER
 LANGUAGE PLpgSQL
 SECURITY DEFINER
-SET search_path = public, pg_temp
 AS $$
 DECLARE
     row_data JSONB;
@@ -46,7 +45,7 @@ BEGIN
         'updated_at', COALESCE(row_data->>'updated_at', row_data->>'created_at')
     ));
 
-    INSERT INTO tenant_event_outbox (
+    INSERT INTO public.tenant_event_outbox (
         tenant_id, event_type, aggregate_type, aggregate_id, topics, payload
     ) VALUES (
         event_tenant,
