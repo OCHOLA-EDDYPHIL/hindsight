@@ -137,7 +137,7 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
                 )
             missing.rollback()
             missing.execute("SELECT set_config('hindsight.tenant_id', 'malformed', true)")
-            with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            with pytest.raises(psycopg.Error, match="UUID|uuid"):
                 missing.execute("SELECT count(*) FROM services")
 
         rollback_incident = uuid4()

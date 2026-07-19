@@ -90,4 +90,5 @@ def test_tenant_foreign_keys_rls_and_cdc_roles_are_explicit():
     assert "FOREIGN KEY (tenant_id, memory_id)" in relationships
     assert "ALTER ROLE hindsight_agent_writer NOBYPASSRLS" in roles
     assert "ALTER ROLE hindsight_memory_worker NOBYPASSRLS" in roles
+    assert "GRANT INSERT ON TABLE tenant_event_outbox" in roles
     assert "GRANT SELECT, CHANGEFEED ON TABLE tenant_event_outbox TO hindsight_cdc" in roles

@@ -314,6 +314,10 @@ GRANT SELECT ON TABLE
     agent_chat_messages
 TO hindsight_archive;
 
+GRANT INSERT ON TABLE tenant_event_outbox
+TO hindsight_agent_writer, hindsight_memory_worker;
 GRANT SELECT, CHANGEFEED ON TABLE tenant_event_outbox TO hindsight_cdc;
+REVOKE SELECT, UPDATE, DELETE ON TABLE tenant_event_outbox
+FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive;
 REVOKE INSERT, UPDATE, DELETE ON TABLE tenant_event_outbox
-FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive, hindsight_cdc;
+FROM hindsight_archive, hindsight_cdc;
