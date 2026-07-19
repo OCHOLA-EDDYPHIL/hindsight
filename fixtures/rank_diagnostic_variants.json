@@ -4,7 +4,7 @@
     {
       "diagnostic_id": "connection-pool-leak",
       "query": "database connections remain checked out until the pool is exhausted",
-      "target": "Trace connection ownership and release every checked-out database connection before increasing pool capacity.",
+      "target": "Database connections remain checked out until the pool is exhausted. Trace connection ownership and release every checked-out database connection before increasing pool capacity.",
       "candidates": [
         {
           "candidate_id": "hard-capacity",
@@ -21,7 +21,7 @@
     {
       "diagnostic_id": "retry-backpressure",
       "query": "encoder retries multiply while the downstream provider is degraded",
-      "target": "Deduplicate submissions and bound retry concurrency while the encoder backlog drains.",
+      "target": "Encoder retries multiply while the downstream provider is degraded. Deduplicate submissions and bound retry concurrency while the encoder backlog drains.",
       "candidates": [
         {
           "candidate_id": "hard-workers",
