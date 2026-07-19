@@ -76,7 +76,7 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
         conn.commit()
 
     resolution = _post_json(
-        f"{api_url}/v1/incidents/{slug}/resolution",
+        f"{api_url}/v2/incidents/{slug}/resolution",
         token=operator_token,
         payload={
             "root_cause": "Retry amplification overloaded an unhealthy payment processor.",

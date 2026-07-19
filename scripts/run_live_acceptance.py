@@ -20,7 +20,7 @@ from xml.etree import ElementTree
 import psycopg
 from psycopg import sql
 
-from hindsight.server_tenants import ACCEPTANCE_TENANT_ID
+from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, PUBLIC_DEMO_TENANT_ID
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -392,7 +392,8 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
     env = dict(os.environ)
     env["HINDSIGHT_ACCEPTANCE_PHASE_ID"] = str(uuid4())
     env["RUN_HOSTED_ACCEPTANCE"] = "1"
-    env["PGOPTIONS"] = f"-c hindsight.tenant_id={ACCEPTANCE_TENANT_ID}"
+    tenant_id = _hosted_phase_tenant_id(args.phase)
+    env["PGOPTIONS"] = f"-c hindsight.tenant_id={tenant_id}"
     selectors = HOSTED_PHASE_SELECTORS[args.phase]
     if args.phase == "roles":
         for name in (
@@ -429,6 +430,12 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
         _required_env("HINDSIGHT_CHANGEFEED_AUTH_TOKEN")
         _verify_changefeed(env)
     _run_hosted_pytest(selectors, env=env, phase=args.phase)
+
+
+def _hosted_phase_tenant_id(phase: str) -> str:
+    if phase in {"worker", "browser"}:
+        return PUBLIC_DEMO_TENANT_ID
+    return ACCEPTANCE_TENANT_ID
 
 
 def _verify_changefeed(env: dict[str, str]) -> None:

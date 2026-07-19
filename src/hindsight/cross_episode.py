@@ -234,7 +234,7 @@ def _record_demo_session(*, namespace: str, db_url: str) -> None:
             """
                 INSERT INTO demo_sessions (demo_kind, namespace, created_by)
                 VALUES ('cross_episode_mechanism', %s, 'demo.runner')
-                ON CONFLICT (namespace) DO NOTHING
+                ON CONFLICT (tenant_id, namespace) DO NOTHING
             """,
             (namespace,),
         )
@@ -442,7 +442,7 @@ def _upsert_service(conn: Any) -> dict[str, Any]:
             """
                 INSERT INTO services (slug, name, owner_team, tier)
                 VALUES (%s, %s, %s, 'critical')
-                ON CONFLICT (slug) DO UPDATE SET
+                ON CONFLICT (tenant_id, slug) DO UPDATE SET
                     name = excluded.name,
                     owner_team = excluded.owner_team,
                     tier = excluded.tier
@@ -464,7 +464,7 @@ def _upsert_incident(conn: Any, *, slug: str, summary: str) -> dict[str, Any]:
                     slug, title, severity, status, started_at, summary
                 )
                 VALUES (%s, %s, 'sev2', 'open', %s, %s)
-                ON CONFLICT (slug) DO UPDATE SET
+                ON CONFLICT (tenant_id, slug) DO UPDATE SET
                     title = excluded.title,
                     severity = excluded.severity,
                     status = excluded.status,

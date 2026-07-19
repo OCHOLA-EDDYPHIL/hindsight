@@ -124,6 +124,7 @@ def poison_demo_memory(
 def ensure_poison_rewind_incident(
     *, fixture_id: UUID | None = None, db_url: str | None = None
 ) -> dict[str, Any]:
+    service_id = fixture_id or UUID("10000000-0000-0000-0000-000000000001")
     incident_id = fixture_id or UUID("40000000-0000-0000-0000-000000000001")
     incident_slug = (
         f"{DEMO_INCIDENT_ID}:{fixture_id.hex}" if fixture_id else DEMO_INCIDENT_ID
@@ -134,16 +135,16 @@ def ensure_poison_rewind_incident(
                 """
                     INSERT INTO services (id, slug, name, owner_team, tier)
                     VALUES (
-                        '10000000-0000-0000-0000-000000000001',
+                        %s,
                         %s,
                         'Payments API',
                         'revenue-platform',
                         'critical'
                     )
-                    ON CONFLICT (slug) DO UPDATE SET name = excluded.name
+                    ON CONFLICT (tenant_id, slug) DO UPDATE SET name = excluded.name
                     RETURNING id
                 """,
-                (DEMO_SERVICE_SLUG,),
+                (service_id, DEMO_SERVICE_SLUG),
             ).fetchone()
             incident = conn.execute(
                 """
@@ -159,7 +160,7 @@ def ensure_poison_rewind_incident(
                         now(),
                         %s
                     )
-                    ON CONFLICT (slug) DO UPDATE SET
+                    ON CONFLICT (tenant_id, slug) DO UPDATE SET
                         title = excluded.title,
                         severity = excluded.severity,
                         status = excluded.status,
