@@ -388,18 +388,30 @@ jobs:
       - name: Verify WebSocket connect and clean close
         shell: bash
         env:
+          API_URL: ${{ steps.stack_outputs.outputs.api_url }}
           WEBSOCKET_URL: ${{ steps.stack_outputs.outputs.websocket_url }}
         run: |
           for _ in {1..12}; do
-            if uv run python - "$WEBSOCKET_URL" <<'PY'
+            if uv run python - "$WEBSOCKET_URL" "$API_URL" <<'PY'
           import asyncio
+          import json
           import sys
+          from urllib import request
+          from urllib.parse import urlencode
 
           from websockets.asyncio.client import connect
 
 
           async def verify() -> None:
-              async with connect(sys.argv[1], open_timeout=15, close_timeout=15):
+              ticket_request = request.Request(
+                  f"{sys.argv[2].rstrip('/')}/v1/realtime/ticket",
+                  data=b"",
+                  method="POST",
+              )
+              with request.urlopen(ticket_request, timeout=15) as response:
+                  ticket = json.loads(response.read())["ticket"]
+              websocket_url = f"{sys.argv[1]}?{urlencode({'ticket': ticket})}"
+              async with connect(websocket_url, open_timeout=15, close_timeout=15):
                   pass
 
 

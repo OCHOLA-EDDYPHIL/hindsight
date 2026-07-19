@@ -8,6 +8,7 @@ import os
 import time
 from datetime import UTC, datetime, timedelta
 from urllib import error, request
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import pytest
@@ -347,7 +348,12 @@ def test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe()
     namespace = f"live-websocket-lifecycle:{uuid4().hex}"
 
     async def scenario() -> None:
-        first = await connect(websocket_url, open_timeout=15, close_timeout=15)
+        first_url = await asyncio.to_thread(
+            _public_websocket_url,
+            api_url=api_url,
+            websocket_url=websocket_url,
+        )
+        first = await connect(first_url, open_timeout=15, close_timeout=15)
         await first.send(
             json.dumps({"type": "subscribe", "namespace": namespace, "run_id": None})
         )
@@ -361,7 +367,12 @@ def test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe()
         await first.wait_closed()
         assert first.close_code == 1000
 
-        async with connect(websocket_url, open_timeout=15, close_timeout=15) as second:
+        second_url = await asyncio.to_thread(
+            _public_websocket_url,
+            api_url=api_url,
+            websocket_url=websocket_url,
+        )
+        async with connect(second_url, open_timeout=15, close_timeout=15) as second:
             disconnected = await asyncio.to_thread(
                 _inject_changefeed_event,
                 api_url=api_url,
@@ -488,6 +499,21 @@ def _post_json(url: str, *, token: str, payload: dict[str, object]) -> dict[str,
     except error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         raise AssertionError(f"hosted API returned {exc.code}: {detail}") from exc
+
+
+def _public_websocket_url(*, api_url: str, websocket_url: str) -> str:
+    req = request.Request(
+        f"{api_url.rstrip('/')}/v1/realtime/ticket",
+        data=b"",
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=30) as response:  # noqa: S310 - fixed hosted URL
+            ticket = str(json.loads(response.read())["ticket"])
+    except error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise AssertionError(f"hosted API returned {exc.code}: {detail}") from exc
+    return f"{websocket_url}?{urlencode({'ticket': ticket})}"
 
 
 def _required_env(name: str) -> str:
