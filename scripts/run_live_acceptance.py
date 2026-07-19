@@ -20,6 +20,8 @@ from xml.etree import ElementTree
 import psycopg
 from psycopg import sql
 
+from hindsight.server_tenants import ACCEPTANCE_TENANT_ID
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
 BENCHMARK_MAX_DISTANCE = 0.35
@@ -390,6 +392,7 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
     env = dict(os.environ)
     env["HINDSIGHT_ACCEPTANCE_PHASE_ID"] = str(uuid4())
     env["RUN_HOSTED_ACCEPTANCE"] = "1"
+    env["PGOPTIONS"] = f"-c hindsight.tenant_id={ACCEPTANCE_TENANT_ID}"
     selectors = HOSTED_PHASE_SELECTORS[args.phase]
     if args.phase == "roles":
         for name in (

@@ -156,6 +156,31 @@ def test_hosted_product_phases_are_selector_isolated():
     assert len(flattened) == len(set(flattened))
 
 
+def test_hosted_product_binds_server_owned_acceptance_tenant(monkeypatch):
+    database_url = (
+        "postgresql://runtime@cluster.example:26257/hindsight?sslmode=verify-full"
+    )
+    monkeypatch.setenv("PGOPTIONS", "-c hindsight.tenant_id=untrusted")
+    monkeypatch.setattr(acceptance, "_require_gemini_credentials", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        acceptance,
+        "_run_hosted_pytest",
+        lambda selectors, *, env, phase: calls.append((selectors, env, phase)),
+    )
+
+    acceptance._run_hosted_product(
+        SimpleNamespace(phase="semantic", database_url=database_url)
+    )
+
+    selectors, env, phase = calls[0]
+    assert selectors == acceptance.SEMANTIC_RETRIEVAL_SELECTORS
+    assert phase == "semantic"
+    assert env["PGOPTIONS"] == (
+        f"-c hindsight.tenant_id={acceptance.ACCEPTANCE_TENANT_ID}"
+    )
+
+
 def test_browser_contract_inventories_have_explicit_local_hosted_parity():
     expected_shared = (
         "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
