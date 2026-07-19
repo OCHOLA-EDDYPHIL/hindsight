@@ -1,0 +1,209 @@
+name: verify deployed demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact deployed main revision to verify
+        required: true
+        type: string
+
+concurrency:
+  group: hindsight-demo-verify
+  cancel-in-progress: true
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      expected_sha: ${{ steps.authorization.outputs.expected_sha }}
+    steps:
+      - id: authorization
+        name: Authorize exact deployed revision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REQUESTED_SHA: ${{ inputs.expected_sha }}
+        shell: bash
+        run: |
+          [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/verify-deployed.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
+            echo "Deployed verification requires the repository owner on main." >&2
+            exit 1
+          }
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Deployed verification requires a full commit SHA." >&2
+            exit 1
+          }
+          echo "expected_sha=$REQUESTED_SHA" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: demo
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      UI_DOMAIN: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.expected_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact source revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: astral-sh/setup-uv@v5
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: uv sync --frozen
+      - id: endpoints
+        name: Resolve deployed endpoints without infrastructure state
+        shell: bash
+        run: |
+          API_URL="$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='hindsight-demo-http'].ApiEndpoint" \
+            --output text)"
+          WEBSOCKET_BASE="$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='hindsight-demo-websocket'].ApiEndpoint" \
+            --output text)"
+          WEBSOCKET_BASE="${WEBSOCKET_BASE/https:\/\//wss://}"
+          [[ "$API_URL" =~ ^https://[^[:space:]]+$ \
+            && "$WEBSOCKET_BASE" =~ ^wss://[^[:space:]]+$ \
+            && "$UI_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || {
+            echo "Deployed endpoints did not resolve uniquely." >&2
+            exit 1
+          }
+          {
+            echo "ui_url=https://$UI_DOMAIN"
+            echo "api_url=$API_URL"
+            echo "websocket_url=$WEBSOCKET_BASE/demo"
+          } >> "$GITHUB_OUTPUT"
+      - name: Verify HTTP surfaces and deployed revision
+        env:
+          UI_URL: ${{ steps.endpoints.outputs.ui_url }}
+          API_URL: ${{ steps.endpoints.outputs.api_url }}
+          EXPECTED_SHA: ${{ needs.authorize.outputs.expected_sha }}
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          import time
+          from urllib import request
+
+
+          def read(url: str) -> bytes:
+              with request.urlopen(url, timeout=15) as response:
+                  if response.status != 200:
+                      raise RuntimeError(f"{url} returned HTTP {response.status}")
+                  return response.read()
+
+
+          def read_json(url: str) -> dict:
+              return json.loads(read(url))
+
+
+          ui_url = os.environ["UI_URL"].rstrip("/")
+          api_url = os.environ["API_URL"].rstrip("/")
+          expected_sha = os.environ["EXPECTED_SHA"]
+          last_error = None
+          for _ in range(12):
+              try:
+                  read(f"{ui_url}/")
+                  live = read_json(f"{api_url}/v1/health/live")
+                  ready = read_json(f"{api_url}/v1/health/ready")
+                  incidents = read_json(f"{api_url}/v1/incidents?limit=1")
+                  proxied = read_json(f"{ui_url}/v1/health/ready")
+                  if live != {"status": "live", "revision": expected_sha}:
+                      raise RuntimeError(f"unexpected liveness payload: {live!r}")
+                  if ready != {"status": "ready", "revision": expected_sha}:
+                      raise RuntimeError(f"unexpected readiness payload: {ready!r}")
+                  if proxied != ready:
+                      raise RuntimeError("UI-proxied readiness does not match the direct API")
+                  if not isinstance(incidents.get("items"), list):
+                      raise RuntimeError("DB-backed incident route returned an invalid payload")
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(10)
+          else:
+              raise RuntimeError("deployed HTTP verification failed") from last_error
+          PY
+      - name: Verify ticketed WebSocket connection
+        env:
+          API_URL: ${{ steps.endpoints.outputs.api_url }}
+          WEBSOCKET_URL: ${{ steps.endpoints.outputs.websocket_url }}
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import json
+          import os
+          import time
+          from urllib import request
+          from urllib.parse import urlencode
+
+          from websockets.asyncio.client import connect
+
+
+          async def verify() -> None:
+              ticket_request = request.Request(
+                  f"{os.environ['API_URL'].rstrip('/')}/v1/realtime/ticket",
+                  data=b"",
+                  method="POST",
+              )
+              with request.urlopen(ticket_request, timeout=15) as response:
+                  ticket_payload = json.loads(response.read())
+              ticket = ticket_payload["ticket"]
+              if not isinstance(ticket, str) or not ticket:
+                  raise RuntimeError("realtime ticket response did not contain a ticket")
+              websocket_url = (
+                  f"{os.environ['WEBSOCKET_URL']}?{urlencode({'ticket': ticket})}"
+              )
+              async with connect(websocket_url, open_timeout=15, close_timeout=15):
+                  pass
+
+          last_error = None
+          for _ in range(12):
+              try:
+                  asyncio.run(verify())
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(10)
+          else:
+              raise RuntimeError("ticketed WebSocket verification failed") from last_error
+          PY
+      - name: Record deployed verification
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.expected_sha }}
+          UI_URL: ${{ steps.endpoints.outputs.ui_url }}
+          API_URL: ${{ steps.endpoints.outputs.api_url }}
+          WEBSOCKET_URL: ${{ steps.endpoints.outputs.websocket_url }}
+        run: |
+          {
+            echo "### Deployed verification"
+            echo
+            echo "Exact revision \`$EXPECTED_SHA\` is serving the verified product surfaces."
+            echo
+            echo "- UI: $UI_URL"
+            echo "- API: $API_URL"
+            echo "- WebSocket: $WEBSOCKET_URL"
+            echo "- Checks: UI root, direct live/ready, exact revision, DB-backed incident list, UI-proxied readiness, ticketed WebSocket connection"
+          } >> "$GITHUB_STEP_SUMMARY"
