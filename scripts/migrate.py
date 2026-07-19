@@ -5,6 +5,7 @@ Applied filenames are recorded in schema_migrations so reruns are no-ops.
 The target database is created if it does not exist yet.
 """
 
+import argparse
 import pathlib
 import sys
 from urllib.parse import urlsplit, urlunsplit
@@ -25,9 +26,11 @@ def ensure_database(url: str) -> None:
         conn.execute(f'CREATE DATABASE IF NOT EXISTS "{dbname}"')
 
 
-def main() -> None:
-    url = database_url()
+def apply_migrations(url: str, *, through: str | None = None) -> int:
     ensure_database(url)
+    available = sorted(MIGRATIONS_DIR.glob("[0-9]*.sql"))
+    if through is not None and through not in {path.name for path in available}:
+        raise ValueError(f"unknown migration filename: {through}")
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
@@ -36,12 +39,14 @@ def main() -> None:
         applied = {
             row[0] for row in conn.execute("SELECT filename FROM schema_migrations").fetchall()
         }
-        pending = sorted(
-            p for p in MIGRATIONS_DIR.glob("[0-9]*.sql") if p.name not in applied
-        )
+        pending = [
+            path
+            for path in available
+            if path.name not in applied and (through is None or path.name <= through)
+        ]
         if not pending:
             print("migrations: up to date")
-            return
+            return 0
         for path in pending:
             print(f"applying {path.name}")
             with conn.transaction():
@@ -50,6 +55,14 @@ def main() -> None:
                     "INSERT INTO schema_migrations (filename) VALUES (%s)", (path.name,)
                 )
         print(f"migrations: applied {len(pending)}")
+        return len(pending)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--through", help="stop after this exact migration filename")
+    args = parser.parse_args()
+    apply_migrations(database_url(), through=args.through)
 
 
 if __name__ == "__main__":

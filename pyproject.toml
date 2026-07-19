@@ -37,6 +37,9 @@ packages = ["src/hindsight"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "migration_acceptance: isolated executable schema-upgrade acceptance",
+]
 
 [tool.ruff]
 line-length = 100

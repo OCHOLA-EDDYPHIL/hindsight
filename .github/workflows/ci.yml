@@ -5,56 +5,231 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+      && format('ci-pr-{0}', github.event.pull_request.number)
+      || format('ci-main-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      database: ${{ steps.classify.outputs.database }}
+      migrations: ${{ steps.classify.outputs.migrations }}
+      diagnostics: ${{ steps.classify.outputs.diagnostics }}
+      frontend: ${{ steps.classify.outputs.frontend }}
+      lambda_artifacts: ${{ steps.classify.outputs.lambda_artifacts }}
+      terraform: ${{ steps.classify.outputs.terraform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python scripts/ci_changes.py
+          --event-name "$EVENT_NAME"
+          --base-sha "$BASE_SHA"
+          --head-sha "$HEAD_SHA"
+          --github-output "$GITHUB_OUTPUT"
+
+  python_static:
+    needs: changes
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_ci?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv lock --check
+      - run: uv sync --frozen
+      - run: uv run python scripts/ci_test_groups.py validate
+      - run: uv run ruff check .
+      - run: uv run python scripts/ci_test_groups.py run unit
+
+  database:
+    needs: changes
+    if: needs.changes.outputs.database == 'true'
+    strategy:
+      fail-fast: ${{ github.event_name == 'pull_request' }}
+      matrix:
+        include:
+          - group: database_a
+            database: hindsight_ci_a
+          - group: database_b
+            database: hindsight_ci_b
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://root@localhost:26257/${{ matrix.database }}?sslmode=disable
+      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: deterministic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - name: Initialize isolated database
+        run: |
+          ready=false
+          for _ in $(seq 1 30); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+          uv run python scripts/migrate.py
+          uv run python scripts/initialize_agent_storage.py
+      - run: uv run python scripts/ci_test_groups.py run "${{ matrix.group }}"
+
+  migration_replay:
+    needs: changes
+    if: needs.changes.outputs.migrations == 'true'
+    strategy:
+      fail-fast: ${{ github.event_name == 'pull_request' }}
+      matrix:
+        case:
+          - benchmark_upgrade
+          - benchmark_fresh
+          - benchmark_preparation
+          - benchmark_finalizer
+          - benchmark_retry
+          - agent_runtime_roles
+          - populated_roles
+          - dispatch_upgrade
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_migration_${{ matrix.case }}?sslmode=disable
+      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: deterministic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - name: Wait for CockroachDB
+        run: |
+          ready=false
+          for _ in $(seq 1 30); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+      - run: >-
+          uv run python scripts/ci_test_groups.py run migration
+          --case "${{ matrix.case }}"
+
+  diagnostics:
+    needs: changes
+    if: needs.changes.outputs.diagnostics == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
+      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
+      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: deterministic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - name: Initialize diagnostic database
+        run: |
+          ready=false
+          for _ in $(seq 1 30); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+          uv run python scripts/migrate.py
+      - name: Run outcome-free vector ordering diagnostic
+        run: >-
+          uv run python scripts/run_rank_diagnostics.py synthetic
+          --code-sha "$GITHUB_SHA"
+          --max-distance 0.35
+          --require-target-rank-one
+      - run: uv run python scripts/run_learning_benchmark.py ci-smoke
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: uv lock --check
-      - run: uv sync --frozen
       - run: npm ci
       - run: npm run check:web
       - run: npm run test:web
       - run: npm run build:web
       - run: git diff --exit-code -- src/hindsight/web
-      - run: docker compose up -d crdb
-      - run: |
-          for _ in $(seq 1 30); do
-            docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1' && break
-            sleep 1
-          done
-          docker compose exec -T crdb cockroach sql --insecure \
-            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
-          uv run python scripts/migrate.py
-          uv run python scripts/initialize_agent_storage.py
-      - run: uv run ruff check .
-      - run: uv run pytest -q
-      - name: Run outcome-free vector ordering diagnostic
-        env:
-          DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
-        run: |
-          docker compose exec -T crdb cockroach sql --insecure \
-            -e 'CREATE DATABASE IF NOT EXISTS hindsight_diagnostic_ci'
-          DATABASE_URL="$DIAGNOSTIC_DATABASE_URL" uv run python scripts/migrate.py
-          DATABASE_URL="$DIAGNOSTIC_DATABASE_URL" \
-            EMBEDDING_PROVIDER=deterministic \
-            uv run python scripts/run_rank_diagnostics.py synthetic \
-              --code-sha "$GITHUB_SHA" \
-              --max-distance 0.35 \
-              --require-target-rank-one
-      - run: uv run python scripts/run_learning_benchmark.py ci-smoke
+
+  lambda_artifacts:
+    needs: changes
+    if: needs.changes.outputs.lambda_artifacts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
       - run: uv run python scripts/build_lambda_artifacts.py
       - run: uv run python scripts/smoke_lambda_artifacts.py
+
+  terraform:
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+    steps:
+      - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
+      - uses: actions/cache@v4
+        with:
+          path: .terraform.d/plugin-cache
+          key: >-
+            terraform-${{ runner.os }}-
+            ${{ hashFiles('infra/terraform/**/.terraform.lock.hcl') }}
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
       - run: terraform fmt -check -recursive infra/terraform
       - run: terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false
       - run: terraform -chdir=infra/terraform/bootstrap validate
@@ -62,3 +237,148 @@ jobs:
       - run: terraform -chdir=infra/terraform/app init -backend=false -input=false
       - run: terraform -chdir=infra/terraform/app validate
       - run: terraform -chdir=infra/terraform/app test
+
+  schema_fresh:
+    needs: changes
+    if: needs.changes.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_fresh?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - name: Build fresh schema manifest
+        run: |
+          ready=false
+          for _ in $(seq 1 30); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+          uv run python scripts/migrate.py
+          uv run python scripts/initialize_agent_storage.py
+          mkdir -p build/schema
+          uv run python scripts/schema_manifest.py export \
+            --apply-roles --output build/schema/fresh.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: schema-fresh-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/schema/fresh.json
+          retention-days: 7
+
+  schema_populated:
+    needs: changes
+    if: needs.changes.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_populated?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - name: Build populated upgrade schema manifest
+        run: |
+          ready=false
+          for _ in $(seq 1 30); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+          uv run python scripts/migrate.py --through 0018_agent_run_attempt_fencing.sql
+          uv run python scripts/populated_upgrade_fixture.py seed
+          uv run python scripts/migrate.py
+          uv run python scripts/initialize_agent_storage.py
+          uv run python scripts/populated_upgrade_fixture.py verify
+          mkdir -p build/schema
+          uv run python scripts/schema_manifest.py export \
+            --apply-roles --output build/schema/populated.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: schema-populated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/schema/populated.json
+          retention-days: 7
+
+  schema_parity:
+    needs: [changes, schema_fresh, schema_populated]
+    if: >-
+      ${{ always()
+        && needs.changes.outputs.migrations == 'true'
+        && needs.schema_fresh.result == 'success'
+        && needs.schema_populated.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: actions/download-artifact@v4
+        with:
+          name: schema-fresh-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/schema
+      - uses: actions/download-artifact@v4
+        with:
+          name: schema-populated-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/schema
+      - run: >-
+          uv run python scripts/schema_manifest.py compare
+          build/schema/fresh.json build/schema/populated.json
+
+  test:
+    if: always()
+    needs:
+      - changes
+      - python_static
+      - database
+      - migration_replay
+      - diagnostics
+      - frontend
+      - lambda_artifacts
+      - terraform
+      - schema_fresh
+      - schema_populated
+      - schema_parity
+    runs-on: ubuntu-latest
+    env:
+      CI_SELECTIONS: >-
+        {"database":"${{ needs.changes.outputs.database }}",
+        "migrations":"${{ needs.changes.outputs.migrations }}",
+        "diagnostics":"${{ needs.changes.outputs.diagnostics }}",
+        "frontend":"${{ needs.changes.outputs.frontend }}",
+        "lambda_artifacts":"${{ needs.changes.outputs.lambda_artifacts }}",
+        "terraform":"${{ needs.changes.outputs.terraform }}"}
+      CI_RESULTS: >-
+        {"changes":"${{ needs.changes.result }}",
+        "python_static":"${{ needs.python_static.result }}",
+        "database":"${{ needs.database.result }}",
+        "migration_replay":"${{ needs.migration_replay.result }}",
+        "diagnostics":"${{ needs.diagnostics.result }}",
+        "frontend":"${{ needs.frontend.result }}",
+        "lambda_artifacts":"${{ needs.lambda_artifacts.result }}",
+        "terraform":"${{ needs.terraform.result }}",
+        "schema_fresh":"${{ needs.schema_fresh.result }}",
+        "schema_populated":"${{ needs.schema_populated.result }}",
+        "schema_parity":"${{ needs.schema_parity.result }}"}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python scripts/verify_ci_components.py

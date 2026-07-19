@@ -107,6 +107,7 @@ def _apply(conn: psycopg.Connection, paths: list[Path]) -> None:
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkeypatch):
     from hindsight import runs
     from hindsight.agent import setup_agent_storage

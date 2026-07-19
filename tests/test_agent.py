@@ -476,6 +476,7 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_preinitialized_agent_storage_supports_start_and_resume_without_create_privilege():
     from hindsight.agent import (
         IncidentInput,

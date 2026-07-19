@@ -18,8 +18,8 @@ import pytest
 from psycopg import sql
 
 ROOT = Path(__file__).resolve().parents[1]
-CORPUS = ROOT / "fixtures" / "benchmark_variants.json"
 MIGRATIONS = ROOT / "migrations"
+CORPUS = ROOT / "fixtures" / "benchmark_variants.json"
 SIMULATOR_KINDS = {
     "retry_amplification",
     "cache_stampede",
@@ -39,10 +39,6 @@ _SCRIPT_SPEC.loader.exec_module(benchmark_script)
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
-def _corpus() -> dict:
-    return json.loads(CORPUS.read_text(encoding="utf-8"))
-
-
 def _create_preserved_database(prefix: str) -> str:
     parts = urlsplit(os.environ["DATABASE_URL"])
     database_name = f"{prefix}_{uuid4().hex}"
@@ -55,6 +51,10 @@ def _create_preserved_database(prefix: str) -> str:
             with conn.transaction():
                 conn.execute(path.read_text())
     return target_url
+
+
+def _corpus() -> dict:
+    return json.loads(CORPUS.read_text(encoding="utf-8"))
 
 
 def test_frozen_corpus_has_balanced_curated_low_overlap_retrieval_challenges():
@@ -286,6 +286,7 @@ def test_shared_context_transaction_persists_equal_rows_in_every_arm():
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_preparation_retry_reuses_seeded_context(monkeypatch):
     from hindsight.benchmark import create_experiment
     from hindsight.db import connect

@@ -36,6 +36,7 @@ def _database_url(name: str) -> str:
 
 
 @requires_db
+@pytest.mark.migration_acceptance
 def test_outbox_migration_backfills_queued_and_resuming_runs():
     database_name = f"hindsight_dispatch_upgrade_{uuid4().hex}"
     target_url = _database_url(database_name)
