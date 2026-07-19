@@ -26,6 +26,10 @@ def test_role_tool_normalizes_verified_connection_urls(monkeypatch):
         def execute(self, statement):
             if statement == "SELECT current_user":
                 return type("Result", (), {"fetchone": lambda self: ("identity",)})()
+            if "rolsuper, rolbypassrls" in statement:
+                return type(
+                    "Result", (), {"fetchone": lambda self: (False, False)}
+                )()
             raise roles.psycopg.errors.InsufficientPrivilege()
 
     def connect(url, **_kwargs):
@@ -61,6 +65,10 @@ def test_role_tool_preserves_explicit_tls_root(monkeypatch):
         def execute(self, statement):
             if statement == "SELECT current_user":
                 return type("Result", (), {"fetchone": lambda self: ("identity",)})()
+            if "rolsuper, rolbypassrls" in statement:
+                return type(
+                    "Result", (), {"fetchone": lambda self: (False, False)}
+                )()
             raise roles.psycopg.errors.InsufficientPrivilege()
 
     monkeypatch.setattr(

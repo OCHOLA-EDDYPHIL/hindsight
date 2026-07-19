@@ -25,6 +25,11 @@ def _assert_restricted(url: str, *, label: str, deploy_url: str) -> str:
         database_url_with_tls_roots(url), autocommit=True
     ) as connection:
         identity = connection.execute("SELECT current_user").fetchone()[0]
+        role_flags = connection.execute(
+            "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+        ).fetchone()
+        if role_flags != (False, False):
+            raise RuntimeError(f"{label} database identity can bypass tenant isolation")
         for statement in (
             f"CREATE TABLE {table_name} (id INT PRIMARY KEY)",
             "DELETE FROM semantic_memories WHERE false",

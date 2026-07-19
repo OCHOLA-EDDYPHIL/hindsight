@@ -556,6 +556,10 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
         )
 
         with psycopg.connect(target_url) as conn:
+            conn.execute(
+                "SELECT set_config('hindsight.tenant_id', %s, false)",
+                ("00000000-0000-0000-0000-000000000001",),
+            )
             conn.execute("SET ROLE hindsight_agent_writer")
             conn.commit()
             with pytest.raises(psycopg.errors.InsufficientPrivilege):

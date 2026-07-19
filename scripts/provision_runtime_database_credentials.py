@@ -110,7 +110,7 @@ def prepare(
                 raise RuntimeError("deploy identity cannot be a runtime identity")
             for label, role in roles.items():
                 connection.execute(
-                    sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD %s").format(
+                    sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD %s NOBYPASSRLS").format(
                         sql.Identifier(role)
                     ),
                     (passwords[label],),
@@ -131,8 +131,13 @@ def prepare(
                 database_url_with_tls_roots(url), connect_timeout=5
             ) as connection:
                 identity = connection.execute("SELECT current_user").fetchone()[0]
+                role_flags = connection.execute(
+                    "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+                ).fetchone()
             if identity != roles[label]:
                 raise RuntimeError("runtime database identity verification failed")
+            if role_flags != (False, False):
+                raise RuntimeError("runtime database identity can bypass tenant isolation")
         _put_secure_string(
             ssm, name=api_parameter, value=runtime_urls["api"], key_id=api_snapshot.key_id
         )

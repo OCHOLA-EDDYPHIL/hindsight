@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from collections.abc import Callable
@@ -13,13 +14,18 @@ from langchain_core.messages import AIMessage, HumanMessage, messages_to_dict
 from langchain_cockroachdb import CockroachDBChatMessageHistory, CockroachDBSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+import psycopg
 from psycopg import errors
+from psycopg.rows import dict_row
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import create_async_engine
 
-from hindsight.db import connect, database_url
+from hindsight.db import TenantConnection, connect, database_url, database_url_with_tls_roots
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
+from hindsight.tenant import current_tenant_id
 
 AGENT_CHAT_TABLE = "agent_chat_messages"
 _AGENT_STORAGE_PROBES = (
@@ -545,7 +551,7 @@ def _invoke_graph(
 ) -> dict[str, Any]:
     resolved_db_url = db_url or database_url()
     validate_agent_storage(db_url=resolved_db_url)
-    with CockroachDBSaver.from_conn_string(resolved_db_url) as checkpointer:
+    with _tenant_checkpointer(resolved_db_url) as checkpointer:
         graph = build_incident_graph(
             db_url=resolved_db_url,
             reasoning_provider=reasoning_provider,
@@ -581,11 +587,53 @@ def _report_progress(
 
 
 def _chat_history(*, thread_id: str, db_url: str) -> CockroachDBChatMessageHistory:
-    return CockroachDBChatMessageHistory(
+    tenant_id = current_tenant_id()
+    if tenant_id is None:
+        return CockroachDBChatMessageHistory(
+            session_id=thread_id,
+            connection_string=_async_sqlalchemy_url(db_url),
+            table_name=AGENT_CHAT_TABLE,
+        )
+    engine = create_async_engine(_async_sqlalchemy_url(db_url))
+
+    @event.listens_for(engine.sync_engine, "begin")
+    def bind_tenant(connection: Any) -> None:
+        connection.exec_driver_sql(
+            "SELECT set_config('hindsight.tenant_id', %s, true)",
+            (tenant_id,),
+        )
+
+    history = CockroachDBChatMessageHistory(
         session_id=thread_id,
-        connection_string=_async_sqlalchemy_url(db_url),
+        engine=engine,
         table_name=AGENT_CHAT_TABLE,
     )
+    history._owns_engine = True
+    return history
+
+
+class _TenantCockroachDBSaver(CockroachDBSaver):
+    """Run each vendor checkpoint cursor inside one tenant-bound transaction."""
+
+    @contextmanager
+    def _cursor(self, *, pipeline: bool = False):
+        del pipeline
+        with self.lock, self.conn.transaction():
+            with self.conn.cursor(binary=True, row_factory=dict_row) as cursor:
+                yield cursor
+
+
+@contextmanager
+def _tenant_checkpointer(db_url: str):
+    tenant_id = current_tenant_id(required=True)
+    with psycopg.connect(
+        database_url_with_tls_roots(db_url),
+        autocommit=False,
+        prepare_threshold=5,
+        row_factory=dict_row,
+    ) as raw_connection:
+        connection = TenantConnection(raw_connection, tenant_id=tenant_id)
+        yield _TenantCockroachDBSaver(connection)
 
 
 def _async_sqlalchemy_url(url: str) -> str:

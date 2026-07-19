@@ -27,6 +27,7 @@ from hindsight.rank_diagnostics import (  # noqa: E402
     opaque_token,
     ranked_candidates,
 )
+from hindsight.tenant import tenant_scope  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_SYNTHETIC_CORPUS = ROOT / "fixtures/rank_diagnostic_variants.json"
@@ -39,9 +40,15 @@ BENCHMARK_TABLES = (
     "benchmark_confirmation_bindings",
     "benchmark_variant_preparations",
 )
+DIAGNOSTIC_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
 def main() -> None:
+    with tenant_scope(DIAGNOSTIC_TENANT_ID):
+        _main()
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("synthetic", "pilot"))
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
