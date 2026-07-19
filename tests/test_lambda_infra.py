@@ -203,6 +203,8 @@ def test_deploy_health_only_is_owner_authorized_exact_main_and_checks_every_endp
     assert 'direct DB-backed route" "$API_URL/v1/incidents?limit=1' in workflow
     assert 'UI-proxied readiness" "$UI_URL/v1/health/ready' in workflow
     assert "from websockets.asyncio.client import connect" in workflow
+    assert 'f"{sys.argv[2].rstrip(\'/\')}/v1/realtime/ticket"' in workflow
+    assert "urlencode({'ticket': ticket})" in workflow
     assert "Exact revision \\`$DEPLOYED_SHA\\` passed" in workflow
 
 
