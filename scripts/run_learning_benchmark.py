@@ -40,6 +40,7 @@ from hindsight.reasoning import (  # noqa: E402
 )
 from hindsight.runs import create_incident, resolve_incident  # noqa: E402
 from hindsight.runtime import runtime_database_url, runtime_settings  # noqa: E402
+from hindsight.tenant import tenant_scope  # noqa: E402
 
 DEFAULT_CORPUS = pathlib.Path(__file__).resolve().parents[1] / "fixtures/benchmark_variants.json"
 CORPUS_SCHEMA_VERSION = 3
@@ -61,6 +62,8 @@ MAX_PREPARATION_ATTEMPTS = 3
 MAX_TARGET_QUERY_OVERLAP = 0.35
 MAX_DISTRACTOR_QUERY_OVERLAP = 0.25
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+BENCHMARK_TENANT_ENV = "HINDSIGHT_BENCHMARK_TENANT_ID"
+DEFAULT_BENCHMARK_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
 class ScientificBenchmarkFailure(RuntimeError):
@@ -68,6 +71,13 @@ class ScientificBenchmarkFailure(RuntimeError):
 
 
 def main() -> None:
+    with tenant_scope(
+        os.environ.get(BENCHMARK_TENANT_ENV, DEFAULT_BENCHMARK_TENANT_ID)
+    ):
+        _main()
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     pilot = subparsers.add_parser("pilot")
