@@ -2,30 +2,19 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import psycopg
 import pytest
-from psycopg import sql
 
 from hindsight.db import TenantConnection
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "migrations"
-
-
-def _database_url(name: str) -> str:
-    parts = urlsplit(os.environ["DATABASE_URL"])
-    return urlunsplit(parts._replace(path=f"/{name}"))
 
 
 def _apply_schema(connection: psycopg.Connection) -> None:
-    for path in sorted(MIGRATIONS.glob("[0-9]*.sql")):
-        with connection.transaction():
-            connection.execute(path.read_text())
     connection.execute((ROOT / "infra/db/roles.sql").read_text())
 
 
@@ -38,40 +27,47 @@ def _runtime_connection(url: str, *, tenant_id: str) -> TenantConnection:
 
 @requires_db
 def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
-    database_name = f"hindsight_tenant_{uuid4().hex}"
-    target_url = _database_url(database_name)
-    admin_url = _database_url("defaultdb")
+    target_url = os.environ["DATABASE_URL"]
     first_tenant = uuid4()
     second_tenant = uuid4()
     first_service = uuid4()
     second_service = uuid4()
     first_incident = uuid4()
+    suffix = uuid4().hex
+    first_service_slug = f"service-a-{suffix}"
+    second_service_slug = f"service-b-{suffix}"
+    first_incident_slug = f"incident-a-{suffix}"
 
-    with psycopg.connect(admin_url, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
     try:
         with psycopg.connect(target_url, autocommit=True) as admin:
             _apply_schema(admin)
             admin.execute(
                 "INSERT INTO tenants (id, slug, tenant_kind) VALUES "
-                "(%s, 'tenant-a', 'diagnostic'), (%s, 'tenant-b', 'diagnostic')",
-                (first_tenant, second_tenant),
+                "(%s, %s, 'diagnostic'), (%s, %s, 'diagnostic')",
+                (first_tenant, f"tenant-a-{suffix}", second_tenant, f"tenant-b-{suffix}"),
             )
             admin.execute(
                 """
                     INSERT INTO services (
                         id, tenant_id, slug, name, owner_team, tier
                     ) VALUES
-                        (%s, %s, 'service-a', 'Service A', 'team-a', 'core'),
-                        (%s, %s, 'service-b', 'Service B', 'team-b', 'core')
+                        (%s, %s, %s, 'Service A', 'team-a', 'core'),
+                        (%s, %s, %s, 'Service B', 'team-b', 'core')
                 """,
-                (first_service, first_tenant, second_service, second_tenant),
+                (
+                    first_service,
+                    first_tenant,
+                    first_service_slug,
+                    second_service,
+                    second_tenant,
+                    second_service_slug,
+                ),
             )
 
         connection = _runtime_connection(target_url, tenant_id=str(first_tenant))
         try:
             assert connection.execute("SELECT slug FROM services ORDER BY slug").fetchall() == [
-                ("service-a",)
+                (first_service_slug,)
             ]
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 connection.execute(
@@ -98,9 +94,9 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
                 """
                     INSERT INTO incidents (
                         id, slug, title, severity, status, started_at, summary
-                    ) VALUES (%s, 'incident-a', 'Incident A', 'sev2', 'open', now(), 'A')
+                    ) VALUES (%s, %s, 'Incident A', 'sev2', 'open', now(), 'A')
                 """,
-                (first_incident,),
+                (first_incident, first_incident_slug),
             )
             with pytest.raises(psycopg.errors.ForeignKeyViolation):
                 connection.execute(
@@ -116,14 +112,14 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
                 """
                     INSERT INTO incidents (
                         id, slug, title, severity, status, started_at, summary
-                    ) VALUES (%s, 'incident-a', 'Incident A', 'sev2', 'open', now(), 'A')
+                    ) VALUES (%s, %s, 'Incident A', 'sev2', 'open', now(), 'A')
                 """,
-                (first_incident,),
+                (first_incident, first_incident_slug),
             )
             connection.commit()
             connection.bind_tenant(str(second_tenant))
             assert connection.execute("SELECT slug FROM services ORDER BY slug").fetchall() == [
-                ("service-b",)
+                (second_service_slug,)
             ]
             connection.commit()
         finally:
@@ -184,11 +180,27 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
 
         with psycopg.connect(target_url) as cdc:
             cdc.execute("SET ROLE hindsight_cdc")
-            assert cdc.execute("SELECT count(*) FROM tenant_event_outbox").fetchone() == (1,)
+            assert cdc.execute(
+                "SELECT count(*) FROM tenant_event_outbox WHERE aggregate_id = %s",
+                (str(first_incident),),
+            ).fetchone() == (1,)
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 cdc.execute("SELECT count(*) FROM incidents")
     finally:
-        with psycopg.connect(admin_url, autocommit=True) as admin:
+        with psycopg.connect(target_url, autocommit=True) as admin:
             admin.execute(
-                sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database_name))
+                "DELETE FROM incidents WHERE tenant_id IN (%s, %s)",
+                (first_tenant, second_tenant),
+            )
+            admin.execute(
+                "DELETE FROM tenant_event_outbox WHERE tenant_id IN (%s, %s)",
+                (first_tenant, second_tenant),
+            )
+            admin.execute(
+                "DELETE FROM services WHERE tenant_id IN (%s, %s)",
+                (first_tenant, second_tenant),
+            )
+            admin.execute(
+                "DELETE FROM tenants WHERE id IN (%s, %s)",
+                (first_tenant, second_tenant),
             )
