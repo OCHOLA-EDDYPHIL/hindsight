@@ -150,8 +150,8 @@ jobs:
     if: needs.changes.outputs.diagnostics == 'true'
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostics?sslmode=disable
-      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostics?sslmode=disable
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
+      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
