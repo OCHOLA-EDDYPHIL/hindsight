@@ -119,15 +119,18 @@ def test_reset_session_readiness_requires_new_namespace_and_known_good_snapshot(
 def test_cross_episode_lesson_identity_chain_is_inspectable():
     from hindsight.cross_episode import run_cross_episode_demo
     from hindsight.db import database_url
+    from hindsight.server_tenants import public_demo_tenant_id
+    from hindsight.tenant import tenant_scope
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from selenium.webdriver.firefox.options import Options
     from selenium.webdriver.support.ui import WebDriverWait
 
-    result = run_cross_episode_demo(
-        db_url=database_url(),
-        namespace=f"live-lesson-chain:{uuid4()}",
-    )
+    with tenant_scope(public_demo_tenant_id()):
+        result = run_cross_episode_demo(
+            db_url=database_url(),
+            namespace=f"live-lesson-chain:{uuid4()}",
+        )
     trace = result.lesson_trace
     options = Options()
     options.add_argument("-headless")
