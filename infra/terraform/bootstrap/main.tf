@@ -1,7 +1,12 @@
 locals {
-  state_bucket_arn               = data.aws_s3_bucket.state.arn
-  oidc_arn                       = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_github_oidc_provider_arn
-  parameter_arn                  = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/*"
+  state_bucket_arn     = data.aws_s3_bucket.state.arn
+  evidence_bucket_name = "hindsight-${var.stage}-learning-evidence-${data.aws_caller_identity.current.account_id}"
+  oidc_arn             = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : var.existing_github_oidc_provider_arn
+  parameter_arn        = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/*"
+  evidence_parameter_arns = [
+    "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/database-url",
+    "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/gemini-api-keys",
+  ]
   lambda_version_refresh_actions = ["lambda:ListVersionsByFunction"]
   lambda_function_arns = [
     for component in ["api", "worker", "websocket", "changefeed"] :
@@ -11,6 +16,57 @@ locals {
 
 data "aws_s3_bucket" "state" {
   bucket = var.state_bucket_name
+}
+
+resource "aws_s3_bucket" "learning_evidence" {
+  bucket              = local.evidence_bucket_name
+  object_lock_enabled = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "learning_evidence" {
+  bucket = aws_s3_bucket.learning_evidence.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "learning_evidence" {
+  bucket = aws_s3_bucket.learning_evidence.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "learning_evidence" {
+  bucket                  = aws_s3_bucket.learning_evidence.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "learning_evidence" {
+  bucket = aws_s3_bucket.learning_evidence.id
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "learning_evidence" {
+  bucket = aws_s3_bucket.learning_evidence.id
+  rule {
+    default_retention {
+      mode  = "GOVERNANCE"
+      years = 7
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.learning_evidence]
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
@@ -75,6 +131,12 @@ resource "aws_iam_role" "github_deploy" {
   max_session_duration = 3600
 }
 
+resource "aws_iam_role" "github_evidence" {
+  name                 = "hindsight-github-evidence"
+  assume_role_policy   = data.aws_iam_policy_document.github_assume.json
+  max_session_duration = 3600
+}
+
 data "aws_iam_policy_document" "github_deploy" {
   statement {
     sid       = "TerraformStateBucketMetadata"
@@ -122,6 +184,27 @@ data "aws_iam_policy_document" "github_deploy" {
     sid       = "LambdaVersionRefresh"
     actions   = local.lambda_version_refresh_actions
     resources = local.lambda_function_arns
+  }
+
+  statement {
+    sid    = "EvidenceArchiveMutationDenied"
+    effect = "Deny"
+    actions = [
+      "s3:BypassGovernanceRetention",
+      "s3:DeleteBucket",
+      "s3:DeleteBucketPolicy",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:PutBucketObjectLockConfiguration",
+      "s3:PutBucketPolicy",
+      "s3:PutBucketVersioning",
+      "s3:PutObject",
+      "s3:PutObjectRetention",
+    ]
+    resources = [
+      aws_s3_bucket.learning_evidence.arn,
+      "${aws_s3_bucket.learning_evidence.arn}/*",
+    ]
   }
 
   statement {
@@ -297,4 +380,112 @@ data "aws_iam_policy_document" "github_deploy" {
 resource "aws_iam_role_policy" "github_deploy" {
   role   = aws_iam_role.github_deploy.id
   policy = data.aws_iam_policy_document.github_deploy.json
+}
+
+data "aws_iam_policy_document" "github_evidence" {
+  statement {
+    sid       = "EvidenceSettings"
+    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = local.evidence_parameter_arns
+  }
+
+  statement {
+    sid = "EvidenceBucketMetadata"
+    actions = [
+      "s3:GetBucketLocation",
+      "s3:GetBucketObjectLockConfiguration",
+      "s3:GetBucketVersioning",
+    ]
+    resources = [aws_s3_bucket.learning_evidence.arn]
+  }
+
+  statement {
+    sid = "EvidenceBucketList"
+    actions = [
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+    ]
+    resources = [aws_s3_bucket.learning_evidence.arn]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["learning", "learning/*"]
+    }
+  }
+
+  statement {
+    sid = "AppendAndVerifyEvidence"
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectAttributes",
+      "s3:GetObjectRetention",
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+    ]
+    resources = ["${aws_s3_bucket.learning_evidence.arn}/learning/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "github_evidence" {
+  role   = aws_iam_role.github_evidence.id
+  policy = data.aws_iam_policy_document.github_evidence.json
+}
+
+data "aws_iam_policy_document" "learning_evidence_bucket" {
+  statement {
+    sid    = "DenyInsecureTransport"
+    effect = "Deny"
+    actions = [
+      "s3:BypassGovernanceRetention",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:GetBucketLocation",
+      "s3:GetBucketObjectLockConfiguration",
+      "s3:GetBucketVersioning",
+      "s3:GetObject",
+      "s3:GetObjectAttributes",
+      "s3:GetObjectRetention",
+      "s3:GetObjectVersion",
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+      "s3:PutObject",
+      "s3:PutObjectRetention",
+    ]
+    resources = [
+      aws_s3_bucket.learning_evidence.arn,
+      "${aws_s3_bucket.learning_evidence.arn}/*",
+    ]
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+
+  statement {
+    sid    = "DenyDeploymentMutation"
+    effect = "Deny"
+    actions = [
+      "s3:BypassGovernanceRetention",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:PutObject",
+      "s3:PutObjectRetention",
+    ]
+    resources = ["${aws_s3_bucket.learning_evidence.arn}/*"]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.github_deploy.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "learning_evidence" {
+  bucket     = aws_s3_bucket.learning_evidence.id
+  policy     = data.aws_iam_policy_document.learning_evidence_bucket.json
+  depends_on = [aws_s3_bucket_public_access_block.learning_evidence]
 }

@@ -161,6 +161,38 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "iam:UpdateAssumeRolePolicy" in bootstrap
 
 
+def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
+
+    bucket = bootstrap.split('resource "aws_s3_bucket" "learning_evidence"', 1)[1].split(
+        'resource "aws_s3_bucket_versioning"', 1
+    )[0]
+    evidence_policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_evidence"', 1
+    )[1].split('resource "aws_iam_role_policy" "github_evidence"', 1)[0]
+    deploy_deny = bootstrap.split('sid    = "EvidenceArchiveMutationDenied"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+
+    assert "object_lock_enabled = true" in bucket
+    assert "prevent_destroy = true" in bucket
+    assert 'mode  = "GOVERNANCE"' in bootstrap
+    assert "years = 7" in bootstrap
+    assert 'status = "Enabled"' in bootstrap
+    assert 'sse_algorithm = "AES256"' in bootstrap
+    assert 'name                 = "hindsight-github-evidence"' in bootstrap
+    assert "local.evidence_parameter_arns" in evidence_policy
+    assert '"s3:PutObject"' in evidence_policy
+    assert '"s3:GetObjectRetention"' in evidence_policy
+    assert "s3:DeleteObject" not in evidence_policy
+    assert "s3:BypassGovernanceRetention" not in evidence_policy
+    assert '"s3:DeleteObject"' in deploy_deny
+    assert '"s3:BypassGovernanceRetention"' in deploy_deny
+    assert 'output "github_evidence_role_arn"' in outputs
+    assert 'output "learning_evidence_bucket"' in outputs
+
+
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
 

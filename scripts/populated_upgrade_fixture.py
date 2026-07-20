@@ -104,7 +104,8 @@ def verify(url: str) -> None:
     with psycopg.connect(url, autocommit=True) as conn:
         experiment = conn.execute(
             """
-                SELECT tenant_id, status, experiment_kind, manifest_sha256
+                SELECT tenant_id, status, experiment_kind, manifest_sha256,
+                       protocol_authorization_id, execution_authorization_id
                 FROM benchmark_experiments WHERE id = %s
             """,
             (EXPERIMENT_ID,),
@@ -123,7 +124,14 @@ def verify(url: str) -> None:
             """,
             (TRIAL_ID,),
         ).fetchone()
-        if experiment != (LEGACY_TENANT_ID, "completed", "ci_smoke", "ci-upgrade-manifest"):
+        if experiment != (
+            LEGACY_TENANT_ID,
+            "completed",
+            "ci_smoke",
+            "ci-upgrade-manifest",
+            None,
+            None,
+        ):
             raise RuntimeError(f"terminal experiment changed during upgrade: {experiment!r}")
         if trial != (LEGACY_TENANT_ID, "completed", 1, 0):
             raise RuntimeError(f"terminal trial changed during upgrade: {trial!r}")

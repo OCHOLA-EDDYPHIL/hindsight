@@ -64,6 +64,34 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition     = aws_iam_role.github_evidence.name == "hindsight-github-evidence"
+    error_message = "The evidence writer must use its dedicated GitHub OIDC role."
+  }
+
+  assert {
+    condition     = aws_s3_bucket.learning_evidence.object_lock_enabled
+    error_message = "The learning evidence bucket must enable Object Lock at creation."
+  }
+
+  assert {
+    condition     = aws_s3_bucket_object_lock_configuration.learning_evidence.rule[0].default_retention[0].mode == "GOVERNANCE" && aws_s3_bucket_object_lock_configuration.learning_evidence.rule[0].default_retention[0].years == 7
+    error_message = "Learning evidence must retain Governance-locked versions for seven years."
+  }
+
+  assert {
+    condition     = aws_s3_bucket_versioning.learning_evidence.versioning_configuration[0].status == "Enabled"
+    error_message = "The learning evidence bucket must keep versioning enabled."
+  }
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+      if contains(statement.actions, "s3:DeleteObject") || contains(statement.actions, "s3:BypassGovernanceRetention")
+    ]) == 0
+    error_message = "The evidence writer must not delete objects or bypass retention."
+  }
+
+  assert {
     condition     = toset(var.github_subjects) == toset(["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"])
     error_message = "OIDC trust must remain scoped to the demo environment."
   }
