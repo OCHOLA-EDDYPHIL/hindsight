@@ -81,7 +81,8 @@ def test_reusable_deploy_workflow_preserves_hosted_runner_default():
 
 
 def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
-    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
+    workflow = workflow_path.read_text()
     suffix = "_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable"
 
     assert f"${{{{ matrix.database }}}}{suffix}" in workflow
@@ -91,6 +92,25 @@ def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
         "hindsight_schema_populated",
     ):
         assert f"{database_name}{suffix}" in workflow
+
+    jobs = yaml.safe_load(workflow)["jobs"]
+    compose_scopes = {
+        "database": "${{ matrix.group }}",
+        "migration_replay": "${{ matrix.case }}",
+        "diagnostics": "diagnostics",
+        "schema_fresh": "schema_fresh",
+        "schema_populated": "schema_populated",
+    }
+    for job_name, scope in compose_scopes.items():
+        job = jobs[job_name]
+        assert job["env"]["COMPOSE_PROJECT_NAME"] == (
+            "hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_" + scope
+        )
+        assert job["steps"][-1] == {
+            "name": "Remove isolated database container",
+            "if": "always()",
+            "run": "docker compose down --volumes --remove-orphans",
+        }
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):

@@ -72,6 +72,7 @@ jobs:
             database: hindsight_ci_b
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.group }}
       DATABASE_URL: postgresql://root@localhost:26257/${{ matrix.database }}_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
@@ -99,6 +100,9 @@ jobs:
           uv run python scripts/migrate.py
           uv run python scripts/initialize_agent_storage.py
       - run: uv run python scripts/ci_test_groups.py run "${{ matrix.group }}"
+      - name: Remove isolated database container
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   migration_replay:
     needs: changes
@@ -117,6 +121,7 @@ jobs:
           - dispatch_upgrade
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.case }}
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_migration_${{ matrix.case }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
@@ -144,12 +149,16 @@ jobs:
       - run: >-
           uv run python scripts/ci_test_groups.py run migration
           --case "${{ matrix.case }}"
+      - name: Remove isolated database container
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   diagnostics:
     needs: changes
     if: needs.changes.outputs.diagnostics == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_diagnostics
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
@@ -183,6 +192,9 @@ jobs:
           --max-distance 0.35
           --require-target-rank-one
       - run: uv run python scripts/run_learning_benchmark.py ci-smoke
+      - name: Remove isolated database container
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   frontend:
     needs: changes
@@ -243,6 +255,7 @@ jobs:
     if: needs.changes.outputs.migrations == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_schema_fresh
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_fresh_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
     steps:
       - uses: actions/checkout@v4
@@ -275,12 +288,16 @@ jobs:
           name: schema-fresh-${{ github.run_id }}-${{ github.run_attempt }}
           path: build/schema/fresh.json
           retention-days: 7
+      - name: Remove isolated database container
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   schema_populated:
     needs: changes
     if: needs.changes.outputs.migrations == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_schema_populated
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_populated_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
     steps:
       - uses: actions/checkout@v4
@@ -316,6 +333,9 @@ jobs:
           name: schema-populated-${{ github.run_id }}-${{ github.run_attempt }}
           path: build/schema/populated.json
           retention-days: 7
+      - name: Remove isolated database container
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   schema_parity:
     needs: [changes, schema_fresh, schema_populated]
