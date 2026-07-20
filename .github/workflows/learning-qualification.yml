@@ -20,7 +20,7 @@ env:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: read
     outputs:
@@ -50,7 +50,7 @@ jobs:
 
   exact_main_ci:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       actions: read
       contents: read
@@ -84,7 +84,7 @@ jobs:
 
   qualify:
     needs: [authorize, exact_main_ci]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 45
     permissions:
@@ -201,7 +201,7 @@ jobs:
   qualification_complete:
     if: always()
     needs: [authorize, exact_main_ci, qualify]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Require complete opaque qualification
         env:

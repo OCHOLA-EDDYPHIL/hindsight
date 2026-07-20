@@ -20,7 +20,7 @@ env:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: read
     outputs:
@@ -54,7 +54,7 @@ jobs:
 
   exact_main_ci:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       actions: read
       contents: read
@@ -97,7 +97,7 @@ jobs:
     needs:
       - authorize
       - exact_main_ci
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 20
     permissions:
@@ -181,7 +181,7 @@ jobs:
 
   semantic_product:
     needs: [authorize, deploy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 20
     permissions:
@@ -225,7 +225,7 @@ jobs:
 
   consolidation_product:
     needs: [authorize, deploy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 20
     permissions:
@@ -272,7 +272,7 @@ jobs:
 
   worker_product:
     needs: [authorize, deploy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 25
     permissions:
@@ -305,7 +305,7 @@ jobs:
 
   browser_product:
     needs: [authorize, deploy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 20
     permissions:
@@ -365,7 +365,7 @@ jobs:
 
   database_roles:
     needs: [authorize, deploy]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 10
     permissions:
@@ -400,7 +400,7 @@ jobs:
       - worker_product
       - browser_product
       - database_roles
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:

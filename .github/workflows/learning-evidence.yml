@@ -47,7 +47,7 @@ env:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       actions: read
       contents: read
@@ -102,7 +102,7 @@ jobs:
 
   exact_main_ci:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       actions: read
       contents: read
@@ -129,7 +129,7 @@ jobs:
 
   claim:
     needs: [authorize, exact_main_ci]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     permissions:
       actions: read
@@ -210,7 +210,7 @@ jobs:
   pilot:
     if: inputs.operation == 'execute'
     needs: [authorize, claim]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 90
     permissions:
@@ -255,7 +255,7 @@ jobs:
   preregister:
     if: inputs.operation == 'execute'
     needs: [authorize, claim, pilot]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 30
     permissions:
@@ -295,7 +295,7 @@ jobs:
   confirmation:
     if: inputs.operation == 'execute'
     needs: [authorize, claim, pilot, preregister]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 150
     permissions:
@@ -337,7 +337,7 @@ jobs:
   finalize:
     if: always() && needs.claim.result == 'success'
     needs: [authorize, claim, pilot, preregister, confirmation]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 30
     permissions:
@@ -380,7 +380,7 @@ jobs:
 
   seal:
     needs: [authorize, claim, finalize]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: demo
     timeout-minutes: 30
     permissions:
@@ -426,7 +426,7 @@ jobs:
   learning_evidence_complete:
     if: always()
     needs: [authorize, exact_main_ci, claim, finalize, seal]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - name: Require authority and sealed evidence
         env:

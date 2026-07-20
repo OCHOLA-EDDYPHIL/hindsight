@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       database: ${{ steps.classify.outputs.database }}
       migrations: ${{ steps.classify.outputs.migrations }}
@@ -43,7 +43,7 @@ jobs:
 
   python_static:
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
@@ -70,9 +70,9 @@ jobs:
             database: hindsight_ci_a
           - group: database_b
             database: hindsight_ci_b
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
-      DATABASE_URL: postgresql://root@localhost:26257/${{ matrix.database }}?sslmode=disable
+      DATABASE_URL: postgresql://root@localhost:26257/${{ matrix.database }}_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -115,7 +115,7 @@ jobs:
           - agent_runtime_roles
           - populated_roles
           - dispatch_upgrade
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_migration_${{ matrix.case }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
@@ -148,10 +148,10 @@ jobs:
   diagnostics:
     needs: changes
     if: needs.changes.outputs.diagnostics == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
-      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci?sslmode=disable
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
+      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -187,7 +187,7 @@ jobs:
   frontend:
     needs: changes
     if: needs.changes.outputs.frontend == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -203,7 +203,7 @@ jobs:
   lambda_artifacts:
     needs: changes
     if: needs.changes.outputs.lambda_artifacts == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -217,7 +217,7 @@ jobs:
   terraform:
     needs: changes
     if: needs.changes.outputs.terraform == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
     steps:
@@ -241,9 +241,9 @@ jobs:
   schema_fresh:
     needs: changes
     if: needs.changes.outputs.migrations == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_fresh?sslmode=disable
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_fresh_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -279,9 +279,9 @@ jobs:
   schema_populated:
     needs: changes
     if: needs.changes.outputs.migrations == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_populated?sslmode=disable
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_populated_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -324,7 +324,7 @@ jobs:
         && needs.changes.outputs.migrations == 'true'
         && needs.schema_fresh.result == 'success'
         && needs.schema_populated.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -358,7 +358,7 @@ jobs:
       - schema_fresh
       - schema_populated
       - schema_parity
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       CI_SELECTIONS: >-
         {"database":"${{ needs.changes.outputs.database }}",
