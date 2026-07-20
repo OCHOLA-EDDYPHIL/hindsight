@@ -307,11 +307,26 @@ GRANT SELECT ON TABLE
     benchmark_confirmation_preregistrations,
     benchmark_confirmation_bindings,
     benchmark_variant_preparations,
+    learning_protocol_authorizations,
+    learning_execution_authorizations,
+    learning_evidence_records,
     agent_run_dispatches,
     checkpoints,
     checkpoint_blobs,
     checkpoint_writes,
     agent_chat_messages
+TO hindsight_archive;
+
+REVOKE ALL ON TABLE
+    learning_protocol_authorizations,
+    learning_execution_authorizations,
+    learning_evidence_records
+FROM hindsight_agent_writer, hindsight_memory_worker,
+     hindsight_mcp_readonly, hindsight_dashboard_reader, hindsight_cdc;
+GRANT SELECT ON TABLE
+    learning_protocol_authorizations,
+    learning_execution_authorizations,
+    learning_evidence_records
 TO hindsight_archive;
 
 GRANT INSERT ON TABLE tenant_event_outbox

@@ -6,6 +6,14 @@ output "github_deploy_role_arn" {
   value = aws_iam_role.github_deploy.arn
 }
 
+output "github_evidence_role_arn" {
+  value = aws_iam_role.github_evidence.arn
+}
+
+output "learning_evidence_bucket" {
+  value = aws_s3_bucket.learning_evidence.id
+}
+
 output "backend_config" {
   value = {
     bucket       = data.aws_s3_bucket.state.id
