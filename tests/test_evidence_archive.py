@@ -34,12 +34,14 @@ class _S3:
             "body": bytes(kwargs["Body"]),
             "version_id": version_id,
             "retain_until": datetime.now(UTC) + timedelta(days=self.retention_days),
+            "metadata": dict(kwargs.get("Metadata") or {}),
         }
         self.puts.append(kwargs)
         return {"VersionId": version_id}
 
     def head_object(self, **kwargs):
-        return {"VersionId": self.objects[str(kwargs["Key"])]["version_id"]}
+        stored = self.objects[str(kwargs["Key"])]
+        return {"VersionId": stored["version_id"], "Metadata": stored["metadata"]}
 
     def get_object(self, **kwargs):
         stored = self.objects[str(kwargs["Key"])]
@@ -99,6 +101,24 @@ def test_existing_different_content_and_short_retention_fail_closed():
     short = EvidenceArchive(bucket="evidence-bucket", client=_S3(retention_days=30))
     with pytest.raises(RuntimeError, match="shorter than seven years"):
         short.put_canonical_json(key="learning/short.json", payload={"value": 1})
+
+
+def test_exact_read_revalidates_canonical_bytes_digest_and_retention():
+    client = _S3()
+    archive = EvidenceArchive(bucket="evidence-bucket", client=client)
+    written = archive.put_canonical_json(
+        key="learning/authority/fixed.json",
+        payload={"sequence": 1, "status": "ready"},
+    )
+
+    payload, observed = archive.get_canonical_json(
+        key="learning/authority/fixed.json",
+        version_id=written["version_id"],
+    )
+
+    assert payload == {"sequence": 1, "status": "ready"}
+    assert observed["sha256"] == written["sha256"]
+    assert observed["version_id"] == written["version_id"]
 
 
 @pytest.mark.parametrize(

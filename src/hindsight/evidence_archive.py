@@ -114,6 +114,82 @@ class EvidenceArchive:
         observed = self._read_exact(key=key, version_id=version_id)
         if observed != body:
             raise RuntimeError("existing evidence object differs from canonical content")
+        normalized_until = self._retention_until(key=key, version_id=version_id)
+        return {
+            "key": key,
+            "version_id": version_id,
+            "bytes": len(body),
+            "sha256": digest,
+            "checksum_sha256": checksum,
+            "retain_until": normalized_until.isoformat(),
+        }
+
+    def get_canonical_json(
+        self,
+        *,
+        key: str,
+        version_id: str | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Read and verify one current or exact-version canonical JSON object."""
+
+        if not key.startswith("learning/"):
+            raise ValueError("evidence keys must remain under learning/")
+        if version_id is None:
+            head = self.client.head_object(Bucket=self.bucket, Key=key)
+            version_id = str(head.get("VersionId") or "")
+        else:
+            head = self.client.head_object(
+                Bucket=self.bucket,
+                Key=key,
+                VersionId=version_id,
+            )
+        if not version_id:
+            raise RuntimeError("evidence object has no version identity")
+        body = self._read_exact(key=key, version_id=version_id)
+        payload = json.loads(body)
+        if canonical_json_bytes(payload) != body:
+            raise RuntimeError("evidence object is not canonical JSON")
+        digest = sha256_hex(body)
+        if str((head.get("Metadata") or {}).get("sha256") or "") != digest:
+            raise RuntimeError("evidence object digest metadata differs from content")
+        normalized_until = self._retention_until(key=key, version_id=version_id)
+        return payload, {
+            "key": key,
+            "version_id": version_id,
+            "bytes": len(body),
+            "sha256": digest,
+            "retain_until": normalized_until.isoformat(),
+        }
+
+    def get_canonical_json_if_exists(
+        self,
+        *,
+        key: str,
+    ) -> tuple[Any, dict[str, Any]] | None:
+        """Return a verified current object, or None when the key is absent."""
+
+        try:
+            return self.get_canonical_json(key=key)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code") or "")
+            status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
+            if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+                return None
+            raise
+
+    def _read_exact(self, *, key: str, version_id: str) -> bytes:
+        response = self.client.get_object(
+            Bucket=self.bucket,
+            Key=key,
+            VersionId=version_id,
+        )
+        body = response["Body"]
+        try:
+            return body.read()
+        finally:
+            body.close()
+
+    def _retention_until(self, *, key: str, version_id: str) -> datetime:
         retention = (
             self.client.get_object_retention(
                 Bucket=self.bucket,
@@ -128,26 +204,7 @@ class EvidenceArchive:
         normalized_until = retain_until.astimezone(UTC)
         if normalized_until < datetime.now(UTC) + _MINIMUM_RETENTION:
             raise RuntimeError("evidence object retention is shorter than seven years")
-        return {
-            "key": key,
-            "version_id": version_id,
-            "bytes": len(body),
-            "sha256": digest,
-            "checksum_sha256": checksum,
-            "retain_until": normalized_until.isoformat(),
-        }
-
-    def _read_exact(self, *, key: str, version_id: str) -> bytes:
-        response = self.client.get_object(
-            Bucket=self.bucket,
-            Key=key,
-            VersionId=version_id,
-        )
-        body = response["Body"]
-        try:
-            return body.read()
-        finally:
-            body.close()
+        return normalized_until
 
     @staticmethod
     def _validate_evidence_id(evidence_id: str) -> None:

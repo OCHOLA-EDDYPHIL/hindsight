@@ -3,13 +3,29 @@ name: learning evidence
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: Execute one authority or retry sealing its existing result
+        required: true
+        type: choice
+        default: execute
+        options:
+          - execute
+          - seal-only
+      execution_sequence:
+        description: Initial execution or the single authorized infrastructure replacement
+        required: true
+        type: choice
+        default: "1"
+        options:
+          - "1"
+          - "2"
       product_run_id:
-        description: Successful product-acceptance run that established deployed provenance
-        required: true
+        description: Successful same-SHA product acceptance for sequence one
+        required: false
         type: string
-      protocol_reset_id:
-        description: Explicitly authorized learning-protocol reset identifier
-        required: true
+      qualification_run_id:
+        description: Successful same-SHA opaque qualification for sequence one
+        required: false
         type: string
 
 permissions: {}
@@ -20,12 +36,14 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
   GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-  DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
-  CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
-  GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
-  GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
-  BENCHMARK_MAX_DISTANCE: "0.35"
+  GEMINI_MODEL: gemini-3.1-flash-lite
+  GEMINI_EMBEDDING_MODEL: gemini-embedding-2
+  EMBEDDING_PROVIDER: gemini
+  LLM_PROVIDER: gemini
+  HINDSIGHT_BENCHMARK_TENANT_ID: 00000000-0000-0000-0000-000000000004
+  HINDSIGHT_LEARNING_EXECUTION_SEQUENCE: ${{ inputs.execution_sequence }}
 
 jobs:
   authorize:
@@ -35,10 +53,9 @@ jobs:
       contents: read
     outputs:
       learning_sha: ${{ steps.authorization.outputs.learning_sha }}
-      api_url: ${{ steps.provenance.outputs.api_url }}
     steps:
       - id: authorization
-        name: Require protocol reset and matching product run
+        name: Resolve owner-authorized exact-main execution
         env:
           REF_NAME: ${{ github.ref }}
           EVENT_SHA: ${{ github.sha }}
@@ -47,9 +64,10 @@ jobs:
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          OPERATION: ${{ inputs.operation }}
+          SEQUENCE: ${{ inputs.execution_sequence }}
           PRODUCT_RUN_ID: ${{ inputs.product_run_id }}
-          REQUESTED_RESET_ID: ${{ inputs.protocol_reset_id }}
-          AUTHORIZED_RESET_ID: ${{ vars.HINDSIGHT_LEARNING_PROTOCOL_RESET_ID }}
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -57,166 +75,369 @@ jobs:
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/learning-evidence.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
             && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
-            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "Learning evidence requires the repository owner on main." >&2
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ \
+            && "$SEQUENCE" =~ ^[12]$ ]] || {
+            echo "Learning evidence requires the repository owner on exact main." >&2
             exit 1
           }
-          [[ -n "$AUTHORIZED_RESET_ID" \
-            && "$REQUESTED_RESET_ID" == "$AUTHORIZED_RESET_ID" ]] || {
-            echo "Learning evidence has no matching authorized protocol reset." >&2
-            exit 1
-          }
-          RUN_JSON="$(GH_TOKEN="$GH_TOKEN" gh api "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID")"
-          jq -e \
-            --arg sha "$EVENT_SHA" \
-            '.name == "live acceptance"
-              and .path == ".github/workflows/live-acceptance.yml"
-              and .event == "workflow_dispatch"
-              and .conclusion == "success"
-              and .head_sha == $sha' \
-            <<<"$RUN_JSON" >/dev/null || {
-              echo "Learning evidence requires a successful same-SHA product run." >&2
-              exit 1
-            }
+          if [[ "$OPERATION" == "execute" && "$SEQUENCE" == "1" ]]; then
+            [[ "$PRODUCT_RUN_ID" =~ ^[1-9][0-9]*$ \
+              && "$QUALIFICATION_RUN_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+            product="$(GH_TOKEN="$GH_TOKEN" gh api "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID")"
+            qualification="$(GH_TOKEN="$GH_TOKEN" gh api "/repos/$REPOSITORY/actions/runs/$QUALIFICATION_RUN_ID")"
+            jq -e --arg sha "$EVENT_SHA" \
+              '.name == "live acceptance"
+                and .path == ".github/workflows/live-acceptance.yml"
+                and .event == "workflow_dispatch"
+                and .conclusion == "success"
+                and .head_sha == $sha' <<<"$product" >/dev/null
+            jq -e --arg sha "$EVENT_SHA" \
+              '.name == "learning qualification"
+                and .path == ".github/workflows/learning-qualification.yml"
+                and .event == "workflow_dispatch"
+                and .conclusion == "success"
+                and .head_sha == $sha' <<<"$qualification" >/dev/null
+          fi
           echo "learning_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
-      - id: provenance
-        name: Verify product provenance artifact
-        env:
-          REPOSITORY: ${{ github.repository }}
-          PRODUCT_RUN_ID: ${{ inputs.product_run_id }}
-          EXPECTED_SHA: ${{ steps.authorization.outputs.learning_sha }}
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          ARTIFACT_NAME="$(
-            GH_TOKEN="$GH_TOKEN" gh api \
-              "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID/artifacts" |
-              jq -r --arg sha "$EXPECTED_SHA" '.artifacts
-              | map(select(.expired == false and (.name | startswith("product-provenance-" + $sha + "-"))))
-              | if length == 1 then .[0].name else empty end'
-          )"
-          [[ -n "$ARTIFACT_NAME" ]] || {
-            echo "A unique product provenance artifact is required." >&2
-            exit 1
-          }
-          mkdir product-provenance
-          GH_TOKEN="$GH_TOKEN" gh run download "$PRODUCT_RUN_ID" \
-            --repo "$REPOSITORY" \
-            --name "$ARTIFACT_NAME" \
-            --dir product-provenance
-          API_URL="$(python - "$EXPECTED_SHA" <<'PY'
-          import json
-          import pathlib
-          import sys
 
-          payload = json.loads(pathlib.Path("product-provenance/product-provenance.json").read_text())
-          if payload.get("head_sha") != sys.argv[1]:
-              raise SystemExit("product provenance SHA mismatch")
-          api_url = str(payload.get("api_url") or "")
-          if not api_url.startswith("https://"):
-              raise SystemExit("product provenance API URL is invalid")
-          print(api_url)
-          PY
-          )"
-          echo "api_url=$API_URL" >> "$GITHUB_OUTPUT"
-
-  learning:
+  exact_main_ci:
     needs: authorize
     runs-on: ubuntu-latest
-    environment: demo
-    timeout-minutes: 240
     permissions:
+      actions: read
       contents: read
-      id-token: write
-    env:
-      EMBEDDING_PROVIDER: gemini
-      LLM_PROVIDER: gemini
-      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.learning_sha }}
-      HINDSIGHT_CHANGEFEED_WEBHOOK_URL: ${{ needs.authorize.outputs.api_url }}/internal/changefeed
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.authorize.outputs.learning_sha }}
           persist-credentials: false
-      - name: Verify exact learning revision
+      - name: Require unique successful exact-main CI
         env:
-          EXPECTED_SHA: ${{ needs.authorize.outputs.learning_sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          GH_TOKEN: ${{ github.token }}
+          LEARNING_SHA: ${{ needs.authorize.outputs.learning_sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$LEARNING_SHA"
+          gh api --method GET \
+            "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main -f event=push -f head_sha="$LEARNING_SHA" -f per_page=100 \
+            > "$RUNNER_TEMP/exact-main-ci.json"
+          python scripts/verify_ci_provenance.py \
+            --repository "$REPOSITORY" --sha "$LEARNING_SHA" \
+            < "$RUNNER_TEMP/exact-main-ci.json"
+
+  claim:
+    needs: [authorize, exact_main_ci]
+    runs-on: ubuntu-latest
+    environment: demo
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    outputs:
+      protocol_sha256: ${{ steps.claim.outputs.protocol_sha256 }}
+      source_run_id: ${{ steps.claim.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.claim.outputs.source_run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Load and mask learning settings from SSM
+      - name: Load and mask authority database
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$CHANGEFEED_TOKEN"; do
-            [[ -n "$value" && "$value" != "None" ]] || {
-              echo "A learning-evidence setting is unavailable." >&2
-              exit 1
-            }
-            echo "::add-mask::$value"
-          done
-          while IFS= read -r api_key; do
-            [[ -n "$api_key" ]] && echo "::add-mask::$api_key"
-          done < <(
-            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
-              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
-          )
-          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
-          {
-            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
-            printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
-            echo "GEMINI_API_KEYS<<$delimiter"
-            printf '%s\n' "$GEMINI_MATERIAL"
-            echo "$delimiter"
-          } >> "$GITHUB_ENV"
-      - id: pause_changefeed
-        name: Pause and fence the managed changefeed
-        run: uv run python scripts/configure_changefeed.py pause
-      - name: Run strict learning evidence
-        run: >-
-          uv run python scripts/run_live_acceptance.py learning-full
-          --database-scope hosted
-          --max-distance "$BENCHMARK_MAX_DISTANCE"
-          --report-dir learning-evidence-reports
-          --summary-path "$GITHUB_STEP_SUMMARY"
-      - name: Preserve learning reports
-        if: always()
-        uses: actions/upload-artifact@v4
+          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
+          echo "::add-mask::$DATABASE_URL"
+          printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Download sequence-one dependencies
+        if: inputs.operation == 'execute' && inputs.execution_sequence == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PRODUCT_RUN_ID: ${{ inputs.product_run_id }}
+          QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
+          LEARNING_SHA: ${{ needs.authorize.outputs.learning_sha }}
+        shell: bash
+        run: |
+          mkdir -p authority-input/qualification authority-input/product
+          qualification_name="$(GH_TOKEN="$GH_TOKEN" gh api "/repos/$REPOSITORY/actions/runs/$QUALIFICATION_RUN_ID/artifacts" | jq -r --arg sha "$LEARNING_SHA" '.artifacts | map(select(.expired == false and (.name | startswith("learning-qualification-" + $sha + "-")))) | if length == 1 then .[0].name else empty end')"
+          product_name="$(GH_TOKEN="$GH_TOKEN" gh api "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID/artifacts" | jq -r --arg sha "$LEARNING_SHA" '.artifacts | map(select(.expired == false and (.name | startswith("product-provenance-" + $sha + "-")))) | if length == 1 then .[0].name else empty end')"
+          [[ -n "$qualification_name" && -n "$product_name" ]] || exit 1
+          GH_TOKEN="$GH_TOKEN" gh run download "$QUALIFICATION_RUN_ID" --repo "$REPOSITORY" --name "$qualification_name" --dir authority-input/qualification
+          GH_TOKEN="$GH_TOKEN" gh run download "$PRODUCT_RUN_ID" --repo "$REPOSITORY" --name "$product_name" --dir authority-input/product
+      - id: claim
+        name: Create or reconcile immutable execution claim
+        env:
+          EVIDENCE_BUCKET: ${{ vars.HINDSIGHT_EVIDENCE_BUCKET }}
+          LEARNING_SHA: ${{ needs.authorize.outputs.learning_sha }}
+          OPERATION: ${{ inputs.operation }}
+          SEQUENCE: ${{ inputs.execution_sequence }}
+        shell: bash
+        run: |
+          if [[ "$OPERATION" == "execute" ]]; then
+            evidence_args=()
+            if [[ "$SEQUENCE" == "1" ]]; then
+              evidence_args+=(
+                --qualification-report authority-input/qualification/qualification.json
+                --qualification-receipt authority-input/qualification/receipt.json
+                --product-provenance authority-input/product/product-provenance.json
+              )
+            fi
+            uv run python scripts/manage_learning_authority.py \
+              --bucket "$EVIDENCE_BUCKET" --database-url "$DATABASE_URL" \
+              authorize-consume --sequence "$SEQUENCE" --code-sha "$LEARNING_SHA" \
+              --actor "$GITHUB_ACTOR" --workflow-run-id "$GITHUB_RUN_ID" \
+              --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" "${evidence_args[@]}" \
+              > authority.json
+          else
+            uv run python scripts/manage_learning_authority.py \
+              --bucket "$EVIDENCE_BUCKET" --database-url "$DATABASE_URL" \
+              reconcile-consumption --sequence "$SEQUENCE" > authority.json
+            test "$(jq -r .code_sha authority.json)" = "$LEARNING_SHA"
+          fi
+          echo "protocol_sha256=$(jq -r .protocol_authorization_sha256 authority.json)" >> "$GITHUB_OUTPUT"
+          echo "source_run_id=$(jq -r '.workflow_run_id // env.GITHUB_RUN_ID' authority.json)" >> "$GITHUB_OUTPUT"
+          echo "source_run_attempt=$(jq -r '.workflow_run_attempt // env.GITHUB_RUN_ATTEMPT' authority.json)" >> "$GITHUB_OUTPUT"
+
+  pilot:
+    if: inputs.operation == 'execute'
+    needs: [authorize, claim]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      pilot_id: ${{ steps.pilot.outputs.pilot_id }}
+    env:
+      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.learning_sha }}
+      HINDSIGHT_PROTOCOL_AUTHORIZATION_SHA256: ${{ needs.claim.outputs.protocol_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          name: learning-evidence-${{ needs.authorize.outputs.learning_sha }}-${{ github.run_attempt }}
-          path: learning-evidence-reports/*.json
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load and mask learning settings
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL"; do [[ -n "$value" && "$value" != "None" ]] || exit 1; echo "::add-mask::$value"; done
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          { printf 'DATABASE_URL=%s\n' "$DATABASE_URL"; echo "GEMINI_API_KEYS<<$delimiter"; printf '%s\n' "$GEMINI_MATERIAL"; echo "$delimiter"; } >> "$GITHUB_ENV"
+      - id: pilot
+        run: |
+          uv run python scripts/run_learning_benchmark.py pilot --repetitions 2 --max-distance 0.35 > pilot.json
+          echo "pilot_id=$(jq -r .experiment_id pilot.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: learning-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          path: pilot.json
           if-no-files-found: ignore
           retention-days: 90
-      - name: Finalize interrupted learning traces
-        if: failure() && steps.pause_changefeed.outcome == 'success'
-        run: >-
-          uv run python scripts/run_learning_benchmark.py finalize-interrupted
-          --code-sha "$HINDSIGHT_BENCHMARK_CODE_SHA"
-          --reason "Learning-evidence workflow ended before strict completion"
-      - name: Restore and verify the managed changefeed
-        if: always() && steps.pause_changefeed.outcome == 'success'
+
+  preregister:
+    if: inputs.operation == 'execute'
+    needs: [authorize, claim, pilot]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.learning_sha }}
+      HINDSIGHT_PROTOCOL_AUTHORIZATION_SHA256: ${{ needs.claim.outputs.protocol_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load and mask learning settings
         shell: bash
         run: |
-          uv run python scripts/configure_changefeed.py apply
-          uv run python scripts/configure_changefeed.py status
+          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL"; do [[ -n "$value" && "$value" != "None" ]] || exit 1; echo "::add-mask::$value"; done
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          { printf 'DATABASE_URL=%s\n' "$DATABASE_URL"; echo "GEMINI_API_KEYS<<$delimiter"; printf '%s\n' "$GEMINI_MATERIAL"; echo "$delimiter"; } >> "$GITHUB_ENV"
+      - run: uv run python scripts/run_learning_benchmark.py preregister --pilot-experiment-id "${{ needs.pilot.outputs.pilot_id }}" > preregistration.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: learning-preregistration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: preregistration.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  confirmation:
+    if: inputs.operation == 'execute'
+    needs: [authorize, claim, pilot, preregister]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      HINDSIGHT_BENCHMARK_CODE_SHA: ${{ needs.authorize.outputs.learning_sha }}
+      HINDSIGHT_PROTOCOL_AUTHORIZATION_SHA256: ${{ needs.claim.outputs.protocol_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load and mask learning settings
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL"; do [[ -n "$value" && "$value" != "None" ]] || exit 1; echo "::add-mask::$value"; done
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          { printf 'DATABASE_URL=%s\n' "$DATABASE_URL"; echo "GEMINI_API_KEYS<<$delimiter"; printf '%s\n' "$GEMINI_MATERIAL"; echo "$delimiter"; } >> "$GITHUB_ENV"
+      - name: Run preregistered confirmation
+        continue-on-error: true
+        run: uv run python scripts/run_learning_benchmark.py confirmation --pilot-experiment-id "${{ needs.pilot.outputs.pilot_id }}" > confirmation.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: learning-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: confirmation.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  finalize:
+    if: always() && needs.claim.result == 'success'
+    needs: [authorize, claim, pilot, preregister, confirmation]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load and mask authority database
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
+          echo "::add-mask::$DATABASE_URL"
+          printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Finalize traces and classify result
+        run: >-
+          uv run python scripts/finalize_learning_study.py
+          --database-url "$DATABASE_URL"
+          --sequence "${{ inputs.execution_sequence }}"
+          --workflow-run-id "${{ needs.claim.outputs.source_run_id }}"
+          --workflow-run-attempt "${{ needs.claim.outputs.source_run_attempt }}"
+          --code-sha "${{ needs.authorize.outputs.learning_sha }}"
+          --protocol-authorization-sha256 "${{ needs.claim.outputs.protocol_sha256 }}"
+          --interruption-reason "Learning workflow reached fenced finalization"
+          --output learning-final/study.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: learning-final-${{ needs.authorize.outputs.learning_sha }}-${{ inputs.execution_sequence }}
+          path: learning-final/study.json
+          retention-days: 90
+
+  seal:
+    needs: [authorize, claim, finalize]
+    runs-on: ubuntu-latest
+    environment: demo
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.learning_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: actions/download-artifact@v4
+        with:
+          name: learning-final-${{ needs.authorize.outputs.learning_sha }}-${{ inputs.execution_sequence }}
+          path: learning-final
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Load and mask authority database
+        shell: bash
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
+          echo "::add-mask::$DATABASE_URL"
+          printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Seal and mirror terminal evidence
+        env:
+          EVIDENCE_BUCKET: ${{ vars.HINDSIGHT_EVIDENCE_BUCKET }}
+        run: >-
+          uv run python scripts/manage_learning_authority.py
+          --bucket "$EVIDENCE_BUCKET" --database-url "$DATABASE_URL"
+          seal --sequence "${{ inputs.execution_sequence }}"
+          --report learning-final/study.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: learning-seal-${{ needs.authorize.outputs.learning_sha }}-${{ inputs.execution_sequence }}
+          path: learning-final/*.json
+          retention-days: 90
 
   learning_evidence_complete:
     if: always()
-    needs:
-      - authorize
-      - learning
+    needs: [authorize, exact_main_ci, claim, finalize, seal]
     runs-on: ubuntu-latest
     steps:
-      - name: Require strict learning completion
+      - name: Require authority and sealed evidence
         env:
           AUTHORIZE_RESULT: ${{ needs.authorize.result }}
-          LEARNING_RESULT: ${{ needs.learning.result }}
+          CI_RESULT: ${{ needs.exact_main_ci.result }}
+          CLAIM_RESULT: ${{ needs.claim.result }}
+          FINALIZE_RESULT: ${{ needs.finalize.result }}
+          SEAL_RESULT: ${{ needs.seal.result }}
         run: |
           [[ "$AUTHORIZE_RESULT" == "success" ]]
-          [[ "$LEARNING_RESULT" == "success" ]]
+          [[ "$CI_RESULT" == "success" ]]
+          [[ "$CLAIM_RESULT" == "success" ]]
+          [[ "$FINALIZE_RESULT" == "success" ]]
+          [[ "$SEAL_RESULT" == "success" ]]

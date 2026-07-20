@@ -34,6 +34,11 @@ from hindsight.db import connect  # noqa: E402
 from hindsight.embedding_index import activate_profile, begin_profile_build  # noqa: E402
 from hindsight.embeddings import embedding_profile, embedding_provider_from_env  # noqa: E402
 from hindsight.memory import MemoryStore, Provenance  # noqa: E402
+from hindsight.learning_authority import (  # noqa: E402
+    execution_authorization_id,
+    protocol_authorization_id,
+    require_execution_lease,
+)
 from hindsight.reasoning import (  # noqa: E402
     reasoning_provider_from_env,
     retrying_reasoning_provider,
@@ -102,12 +107,18 @@ def _main() -> None:
     finalize_interrupted.add_argument("--reason", required=True)
     args = parser.parse_args()
     if args.command == "finalize-interrupted":
+        finalizer_db_url = runtime_database_url()
+        _learning_authority(
+            command=args.command,
+            db_url=finalizer_db_url,
+            code_sha=args.code_sha,
+        )
         print(
             json.dumps(
                 finalize_interrupted_experiments(
                     code_sha=args.code_sha,
                     reason=args.reason,
-                    db_url=runtime_database_url(),
+                    db_url=finalizer_db_url,
                 ),
                 indent=2,
                 sort_keys=True,
@@ -134,6 +145,11 @@ def _main() -> None:
         expected_max_distance=getattr(args, "max_distance", None),
     )
     code_sha = _code_sha(args.command)
+    authority = _learning_authority(
+        command=args.command,
+        db_url=settings.database_url,
+        code_sha=code_sha,
+    )
     claim_family_contract = {
         "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
         "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
@@ -148,6 +164,7 @@ def _main() -> None:
         "repetitions_per_variant": 2,
         "independent_analysis_unit": "simulator_kind",
         "action_vocabulary_sha256": _digest(list(ALL_SIMULATOR_ACTIONS)),
+        "protocol_authorization_sha256": authority.get("protocol_authorization_sha256"),
     }
     claim_family_sha256 = _digest(claim_family_contract)
     study_contract = {
@@ -162,6 +179,9 @@ def _main() -> None:
         "code_sha": code_sha,
         "study_key_sha256": study_key_sha256,
         "claim_family_sha256": claim_family_sha256,
+        "protocol_authorization_id": authority.get("protocol_authorization_id"),
+        "execution_authorization_id": authority.get("execution_authorization_id"),
+        "execution_sequence": authority.get("sequence"),
         "provider": reasoning.provider_name,
         "model": reasoning.model_name,
         "embedding_profile_id": active_profile.profile_id,
@@ -243,6 +263,8 @@ def _main() -> None:
             provider=reasoning.provider_name,
             model=reasoning.model_name,
             embedding_profile_id=active_profile.profile_id,
+            protocol_authorization_id=authority.get("protocol_authorization_id"),
+            execution_authorization_id=authority.get("execution_authorization_id"),
             db_url=settings.database_url,
         )
     else:
@@ -277,6 +299,8 @@ def _main() -> None:
             model=reasoning.model_name,
             embedding_profile_id=active_profile.profile_id,
             preregistration=preregistration,
+            protocol_authorization_id=authority.get("protocol_authorization_id"),
+            execution_authorization_id=authority.get("execution_authorization_id"),
             db_url=settings.database_url,
         )
     if experiment["status"] == "completed":
@@ -323,6 +347,42 @@ def _code_sha(command: str) -> str:
             "live benchmark commands require HINDSIGHT_BENCHMARK_CODE_SHA or GITHUB_SHA"
         )
     return value
+
+
+def _learning_authority(*, command: str, db_url: str, code_sha: str) -> dict[str, Any]:
+    if command == "ci-smoke":
+        return {}
+    values = {
+        "sequence": os.environ.get("HINDSIGHT_LEARNING_EXECUTION_SEQUENCE"),
+        "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "protocol_authorization_sha256": os.environ.get(
+            "HINDSIGHT_PROTOCOL_AUTHORIZATION_SHA256"
+        ),
+    }
+    try:
+        sequence = int(str(values["sequence"] or ""))
+        workflow_run_id = int(str(values["workflow_run_id"] or ""))
+        workflow_run_attempt = int(str(values["workflow_run_attempt"] or ""))
+    except ValueError as exc:
+        raise RuntimeError("live benchmark requires exact execution authority") from exc
+    protocol_sha256 = str(values["protocol_authorization_sha256"] or "")
+    if len(protocol_sha256) != 64:
+        raise RuntimeError("live benchmark requires the reset authorization digest")
+    require_execution_lease(
+        db_url=db_url,
+        sequence=sequence,
+        workflow_run_id=workflow_run_id,
+        workflow_run_attempt=workflow_run_attempt,
+        code_sha=code_sha,
+        protocol_authorization_sha256=protocol_sha256,
+    )
+    return {
+        "sequence": sequence,
+        "protocol_authorization_id": protocol_authorization_id(),
+        "execution_authorization_id": execution_authorization_id(sequence),
+        "protocol_authorization_sha256": protocol_sha256,
+    }
 
 
 def _experiment_manifest(

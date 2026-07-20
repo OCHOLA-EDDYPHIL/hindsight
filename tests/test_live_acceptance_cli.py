@@ -614,9 +614,13 @@ def test_learning_workflow_is_manual_guarded_and_never_deploys():
     workflow = (ROOT / ".github" / "workflows" / "learning-evidence.yml").read_text()
 
     assert "workflow_dispatch:" in workflow
-    assert "HINDSIGHT_LEARNING_PROTOCOL_RESET_ID" in workflow
-    assert "scripts/run_live_acceptance.py learning-full" in workflow
-    assert "configure_changefeed.py pause" in workflow
-    assert "finalize-interrupted" in workflow
+    assert 'HINDSIGHT_BENCHMARK_TENANT_ID: 00000000-0000-0000-0000-000000000004' in workflow
+    assert "manage_learning_authority.py" in workflow
+    assert "run_learning_benchmark.py pilot" in workflow
+    assert "run_learning_benchmark.py preregister" in workflow
+    assert "run_learning_benchmark.py confirmation" in workflow
+    assert "finalize_learning_study.py" in workflow
+    assert "configure_changefeed.py pause" not in workflow
+    assert "protocol_reset_id" not in workflow
     assert "deploy-demo.yml" not in workflow
     assert "pull_request:" not in workflow
