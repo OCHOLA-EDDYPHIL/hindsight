@@ -7,6 +7,14 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNNER_EXPRESSION = "${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}"
+RUNNER_ROUTED_WORKFLOWS = (
+    "ci.yml",
+    "deploy-demo.yml",
+    "live-acceptance.yml",
+    "learning-qualification.yml",
+    "learning-evidence.yml",
+)
 
 
 def _load_script(name: str):
@@ -49,6 +57,60 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
         "populated_roles",
         "dispatch_upgrade",
     }
+
+
+@pytest.mark.parametrize("workflow_name", RUNNER_ROUTED_WORKFLOWS)
+def test_hosted_workflow_jobs_honor_opt_in_runner_override(workflow_name: str):
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / workflow_name).read_text()
+    )
+    jobs = workflow["jobs"].values()
+    executable_jobs = [job for job in jobs if "runs-on" in job]
+
+    assert executable_jobs
+    assert all("runs-on" in job or "uses" in job for job in jobs)
+    assert {job["runs-on"] for job in executable_jobs} == {RUNNER_EXPRESSION}
+
+
+def test_reusable_deploy_workflow_preserves_hosted_runner_default():
+    workflow = (ROOT / ".github" / "workflows" / "deploy-demo.yml").read_text()
+
+    assert "workflow_call:" in workflow
+    assert RUNNER_EXPRESSION in workflow
+    assert "runs-on: ubuntu-latest" not in workflow
+
+
+def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
+    workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
+    workflow = workflow_path.read_text()
+    suffix = "_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable"
+
+    assert f"${{{{ matrix.database }}}}{suffix}" in workflow
+    for database_name in (
+        "hindsight_diagnostic_ci",
+        "hindsight_schema_fresh",
+        "hindsight_schema_populated",
+    ):
+        assert f"{database_name}{suffix}" in workflow
+
+    jobs = yaml.safe_load(workflow)["jobs"]
+    compose_scopes = {
+        "database": "${{ matrix.group }}",
+        "migration_replay": "${{ matrix.case }}",
+        "diagnostics": "diagnostics",
+        "schema_fresh": "schema_fresh",
+        "schema_populated": "schema_populated",
+    }
+    for job_name, scope in compose_scopes.items():
+        job = jobs[job_name]
+        assert job["env"]["COMPOSE_PROJECT_NAME"] == (
+            "hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_" + scope
+        )
+        assert job["steps"][-1] == {
+            "name": "Remove isolated database container",
+            "if": "always()",
+            "run": "docker compose down --volumes --remove-orphans",
+        }
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):
