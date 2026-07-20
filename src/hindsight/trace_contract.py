@@ -383,7 +383,7 @@ def _governed_decision_trace(conn: Any, *, decision_id: str) -> dict[str, Any] |
                     SELECT episodic_memory_id FROM memory_reads
                     WHERE decision_id = %s AND episodic_memory_id IS NOT NULL
                 )
-                ORDER BY edge.created_at
+                ORDER BY edge.created_at, edge.id
             """,
             (decision_id, decision_id, decision_id),
         )

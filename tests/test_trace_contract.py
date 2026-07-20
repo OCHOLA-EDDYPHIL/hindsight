@@ -31,12 +31,23 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
                 "Seed a governed source memory",
             ),
         )
+        second_source = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="processor timeouts caused retry fanout in payments",
+            provenance=Provenance(
+                "pytest.trace",
+                "trace:second-source",
+                "Seed a second governed source memory",
+            ),
+        )
         retrieval = store.retrieve_semantic(
             namespace=namespace,
             query="processor timeouts caused retry fanout",
             decision_id=decision_id,
             reader="pytest.trace",
             purpose="Build an inspectable decision trace",
+            limit=2,
         )
         child = store.remember(
             memory_kind="semantic",
@@ -48,7 +59,7 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
                 "Derive a child memory from the retrieved source",
             ),
             producer_decision_id=decision_id,
-            parent_memory_ids=[str(source["id"])],
+            parent_memory_ids=[str(source["id"]), str(second_source["id"])],
         )
         store.invalidate(
             memory_id=str(source["id"]),
@@ -75,19 +86,40 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
     assert read["t_invalid"] is not None
     assert read["evidence_ids"]
     assert read["outgoing_lineage_edge_ids"]
-    edge = trace["lineage_edges"][0]
-    assert str(edge["child_semantic_memory_id"]) == str(child["id"])
-    assert edge["producer_decision_id"] == decision_id
+    assert len(trace["lineage_edges"]) == 2
+    assert {str(edge["child_semantic_memory_id"]) for edge in trace["lineage_edges"]} == {
+        str(child["id"])
+    }
+    assert {edge["producer_decision_id"] for edge in trace["lineage_edges"]} == {
+        decision_id
+    }
+    assert len({edge["created_at"] for edge in trace["lineage_edges"]}) == 1
+    lineage_ids = [str(edge["id"]) for edge in trace["lineage_edges"]]
+    assert lineage_ids == sorted(lineage_ids)
+
+    repeated = governed_decision_trace(decision_id=decision_id, db_url=database_url())
+    assert repeated is not None
+    assert [str(edge["id"]) for edge in repeated["lineage_edges"]] == lineage_ids
 
     from hindsight import api
 
     influence = api.decisions_influence(decision_id)
     assert influence["decision_id"] == decision_id
-    assert influence["count"] == 1
-    assert influence["memories"][0]["memory"]["content"] == source["content"]
+    assert influence["count"] == 2
+    assert {row["memory"]["content"] for row in influence["memories"]} == {
+        source["content"],
+        second_source["content"],
+    }
     assert influence["decision"]["id"] == decision_id
     assert influence["retrievals"][0]["id"] == retrieval.retrieval_id
     assert influence["trace"]["reads"][0]["belief_id"] == str(source["belief_id"])
+    assert [str(edge["id"]) for edge in influence["trace"]["lineage_edges"]] == lineage_ids
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(api.app).get(f"/v1/decisions/{decision_id}/influence")
+    assert response.status_code == 200
+    assert [edge["id"] for edge in response.json()["trace"]["lineage_edges"]] == lineage_ids
 
 
 @requires_db
