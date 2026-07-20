@@ -655,6 +655,8 @@ def create_experiment(
     model: str,
     embedding_profile_id: str,
     preregistration: dict[str, Any] | None = None,
+    protocol_authorization_id: str | None = None,
+    execution_authorization_id: str | None = None,
     db_url: str | None = None,
 ) -> dict[str, Any]:
     """Persist an immutable experiment manifest and optional preregistration."""
@@ -663,10 +665,14 @@ def create_experiment(
     claim_family_sha256 = str(manifest.get("claim_family_sha256") or "") or None
     code_sha = str(manifest.get("code_sha") or "") or None
     if experiment_kind != "ci_smoke" and (
-        study_key_sha256 is None or claim_family_sha256 is None or code_sha is None
+        study_key_sha256 is None
+        or claim_family_sha256 is None
+        or code_sha is None
+        or protocol_authorization_id is None
+        or execution_authorization_id is None
     ):
         raise ValueError(
-            "live experiments require immutable claim-family, study, and code identities"
+            "live experiments require immutable authority, claim-family, study, and code identities"
         )
 
     if experiment_kind == "confirmation":
@@ -706,6 +712,8 @@ def create_experiment(
                         if (
                             existing["status"] in {"created", "completed"}
                             and str(existing["manifest_sha256"]) == manifest_hash
+                            and str(existing["protocol_authorization_id"] or "")
+                            == str(protocol_authorization_id or "")
                             and (
                                 str(existing["preregistration_sha256"] or "")
                                 == str(prereg_hash or "")
@@ -809,9 +817,11 @@ def create_experiment(
                             id, experiment_kind, manifest, manifest_sha256,
                             preregistration, preregistration_sha256,
                             provider, model, embedding_profile_id,
-                            study_key_sha256, claim_family_sha256, code_sha
+                            study_key_sha256, claim_family_sha256, code_sha,
+                            protocol_authorization_id, execution_authorization_id
                         ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s
                         )
                         RETURNING *
                     """,
@@ -828,6 +838,8 @@ def create_experiment(
                         study_key_sha256,
                         claim_family_sha256,
                         code_sha,
+                        protocol_authorization_id,
+                        execution_authorization_id,
                     ),
                 )
                 return dict(cur.fetchone())

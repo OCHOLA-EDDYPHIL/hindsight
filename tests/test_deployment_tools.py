@@ -337,11 +337,11 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
         values={
             "EVENT_NAME": "workflow_dispatch",
             "REF_NAME": "refs/heads/main",
-            "WORKFLOW_REF": (
-                "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
-            ),
-            "REPOSITORY": "owner/project",
-            "ACTOR": "owner",
+                "WORKFLOW_REF": (
+                    "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
+                ),
+                "REPOSITORY": "owner/project",
+                "ACTOR": "owner",
             "TRIGGERING_ACTOR": "owner",
             "REPOSITORY_OWNER": "owner",
             "REQUESTED_SHA": "a" * 40,
@@ -562,14 +562,16 @@ def test_product_completion_ignores_learning_result_but_requires_every_product_j
 def test_learning_authorization_guards_precede_all_hosted_side_effects(tmp_path):
     workflow_path = ".github/workflows/learning-evidence.yml"
     workflow = pathlib.Path(workflow_path).read_text()
-    authorize_job = workflow.split("  authorize:\n", 1)[1].split("  learning:\n", 1)[0]
+    authorize_job = workflow.split("  authorize:\n", 1)[1].split("  exact_main_ci:\n", 1)[0]
 
-    assert authorize_job.index("AUTHORIZED_RESET_ID") < authorize_job.index("RUN_JSON")
+    assert authorize_job.index('"$ACTOR" == "$REPOSITORY_OWNER"') < authorize_job.index(
+        'gh api "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID"'
+    )
     for forbidden in (
         "configure-aws-credentials",
         "aws ssm get-parameter",
         "configure_changefeed.py",
-        "learning-evidence-reports",
+        "manage_learning_authority.py",
     ):
         assert forbidden not in authorize_job
 
@@ -582,19 +584,20 @@ def test_learning_authorization_guards_precede_all_hosted_side_effects(tmp_path)
             "WORKFLOW_REF": (
                 "owner/project/.github/workflows/learning-evidence.yml@refs/heads/main"
             ),
-            "ACTOR": "owner",
+            "ACTOR": "different-user",
             "TRIGGERING_ACTOR": "owner",
             "REPOSITORY_OWNER": "owner",
-            "PRODUCT_RUN_ID": "1",
-            "REQUESTED_RESET_ID": "requested",
-            "AUTHORIZED_RESET_ID": "",
+            "OPERATION": "seal-only",
+            "SEQUENCE": "1",
+            "PRODUCT_RUN_ID": "",
+            "QUALIFICATION_RUN_ID": "",
             "GH_TOKEN": "unused",
         },
         output_path=tmp_path / "learning-rejected",
     )
 
     assert rejected.returncode != 0
-    assert "protocol reset" in rejected.stderr
+    assert "repository owner on exact main" in rejected.stderr
 
 
 def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_path):

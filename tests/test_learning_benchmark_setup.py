@@ -427,6 +427,12 @@ def test_interrupted_finalizer_cli_does_not_initialize_live_providers(
         "embedding_provider_from_env",
         fail_provider_initialization,
     )
+    authority_calls = []
+    monkeypatch.setattr(
+        benchmark_script,
+        "_learning_authority",
+        lambda **kwargs: authority_calls.append(kwargs) or {},
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -447,6 +453,13 @@ def test_interrupted_finalizer_cli_does_not_initialize_live_providers(
             "code_sha": "a" * 40,
             "reason": "runner timed out",
             "db_url": "postgresql://benchmark",
+        }
+    ]
+    assert authority_calls == [
+        {
+            "command": "finalize-interrupted",
+            "db_url": "postgresql://benchmark",
+            "code_sha": "a" * 40,
         }
     ]
     assert json.loads(capsys.readouterr().out) == {"experiments": 2}
