@@ -31,6 +31,7 @@ def test_ranked_candidates_reports_only_opaque_ordering_metadata():
     assert result["target_rank"] == 1
     assert result["target_rank_one"] is True
     assert result["target_margin"] == pytest.approx(0.2)
+    assert result["candidates"][0]["within_cutoff"] is True
     assert result["rankings"] == [
         {
             "candidate_token": target,
@@ -61,10 +62,21 @@ def test_ranked_candidates_records_targets_outside_the_cutoff_without_fallback()
     )
 
     assert result == {
+        "target_distance": 1.0,
         "target_rank": None,
         "target_within_cutoff": False,
         "target_rank_one": False,
+        "target_cutoff_margin": pytest.approx(-0.65),
         "target_margin": None,
+        "candidates": [
+            {
+                "candidate_token": target,
+                "candidate_role": "target",
+                "distance": 1.0,
+                "within_cutoff": False,
+                "rank": None,
+            }
+        ],
         "rankings": [],
     }
 
@@ -84,15 +96,18 @@ def test_indexed_candidates_rejects_unknown_memories_and_preserves_margin():
             "other-id": (other, "background"),
         },
         target_token=target,
+        max_distance=0.35,
     )
     assert result["target_rank"] == 1
     assert result["target_margin"] == pytest.approx(0.2)
+    assert result["target_cutoff_margin"] == pytest.approx(0.25)
 
     with pytest.raises(ValueError, match="unknown diagnostic memory"):
         indexed_candidates(
             hits=[{"id": "unknown", "distance": 0.0}],
             identity_by_memory_id={},
             target_token=target,
+            max_distance=0.35,
         )
 
 

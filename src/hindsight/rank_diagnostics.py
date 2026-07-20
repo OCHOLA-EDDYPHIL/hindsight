@@ -46,11 +46,20 @@ def ranked_candidates(
     if sum(str(row["token"]) == target_token for row in candidates) != 1:
         raise ValueError("exactly one target candidate is required")
 
+    candidates_by_distance = []
     measured = []
     target_distance = None
     for candidate in candidates:
         distance = cosine_distance(query_embedding, candidate["embedding"])
         token = str(candidate["token"])
+        candidates_by_distance.append(
+            {
+                "candidate_token": token,
+                "candidate_role": str(candidate["role"]),
+                "distance": distance,
+                "within_cutoff": distance <= max_distance,
+            }
+        )
         if token == target_token:
             target_distance = distance
         if distance <= max_distance:
@@ -62,24 +71,33 @@ def ranked_candidates(
                 }
             )
     measured.sort(key=lambda row: (row["distance"], row["candidate_token"]))
+    candidates_by_distance.sort(key=lambda row: (row["distance"], row["candidate_token"]))
     for rank, row in enumerate(measured, start=1):
         row["rank"] = rank
+    rank_by_token = {row["candidate_token"]: row["rank"] for row in measured}
+    for row in candidates_by_distance:
+        row["rank"] = rank_by_token.get(row["candidate_token"])
 
     target_rank = next(
         (row["rank"] for row in measured if row["candidate_token"] == target_token),
         None,
     )
     competing = [
-        row["distance"] for row in measured if row["candidate_token"] != target_token
+        row["distance"] for row in candidates_by_distance if row["candidate_token"] != target_token
     ]
     margin = None
     if target_distance is not None and competing:
         margin = min(competing) - target_distance
     return {
+        "target_distance": target_distance,
         "target_rank": target_rank,
         "target_within_cutoff": target_rank is not None,
         "target_rank_one": target_rank == 1,
+        "target_cutoff_margin": (
+            max_distance - target_distance if target_distance is not None else None
+        ),
         "target_margin": margin,
+        "candidates": candidates_by_distance,
         "rankings": measured,
     }
 
@@ -89,6 +107,7 @@ def indexed_candidates(
     hits: Sequence[dict[str, Any]],
     identity_by_memory_id: dict[str, tuple[str, str]],
     target_token: str,
+    max_distance: float,
 ) -> dict[str, Any]:
     """Sanitize CockroachDB search hits into the direct-ranking report shape."""
 
@@ -108,16 +127,16 @@ def indexed_candidates(
             }
         )
     target = next((row for row in rankings if row["candidate_token"] == target_token), None)
-    competing = [
-        row["distance"] for row in rankings if row["candidate_token"] != target_token
-    ]
+    competing = [row["distance"] for row in rankings if row["candidate_token"] != target_token]
     margin = None
     if target is not None and competing:
         margin = min(competing) - target["distance"]
     return {
+        "target_distance": target["distance"] if target is not None else None,
         "target_rank": target["rank"] if target is not None else None,
         "target_within_cutoff": target is not None,
         "target_rank_one": bool(target and target["rank"] == 1),
+        "target_cutoff_margin": (max_distance - target["distance"] if target is not None else None),
         "target_margin": margin,
         "rankings": rankings,
     }
