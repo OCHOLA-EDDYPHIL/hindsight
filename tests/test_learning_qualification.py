@@ -5,6 +5,7 @@ import hashlib
 import json
 import pathlib
 import sys
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import yaml
@@ -177,13 +178,55 @@ def test_index_parity_requires_membership_order_and_distance_tolerance():
     assert not diagnostic._ordering_parity(direct=direct, indexed=indexed)["index_parity"]
 
 
-def test_diagnostic_cleanup_refuses_non_workflow_database_names():
+def test_diagnostic_cleanup_normalizes_tls_and_refuses_non_workflow_database_names(
+    monkeypatch,
+):
+    import certifi
+
     cleanup = _load_script("drop_diagnostic_database")
-    name, admin = cleanup.diagnostic_database_target(
-        "postgresql://root@db.example:26257/hindsight_diagnostic_123_2?sslmode=require"
+    database_url = (
+        "postgresql://root@db.example:26257/hindsight_diagnostic_123_2"
+        "?sslmode=verify-full"
     )
+    name, admin = cleanup.diagnostic_database_target(database_url)
     assert name == "hindsight_diagnostic_123_2"
     assert "/defaultdb?" in admin
+    connected = []
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, *_args):
+            return None
+
+    def fake_connect(url, **kwargs):
+        connected.append((url, kwargs))
+        return _Connection()
+
+    monkeypatch.setattr(cleanup.psycopg, "connect", fake_connect)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["drop_diagnostic_database.py", "--database-url", database_url],
+    )
+
+    cleanup.main()
+
+    query = parse_qs(urlsplit(connected[0][0]).query)
+    assert query["sslrootcert"] == [certifi.where()]
+    assert connected[0][1] == {"autocommit": True}
+
+    explicit = (
+        "postgresql://root@db.example:26257/hindsight_diagnostic_123_2"
+        "?sslmode=verify-full&sslrootcert=system"
+    )
+    _, explicit_admin = cleanup.diagnostic_database_target(explicit)
+    assert parse_qs(urlsplit(cleanup.database_url_with_tls_roots(explicit_admin)).query)[
+        "sslrootcert"
+    ] == ["system"]
     with pytest.raises(RuntimeError, match="refusing"):
         cleanup.diagnostic_database_target(
             "postgresql://root@db.example:26257/hindsight?sslmode=require"
