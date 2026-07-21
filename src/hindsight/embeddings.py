@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
@@ -22,6 +23,11 @@ EMBEDDING_DIMENSIONS = 1024
 BEDROCK_TITAN_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 LIVE_BEDROCK_EMBEDDINGS_FLAG = "RUN_LIVE_BEDROCK_EMBEDDINGS"
 DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-2"
+GEMINI_REPRESENTATIONS = (
+    "raw_control",
+    "generic_title",
+    "applicability_instruction",
+)
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -146,20 +152,29 @@ class GeminiEmbeddingProvider:
         credential_pool: GeminiCredentialPool,
         model_name: str = DEFAULT_GEMINI_EMBEDDING_MODEL,
         dimensions: int = EMBEDDING_DIMENSIONS,
+        representation: str = "raw_control",
     ):
+        if representation not in GEMINI_REPRESENTATIONS:
+            raise ValueError("unsupported Gemini retrieval representation")
         self.model_name = model_name
         self.dimensions = dimensions
+        self.representation = representation
+        if representation != "raw_control":
+            self.encoder_revision = f"gemini-retrieval-task-v2-{representation}"
         self._credential_pool = credential_pool
 
-    def _embed(self, text: str, *, task_type: str) -> list[float]:
+    def _embed(self, text: str, *, task_type: str, title: str | None = None) -> list[float]:
         def invoke(client: Any) -> Any:
+            config = {
+                "output_dimensionality": self.dimensions,
+                "task_type": task_type,
+            }
+            if title is not None:
+                config["title"] = title
             return client.models.embed_content(
                 model=self.model_name,
                 contents=text,
-                config={
-                    "output_dimensionality": self.dimensions,
-                    "task_type": task_type,
-                },
+                config=config,
             )
 
         execution = self._credential_pool.execute(invoke, routing_key=text)
@@ -182,10 +197,21 @@ class GeminiEmbeddingProvider:
         return self.embed_document(text)
 
     def embed_document(self, text: str) -> list[float]:
-        return self._embed(text, task_type="RETRIEVAL_DOCUMENT")
+        content, title = _gemini_representation(
+            text, representation=self.representation, query=False
+        )
+        return self._embed(
+            content,
+            task_type="RETRIEVAL_DOCUMENT",
+            title=title,
+        )
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed(text, task_type="RETRIEVAL_QUERY")
+        content, _ = _gemini_representation(text, representation=self.representation, query=True)
+        return self._embed(
+            content,
+            task_type="RETRIEVAL_QUERY",
+        )
 
 
 class BedrockTitanEmbeddingProvider:
@@ -259,6 +285,7 @@ def embedding_provider_from_env(
             model_name=(
                 env.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
             ).strip(),
+            representation=(env.get("HINDSIGHT_GEMINI_REPRESENTATION") or "raw_control").strip(),
         )
     if provider == "bedrock":
         return BedrockTitanEmbeddingProvider(
@@ -266,3 +293,30 @@ def embedding_provider_from_env(
             region_name=env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION"),
         )
     raise ValueError(f"Unsupported EMBEDDING_PROVIDER: {provider}")
+
+
+def _gemini_representation(
+    text: str, *, representation: str, query: bool
+) -> tuple[str, str | None]:
+    """Format raw text without accepting candidate metadata or identity."""
+
+    normalized = unicodedata.normalize(
+        "NFC", text.replace("\r\n", "\n").replace("\r", "\n")
+    ).strip()
+    if representation == "raw_control":
+        return normalized, None
+    if representation == "generic_title":
+        return normalized, None if query else "Hindsight operational memory"
+    if representation == "applicability_instruction":
+        if query:
+            return (
+                "Retrieve the operational memory most applicable to this incident.\n"
+                f"Incident:\n{normalized}",
+                None,
+            )
+        return (
+            "Operational memory that may contain a relevant situation, check, or action.\n"
+            f"Memory:\n{normalized}",
+            "Hindsight operational memory",
+        )
+    raise ValueError("unsupported Gemini retrieval representation")

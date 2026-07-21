@@ -458,6 +458,7 @@ resource "aws_lambda_function" "api" {
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
     }
   }
 }
@@ -506,6 +507,7 @@ resource "aws_lambda_function" "worker" {
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_MODEL                        = var.gemini_model
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
       REASONING_MAX_ATTEMPTS              = tostring(var.reasoning_max_attempts)
     }
   }

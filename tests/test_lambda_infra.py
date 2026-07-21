@@ -59,6 +59,7 @@ def test_runtime_lambdas_use_distinct_database_parameters_without_bedrock():
     assert "LLM_PROVIDER" in api_lambda
     assert "EMBEDDING_PROVIDER" in api_lambda
     assert "GEMINI_EMBEDDING_MODEL" in api_lambda
+    assert "HINDSIGHT_GEMINI_REPRESENTATION" in api_lambda
     assert "BEDROCK_" not in api_lambda
     assert 'resource "aws_cloudwatch_event_rule" "operation_reaper"' in stack
     assert 'command = "reap_memory_operations"' in stack
