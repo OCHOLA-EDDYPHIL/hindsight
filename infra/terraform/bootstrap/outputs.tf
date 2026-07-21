@@ -14,6 +14,14 @@ output "learning_evidence_bucket" {
   value = aws_s3_bucket.learning_evidence.id
 }
 
+output "learning_qualification_hmac_key_arn" {
+  value = aws_kms_key.learning_qualification_hmac.arn
+}
+
+output "learning_qualification_hmac_key_alias" {
+  value = aws_kms_alias.learning_qualification_hmac.name
+}
+
 output "backend_config" {
   value = {
     bucket       = data.aws_s3_bucket.state.id

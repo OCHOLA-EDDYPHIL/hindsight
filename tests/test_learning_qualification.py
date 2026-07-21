@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import pathlib
 import sys
@@ -102,6 +103,21 @@ def test_confirmation_failure_writes_complete_opaque_report(monkeypatch, tmp_pat
             "indexed": {"target_rank_one": False},
         },
     )
+    family_sha256 = diagnostic.family_sha256(
+        diagnostic.v3_family_contract(
+            corpus_sha256=hashlib.sha256(corpus_path.read_bytes()).hexdigest()
+        )
+    )
+
+    class Tokenizer:
+        def __init__(self, *, key_id, family_sha256):
+            assert key_id == "alias/test"
+            assert len(family_sha256) == 64
+
+        def token(self, *, kind, raw_id):
+            return diagnostic.opaque_token("kms-test", kind, raw_id)
+
+    monkeypatch.setattr(diagnostic, "KmsHmacTokenizer", Tokenizer)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -116,6 +132,12 @@ def test_confirmation_failure_writes_complete_opaque_report(monkeypatch, tmp_pat
             "7",
             "--workflow-run-attempt",
             "1",
+            "--qualification-sequence",
+            "1",
+            "--scientific-family-sha256",
+            family_sha256,
+            "--token-key-id",
+            "alias/test",
             "--output",
             str(output),
         ],
@@ -211,6 +233,32 @@ def test_diagnostic_cleanup_normalizes_tls_and_refuses_non_workflow_database_nam
         )
 
 
+def test_interrupted_report_preserves_sequence_and_outcome_boundary(tmp_path):
+    authority = _load_script("manage_qualification_family")
+    attempt = tmp_path / "attempt.json"
+    attempt.write_text(
+        json.dumps(
+            {
+                "code_sha": "a" * 40,
+                "sequence": 2,
+                "run_id": 7,
+                "run_attempt": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = authority._infrastructure_report(
+        attempt=attempt,
+        corpus=ROOT / "fixtures" / "benchmark_variants.json",
+        outcome_accessed=True,
+    )
+
+    assert report["status"] == "infrastructure_incomplete"
+    assert report["workflow"] == {"run_id": 7, "run_attempt": 1, "sequence": 2}
+    assert report["outcome_accessed"] is True
+
+
 def test_qualification_workflow_is_owner_only_outcome_free_and_sealed():
     path = ROOT / ".github" / "workflows" / "learning-qualification.yml"
     workflow = path.read_text()
@@ -219,6 +267,7 @@ def test_qualification_workflow_is_owner_only_outcome_free_and_sealed():
     assert set(parsed["jobs"]) == {
         "authorize",
         "exact_main_ci",
+        "claim",
         "qualify",
         "qualification_complete",
     }
@@ -226,11 +275,19 @@ def test_qualification_workflow_is_owner_only_outcome_free_and_sealed():
     assert '"$ACTOR" == "$REPOSITORY_OWNER"' in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
     assert "verify_ci_provenance.py" in workflow
+    assert "manage_qualification_family.py claim" in workflow
     assert "run_rank_diagnostics.py confirmation" in workflow
+    assert '--qualification-sequence "$QUALIFICATION_SEQUENCE"' in workflow
+    assert '--scientific-family-sha256 "$FAMILY_SHA256"' in workflow
+    assert '--token-key-id "$HINDSIGHT_QUALIFICATION_HMAC_KEY_ID"' in workflow
     assert "hindsight_diagnostic_{os.environ['GITHUB_RUN_ID']}_" in workflow
     assert "HINDSIGHT_EVIDENCE_ROLE_ARN" in workflow
     assert "seal_learning_evidence.py" in workflow
+    assert "manage_qualification_family.py finalize" in workflow
     assert "drop_diagnostic_database.py" in workflow
+    assert workflow.index("manage_qualification_family.py claim") < workflow.index(
+        "aws ssm get-parameter"
+    )
     for forbidden in (
         "run_learning_benchmark.py",
         "learning-full",

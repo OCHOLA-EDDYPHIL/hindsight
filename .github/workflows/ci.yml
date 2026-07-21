@@ -119,6 +119,7 @@ jobs:
           - agent_runtime_roles
           - populated_roles
           - dispatch_upgrade
+          - qualification_authority
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.case }}

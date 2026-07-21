@@ -56,14 +56,13 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
         "agent_runtime_roles",
         "populated_roles",
         "dispatch_upgrade",
+        "qualification_authority",
     }
 
 
 @pytest.mark.parametrize("workflow_name", RUNNER_ROUTED_WORKFLOWS)
 def test_hosted_workflow_jobs_honor_opt_in_runner_override(workflow_name: str):
-    workflow = yaml.safe_load(
-        (ROOT / ".github" / "workflows" / workflow_name).read_text()
-    )
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / workflow_name).read_text())
     jobs = workflow["jobs"].values()
     executable_jobs = [job for job in jobs if "runs-on" in job]
 

@@ -168,9 +168,9 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     bucket = bootstrap.split('resource "aws_s3_bucket" "learning_evidence"', 1)[1].split(
         'resource "aws_s3_bucket_versioning"', 1
     )[0]
-    evidence_policy = bootstrap.split(
-        'data "aws_iam_policy_document" "github_evidence"', 1
-    )[1].split('resource "aws_iam_role_policy" "github_evidence"', 1)[0]
+    evidence_policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[
+        1
+    ].split('resource "aws_iam_role_policy" "github_evidence"', 1)[0]
     deploy_deny = bootstrap.split('sid    = "EvidenceArchiveMutationDenied"', 1)[1].split(
         "\n  statement {", 1
     )[0]
@@ -191,6 +191,26 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     assert '"s3:BypassGovernanceRetention"' in deploy_deny
     assert 'output "github_evidence_role_arn"' in outputs
     assert 'output "learning_evidence_bucket"' in outputs
+
+
+def test_qualification_hmac_key_is_non_exportable_and_evidence_role_scoped():
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
+
+    key = bootstrap.split('resource "aws_kms_key" "learning_qualification_hmac"', 1)[1].split(
+        'resource "aws_kms_alias" "learning_qualification_hmac"', 1
+    )[0]
+    policy = bootstrap.split('sid = "QualificationOpaqueIdentifiers"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+
+    assert 'key_usage                = "GENERATE_VERIFY_MAC"' in key
+    assert 'customer_master_key_spec = "HMAC_256"' in key
+    assert "prevent_destroy = true" in key
+    assert "kms:GenerateMac" in policy
+    assert "kms:VerifyMac" in policy
+    assert "kms:Decrypt" not in policy
+    assert 'output "learning_qualification_hmac_key_arn"' in outputs
 
 
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
@@ -235,7 +255,7 @@ def test_deploy_health_only_is_owner_authorized_exact_main_and_checks_every_endp
     assert 'direct DB-backed route" "$API_URL/v1/incidents?limit=1' in workflow
     assert 'UI-proxied readiness" "$UI_URL/v1/health/ready' in workflow
     assert "from websockets.asyncio.client import connect" in workflow
-    assert 'f"{sys.argv[2].rstrip(\'/\')}/v1/realtime/ticket"' in workflow
+    assert "f\"{sys.argv[2].rstrip('/')}/v1/realtime/ticket\"" in workflow
     assert "urlencode({'ticket': ticket})" in workflow
     assert "Exact revision \\`$DEPLOYED_SHA\\` passed" in workflow
 
