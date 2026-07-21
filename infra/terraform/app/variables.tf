@@ -88,6 +88,21 @@ variable "gemini_embedding_model" {
   default = "gemini-embedding-2"
 }
 
+variable "gemini_embedding_representation" {
+  description = "Candidate-neutral Gemini retrieval representation"
+  type        = string
+  default     = "raw_control"
+
+  validation {
+    condition = contains([
+      "raw_control",
+      "generic_title",
+      "applicability_instruction",
+    ], var.gemini_embedding_representation)
+    error_message = "Gemini embedding representation must be one of the frozen candidates."
+  }
+}
+
 variable "reasoning_max_attempts" {
   type    = number
   default = 2
