@@ -27,6 +27,15 @@ resource "aws_s3_bucket" "learning_evidence" {
   }
 }
 
+resource "aws_kms_key" "learning_corpus" {
+  description             = "Hindsight protected learning corpus packages"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
 resource "aws_kms_key" "learning_qualification_hmac" {
   description              = "Hindsight learning qualification opaque identifiers"
   key_usage                = "GENERATE_VERIFY_MAC"
@@ -37,6 +46,11 @@ resource "aws_kms_key" "learning_qualification_hmac" {
   lifecycle {
     prevent_destroy = true
   }
+}
+
+resource "aws_kms_alias" "learning_corpus" {
+  name          = "alias/hindsight-${var.stage}-learning-corpus"
+  target_key_id = aws_kms_key.learning_corpus.key_id
 }
 
 resource "aws_kms_alias" "learning_qualification_hmac" {
@@ -404,6 +418,39 @@ data "aws_iam_policy_document" "github_evidence" {
     sid       = "EvidenceSettings"
     actions   = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = local.evidence_parameter_arns
+  }
+
+  statement {
+    sid = "CorpusConstructionPreflight"
+    actions = [
+      "bedrock:GetModelInvocationLoggingConfiguration",
+      "bedrock:ListInferenceProfiles",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid     = "PinnedCorpusConstructionModels"
+    actions = ["bedrock:InvokeModel"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-4-6",
+      "arn:${data.aws_partition.current.partition}:bedrock:*:*:inference-profile/us.amazon.nova-pro-v1:0",
+      "arn:${data.aws_partition.current.partition}:bedrock:*:*:inference-profile/us.meta.llama4-maverick-17b-instruct-v1:0",
+      "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6*",
+      "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/amazon.nova-pro-v1:0",
+      "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/meta.llama4-maverick-17b-instruct-v1:0",
+    ]
+  }
+
+  statement {
+    sid = "ProtectedCorpusEncryption"
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey",
+      "kms:Encrypt",
+      "kms:GenerateDataKey",
+    ]
+    resources = [aws_kms_key.learning_corpus.arn]
   }
 
   statement {

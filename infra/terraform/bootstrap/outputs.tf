@@ -14,6 +14,14 @@ output "learning_evidence_bucket" {
   value = aws_s3_bucket.learning_evidence.id
 }
 
+output "learning_corpus_kms_key_arn" {
+  value = aws_kms_key.learning_corpus.arn
+}
+
+output "learning_corpus_kms_key_alias" {
+  value = aws_kms_alias.learning_corpus.name
+}
+
 output "learning_qualification_hmac_key_arn" {
   value = aws_kms_key.learning_qualification_hmac.arn
 }

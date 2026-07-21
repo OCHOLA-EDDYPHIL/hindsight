@@ -14,6 +14,7 @@ RUNNER_ROUTED_WORKFLOWS = (
     "live-acceptance.yml",
     "learning-qualification.yml",
     "learning-evidence.yml",
+    "v4-corpus-construction.yml",
 )
 
 

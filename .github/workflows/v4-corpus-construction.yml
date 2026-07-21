@@ -1,0 +1,113 @@
+name: v4 corpus construction
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: hindsight-v4-corpus-construction
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  authorize:
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    outputs:
+      construction_sha: ${{ steps.authorize.outputs.construction_sha }}
+    steps:
+      - id: authorize
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          [[ "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/v4-corpus-construction.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          echo "construction_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+
+  exact_main_ci:
+    needs: authorize
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.construction_sha }}
+          persist-credentials: false
+      - name: Require unique successful exact-main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ needs.authorize.outputs.construction_sha }}
+        shell: bash
+        run: |
+          gh api --method GET \
+            "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$SHA" \
+            -f per_page=100 \
+            > "$RUNNER_TEMP/exact-main-ci.json"
+          python scripts/verify_ci_provenance.py \
+            --repository "$REPOSITORY" \
+            --sha "$SHA" \
+            < "$RUNNER_TEMP/exact-main-ci.json"
+
+  construct:
+    needs: [authorize, exact_main_ci]
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: demo
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.construction_sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Construct the fixed candidate slots
+        run: |
+          uv run python scripts/manage_v4_corpus.py construct \
+            --pool-id "run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}" \
+            --output "$RUNNER_TEMP/construction-pool.json"
+          uv run python scripts/manage_v4_corpus.py protocol \
+            > "$RUNNER_TEMP/construction-protocol.json"
+      - name: Seal the private construction pool
+        env:
+          EVIDENCE_BUCKET: ${{ vars.HINDSIGHT_EVIDENCE_BUCKET }}
+        run: |
+          uv run python scripts/seal_learning_evidence.py \
+            --bucket "$EVIDENCE_BUCKET" \
+            --evidence-id "corpus/v4/construction/run-${GITHUB_RUN_ID}/attempt-${GITHUB_RUN_ATTEMPT}" \
+            --object construction_pool="$RUNNER_TEMP/construction-pool.json" \
+            --object protocol="$RUNNER_TEMP/construction-protocol.json" \
+            --receipt "$RUNNER_TEMP/construction-receipt.json"
+      - name: Preserve only the private archive receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-corpus-construction-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/construction-receipt.json
+          if-no-files-found: error
+          retention-days: 30
