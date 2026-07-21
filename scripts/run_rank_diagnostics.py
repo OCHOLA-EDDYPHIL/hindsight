@@ -23,6 +23,11 @@ from hindsight.embeddings import (  # noqa: E402
     embedding_provider_from_env,
 )
 from hindsight.memory import MemoryStore, Provenance  # noqa: E402
+from hindsight.opaque_tokens import KmsHmacTokenizer  # noqa: E402
+from hindsight.qualification_authority import (  # noqa: E402
+    family_sha256,
+    v3_family_contract,
+)
 from hindsight.rank_diagnostics import (  # noqa: E402
     indexed_candidates,
     opaque_token,
@@ -61,6 +66,16 @@ def _main() -> None:
     parser.add_argument("--require-target-rank-one", action="store_true")
     parser.add_argument("--workflow-run-id", default=os.environ.get("GITHUB_RUN_ID"))
     parser.add_argument("--workflow-run-attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT"))
+    parser.add_argument("--qualification-sequence", type=int)
+    parser.add_argument(
+        "--scientific-family-sha256",
+        default=os.environ.get("HINDSIGHT_QUALIFICATION_FAMILY_SHA256"),
+    )
+    parser.add_argument(
+        "--token-key-id",
+        default=os.environ.get("HINDSIGHT_QUALIFICATION_HMAC_KEY_ID"),
+    )
+    parser.add_argument("--outcome-marker", type=pathlib.Path)
     args = parser.parse_args()
 
     if not args.database_url:
@@ -74,6 +89,7 @@ def _main() -> None:
         DEFAULT_SYNTHETIC_CORPUS if args.mode == "synthetic" else DEFAULT_BENCHMARK_CORPUS
     )
     corpus_bytes = corpus_path.read_bytes()
+    corpus_sha256 = hashlib.sha256(corpus_bytes).hexdigest()
     variants = _load_variants(mode=args.mode, corpus=json.loads(corpus_bytes))
     provider = embedding_provider_from_env()
     if args.mode in {"pilot", "confirmation"} and provider.capability != "semantic":
@@ -90,8 +106,12 @@ def _main() -> None:
         if (
             not str(args.workflow_run_id or "").isdigit()
             or not str(args.workflow_run_attempt or "").isdigit()
+            or args.qualification_sequence not in {1, 2}
         ):
             parser.error("confirmation qualification requires workflow run identity")
+        expected_family = family_sha256(v3_family_contract(corpus_sha256=corpus_sha256))
+        if args.scientific_family_sha256 != expected_family or not args.token_key_id:
+            parser.error("confirmation qualification requires claimed family and HMAC identity")
 
     active_profile = _active_or_empty_profile(
         db_url=args.database_url,
@@ -99,28 +119,43 @@ def _main() -> None:
         max_distance=args.max_distance,
     )
     before = _benchmark_counts(args.database_url)
-    corpus_sha256 = hashlib.sha256(corpus_bytes).hexdigest()
     run_token = opaque_token(args.code_sha, corpus_sha256, uuid4().hex)
+    if args.mode == "confirmation":
+        kms_tokenizer = KmsHmacTokenizer(
+            key_id=str(args.token_key_id),
+            family_sha256=str(args.scientific_family_sha256),
+        )
+
+        def tokenize(kind: str, raw_id: str) -> str:
+            return kms_tokenizer.token(kind=kind, raw_id=raw_id)
+
+    else:
+
+        def tokenize(kind: str, raw_id: str) -> str:
+            return opaque_token(corpus_sha256, kind, raw_id)
+
     reports = []
     for row in variants:
         try:
+            if args.outcome_marker:
+                args.outcome_marker.touch(exist_ok=True)
             reports.append(
                 _diagnose_variant(
                     row=row,
                     mode=args.mode,
-                    corpus_sha256=corpus_sha256,
                     code_sha=args.code_sha,
                     run_token=run_token,
                     db_url=args.database_url,
                     provider=provider,
                     profile_id=str(active_profile["id"]),
                     max_distance=float(active_profile["max_distance"]),
+                    tokenize=tokenize,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - preserve a complete opaque attempt
             reports.append(
                 {
-                    "variant_token": opaque_token(corpus_sha256, str(row["id"])),
+                    "variant_token": tokenize("variant", str(row["id"])),
                     "status": "infrastructure_failed",
                     "error_code": type(exc).__name__,
                 }
@@ -176,10 +211,23 @@ def _main() -> None:
         "workflow": {
             "run_id": int(args.workflow_run_id) if args.workflow_run_id else None,
             "run_attempt": (int(args.workflow_run_attempt) if args.workflow_run_attempt else None),
+            "sequence": args.qualification_sequence,
         },
         "corpus_sha256": corpus_sha256,
         "code_sha": args.code_sha,
         "protocol_identity_sha256": protocol_identity_sha256,
+        "scientific_family_sha256": (
+            args.scientific_family_sha256 if args.mode == "confirmation" else None
+        ),
+        "outcome_accessed": bool(args.outcome_marker and args.outcome_marker.exists()),
+        "token_scheme": (
+            {
+                "name": "kms-hmac-sha256-v1",
+                "key_id": args.token_key_id,
+            }
+            if args.mode == "confirmation"
+            else {"name": "sha256-diagnostic-v1"}
+        ),
         "protocol": protocol_contract,
         "profile": active_profile,
         "benchmark_state_unchanged": benchmark_state_unchanged,
@@ -260,16 +308,16 @@ def _diagnose_variant(
     *,
     row: dict[str, Any],
     mode: str,
-    corpus_sha256: str,
     code_sha: str,
     run_token: str,
     db_url: str,
     provider: Any,
     profile_id: str,
     max_distance: float,
+    tokenize: Any,
 ) -> dict[str, Any]:
-    variant_token = opaque_token(corpus_sha256, row["id"])
-    target_token = opaque_token(variant_token, "target")
+    variant_token = tokenize("variant", str(row["id"]))
+    target_token = tokenize("target", str(row["id"]))
     candidates = [
         {
             "token": target_token,
@@ -278,7 +326,7 @@ def _diagnose_variant(
         },
         *[
             {
-                "token": opaque_token(variant_token, candidate["id"]),
+                "token": tokenize("candidate", f"{row['id']}:{candidate['id']}"),
                 "role": candidate["role"],
                 "content": candidate["content"],
             }

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import psycopg
@@ -253,3 +254,110 @@ def test_learning_authority_transitions_and_evidence_are_immutable():
                 )
             )
             admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+@requires_db
+@pytest.mark.migration_acceptance
+def test_qualification_family_authority_migration_is_executable_and_immutable():
+    base_url = os.environ["DATABASE_URL"]
+    parts = urlsplit(base_url)
+    database_name = f"hindsight_qualification_authority_{uuid4().hex}"
+    admin_url = urlunsplit(parts._replace(path="/defaultdb"))
+    target_url = urlunsplit(parts._replace(path=f"/{database_name}"))
+    attempt_id = uuid4()
+    family_sha256 = uuid4().hex * 2
+
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
+    try:
+        with psycopg.connect(target_url, autocommit=True) as conn:
+            for path in sorted((ROOT / "migrations").glob("[0-9]*.sql")):
+                with conn.transaction():
+                    conn.execute(path.read_text())
+            conn.execute(
+                "SELECT set_config('hindsight.tenant_id', %s, false)",
+                ("00000000-0000-0000-0000-000000000004",),
+            )
+            conn.execute(
+                """
+                INSERT INTO learning_qualification_attempts (
+                    id, family_sha256, sequence, family_contract, status,
+                    authorization_payload, authorization_sha256,
+                    authorization_archive_key, authorization_archive_version_id,
+                    consumption_payload, consumption_sha256,
+                    consumption_archive_key, consumption_archive_version_id,
+                    consumer_workflow_run_id, consumer_workflow_run_attempt,
+                    consumer_code_sha, consumed_at
+                ) VALUES (
+                    %s, %s, 1, %s, 'consumed', %s, %s, %s, %s,
+                    %s, %s, %s, %s, 7, 1, %s, now()
+                )
+                """,
+                (
+                    attempt_id,
+                    family_sha256,
+                    Jsonb({"schema_version": 1, "corpus_sha256": "a" * 64}),
+                    Jsonb({"attempt_id": str(attempt_id)}),
+                    f"authorization-{family_sha256}",
+                    f"learning/qualification/{family_sha256}/authorization",
+                    "authorization-version",
+                    Jsonb({"attempt_id": str(attempt_id)}),
+                    f"consumption-{family_sha256}",
+                    f"learning/qualification/{family_sha256}/consumption",
+                    "consumption-version",
+                    "b" * 40,
+                ),
+            )
+            _expect_database_error(
+                conn,
+                "UPDATE learning_qualification_attempts SET sequence = 2 WHERE id = %s",
+                (attempt_id,),
+            )
+            conn.execute(
+                """
+                UPDATE learning_qualification_attempts
+                SET status = 'finalized', qualification_status = 'scientific_failed',
+                    terminal_class = 'scientific_failed', finalization_payload = %s,
+                    finalization_sha256 = %s, finalization_archive_key = %s,
+                    finalization_archive_version_id = %s, finalized_at = now()
+                WHERE id = %s
+                """,
+                (
+                    Jsonb({"terminal_class": "scientific_failed"}),
+                    f"finalization-{family_sha256}",
+                    f"learning/qualification/{family_sha256}/finalization",
+                    "finalization-version",
+                    attempt_id,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO learning_qualification_family_terminals (
+                    family_sha256, family_contract, terminal_class,
+                    qualification_status, terminal_payload, terminal_sha256,
+                    archive_bucket, archive_key, archive_version_id,
+                    manifest_key, manifest_version_id, manifest_sha256
+                ) VALUES (%s, %s, 'scientific_failed', 'scientific_failed',
+                    %s, %s, 'bucket', %s, 'terminal-version',
+                    %s, 'manifest-version', %s)
+                """,
+                (
+                    family_sha256,
+                    Jsonb({"schema_version": 1, "corpus_sha256": "a" * 64}),
+                    Jsonb({"terminal_class": "scientific_failed"}),
+                    f"terminal-{family_sha256}",
+                    f"learning/qualification/{family_sha256}/terminal",
+                    f"learning/evidence/{family_sha256}/manifest",
+                    f"manifest-{family_sha256}",
+                ),
+            )
+            _expect_database_error(
+                conn,
+                "DELETE FROM learning_qualification_family_terminals WHERE family_sha256 = %s",
+                (family_sha256,),
+            )
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database_name))
+            )
