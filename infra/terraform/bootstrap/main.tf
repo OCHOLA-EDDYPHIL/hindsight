@@ -27,6 +27,23 @@ resource "aws_s3_bucket" "learning_evidence" {
   }
 }
 
+resource "aws_kms_key" "learning_qualification_hmac" {
+  description              = "Hindsight learning qualification opaque identifiers"
+  key_usage                = "GENERATE_VERIFY_MAC"
+  customer_master_key_spec = "HMAC_256"
+  deletion_window_in_days  = 30
+  enable_key_rotation      = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_kms_alias" "learning_qualification_hmac" {
+  name          = "alias/hindsight-${var.stage}-learning-qualification-hmac"
+  target_key_id = aws_kms_key.learning_qualification_hmac.key_id
+}
+
 resource "aws_s3_bucket_versioning" "learning_evidence" {
   bucket = aws_s3_bucket.learning_evidence.id
   versioning_configuration {
@@ -387,6 +404,16 @@ data "aws_iam_policy_document" "github_evidence" {
     sid       = "EvidenceSettings"
     actions   = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = local.evidence_parameter_arns
+  }
+
+  statement {
+    sid = "QualificationOpaqueIdentifiers"
+    actions = [
+      "kms:DescribeKey",
+      "kms:GenerateMac",
+      "kms:VerifyMac",
+    ]
+    resources = [aws_kms_key.learning_qualification_hmac.arn]
   }
 
   statement {

@@ -84,11 +84,32 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition     = aws_kms_key.learning_qualification_hmac.key_usage == "GENERATE_VERIFY_MAC" && aws_kms_key.learning_qualification_hmac.customer_master_key_spec == "HMAC_256"
+    error_message = "Qualification identifiers must use a non-exportable HMAC-SHA256 KMS key."
+  }
+
+  assert {
+    condition     = aws_kms_alias.learning_qualification_hmac.name == "alias/hindsight-demo-learning-qualification-hmac"
+    error_message = "The qualification HMAC alias must remain stable."
+  }
+
+  assert {
     condition = length([
       for statement in data.aws_iam_policy_document.github_evidence.statement : statement
       if contains(statement.actions, "s3:DeleteObject") || contains(statement.actions, "s3:BypassGovernanceRetention")
     ]) == 0
     error_message = "The evidence writer must not delete objects or bypass retention."
+  }
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+      if statement.sid == "QualificationOpaqueIdentifiers"
+      ]) == 1 && toset(one([
+        for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+        if statement.sid == "QualificationOpaqueIdentifiers"
+    ]).actions) == toset(["kms:DescribeKey", "kms:GenerateMac", "kms:VerifyMac"])
+    error_message = "The evidence role must have only the required qualification HMAC operations."
   }
 
   assert {
