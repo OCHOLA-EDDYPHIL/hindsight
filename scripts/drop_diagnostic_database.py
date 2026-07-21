@@ -10,6 +10,8 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import psycopg
 from psycopg import sql
 
+from hindsight.db import database_url_with_tls_roots
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -18,7 +20,7 @@ def main() -> None:
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
     database_name, admin_url = diagnostic_database_target(args.database_url)
-    with psycopg.connect(admin_url, autocommit=True) as conn:
+    with psycopg.connect(database_url_with_tls_roots(admin_url), autocommit=True) as conn:
         conn.execute(
             sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database_name))
         )
