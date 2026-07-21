@@ -57,6 +57,7 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
         "agent_runtime_roles",
         "populated_roles",
         "dispatch_upgrade",
+        "qualification_authority",
     }
 
 

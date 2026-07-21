@@ -218,6 +218,26 @@ def test_protected_corpus_uses_rotating_kms_and_pinned_bedrock_profiles():
     assert 'output "learning_corpus_kms_key_arn"' in outputs
 
 
+def test_qualification_hmac_key_is_non_exportable_and_evidence_role_scoped():
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
+
+    key = bootstrap.split('resource "aws_kms_key" "learning_qualification_hmac"', 1)[1].split(
+        'resource "aws_kms_alias" "learning_qualification_hmac"', 1
+    )[0]
+    policy = bootstrap.split('sid = "QualificationOpaqueIdentifiers"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+
+    assert 'key_usage                = "GENERATE_VERIFY_MAC"' in key
+    assert 'customer_master_key_spec = "HMAC_256"' in key
+    assert "prevent_destroy = true" in key
+    assert "kms:GenerateMac" in policy
+    assert "kms:VerifyMac" in policy
+    assert "kms:Decrypt" not in policy
+    assert 'output "learning_qualification_hmac_key_arn"' in outputs
+
+
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
 

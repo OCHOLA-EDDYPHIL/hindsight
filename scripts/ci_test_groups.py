@@ -31,8 +31,7 @@ MIGRATION_CASES = {
         "test_interrupted_benchmark_finalizer_closes_children_before_parents"
     ),
     "benchmark_retry": (
-        "tests/test_learning_benchmark_setup.py::"
-        "test_preparation_retry_reuses_seeded_context"
+        "tests/test_learning_benchmark_setup.py::test_preparation_retry_reuses_seeded_context"
     ),
     "agent_runtime_roles": (
         "tests/test_agent.py::"
@@ -43,8 +42,11 @@ MIGRATION_CASES = {
         "test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write"
     ),
     "dispatch_upgrade": (
-        "tests/test_run_dispatch.py::"
-        "test_outbox_migration_backfills_queued_and_resuming_runs"
+        "tests/test_run_dispatch.py::test_outbox_migration_backfills_queued_and_resuming_runs"
+    ),
+    "qualification_authority": (
+        "tests/test_learning_evidence_foundation.py::"
+        "test_qualification_family_authority_migration_is_executable_and_immutable"
     ),
 }
 
@@ -80,11 +82,7 @@ DATABASE_GROUPS = {
 
 
 def all_test_files() -> set[str]:
-    return {
-        str(path.relative_to(ROOT))
-        for path in TESTS.glob("test_*.py")
-        if path.is_file()
-    }
+    return {str(path.relative_to(ROOT)) for path in TESTS.glob("test_*.py") if path.is_file()}
 
 
 def database_test_files() -> set[str]:
@@ -124,9 +122,7 @@ def inventory_errors() -> list[str]:
         path = node.split("::", 1)[0]
         if path not in assigned:
             errors.append(f"migration case {case} is not owned by a database group")
-    database_marked_files = {
-        node.split("::", 1)[0] for node in _decorated_tests("requires_db")
-    }
+    database_marked_files = {node.split("::", 1)[0] for node in _decorated_tests("requires_db")}
     for path in sorted(database_marked_files - set(assigned)):
         errors.append(f"database-marked test file is not assigned to a database group: {path}")
     migration_nodes = _decorated_tests("pytest.mark.migration_acceptance")
