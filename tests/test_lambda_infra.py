@@ -134,7 +134,10 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle
     assert "function:hindsight-${var.stage}-${component}" in bootstrap
-    assert "bedrock:" not in bootstrap
+    deploy_policy = bootstrap.split('data "aws_iam_policy_document" "github_deploy"', 1)[1].split(
+        'resource "aws_iam_role_policy" "github_deploy"', 1
+    )[0]
+    assert "bedrock:" not in deploy_policy
     assert "BEDROCK_" not in bootstrap
     assert "s3:GetBucketAcl" in bootstrap
     assert "s3:GetBucketCORS" in bootstrap
@@ -168,9 +171,9 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     bucket = bootstrap.split('resource "aws_s3_bucket" "learning_evidence"', 1)[1].split(
         'resource "aws_s3_bucket_versioning"', 1
     )[0]
-    evidence_policy = bootstrap.split(
-        'data "aws_iam_policy_document" "github_evidence"', 1
-    )[1].split('resource "aws_iam_role_policy" "github_evidence"', 1)[0]
+    evidence_policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[
+        1
+    ].split('resource "aws_iam_role_policy" "github_evidence"', 1)[0]
     deploy_deny = bootstrap.split('sid    = "EvidenceArchiveMutationDenied"', 1)[1].split(
         "\n  statement {", 1
     )[0]
@@ -191,6 +194,27 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     assert '"s3:BypassGovernanceRetention"' in deploy_deny
     assert 'output "github_evidence_role_arn"' in outputs
     assert 'output "learning_evidence_bucket"' in outputs
+
+
+def test_protected_corpus_uses_rotating_kms_and_pinned_bedrock_profiles():
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
+    policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[1].split(
+        'resource "aws_iam_role_policy" "github_evidence"', 1
+    )[0]
+
+    assert 'resource "aws_kms_key" "learning_corpus"' in bootstrap
+    assert "enable_key_rotation     = true" in bootstrap
+    assert "prevent_destroy = true" in bootstrap
+    for model in (
+        "us.anthropic.claude-sonnet-4-6",
+        "us.amazon.nova-pro-v1:0",
+        "us.meta.llama4-maverick-17b-instruct-v1:0",
+    ):
+        assert model in policy
+    assert 'actions = ["bedrock:InvokeModel"]' in policy
+    assert 'sid = "ProtectedCorpusEncryption"' in policy
+    assert 'output "learning_corpus_kms_key_arn"' in outputs
 
 
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
@@ -235,7 +259,7 @@ def test_deploy_health_only_is_owner_authorized_exact_main_and_checks_every_endp
     assert 'direct DB-backed route" "$API_URL/v1/incidents?limit=1' in workflow
     assert 'UI-proxied readiness" "$UI_URL/v1/health/ready' in workflow
     assert "from websockets.asyncio.client import connect" in workflow
-    assert 'f"{sys.argv[2].rstrip(\'/\')}/v1/realtime/ticket"' in workflow
+    assert "f\"{sys.argv[2].rstrip('/')}/v1/realtime/ticket\"" in workflow
     assert "urlencode({'ticket': ticket})" in workflow
     assert "Exact revision \\`$DEPLOYED_SHA\\` passed" in workflow
 

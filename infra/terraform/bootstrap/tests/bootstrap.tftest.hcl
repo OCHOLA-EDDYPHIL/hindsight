@@ -84,6 +84,22 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition     = aws_kms_key.learning_corpus.enable_key_rotation && aws_kms_alias.learning_corpus.name == "alias/hindsight-demo-learning-corpus"
+    error_message = "Protected corpus packages must use the stable rotating KMS key."
+  }
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+      if statement.sid == "PinnedCorpusConstructionModels"
+      ]) == 1 && toset(one([
+        for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+        if statement.sid == "PinnedCorpusConstructionModels"
+    ]).actions) == toset(["bedrock:InvokeModel"])
+    error_message = "Corpus construction must invoke only the three pinned Bedrock profiles."
+  }
+
+  assert {
     condition = length([
       for statement in data.aws_iam_policy_document.github_evidence.statement : statement
       if contains(statement.actions, "s3:DeleteObject") || contains(statement.actions, "s3:BypassGovernanceRetention")
