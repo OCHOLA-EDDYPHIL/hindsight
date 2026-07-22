@@ -442,11 +442,10 @@ def test_exact_main_ci_query_does_not_hide_unsuccessful_runs():
     )[0]
 
     assert "actions: read" in job
-    assert "actions/workflows/ci.yml/runs" in job
-    assert "-f branch=main" in job
-    assert "-f event=push" in job
-    assert '-f head_sha="$PRODUCT_SHA"' in job
-    assert "-f status=" not in job
+    assert "GITHUB_API_URL: ${{ github.api_url }}" in job
+    assert "GITHUB_TOKEN: ${{ github.token }}" in job
+    assert "--fetch" in job
+    assert "gh api" not in job
     assert "scripts/verify_ci_provenance.py" in job
 
 

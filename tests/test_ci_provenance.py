@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -67,3 +69,46 @@ def test_exact_main_ci_fails_closed(payload):
             repository="owner/project",
             sha="a" * 40,
         )
+
+
+def test_fetches_exact_main_runs_with_authenticated_filtered_query(monkeypatch):
+    sha = "a" * 40
+    response_payload = {"total_count": 0, "workflow_runs": []}
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(response_payload).encode()
+
+    def urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(provenance.urllib.request, "urlopen", urlopen)
+
+    result = provenance.fetch_ci_runs(
+        api_url="https://api.github.example",
+        repository="owner/project",
+        sha=sha,
+        token="secret-token",
+    )
+
+    assert result == response_payload
+    assert captured["timeout"] == 30
+    request = captured["request"]
+    parsed = urllib.parse.urlsplit(request.full_url)
+    assert parsed.path == "/repos/owner/project/actions/workflows/ci.yml/runs"
+    assert urllib.parse.parse_qs(parsed.query) == {
+        "branch": ["main"],
+        "event": ["push"],
+        "head_sha": [sha],
+        "per_page": ["100"],
+    }
+    assert request.headers["Authorization"] == "Bearer secret-token"
