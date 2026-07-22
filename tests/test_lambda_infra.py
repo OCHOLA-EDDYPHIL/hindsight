@@ -97,6 +97,35 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert 'resource "aws_cloudwatch_event_rule" "run_dispatcher"' in stack
     assert 'command = "dispatch_run_commands"' in stack
     assert 'resource "aws_lambda_permission" "run_dispatcher"' in stack
+    assert stack.count("enabled                 = var.runtime_active") == 2
+    assert stack.count('state               = var.runtime_active ? "ENABLED" : "DISABLED"') == 2
+
+
+def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    variables = pathlib.Path("infra/terraform/app/variables.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/app/outputs.tf").read_text()
+    deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+    ci = pathlib.Path(".github/workflows/ci.yml").read_text()
+
+    for variable in (
+        "runtime_active",
+        "manage_public_dns",
+        "public_origin",
+        "cloudfront_aliases",
+    ):
+        assert f'variable "{variable}"' in variables
+    assert "aliases             = local.cloudfront_aliases" in stack
+    assert "count = var.manage_public_dns ? 1 : 0" in stack
+    assert "HINDSIGHT_ALLOWED_ORIGINS           = local.public_origin" in stack
+    assert 'output "cloudfront_distribution_domain_name"' in outputs
+    assert 'output "runtime_active"' in outputs
+    assert "TF_VAR_runtime_active" in deploy
+    assert "TF_VAR_manage_public_dns" in deploy
+    assert "TF_VAR_cloudfront_aliases" in deploy
+    assert "inputs.health_only != true && env.TF_VAR_runtime_active == 'true'" in deploy
+    for command in ("init -backend=false -input=false", "validate", "test"):
+        assert f"terraform -chdir=infra/terraform/edge {command}" in ci
 
 
 def test_destroy_workflow_pauses_changefeed_and_requires_confirmation():

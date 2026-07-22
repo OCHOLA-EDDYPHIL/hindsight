@@ -60,6 +60,12 @@ variable "application_state_key" {
   default     = "hindsight/demo/terraform.tfstate"
 }
 
+variable "edge_state_key" {
+  description = "Remote-state object that owns the stable public DNS record independently of either app plane."
+  type        = string
+  default     = "hindsight/edge/terraform.tfstate"
+}
+
 variable "enable_learning_infrastructure" {
   description = "Retain the source account's immutable learning archive and evidence role. Disable only for a fresh product-only account."
   type        = bool

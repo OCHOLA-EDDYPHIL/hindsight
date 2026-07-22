@@ -136,6 +136,45 @@ variable "domain_name" {
   nullable    = true
 }
 
+variable "public_origin" {
+  description = "Browser origin authorized by the API. Defaults to domain_name when present."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.public_origin == null || can(regex("^https://[A-Za-z0-9.-]+$", var.public_origin))
+    error_message = "public_origin must be an HTTPS origin without a path."
+  }
+}
+
+variable "cloudfront_aliases" {
+  description = "Custom aliases attached to the distribution. Defaults to domain_name when present."
+  type        = list(string)
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.cloudfront_aliases == null || alltrue([
+      for alias in var.cloudfront_aliases :
+      can(regex("^(\\*\\.)?[A-Za-z0-9.-]+$", alias))
+    ])
+    error_message = "cloudfront_aliases must contain only DNS names or leftmost wildcards."
+  }
+}
+
+variable "manage_public_dns" {
+  description = "Allow this application state to own the domain_name CNAME."
+  type        = bool
+  default     = false
+}
+
+variable "runtime_active" {
+  description = "Enable schedules, queue consumers, and external changefeed configuration."
+  type        = bool
+  default     = true
+}
+
 variable "acm_certificate_arn" {
   description = "us-east-1 ACM certificate for domain_name."
   type        = string

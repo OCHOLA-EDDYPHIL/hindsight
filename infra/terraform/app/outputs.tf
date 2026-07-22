@@ -1,5 +1,17 @@
 output "ui_url" {
-  value = var.domain_name != null ? "https://${var.domain_name}" : "https://${aws_cloudfront_distribution.ui.domain_name}"
+  value = local.public_origin != "" ? local.public_origin : "https://${aws_cloudfront_distribution.ui.domain_name}"
+}
+
+output "cloudfront_distribution_domain_name" {
+  value = aws_cloudfront_distribution.ui.domain_name
+}
+
+output "cloudfront_aliases" {
+  value = local.cloudfront_aliases
+}
+
+output "runtime_active" {
+  value = var.runtime_active
 }
 
 output "api_url" {

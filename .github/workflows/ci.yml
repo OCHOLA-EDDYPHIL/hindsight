@@ -250,6 +250,9 @@ jobs:
       - run: terraform -chdir=infra/terraform/app init -backend=false -input=false
       - run: terraform -chdir=infra/terraform/app validate
       - run: terraform -chdir=infra/terraform/app test
+      - run: terraform -chdir=infra/terraform/edge init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform/edge validate
+      - run: terraform -chdir=infra/terraform/edge test
 
   schema_fresh:
     needs: changes
