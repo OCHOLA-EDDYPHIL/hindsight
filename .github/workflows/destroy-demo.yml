@@ -4,22 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type destroy-demo to remove ephemeral AWS application resources
+        description: Type destroy-<environment> to remove that application plane
         required: true
         type: string
+      deployment_environment:
+        description: Protected GitHub environment containing one AWS account configuration
+        required: true
+        type: choice
+        default: demo
+        options:
+          - demo
+          - demo-candidate
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: hindsight-demo-environment
+  group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2
   cancel-in-progress: false
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_IN_AUTOMATION: "true"
-  TF_VAR_stage: demo
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
   TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
@@ -34,14 +41,31 @@ env:
 jobs:
   destroy:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    environment: demo
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: ${{ inputs.deployment_environment }}
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'hindsight/demo/terraform.tfstate' }}
+      TF_VAR_stage: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+      TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
+      TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+      TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
+      TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
+      TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Confirm destructive operation
-        if: inputs.confirmation != 'destroy-demo'
-        run: exit 1
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
+        run: test "$CONFIRMATION" = "destroy-$DEPLOYMENT_ENVIRONMENT"
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - uses: hashicorp/setup-terraform@v3
@@ -50,12 +74,19 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - run: uv sync --frozen
+      - name: Verify deployment account and state identity
+        run: >-
+          uv run python scripts/deployment_identity_preflight.py
+          --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID"
+          --region "$AWS_REGION"
+          --state-bucket "$TF_STATE_BUCKET"
+          --certificate-arn "$TF_VAR_acm_certificate_arn"
       - run: uv run python scripts/build_lambda_artifacts.py
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
-          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
-          -backend-config="key=hindsight/demo/terraform.tfstate"
+          -backend-config="bucket=$TF_STATE_BUCKET"
+          -backend-config="key=$TF_STATE_KEY"
           -backend-config="region=${{ env.AWS_REGION }}"
           -backend-config="encrypt=true"
           -backend-config="use_lockfile=true"

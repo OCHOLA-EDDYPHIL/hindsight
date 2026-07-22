@@ -102,9 +102,9 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
 def test_destroy_workflow_pauses_changefeed_and_requires_confirmation():
     workflow = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
 
-    assert "destroy-demo" in workflow
+    assert '"destroy-$DEPLOYMENT_ENVIRONMENT"' in workflow
     assert "configure_changefeed.py pause" in workflow
-    assert "environment: demo" in workflow
+    assert "environment: ${{ inputs.deployment_environment }}" in workflow
     assert "CLOUDFLARE_API_TOKEN" in workflow
     assert "plan -destroy" in workflow
 
@@ -244,7 +244,11 @@ def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     assert "deployment_preflight.py" in workflow
     assert "reembed_memories.py" in workflow
     assert "create-invalidation" in workflow
-    assert "environment: demo" in workflow
+    assert "environment: ${{ needs.authorize.outputs.deployment_environment }}" in workflow
+    assert "scripts/deployment_identity_preflight.py" in workflow
+    assert "EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}" in workflow
+    assert "TF_STATE_KEY: ${{ vars.TF_STATE_KEY" in workflow
+    assert '"demo" || "$REQUESTED_ENVIRONMENT" == "demo-candidate"' in workflow
     assert "CLOUDFLARE_API_TOKEN" in workflow
     migration = workflow.index("scripts/migrate.py")
     persistence = workflow.index("scripts/initialize_agent_storage.py")
@@ -312,5 +316,5 @@ def test_deploy_uses_the_caller_authorized_source_revision():
     assert workflow.count("ref: ${{ needs.authorize.outputs.source_sha }}") == 2
     assert workflow.count("EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}") == 2
     assert "DEPLOYED_SHA: ${{ needs.authorize.outputs.source_sha }}" in workflow
-    assert "demo-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}" in workflow
+    assert "${DEPLOYMENT_ENVIRONMENT}-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}" in workflow
     assert "github.event.pull_request.head.sha || github.sha" not in workflow

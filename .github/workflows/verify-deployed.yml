@@ -7,6 +7,14 @@ on:
         description: Exact deployed main revision to verify
         required: true
         type: string
+      deployment_environment:
+        description: Protected GitHub environment containing one AWS account configuration
+        required: true
+        type: choice
+        default: demo
+        options:
+          - demo
+          - demo-candidate
 
 concurrency:
   group: hindsight-demo-verify
@@ -14,11 +22,12 @@ concurrency:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     permissions:
       contents: read
     outputs:
       expected_sha: ${{ steps.authorization.outputs.expected_sha }}
+      deployment_environment: ${{ steps.authorization.outputs.deployment_environment }}
     steps:
       - id: authorization
         name: Authorize exact deployed revision
@@ -31,8 +40,14 @@ jobs:
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           REQUESTED_SHA: ${{ inputs.expected_sha }}
+          REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment || 'demo' }}
         shell: bash
         run: |
+          REQUESTED_ENVIRONMENT="${REQUESTED_ENVIRONMENT:-demo}"
+          [[ "$REQUESTED_ENVIRONMENT" == "demo" || "$REQUESTED_ENVIRONMENT" == "demo-candidate" ]] || {
+            echo "Unsupported deployment environment." >&2
+            exit 1
+          }
           [[ "$EVENT_NAME" == "workflow_dispatch" \
             && "$REF_NAME" == "refs/heads/main" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/verify-deployed.yml@$REF_NAME" \
@@ -46,17 +61,20 @@ jobs:
             exit 1
           }
           echo "expected_sha=$REQUESTED_SHA" >> "$GITHUB_OUTPUT"
+          echo "deployment_environment=$REQUESTED_ENVIRONMENT" >> "$GITHUB_OUTPUT"
 
   verify:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 10
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     permissions:
       contents: read
       id-token: write
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
       UI_DOMAIN: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
     steps:
       - uses: actions/checkout@v4
@@ -73,16 +91,19 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - name: Verify AWS account identity
+        shell: bash
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_AWS_ACCOUNT_ID"
       - run: uv sync --frozen
       - id: endpoints
         name: Resolve deployed endpoints without infrastructure state
         shell: bash
         run: |
           API_URL="$(aws apigatewayv2 get-apis \
-            --query "Items[?Name=='hindsight-demo-http'].ApiEndpoint" \
+            --query "Items[?Name=='hindsight-${HINDSIGHT_STAGE}-http'].ApiEndpoint" \
             --output text)"
           WEBSOCKET_BASE="$(aws apigatewayv2 get-apis \
-            --query "Items[?Name=='hindsight-demo-websocket'].ApiEndpoint" \
+            --query "Items[?Name=='hindsight-${HINDSIGHT_STAGE}-websocket'].ApiEndpoint" \
             --output text)"
           WEBSOCKET_BASE="${WEBSOCKET_BASE/https:\/\//wss://}"
           [[ "$API_URL" =~ ^https://[^[:space:]]+$ \
@@ -94,7 +115,7 @@ jobs:
           {
             echo "ui_url=https://$UI_DOMAIN"
             echo "api_url=$API_URL"
-            echo "websocket_url=$WEBSOCKET_BASE/demo"
+            echo "websocket_url=$WEBSOCKET_BASE/$HINDSIGHT_STAGE"
           } >> "$GITHUB_OUTPUT"
       - name: Verify HTTP surfaces and deployed revision
         env:

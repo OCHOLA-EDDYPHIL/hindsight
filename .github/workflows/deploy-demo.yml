@@ -16,6 +16,14 @@ on:
         required: true
         type: boolean
         default: true
+      deployment_environment:
+        description: Protected GitHub environment containing one AWS account configuration
+        required: true
+        type: choice
+        default: demo
+        options:
+          - demo
+          - demo-candidate
   workflow_call:
     inputs:
       apply:
@@ -42,6 +50,11 @@ on:
         description: Exact caller-authorized revision to deploy
         required: true
         type: string
+      deployment_environment:
+        description: Protected GitHub environment containing one AWS account configuration
+        required: false
+        type: string
+        default: demo
     outputs:
       ui_url:
         description: Deployed CloudFront/custom-domain URL
@@ -73,13 +86,12 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ${{ inputs.validation_mode && format('hindsight-live-deploy-{0}', github.run_id) || 'hindsight-demo-environment' }}
+  group: ${{ inputs.validation_mode && format('hindsight-live-deploy-{0}-{1}', inputs.deployment_environment || 'demo', github.run_id) || format('hindsight-{0}-environment-v2', inputs.deployment_environment || 'demo') }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_IN_AUTOMATION: "true"
-  TF_VAR_stage: demo
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_VAR_validation_mode: ${{ inputs.validation_mode && 'true' || 'false' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
@@ -105,6 +117,7 @@ jobs:
       authorized: ${{ steps.authorize.outputs.authorized }}
       should_apply: ${{ steps.authorize.outputs.should_apply }}
       source_sha: ${{ steps.authorize.outputs.source_sha }}
+      deployment_environment: ${{ steps.authorize.outputs.deployment_environment }}
     steps:
       - id: authorize
         name: Authorize deployment source
@@ -123,8 +136,14 @@ jobs:
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment || 'demo' }}
         shell: bash
         run: |
+          REQUESTED_ENVIRONMENT="${REQUESTED_ENVIRONMENT:-demo}"
+          [[ "$REQUESTED_ENVIRONMENT" == "demo" || "$REQUESTED_ENVIRONMENT" == "demo-candidate" ]] || {
+            echo "Unsupported deployment environment." >&2
+            exit 1
+          }
           if [[ "$VALIDATION_MODE" == "true" ]]; then
             [[ "$REQUESTED_APPLY" == "true" \
               && "$REQUESTED_HEALTH_ONLY" == "false" \
@@ -147,6 +166,7 @@ jobs:
               echo "authorized=true"
               echo "should_apply=true"
               echo "source_sha=$REQUESTED_SOURCE_SHA"
+              echo "deployment_environment=$REQUESTED_ENVIRONMENT"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -176,6 +196,7 @@ jobs:
                 echo "should_apply=false"
               fi
               echo "source_sha=$EVENT_SHA"
+              echo "deployment_environment=$REQUESTED_ENVIRONMENT"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -187,8 +208,22 @@ jobs:
     needs: authorize
     if: needs.authorize.outputs.authorized == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'hindsight/demo/terraform.tfstate' }}
+      TF_VAR_stage: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+      TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
+      TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+      TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
+      TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
+      TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       TF_VAR_deployed_revision: ${{ needs.authorize.outputs.source_sha }}
     outputs:
@@ -209,6 +244,13 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - run: uv sync --frozen
+      - name: Verify deployment account and state identity
+        run: >-
+          uv run python scripts/deployment_identity_preflight.py
+          --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID"
+          --region "$AWS_REGION"
+          --state-bucket "$TF_STATE_BUCKET"
+          --certificate-arn "$TF_VAR_acm_certificate_arn"
       - run: uv run python scripts/build_lambda_artifacts.py
       - name: Record deployment artifact identities
         shell: bash
@@ -216,8 +258,8 @@ jobs:
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
-          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
-          -backend-config="key=hindsight/demo/terraform.tfstate"
+          -backend-config="bucket=$TF_STATE_BUCKET"
+          -backend-config="key=$TF_STATE_KEY"
           -backend-config="region=${{ env.AWS_REGION }}"
           -backend-config="encrypt=true"
           -backend-config="use_lockfile=true"
@@ -225,8 +267,9 @@ jobs:
         run: terraform -chdir=infra/terraform/app plan -input=false -out="$GITHUB_WORKSPACE/build/demo.tfplan"
       - id: plan_name
         env:
+          DEPLOYMENT_ENVIRONMENT: ${{ needs.authorize.outputs.deployment_environment }}
           SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
-        run: echo "name=demo-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+        run: echo "name=${DEPLOYMENT_ENVIRONMENT}-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.plan_name.outputs.name }}
@@ -243,8 +286,23 @@ jobs:
     if: needs.authorize.outputs.should_apply == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 60
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'hindsight/demo/terraform.tfstate' }}
+      TF_VAR_stage: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+      TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
+      TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+      TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
+      TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
+      TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     outputs:
       ui_url: ${{ steps.stack_outputs.outputs.ui_url }}
@@ -271,6 +329,13 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - run: uv sync --frozen
+      - name: Verify deployment account and state identity
+        run: >-
+          uv run python scripts/deployment_identity_preflight.py
+          --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID"
+          --region "$AWS_REGION"
+          --state-bucket "$TF_STATE_BUCKET"
+          --certificate-arn "$TF_VAR_acm_certificate_arn"
       - uses: actions/download-artifact@v4
         with:
           name: ${{ needs.plan.outputs.artifact_name }}
@@ -304,8 +369,8 @@ jobs:
       - name: Initialize remote state
         run: >-
           terraform -chdir=infra/terraform/app init -input=false
-          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
-          -backend-config="key=hindsight/demo/terraform.tfstate"
+          -backend-config="bucket=$TF_STATE_BUCKET"
+          -backend-config="key=$TF_STATE_KEY"
           -backend-config="region=${{ env.AWS_REGION }}"
           -backend-config="encrypt=true"
           -backend-config="use_lockfile=true"

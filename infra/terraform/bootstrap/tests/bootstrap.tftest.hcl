@@ -48,9 +48,10 @@ run "isolated_bootstrap" {
   command = plan
 
   variables {
-    state_bucket_name  = "existing-state-bucket"
-    cloudflare_zone_id = "00000000000000000000000000000000"
-    domain_name        = "hindsight.example.com"
+    expected_aws_account_id = "123456789012"
+    state_bucket_name       = "existing-state-bucket"
+    cloudflare_zone_id      = "00000000000000000000000000000000"
+    domain_name             = "hindsight.example.com"
   }
 
   assert {
@@ -64,54 +65,54 @@ run "isolated_bootstrap" {
   }
 
   assert {
-    condition     = aws_iam_role.github_evidence.name == "hindsight-github-evidence"
+    condition     = aws_iam_role.github_evidence[0].name == "hindsight-github-evidence"
     error_message = "The evidence writer must use its dedicated GitHub OIDC role."
   }
 
   assert {
-    condition     = aws_s3_bucket.learning_evidence.object_lock_enabled
+    condition     = aws_s3_bucket.learning_evidence[0].object_lock_enabled
     error_message = "The learning evidence bucket must enable Object Lock at creation."
   }
 
   assert {
-    condition     = aws_s3_bucket_object_lock_configuration.learning_evidence.rule[0].default_retention[0].mode == "GOVERNANCE" && aws_s3_bucket_object_lock_configuration.learning_evidence.rule[0].default_retention[0].years == 7
+    condition     = aws_s3_bucket_object_lock_configuration.learning_evidence[0].rule[0].default_retention[0].mode == "GOVERNANCE" && aws_s3_bucket_object_lock_configuration.learning_evidence[0].rule[0].default_retention[0].years == 7
     error_message = "Learning evidence must retain Governance-locked versions for seven years."
   }
 
   assert {
-    condition     = aws_s3_bucket_versioning.learning_evidence.versioning_configuration[0].status == "Enabled"
+    condition     = aws_s3_bucket_versioning.learning_evidence[0].versioning_configuration[0].status == "Enabled"
     error_message = "The learning evidence bucket must keep versioning enabled."
   }
 
   assert {
-    condition     = aws_kms_key.learning_corpus.enable_key_rotation && aws_kms_alias.learning_corpus.name == "alias/hindsight-demo-learning-corpus"
+    condition     = aws_kms_key.learning_corpus[0].enable_key_rotation && aws_kms_alias.learning_corpus[0].name == "alias/hindsight-demo-learning-corpus"
     error_message = "Protected corpus packages must use the stable rotating KMS key."
   }
 
   assert {
     condition = length([
-      for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+      for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
       if statement.sid == "PinnedCorpusConstructionModels"
       ]) == 1 && toset(one([
-        for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+        for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
         if statement.sid == "PinnedCorpusConstructionModels"
     ]).actions) == toset(["bedrock:InvokeModel"])
     error_message = "Corpus construction must invoke only the three pinned Bedrock profiles."
   }
 
   assert {
-    condition     = aws_kms_key.learning_qualification_hmac.key_usage == "GENERATE_VERIFY_MAC" && aws_kms_key.learning_qualification_hmac.customer_master_key_spec == "HMAC_256"
+    condition     = aws_kms_key.learning_qualification_hmac[0].key_usage == "GENERATE_VERIFY_MAC" && aws_kms_key.learning_qualification_hmac[0].customer_master_key_spec == "HMAC_256"
     error_message = "Qualification identifiers must use a non-exportable HMAC-SHA256 KMS key."
   }
 
   assert {
-    condition     = aws_kms_alias.learning_qualification_hmac.name == "alias/hindsight-demo-learning-qualification-hmac"
+    condition     = aws_kms_alias.learning_qualification_hmac[0].name == "alias/hindsight-demo-learning-qualification-hmac"
     error_message = "The qualification HMAC alias must remain stable."
   }
 
   assert {
     condition = length([
-      for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+      for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
       if contains(statement.actions, "s3:DeleteObject") || contains(statement.actions, "s3:BypassGovernanceRetention")
     ]) == 0
     error_message = "The evidence writer must not delete objects or bypass retention."
@@ -119,10 +120,10 @@ run "isolated_bootstrap" {
 
   assert {
     condition = length([
-      for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+      for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
       if statement.sid == "QualificationOpaqueIdentifiers"
       ]) == 1 && toset(one([
-        for statement in data.aws_iam_policy_document.github_evidence.statement : statement
+        for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
         if statement.sid == "QualificationOpaqueIdentifiers"
     ]).actions) == toset(["kms:DescribeKey", "kms:GenerateMac", "kms:VerifyMac"])
     error_message = "The evidence role must have only the required qualification HMAC operations."
@@ -165,5 +166,47 @@ run "isolated_bootstrap" {
       if statement.sid == "LambdaVersionRefresh"
     ]).resources) == toset(local.lambda_function_arns)
     error_message = "The LambdaVersionRefresh statement must use only the four scoped function ARNs."
+  }
+}
+
+run "product_only_bootstrap" {
+  command = plan
+
+  variables {
+    expected_aws_account_id        = "123456789012"
+    state_bucket_name              = "target-state-bucket"
+    application_state_key          = "hindsight/demo-candidate/terraform.tfstate"
+    cloudflare_zone_id             = "00000000000000000000000000000000"
+    domain_name                    = "candidate.hindsight.example.com"
+    github_subjects                = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo-candidate"]
+    enable_learning_infrastructure = false
+  }
+
+  assert {
+    condition     = aws_iam_role.github_deploy.name == "hindsight-github-deploy"
+    error_message = "Product-only bootstrap must retain the deployment trust anchor."
+  }
+
+  assert {
+    condition = (
+      length(aws_s3_bucket.learning_evidence) == 0 &&
+      length(aws_kms_key.learning_corpus) == 0 &&
+      length(aws_kms_key.learning_qualification_hmac) == 0 &&
+      length(aws_iam_role.github_evidence) == 0
+    )
+    error_message = "Product-only bootstrap must not create abandoned learning infrastructure."
+  }
+
+  assert {
+    condition = length([
+      for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+      if statement.sid == "EvidenceArchiveMutationDenied"
+    ]) == 0
+    error_message = "A product-only account must not reference a nonexistent learning archive."
+  }
+
+  assert {
+    condition     = var.application_state_key == "hindsight/demo-candidate/terraform.tfstate"
+    error_message = "Candidate bootstrap must scope the application state key independently."
   }
 }
