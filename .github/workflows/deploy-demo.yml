@@ -86,7 +86,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ${{ inputs.validation_mode && format('hindsight-live-deploy-{0}-{1}', inputs.deployment_environment || 'demo', github.run_id) || format('hindsight-{0}-environment', inputs.deployment_environment || 'demo') }}
+  group: ${{ inputs.validation_mode && format('hindsight-live-deploy-{0}-{1}', inputs.deployment_environment || 'demo', github.run_id) || format('hindsight-{0}-environment-v2', inputs.deployment_environment || 'demo') }}
   cancel-in-progress: false
 
 env:

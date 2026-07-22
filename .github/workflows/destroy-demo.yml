@@ -21,7 +21,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment
+  group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2
   cancel-in-progress: false
 
 env:

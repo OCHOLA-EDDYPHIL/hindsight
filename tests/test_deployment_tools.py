@@ -241,12 +241,12 @@ def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
 
-    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment" in live_concurrency
+    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2" in live_concurrency
     assert "group: hindsight-demo-environment" in learning_concurrency
-    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment" in destroy_concurrency
+    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2" in destroy_concurrency
     assert "inputs.validation_mode" in deploy_concurrency
     assert "format('hindsight-live-deploy-{0}-{1}'" in deploy_concurrency
-    assert "format('hindsight-{0}-environment'" in deploy_concurrency
+    assert "format('hindsight-{0}-environment-v2'" in deploy_concurrency
     for concurrency in (
         live_concurrency,
         learning_concurrency,
