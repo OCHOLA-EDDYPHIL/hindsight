@@ -557,6 +557,24 @@ def test_product_preflight_does_not_repeat_normal_ci():
         assert duplicate not in preflight
 
 
+def test_product_preflight_always_removes_its_run_scoped_database():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    parsed = yaml.safe_load(workflow)
+    preflight = parsed["jobs"]["product_preflight"]
+
+    assert preflight["env"]["COMPOSE_PROJECT_NAME"] == (
+        "hindsight_product_preflight_${{ github.run_id }}_${{ github.run_attempt }}"
+    )
+    cleanup = next(
+        step
+        for step in preflight["steps"]
+        if step.get("name") == "Remove isolated CockroachDB"
+    )
+    assert cleanup["if"] == "always()"
+    assert cleanup["run"] == "docker compose down --volumes --remove-orphans"
+    assert preflight["steps"].index(cleanup) == len(preflight["steps"]) - 1
+
+
 def test_exact_main_ci_query_does_not_hide_unsuccessful_runs():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     job = workflow.split("  exact_main_ci:\n", 1)[1].split(
