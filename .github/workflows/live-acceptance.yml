@@ -119,6 +119,7 @@ jobs:
       GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
       GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
       GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
+      COMPOSE_PROJECT_NAME: hindsight_product_preflight_${{ github.run_id }}_${{ github.run_attempt }}
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_product_${{ github.run_id }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
@@ -177,6 +178,9 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Verify product providers
         run: uv run python scripts/run_live_acceptance.py hosted-product --phase providers
+      - name: Remove isolated CockroachDB
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   deploy:
     needs:
