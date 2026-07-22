@@ -16,6 +16,43 @@ COMPONENTS = (
     "lambda_artifacts",
     "terraform",
 )
+DATABASE_TEST_FILES = frozenset(
+    {
+        "test_agent.py",
+        "test_benchmark_protocol_migrations.py",
+        "test_consolidation.py",
+        "test_cross_episode_demo.py",
+        "test_dashboard.py",
+        "test_embedding_rotation.py",
+        "test_governed_memory.py",
+        "test_learning_benchmark_setup.py",
+        "test_learning_evidence_foundation.py",
+        "test_learning_orchestration.py",
+        "test_mcp_server.py",
+        "test_memory.py",
+        "test_migrations_and_roles.py",
+        "test_operation_retries.py",
+        "test_poison_rewind_demo.py",
+        "test_run_attempts.py",
+        "test_run_dispatch.py",
+        "test_runs.py",
+        "test_smoke.py",
+        "test_system_of_record.py",
+        "test_telemetry.py",
+        "test_tenant_isolation.py",
+        "test_trace_contract.py",
+    }
+)
+MIGRATION_TEST_FILES = frozenset(
+    {
+        "test_agent.py",
+        "test_benchmark_protocol_migrations.py",
+        "test_learning_benchmark_setup.py",
+        "test_learning_evidence_foundation.py",
+        "test_migrations_and_roles.py",
+        "test_run_dispatch.py",
+    }
+)
 
 
 def _all_selected() -> dict[str, bool]:
@@ -58,7 +95,10 @@ def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
                 selected["diagnostics"] = True
             continue
         if path.startswith("migrations/") or path.startswith("infra/db/"):
-            return _all_selected()
+            selected["database"] = True
+            selected["migrations"] = True
+            selected["lambda_artifacts"] = True
+            continue
         if path.startswith("fixtures/"):
             selected["database"] = True
             selected["diagnostics"] = True
@@ -66,8 +106,23 @@ def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
             continue
         if path.startswith("docs/") or path.endswith((".md", ".rst", ".txt")):
             continue
+        if path.startswith("tests/"):
+            name = Path(path).name
+            if name in DATABASE_TEST_FILES:
+                selected["database"] = True
+            if name in MIGRATION_TEST_FILES:
+                selected["migrations"] = True
+            continue
         if path.startswith("scripts/"):
-            return _all_selected()
+            name = Path(path).name
+            if name in {"migrate.py", "apply_database_roles.py", "initialize_agent_storage.py"}:
+                selected["database"] = True
+                selected["migrations"] = True
+            elif name in {"run_rank_diagnostics.py", "run_learning_benchmark.py"}:
+                selected["diagnostics"] = True
+            elif name in {"build_lambda_artifacts.py", "smoke_lambda_artifacts.py"}:
+                selected["lambda_artifacts"] = True
+            continue
         return _all_selected()
 
     if not saw_path:
@@ -79,8 +134,12 @@ def _forces_full_matrix(path: str) -> bool:
     return (
         path.startswith(".github/workflows/")
         or path.startswith(".github/actions/")
-        or path.startswith("tests/")
         or path.startswith("scripts/ci_")
+        or path in {
+            "tests/test_ci_aggregate.py",
+            "tests/test_ci_changes.py",
+            "tests/test_ci_contracts.py",
+        }
         or path
         in {
             "Makefile",
