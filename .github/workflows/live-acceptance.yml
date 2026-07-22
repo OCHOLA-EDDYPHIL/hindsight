@@ -2,11 +2,20 @@ name: live acceptance
 
 on:
   workflow_dispatch:
+    inputs:
+      deployment_environment:
+        description: Protected GitHub environment containing one AWS account configuration
+        required: true
+        type: choice
+        default: demo
+        options:
+          - demo
+          - demo-candidate
 
 permissions: {}
 
 concurrency:
-  group: hindsight-demo-environment
+  group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment
   cancel-in-progress: false
 
 env:
@@ -26,6 +35,7 @@ jobs:
     outputs:
       authorized: ${{ steps.authorization.outputs.authorized }}
       product_sha: ${{ steps.authorization.outputs.product_sha }}
+      deployment_environment: ${{ steps.authorization.outputs.deployment_environment }}
     steps:
       - id: authorization
         name: Resolve owner-authorized product revision
@@ -37,8 +47,14 @@ jobs:
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment || 'demo' }}
         shell: bash
         run: |
+          REQUESTED_ENVIRONMENT="${REQUESTED_ENVIRONMENT:-demo}"
+          [[ "$REQUESTED_ENVIRONMENT" == "demo" || "$REQUESTED_ENVIRONMENT" == "demo-candidate" ]] || {
+            echo "Unsupported deployment environment." >&2
+            exit 1
+          }
           [[ "$REF_NAME" == "refs/heads/main" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/live-acceptance.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
@@ -50,6 +66,7 @@ jobs:
           {
             echo "authorized=true"
             echo "product_sha=$EVENT_SHA"
+            echo "deployment_environment=$REQUESTED_ENVIRONMENT"
           } >> "$GITHUB_OUTPUT"
 
   exact_main_ci:
@@ -98,12 +115,16 @@ jobs:
       - authorize
       - exact_main_ci
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+      GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_product_${{ github.run_id }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
@@ -178,16 +199,22 @@ jobs:
       validation_mode: true
       embedding_max_distance: "0.35"
       source_sha: ${{ needs.authorize.outputs.product_sha }}
+      deployment_environment: ${{ needs.authorize.outputs.deployment_environment }}
 
   semantic_product:
     needs: [authorize, deploy]
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+      GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
@@ -226,12 +253,18 @@ jobs:
   consolidation_product:
     needs: [authorize, deploy]
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+      GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+      GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
@@ -273,12 +306,14 @@ jobs:
   worker_product:
     needs: [authorize, deploy]
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 25
     permissions:
       contents: read
       id-token: write
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
       HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS: ${{ needs.deploy.outputs.run_attempt_lease_seconds }}
       HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS: ${{ needs.deploy.outputs.run_queue_visibility_seconds }}
       HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS: ${{ needs.deploy.outputs.run_max_attempts }}
@@ -306,12 +341,19 @@ jobs:
   browser_product:
     needs: [authorize, deploy]
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+      CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+      GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       HINDSIGHT_BROWSER_BASE_URL: ${{ needs.deploy.outputs.ui_url }}
       HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
       HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}
@@ -366,12 +408,13 @@ jobs:
   database_roles:
     needs: [authorize, deploy]
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    environment: demo
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
     env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       HINDSIGHT_DEPLOY_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
       HINDSIGHT_API_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       HINDSIGHT_WORKER_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}

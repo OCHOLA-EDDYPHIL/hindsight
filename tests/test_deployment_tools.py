@@ -28,6 +28,15 @@ def _changefeed_module():
     return module
 
 
+def _deployment_identity_module():
+    path = pathlib.Path("scripts/deployment_identity_preflight.py")
+    spec = importlib.util.spec_from_file_location("deployment_identity_preflight", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _run_authorization_script(
     workflow_path: str,
     *,
@@ -232,12 +241,12 @@ def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
 
-    assert "group: hindsight-demo-environment" in live_concurrency
+    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment" in live_concurrency
     assert "group: hindsight-demo-environment" in learning_concurrency
-    assert "group: hindsight-demo-environment" in destroy_concurrency
+    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment" in destroy_concurrency
     assert "inputs.validation_mode" in deploy_concurrency
-    assert "format('hindsight-live-deploy-{0}', github.run_id)" in deploy_concurrency
-    assert "|| 'hindsight-demo-environment'" in deploy_concurrency
+    assert "format('hindsight-live-deploy-{0}-{1}'" in deploy_concurrency
+    assert "format('hindsight-{0}-environment'" in deploy_concurrency
     for concurrency in (
         live_concurrency,
         learning_concurrency,
@@ -349,7 +358,8 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
         output_path=output,
     )
     assert result.returncode == 0
-    assert output.read_text().strip() == f"expected_sha={'a' * 40}"
+    assert f"expected_sha={'a' * 40}" in output.read_text()
+    assert "deployment_environment=demo" in output.read_text()
     rejected = _run_authorization_script(
         workflow_path,
         values={
@@ -371,8 +381,8 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
     assert "ref: ${{ needs.authorize.outputs.expected_sha }}" in verify
     assert "Verify exact source revision" in verify
     assert "aws apigatewayv2 get-apis" in verify
-    assert "hindsight-demo-http" in verify
-    assert "hindsight-demo-websocket" in verify
+    assert "hindsight-${HINDSIGHT_STAGE}-http" in verify
+    assert "hindsight-${HINDSIGHT_STAGE}-websocket" in verify
     assert 'f"{api_url}/v1/health/live"' in verify
     assert 'f"{api_url}/v1/health/ready"' in verify
     assert 'f"{api_url}/v1/incidents?limit=1"' in verify
@@ -674,6 +684,117 @@ def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_pat
     assert direct.returncode == 0, direct.stderr
     assert "should_apply=false" in direct_output.read_text()
     assert f"source_sha={main_sha}" in direct_output.read_text()
+    assert "deployment_environment=demo" in direct_output.read_text()
+
+    candidate_output = tmp_path / "candidate"
+    candidate = _run_authorization_script(
+        ".github/workflows/deploy-demo.yml",
+        values={
+            **reusable,
+            "REQUESTED_ENVIRONMENT": "demo-candidate",
+        },
+        output_path=candidate_output,
+    )
+    assert candidate.returncode == 0, candidate.stderr
+    assert "deployment_environment=demo-candidate" in candidate_output.read_text()
+
+    rejected_environment = _run_authorization_script(
+        ".github/workflows/deploy-demo.yml",
+        values={**reusable, "REQUESTED_ENVIRONMENT": "untrusted"},
+        output_path=tmp_path / "environment-rejected",
+    )
+    assert rejected_environment.returncode != 0
+    assert "Unsupported deployment environment" in rejected_environment.stderr
+
+
+def test_deployment_identity_preflight_binds_account_state_and_certificate(capsys):
+    identity = _deployment_identity_module()
+
+    class FakeSts:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class FakeS3:
+        def __init__(self):
+            self.calls = []
+
+        def get_bucket_location(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"LocationConstraint": None}
+
+        def get_bucket_versioning(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"Status": "Enabled"}
+
+    class FakeAcm:
+        def describe_certificate(self, **kwargs):
+            return {"Certificate": {"Status": "ISSUED"}}
+
+    s3 = FakeS3()
+    identity.verify_deployment_identity(
+        expected_account_id="123456789012",
+        region="us-east-1",
+        state_bucket="target-state",
+        certificate_arn=(
+            "arn:aws:acm:us-east-1:123456789012:certificate/"
+            "00000000-0000-0000-0000-000000000000"
+        ),
+        sts_client=FakeSts(),
+        s3_client=s3,
+        acm_client=FakeAcm(),
+    )
+
+    assert all(call["ExpectedBucketOwner"] == "123456789012" for call in s3.calls)
+    assert "versioned state bucket" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("caller_account", "certificate_arn", "error"),
+    (
+        (
+            "210987654321",
+            "arn:aws:acm:us-east-1:123456789012:certificate/test",
+            "unexpected account",
+        ),
+        (
+            "123456789012",
+            "arn:aws:acm:us-east-1:210987654321:certificate/test",
+            "does not belong",
+        ),
+    ),
+)
+def test_deployment_identity_preflight_rejects_mixed_accounts(
+    caller_account,
+    certificate_arn,
+    error,
+):
+    identity = _deployment_identity_module()
+
+    class FakeSts:
+        def get_caller_identity(self):
+            return {"Account": caller_account}
+
+    class FakeS3:
+        def get_bucket_location(self, **kwargs):
+            return {"LocationConstraint": None}
+
+        def get_bucket_versioning(self, **kwargs):
+            return {"Status": "Enabled"}
+
+    class FakeAcm:
+        def describe_certificate(self, **kwargs):
+            return {"Certificate": {"Status": "ISSUED"}}
+
+    with pytest.raises(RuntimeError, match=error):
+        identity.verify_deployment_identity(
+            expected_account_id="123456789012",
+            region="us-east-1",
+            state_bucket="target-state",
+            certificate_arn=certificate_arn,
+            sts_client=FakeSts(),
+            s3_client=FakeS3(),
+            acm_client=FakeAcm(),
+        )
 
 
 def test_validation_deployment_selects_bounded_runtime_timing():

@@ -14,11 +14,20 @@ locals {
   ]
 }
 
+check "expected_aws_account" {
+  assert {
+    condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+    error_message = "Authenticated AWS account does not match expected_aws_account_id."
+  }
+}
+
 data "aws_s3_bucket" "state" {
   bucket = var.state_bucket_name
 }
 
 resource "aws_s3_bucket" "learning_evidence" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   bucket              = local.evidence_bucket_name
   object_lock_enabled = true
 
@@ -28,6 +37,8 @@ resource "aws_s3_bucket" "learning_evidence" {
 }
 
 resource "aws_kms_key" "learning_corpus" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   description             = "Hindsight protected learning corpus packages"
   deletion_window_in_days = 30
   enable_key_rotation     = true
@@ -37,6 +48,8 @@ resource "aws_kms_key" "learning_corpus" {
 }
 
 resource "aws_kms_key" "learning_qualification_hmac" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   description              = "Hindsight learning qualification opaque identifiers"
   key_usage                = "GENERATE_VERIFY_MAC"
   customer_master_key_spec = "HMAC_256"
@@ -49,24 +62,32 @@ resource "aws_kms_key" "learning_qualification_hmac" {
 }
 
 resource "aws_kms_alias" "learning_corpus" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   name          = "alias/hindsight-${var.stage}-learning-corpus"
-  target_key_id = aws_kms_key.learning_corpus.key_id
+  target_key_id = aws_kms_key.learning_corpus[0].key_id
 }
 
 resource "aws_kms_alias" "learning_qualification_hmac" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   name          = "alias/hindsight-${var.stage}-learning-qualification-hmac"
-  target_key_id = aws_kms_key.learning_qualification_hmac.key_id
+  target_key_id = aws_kms_key.learning_qualification_hmac[0].key_id
 }
 
 resource "aws_s3_bucket_versioning" "learning_evidence" {
-  bucket = aws_s3_bucket.learning_evidence.id
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  bucket = aws_s3_bucket.learning_evidence[0].id
   versioning_configuration {
     status = "Enabled"
   }
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "learning_evidence" {
-  bucket = aws_s3_bucket.learning_evidence.id
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  bucket = aws_s3_bucket.learning_evidence[0].id
   rule {
     apply_server_side_encryption_by_default {
       sse_algorithm = "AES256"
@@ -75,7 +96,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "learning_evidence
 }
 
 resource "aws_s3_bucket_public_access_block" "learning_evidence" {
-  bucket                  = aws_s3_bucket.learning_evidence.id
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  bucket                  = aws_s3_bucket.learning_evidence[0].id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -83,21 +106,25 @@ resource "aws_s3_bucket_public_access_block" "learning_evidence" {
 }
 
 resource "aws_s3_bucket_ownership_controls" "learning_evidence" {
-  bucket = aws_s3_bucket.learning_evidence.id
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  bucket = aws_s3_bucket.learning_evidence[0].id
   rule {
     object_ownership = "BucketOwnerEnforced"
   }
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "learning_evidence" {
-  bucket = aws_s3_bucket.learning_evidence.id
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  bucket = aws_s3_bucket.learning_evidence[0].id
   rule {
     default_retention {
       mode  = "GOVERNANCE"
       years = 7
     }
   }
-  depends_on = [aws_s3_bucket_versioning.learning_evidence]
+  depends_on = [aws_s3_bucket_versioning.learning_evidence[0]]
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
@@ -163,6 +190,8 @@ resource "aws_iam_role" "github_deploy" {
 }
 
 resource "aws_iam_role" "github_evidence" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   name                 = "hindsight-github-evidence"
   assume_role_policy   = data.aws_iam_policy_document.github_assume.json
   max_session_duration = 3600
@@ -217,25 +246,28 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = local.lambda_function_arns
   }
 
-  statement {
-    sid    = "EvidenceArchiveMutationDenied"
-    effect = "Deny"
-    actions = [
-      "s3:BypassGovernanceRetention",
-      "s3:DeleteBucket",
-      "s3:DeleteBucketPolicy",
-      "s3:DeleteObject",
-      "s3:DeleteObjectVersion",
-      "s3:PutBucketObjectLockConfiguration",
-      "s3:PutBucketPolicy",
-      "s3:PutBucketVersioning",
-      "s3:PutObject",
-      "s3:PutObjectRetention",
-    ]
-    resources = [
-      aws_s3_bucket.learning_evidence.arn,
-      "${aws_s3_bucket.learning_evidence.arn}/*",
-    ]
+  dynamic "statement" {
+    for_each = var.enable_learning_infrastructure ? [true] : []
+    content {
+      sid    = "EvidenceArchiveMutationDenied"
+      effect = "Deny"
+      actions = [
+        "s3:BypassGovernanceRetention",
+        "s3:DeleteBucket",
+        "s3:DeleteBucketPolicy",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutBucketPolicy",
+        "s3:PutBucketVersioning",
+        "s3:PutObject",
+        "s3:PutObjectRetention",
+      ]
+      resources = [
+        aws_s3_bucket.learning_evidence[0].arn,
+        "${aws_s3_bucket.learning_evidence[0].arn}/*",
+      ]
+    }
   }
 
   statement {
@@ -414,6 +446,8 @@ resource "aws_iam_role_policy" "github_deploy" {
 }
 
 data "aws_iam_policy_document" "github_evidence" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   statement {
     sid       = "EvidenceSettings"
     actions   = ["ssm:GetParameter", "ssm:GetParameters"]
@@ -450,7 +484,7 @@ data "aws_iam_policy_document" "github_evidence" {
       "kms:Encrypt",
       "kms:GenerateDataKey",
     ]
-    resources = [aws_kms_key.learning_corpus.arn]
+    resources = [aws_kms_key.learning_corpus[0].arn]
   }
 
   statement {
@@ -460,7 +494,7 @@ data "aws_iam_policy_document" "github_evidence" {
       "kms:GenerateMac",
       "kms:VerifyMac",
     ]
-    resources = [aws_kms_key.learning_qualification_hmac.arn]
+    resources = [aws_kms_key.learning_qualification_hmac[0].arn]
   }
 
   statement {
@@ -470,7 +504,7 @@ data "aws_iam_policy_document" "github_evidence" {
       "s3:GetBucketObjectLockConfiguration",
       "s3:GetBucketVersioning",
     ]
-    resources = [aws_s3_bucket.learning_evidence.arn]
+    resources = [aws_s3_bucket.learning_evidence[0].arn]
   }
 
   statement {
@@ -479,7 +513,7 @@ data "aws_iam_policy_document" "github_evidence" {
       "s3:ListBucket",
       "s3:ListBucketVersions",
     ]
-    resources = [aws_s3_bucket.learning_evidence.arn]
+    resources = [aws_s3_bucket.learning_evidence[0].arn]
     condition {
       test     = "StringLike"
       variable = "s3:prefix"
@@ -496,16 +530,20 @@ data "aws_iam_policy_document" "github_evidence" {
       "s3:GetObjectVersion",
       "s3:PutObject",
     ]
-    resources = ["${aws_s3_bucket.learning_evidence.arn}/learning/*"]
+    resources = ["${aws_s3_bucket.learning_evidence[0].arn}/learning/*"]
   }
 }
 
 resource "aws_iam_role_policy" "github_evidence" {
-  role   = aws_iam_role.github_evidence.id
-  policy = data.aws_iam_policy_document.github_evidence.json
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  role   = aws_iam_role.github_evidence[0].id
+  policy = data.aws_iam_policy_document.github_evidence[0].json
 }
 
 data "aws_iam_policy_document" "learning_evidence_bucket" {
+  count = var.enable_learning_infrastructure ? 1 : 0
+
   statement {
     sid    = "DenyInsecureTransport"
     effect = "Deny"
@@ -526,8 +564,8 @@ data "aws_iam_policy_document" "learning_evidence_bucket" {
       "s3:PutObjectRetention",
     ]
     resources = [
-      aws_s3_bucket.learning_evidence.arn,
-      "${aws_s3_bucket.learning_evidence.arn}/*",
+      aws_s3_bucket.learning_evidence[0].arn,
+      "${aws_s3_bucket.learning_evidence[0].arn}/*",
     ]
     principals {
       type        = "*"
@@ -550,7 +588,7 @@ data "aws_iam_policy_document" "learning_evidence_bucket" {
       "s3:PutObject",
       "s3:PutObjectRetention",
     ]
-    resources = ["${aws_s3_bucket.learning_evidence.arn}/*"]
+    resources = ["${aws_s3_bucket.learning_evidence[0].arn}/*"]
     principals {
       type        = "AWS"
       identifiers = [aws_iam_role.github_deploy.arn]
@@ -559,7 +597,74 @@ data "aws_iam_policy_document" "learning_evidence_bucket" {
 }
 
 resource "aws_s3_bucket_policy" "learning_evidence" {
-  bucket     = aws_s3_bucket.learning_evidence.id
-  policy     = data.aws_iam_policy_document.learning_evidence_bucket.json
-  depends_on = [aws_s3_bucket_public_access_block.learning_evidence]
+  count = var.enable_learning_infrastructure ? 1 : 0
+
+  bucket     = aws_s3_bucket.learning_evidence[0].id
+  policy     = data.aws_iam_policy_document.learning_evidence_bucket[0].json
+  depends_on = [aws_s3_bucket_public_access_block.learning_evidence[0]]
+}
+
+moved {
+  from = aws_s3_bucket.learning_evidence
+  to   = aws_s3_bucket.learning_evidence[0]
+}
+
+moved {
+  from = aws_kms_key.learning_corpus
+  to   = aws_kms_key.learning_corpus[0]
+}
+
+moved {
+  from = aws_kms_key.learning_qualification_hmac
+  to   = aws_kms_key.learning_qualification_hmac[0]
+}
+
+moved {
+  from = aws_kms_alias.learning_corpus
+  to   = aws_kms_alias.learning_corpus[0]
+}
+
+moved {
+  from = aws_kms_alias.learning_qualification_hmac
+  to   = aws_kms_alias.learning_qualification_hmac[0]
+}
+
+moved {
+  from = aws_s3_bucket_versioning.learning_evidence
+  to   = aws_s3_bucket_versioning.learning_evidence[0]
+}
+
+moved {
+  from = aws_s3_bucket_server_side_encryption_configuration.learning_evidence
+  to   = aws_s3_bucket_server_side_encryption_configuration.learning_evidence[0]
+}
+
+moved {
+  from = aws_s3_bucket_public_access_block.learning_evidence
+  to   = aws_s3_bucket_public_access_block.learning_evidence[0]
+}
+
+moved {
+  from = aws_s3_bucket_ownership_controls.learning_evidence
+  to   = aws_s3_bucket_ownership_controls.learning_evidence[0]
+}
+
+moved {
+  from = aws_s3_bucket_object_lock_configuration.learning_evidence
+  to   = aws_s3_bucket_object_lock_configuration.learning_evidence[0]
+}
+
+moved {
+  from = aws_iam_role.github_evidence
+  to   = aws_iam_role.github_evidence[0]
+}
+
+moved {
+  from = aws_iam_role_policy.github_evidence
+  to   = aws_iam_role_policy.github_evidence[0]
+}
+
+moved {
+  from = aws_s3_bucket_policy.learning_evidence
+  to   = aws_s3_bucket_policy.learning_evidence[0]
 }
