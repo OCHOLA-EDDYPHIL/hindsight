@@ -10,11 +10,27 @@ SPEC.loader.exec_module(ci_changes)
 COMPONENTS = ci_changes.COMPONENTS
 classify_paths = ci_changes.classify_paths
 write_github_output = ci_changes.write_github_output
+GROUP_SPEC = importlib.util.spec_from_file_location(
+    "ci_test_groups", ROOT / "scripts/ci_test_groups.py"
+)
+assert GROUP_SPEC is not None and GROUP_SPEC.loader is not None
+ci_test_groups = importlib.util.module_from_spec(GROUP_SPEC)
+GROUP_SPEC.loader.exec_module(ci_test_groups)
 
 
 def test_main_always_runs_every_component():
     assert classify_paths(["docs/architecture.md"], event_name="push") == {
         component: True for component in COMPONENTS
+    }
+
+
+def test_path_classifier_tracks_database_and_migration_test_inventory():
+    assert ci_changes.DATABASE_TEST_FILES == {
+        Path(path).name for path in ci_test_groups.database_test_files()
+    }
+    assert ci_changes.MIGRATION_TEST_FILES == {
+        Path(node.split("::", 1)[0]).name
+        for node in ci_test_groups.MIGRATION_CASES.values()
     }
 
 
@@ -63,15 +79,63 @@ def test_backend_paths_select_database_and_lambda_with_targeted_diagnostics():
     assert diagnostic["diagnostics"] is True
 
 
-def test_workflow_test_migration_and_unknown_paths_fail_safe_to_full_matrix():
+def test_ci_control_and_unknown_paths_fail_safe_to_full_matrix():
     for path in (
         ".github/workflows/ci.yml",
-        "tests/test_api.py",
-        "migrations/0023_future.sql",
+        "tests/test_ci_changes.py",
         "unclassified.config",
     ):
         selected = classify_paths([path], event_name="pull_request")
         assert all(selected.values()), path
+
+
+def test_ordinary_unit_and_deployment_tool_changes_use_static_ci_only():
+    selected = classify_paths(
+        ["tests/test_api.py", "tests/test_deployment_tools.py", "scripts/configure_changefeed.py"],
+        event_name="pull_request",
+    )
+
+    assert not any(selected.values())
+
+
+def test_database_tests_do_not_select_migrations_unless_migration_sensitive():
+    ordinary = classify_paths(["tests/test_memory.py"], event_name="pull_request")
+    migration = classify_paths(
+        ["tests/test_migrations_and_roles.py"], event_name="pull_request"
+    )
+
+    assert ordinary["database"] is True
+    assert ordinary["migrations"] is False
+    assert migration["database"] is True
+    assert migration["migrations"] is True
+    assert migration["diagnostics"] is False
+
+
+def test_migration_paths_select_database_replay_and_packaging_only():
+    selected = classify_paths(
+        ["migrations/0026_future.sql"], event_name="pull_request"
+    )
+
+    assert selected == {
+        "database": True,
+        "migrations": True,
+        "diagnostics": False,
+        "frontend": False,
+        "lambda_artifacts": True,
+        "terraform": False,
+    }
+
+
+def test_research_checks_run_only_for_their_own_inputs():
+    ordinary = classify_paths(
+        ["scripts/configure_changefeed.py"], event_name="pull_request"
+    )
+    research = classify_paths(
+        ["scripts/run_rank_diagnostics.py"], event_name="pull_request"
+    )
+
+    assert ordinary["diagnostics"] is False
+    assert research["diagnostics"] is True
 
 
 def test_documentation_only_pull_request_keeps_component_jobs_disabled():
