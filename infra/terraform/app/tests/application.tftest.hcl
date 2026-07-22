@@ -222,16 +222,16 @@ run "inactive_candidate_plane" {
   command = plan
 
   variables {
-    stage                    = "candidate"
-    runtime_active           = false
-    manage_public_dns        = false
-    domain_name              = "candidate.hindsight.example.com"
-    public_origin            = "https://candidate.hindsight.example.com"
-    cloudfront_aliases       = ["candidate.hindsight.example.com", "*.hindsight.example.com"]
-    acm_certificate_arn      = "arn:aws:acm:us-east-1:123456789012:certificate/test"
-    api_zip_path             = "../../../src/hindsight/web/favicon.svg"
-    worker_zip_path          = "../../../src/hindsight/web/favicon.svg"
-    realtime_zip_path        = "../../../src/hindsight/web/favicon.svg"
+    stage               = "candidate"
+    runtime_active      = false
+    manage_public_dns   = false
+    domain_name         = "candidate.hindsight.example.com"
+    public_origin       = "https://candidate.hindsight.example.com"
+    cloudfront_aliases  = ["candidate.hindsight.example.com", "*.hindsight.example.com"]
+    acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
+    api_zip_path        = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path     = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path   = "../../../src/hindsight/web/favicon.svg"
   }
 
   assert {
