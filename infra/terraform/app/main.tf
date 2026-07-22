@@ -9,10 +9,10 @@ locals {
   run_dispatch_schedule_seconds = 60
   operation_poll_seconds        = (local.run_max_attempts - 1) * local.run_queue_visibility_seconds + local.worker_timeout_seconds + 60
 
-  api_zip      = var.api_zip_path != null ? abspath(var.api_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-api.zip")
-  worker_zip   = var.worker_zip_path != null ? abspath(var.worker_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip")
-  realtime_zip = var.realtime_zip_path != null ? abspath(var.realtime_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-realtime.zip")
-  web_root     = abspath("${path.module}/../../../src/hindsight/web")
+  api_zip      = var.api_zip_path != null ? var.api_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-api.zip"
+  worker_zip   = var.worker_zip_path != null ? var.worker_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip"
+  realtime_zip = var.realtime_zip_path != null ? var.realtime_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-realtime.zip"
+  web_root     = "${path.module}/../../../src/hindsight/web"
 
   cloudfront_aliases = var.cloudfront_aliases != null ? var.cloudfront_aliases : (
     var.domain_name == null ? [] : [var.domain_name]

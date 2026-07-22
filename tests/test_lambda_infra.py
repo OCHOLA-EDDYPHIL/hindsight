@@ -33,6 +33,19 @@ def test_application_stack_uses_split_artifacts_and_external_secret_references()
     assert 'resource "aws_dynamodb_table" "gemini_key_health"' in stack
 
 
+def test_saved_plan_sources_do_not_capture_a_runner_checkout_path():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+
+    for artifact in ("api", "worker", "realtime"):
+        assert f'abspath(var.{artifact}_zip_path)' not in stack
+        assert (
+            f'"${{path.module}}/../../../build/lambda-artifacts/hindsight-{artifact}.zip"'
+            in stack
+        )
+    assert 'web_root     = "${path.module}/../../../src/hindsight/web"' in stack
+    assert 'web_root     = abspath(' not in stack
+
+
 def test_runtime_lambdas_use_distinct_database_parameters_without_bedrock():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
     api_policy = stack.split('data "aws_iam_policy_document" "api"', 1)[1].split(

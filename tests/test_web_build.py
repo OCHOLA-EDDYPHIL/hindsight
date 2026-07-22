@@ -45,5 +45,5 @@ def test_local_api_lambda_and_s3_use_the_same_static_output():
     assert 'assets.joinpath("app.js")' in dashboard
     assert 'assets.joinpath("styles.css")' in dashboard
     assert '"web",' in builder
-    assert 'web_root     = abspath("${path.module}/../../../src/hindsight/web")' in terraform
+    assert 'web_root     = "${path.module}/../../../src/hindsight/web"' in terraform
     assert 'fileset(local.web_root, "**")' in terraform
