@@ -180,6 +180,128 @@ def test_changefeed_status_command_fails_when_not_running(monkeypatch):
         configure.main()
 
 
+@pytest.mark.parametrize(
+    ("operation", "attempt_name", "expected"),
+    [
+        (
+            lambda configure: configure.apply_changefeed(
+                webhook_url="https://example.com/changefeed",
+                auth_token="token",
+                db_url="postgresql://fixture",
+            ),
+            "_apply_changefeed_once",
+            {"job_id": "42", "status": "running", "changed": False},
+        ),
+        (
+            lambda configure: configure.pause_changefeed(db_url="postgresql://fixture"),
+            "_pause_changefeed_once",
+            {"job_id": "42", "status": "paused", "changed": False},
+        ),
+        (
+            lambda configure: configure.changefeed_status(db_url="postgresql://fixture"),
+            "_changefeed_status_once",
+            {"job_id": "42", "status": "running", "changed": False},
+        ),
+    ],
+)
+def test_changefeed_operations_retry_serialization_failure(
+    monkeypatch, operation, attempt_name, expected
+):
+    configure = _changefeed_module()
+    from psycopg.errors import SerializationFailure
+
+    attempts = 0
+
+    def flaky_attempt(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SerializationFailure("restart transaction")
+        if attempt_name == "_changefeed_status_once":
+            return expected
+        return "42", False
+
+    monkeypatch.setattr(configure, attempt_name, flaky_attempt)
+    monkeypatch.setattr(
+        configure,
+        "_wait_for_job_status",
+        lambda **kwargs: {
+            "job_id": kwargs["job_id"],
+            "status": kwargs["expected"],
+            "changed": kwargs["changed"],
+        },
+    )
+
+    assert operation(configure) == expected
+    assert attempts == 2
+
+
+def test_changefeed_serialization_retries_open_fresh_connections(monkeypatch):
+    configure = _changefeed_module()
+    from psycopg.errors import SerializationFailure
+
+    connections = []
+
+    class FakeConnection:
+        def __enter__(self):
+            connections.append(self)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(configure, "connect", lambda *_args, **_kwargs: FakeConnection())
+
+    def flaky_app_meta(_conn, _key):
+        if len(connections) < configure.CHANGEFEED_TRANSACTION_ATTEMPTS:
+            raise SerializationFailure("restart transaction")
+        return None
+
+    monkeypatch.setattr(configure, "_app_meta", flaky_app_meta)
+
+    assert configure.changefeed_status(db_url="postgresql://fixture") == {
+        "job_id": None,
+        "status": "absent",
+        "changed": False,
+    }
+    assert len(connections) == configure.CHANGEFEED_TRANSACTION_ATTEMPTS
+    assert len({id(connection) for connection in connections}) == len(connections)
+
+
+def test_changefeed_serialization_retries_are_bounded(monkeypatch):
+    configure = _changefeed_module()
+    from psycopg.errors import SerializationFailure
+
+    attempts = 0
+
+    def always_serialized(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise SerializationFailure("restart transaction")
+
+    monkeypatch.setattr(configure, "_changefeed_status_once", always_serialized)
+
+    with pytest.raises(SerializationFailure):
+        configure.changefeed_status()
+    assert attempts == configure.CHANGEFEED_TRANSACTION_ATTEMPTS
+
+
+def test_changefeed_does_not_retry_non_serialization_failure(monkeypatch):
+    configure = _changefeed_module()
+    attempts = 0
+
+    def non_retryable(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("configuration failed")
+
+    monkeypatch.setattr(configure, "_pause_changefeed_once", non_retryable)
+
+    with pytest.raises(RuntimeError, match="configuration failed"):
+        configure.pause_changefeed()
+    assert attempts == 1
+
+
 def test_live_acceptance_is_product_only_and_never_fences_changefeed():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     assert "github.triggering_actor" in workflow
