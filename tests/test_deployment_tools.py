@@ -797,6 +797,34 @@ def test_deployment_identity_preflight_rejects_mixed_accounts(
         )
 
 
+def test_deployment_identity_preflight_rejects_unisolated_candidate():
+    identity = _deployment_identity_module()
+
+    with pytest.raises(RuntimeError, match="stage and state key"):
+        identity.verify_deployment_identity(
+            expected_account_id="123456789012",
+            region="us-east-1",
+            state_bucket="target-state",
+            certificate_arn="arn:aws:acm:us-east-1:123456789012:certificate/test",
+            deployment_environment="demo-candidate",
+            stage="demo",
+            state_key="hindsight/demo/terraform.tfstate",
+            domain_name="candidate.hindsight.strathmoreedu.qzz.io",
+        )
+
+    with pytest.raises(RuntimeError, match="source DNS ownership"):
+        identity.verify_deployment_identity(
+            expected_account_id="123456789012",
+            region="us-east-1",
+            state_bucket="target-state",
+            certificate_arn="arn:aws:acm:us-east-1:123456789012:certificate/test",
+            deployment_environment="demo-candidate",
+            stage="candidate",
+            state_key="hindsight/demo-candidate/terraform.tfstate",
+            domain_name="hindsight.strathmoreedu.qzz.io",
+        )
+
+
 def test_validation_deployment_selects_bounded_runtime_timing():
     workflow = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
 

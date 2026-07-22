@@ -8,6 +8,16 @@ locals {
     "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/gemini-api-keys",
   ]
   lambda_version_refresh_actions = ["lambda:ListVersionsByFunction"]
+  terraform_state_keys           = [var.application_state_key, var.edge_state_key]
+  terraform_state_prefixes = flatten([
+    for key in local.terraform_state_keys : [key, "${key}.*"]
+  ])
+  terraform_state_object_arns = flatten([
+    for key in local.terraform_state_keys : [
+      "${local.state_bucket_arn}/${key}",
+      "${local.state_bucket_arn}/${key}.*",
+    ]
+  ])
   lambda_function_arns = [
     for component in ["api", "worker", "websocket", "changefeed"] :
     "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:hindsight-${var.stage}-${component}"
@@ -211,7 +221,7 @@ data "aws_iam_policy_document" "github_deploy" {
     condition {
       test     = "StringLike"
       variable = "s3:prefix"
-      values   = [var.application_state_key, "${var.application_state_key}.*"]
+      values   = local.terraform_state_prefixes
     }
   }
 
@@ -222,10 +232,7 @@ data "aws_iam_policy_document" "github_deploy" {
       "s3:GetObject",
       "s3:PutObject"
     ]
-    resources = [
-      "${local.state_bucket_arn}/${var.application_state_key}",
-      "${local.state_bucket_arn}/${var.application_state_key}.*"
-    ]
+    resources = local.terraform_state_object_arns
   }
 
   statement {

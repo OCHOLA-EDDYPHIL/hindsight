@@ -209,4 +209,12 @@ run "product_only_bootstrap" {
     condition     = var.application_state_key == "hindsight/demo-candidate/terraform.tfstate"
     error_message = "Candidate bootstrap must scope the application state key independently."
   }
+
+  assert {
+    condition = toset(local.terraform_state_keys) == toset([
+      "hindsight/demo-candidate/terraform.tfstate",
+      "hindsight/edge/terraform.tfstate",
+    ])
+    error_message = "Target trust must scope application and stable-edge state independently."
+  }
 }

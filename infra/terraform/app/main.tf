@@ -14,6 +14,13 @@ locals {
   realtime_zip = var.realtime_zip_path != null ? abspath(var.realtime_zip_path) : abspath("${path.module}/../../../build/lambda-artifacts/hindsight-realtime.zip")
   web_root     = abspath("${path.module}/../../../src/hindsight/web")
 
+  cloudfront_aliases = var.cloudfront_aliases != null ? var.cloudfront_aliases : (
+    var.domain_name == null ? [] : [var.domain_name]
+  )
+  public_origin = var.public_origin != null ? var.public_origin : (
+    var.domain_name == null ? "" : "https://${var.domain_name}"
+  )
+
   lambda_artifacts = {
     api      = local.api_zip
     worker   = local.worker_zip
@@ -39,10 +46,22 @@ locals {
 check "custom_domain_configuration" {
   assert {
     condition = (
-      var.domain_name == null ||
-      (var.acm_certificate_arn != null && var.cloudflare_zone_id != null)
+      length(local.cloudfront_aliases) == 0 ||
+      var.acm_certificate_arn != null
     )
-    error_message = "domain_name requires acm_certificate_arn and cloudflare_zone_id."
+    error_message = "CloudFront aliases require acm_certificate_arn."
+  }
+
+  assert {
+    condition = (
+      !var.manage_public_dns ||
+      (
+        var.domain_name != null &&
+        var.cloudflare_zone_id != null &&
+        contains(local.cloudfront_aliases, var.domain_name)
+      )
+    )
+    error_message = "Managed public DNS requires domain_name, cloudflare_zone_id, and a matching CloudFront alias."
   }
 }
 
@@ -452,7 +471,7 @@ resource "aws_lambda_function" "api" {
       HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
       HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
-      HINDSIGHT_ALLOWED_ORIGINS           = var.domain_name == null ? "" : "https://${var.domain_name}"
+      HINDSIGHT_ALLOWED_ORIGINS           = local.public_origin
       HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
       HINDSIGHT_SECURE_COOKIES            = "1"
       LLM_PROVIDER                        = var.llm_provider
@@ -567,6 +586,7 @@ resource "aws_lambda_event_source_mapping" "worker" {
   function_name           = aws_lambda_function.worker.arn
   batch_size              = 5
   function_response_types = ["ReportBatchItemFailures"]
+  enabled                 = var.runtime_active
 }
 
 resource "aws_lambda_event_source_mapping" "worker_dlq" {
@@ -574,12 +594,14 @@ resource "aws_lambda_event_source_mapping" "worker_dlq" {
   function_name           = aws_lambda_function.worker.arn
   batch_size              = 5
   function_response_types = ["ReportBatchItemFailures"]
+  enabled                 = var.runtime_active
 }
 
 resource "aws_cloudwatch_event_rule" "operation_reaper" {
   name                = "${local.name}-operation-reaper"
   description         = "Terminalize expired final governed-memory operation attempts"
   schedule_expression = local.run_dispatch_schedule
+  state               = var.runtime_active ? "ENABLED" : "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "operation_reaper" {
@@ -601,6 +623,7 @@ resource "aws_cloudwatch_event_rule" "run_dispatcher" {
   name                = "${local.name}-run-dispatcher"
   description         = "Dispatch pending and expired agent-run outbox commands"
   schedule_expression = local.run_dispatch_schedule
+  state               = var.runtime_active ? "ENABLED" : "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "run_dispatcher" {
@@ -804,7 +827,7 @@ resource "aws_cloudfront_distribution" "ui" {
   is_ipv6_enabled     = true
   default_root_object = "index.html"
   price_class         = "PriceClass_100"
-  aliases             = var.domain_name != null ? [var.domain_name] : []
+  aliases             = local.cloudfront_aliases
 
   origin {
     domain_name              = aws_s3_bucket.ui.bucket_regional_domain_name
@@ -865,10 +888,10 @@ resource "aws_cloudfront_distribution" "ui" {
   }
 
   viewer_certificate {
-    cloudfront_default_certificate = var.domain_name == null
-    acm_certificate_arn            = var.domain_name != null ? var.acm_certificate_arn : null
-    ssl_support_method             = var.domain_name != null ? "sni-only" : null
-    minimum_protocol_version       = var.domain_name != null ? "TLSv1.2_2021" : "TLSv1"
+    cloudfront_default_certificate = length(local.cloudfront_aliases) == 0
+    acm_certificate_arn            = length(local.cloudfront_aliases) > 0 ? var.acm_certificate_arn : null
+    ssl_support_method             = length(local.cloudfront_aliases) > 0 ? "sni-only" : null
+    minimum_protocol_version       = length(local.cloudfront_aliases) > 0 ? "TLSv1.2_2021" : "TLSv1"
   }
 }
 
@@ -894,7 +917,7 @@ resource "aws_s3_bucket_policy" "ui" {
 }
 
 resource "cloudflare_dns_record" "ui" {
-  count = var.domain_name != null && var.cloudflare_zone_id != null ? 1 : 0
+  count = var.manage_public_dns ? 1 : 0
 
   zone_id = var.cloudflare_zone_id
   name    = var.domain_name

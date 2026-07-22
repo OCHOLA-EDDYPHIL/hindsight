@@ -39,12 +39,26 @@ def verify_deployment_identity(
     region: str,
     state_bucket: str,
     certificate_arn: str,
+    deployment_environment: str = "demo",
+    stage: str = "demo",
+    state_key: str = "hindsight/demo/terraform.tfstate",
+    domain_name: str = "hindsight.strathmoreedu.qzz.io",
+    source_state_key: str = "hindsight/demo/terraform.tfstate",
+    source_domain_name: str = "hindsight.strathmoreedu.qzz.io",
     sts_client: Any | None = None,
     s3_client: Any | None = None,
     acm_client: Any | None = None,
 ) -> None:
     if not ACCOUNT_ID_PATTERN.fullmatch(expected_account_id):
         raise RuntimeError("expected AWS account ID must contain exactly 12 digits")
+
+    if deployment_environment not in {"demo", "demo-candidate"}:
+        raise RuntimeError("deployment environment is not allow-listed")
+    if deployment_environment == "demo-candidate":
+        if stage == "demo" or state_key == source_state_key:
+            raise RuntimeError("candidate stage and state key must be isolated from the source")
+        if domain_name == source_domain_name:
+            raise RuntimeError("candidate domain must not take source DNS ownership before cutover")
 
     certificate_region, certificate_account = _certificate_identity(certificate_arn)
     if certificate_region != region or certificate_account != expected_account_id:
@@ -92,6 +106,18 @@ def main() -> None:
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--state-bucket", required=True)
     parser.add_argument("--certificate-arn", required=True)
+    parser.add_argument("--deployment-environment", required=True)
+    parser.add_argument("--stage", required=True)
+    parser.add_argument("--state-key", required=True)
+    parser.add_argument("--domain-name", required=True)
+    parser.add_argument(
+        "--source-state-key",
+        default="hindsight/demo/terraform.tfstate",
+    )
+    parser.add_argument(
+        "--source-domain-name",
+        default="hindsight.strathmoreedu.qzz.io",
+    )
     args = parser.parse_args()
 
     verify_deployment_identity(
@@ -99,6 +125,12 @@ def main() -> None:
         region=args.region,
         state_bucket=args.state_bucket,
         certificate_arn=args.certificate_arn,
+        deployment_environment=args.deployment_environment,
+        stage=args.stage,
+        state_key=args.state_key,
+        domain_name=args.domain_name,
+        source_state_key=args.source_state_key,
+        source_domain_name=args.source_domain_name,
     )
 
 

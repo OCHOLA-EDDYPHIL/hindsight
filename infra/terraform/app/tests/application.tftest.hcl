@@ -51,6 +51,7 @@ run "complete_demo_graph" {
     domain_name         = "hindsight.example.com"
     acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
     cloudflare_zone_id  = "00000000000000000000000000000000"
+    manage_public_dns   = true
   }
 
   assert {
@@ -214,5 +215,45 @@ run "validation_timing_profile" {
   assert {
     condition     = local.operation_poll_seconds == 450
     error_message = "The deployed UI must wait through the complete validation retry budget."
+  }
+}
+
+run "inactive_candidate_plane" {
+  command = plan
+
+  variables {
+    stage                    = "candidate"
+    runtime_active           = false
+    manage_public_dns        = false
+    domain_name              = "candidate.hindsight.example.com"
+    public_origin            = "https://candidate.hindsight.example.com"
+    cloudfront_aliases       = ["candidate.hindsight.example.com", "*.hindsight.example.com"]
+    acm_certificate_arn      = "arn:aws:acm:us-east-1:123456789012:certificate/test"
+    api_zip_path             = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path          = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path        = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  assert {
+    condition = (
+      aws_lambda_event_source_mapping.worker.enabled == false &&
+      aws_lambda_event_source_mapping.worker_dlq.enabled == false &&
+      aws_cloudwatch_event_rule.run_dispatcher.state == "DISABLED" &&
+      aws_cloudwatch_event_rule.operation_reaper.state == "DISABLED"
+    )
+    error_message = "An inactive candidate must not consume queued or scheduled work."
+  }
+
+  assert {
+    condition     = length(cloudflare_dns_record.ui) == 0
+    error_message = "A candidate without DNS ownership must not create or replace the public CNAME."
+  }
+
+  assert {
+    condition = (
+      toset(aws_cloudfront_distribution.ui.aliases) == toset(var.cloudfront_aliases) &&
+      aws_lambda_function.api.environment[0].variables.HINDSIGHT_ALLOWED_ORIGINS == var.public_origin
+    )
+    error_message = "Candidate aliases and browser origin must remain independently configurable."
   }
 }

@@ -40,6 +40,16 @@ output "backend_config" {
   }
 }
 
+output "edge_backend_config" {
+  value = {
+    bucket       = data.aws_s3_bucket.state.id
+    key          = var.edge_state_key
+    region       = var.aws_region
+    use_lockfile = true
+    encrypt      = true
+  }
+}
+
 output "acm_certificate_arn" {
   value = aws_acm_certificate_validation.demo.certificate_arn
 }

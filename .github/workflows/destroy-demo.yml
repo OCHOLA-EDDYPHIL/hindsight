@@ -46,8 +46,11 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'hindsight/demo/terraform.tfstate' }}
+      SOURCE_STATE_KEY: ${{ vars.HINDSIGHT_SOURCE_STATE_KEY || 'hindsight/demo/terraform.tfstate' }}
+      SOURCE_DOMAIN_NAME: ${{ vars.HINDSIGHT_SOURCE_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
       TF_VAR_stage: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
       TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
       DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
@@ -57,6 +60,10 @@ jobs:
       TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
       TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
       TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
+      TF_VAR_public_origin: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
+      TF_VAR_cloudfront_aliases: ${{ vars.HINDSIGHT_CLOUDFRONT_ALIASES || format('["{0}"]', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
+      TF_VAR_manage_public_dns: ${{ vars.HINDSIGHT_MANAGE_PUBLIC_DNS || 'true' }}
+      TF_VAR_runtime_active: ${{ vars.HINDSIGHT_RUNTIME_ACTIVE || 'true' }}
       TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
       TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -81,6 +88,12 @@ jobs:
           --region "$AWS_REGION"
           --state-bucket "$TF_STATE_BUCKET"
           --certificate-arn "$TF_VAR_acm_certificate_arn"
+          --deployment-environment "$DEPLOYMENT_ENVIRONMENT"
+          --stage "$TF_VAR_stage"
+          --state-key "$TF_STATE_KEY"
+          --domain-name "$TF_VAR_domain_name"
+          --source-state-key "$SOURCE_STATE_KEY"
+          --source-domain-name "$SOURCE_DOMAIN_NAME"
       - run: uv run python scripts/build_lambda_artifacts.py
       - name: Initialize remote state
         run: >-
