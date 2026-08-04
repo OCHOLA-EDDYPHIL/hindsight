@@ -35,7 +35,7 @@ def test_poison_rewind_demo_runs_bad_trace_rewind_and_corrected_turn():
     assert str(result.poison_memory["id"]) in result.bad_run.recalled_memory_ids
     assert result.diagnosis["decision_id"] == result.bad_run.decision_id
     assert any(
-        item["memory"]["id"] == str(result.poison_memory["id"])
+        str(item["memory"]["id"]) == str(result.poison_memory["id"])
         and item["provenance"]["writer"] == "demo.poison"
         for item in result.diagnosis["memories"]
     )

@@ -19,9 +19,9 @@ from hindsight.demo import (  # noqa: E402
     run_poison_rewind_demo,
 )
 from hindsight.embeddings import embedding_provider_from_env  # noqa: E402
-from hindsight.mcp_server import inspect_decision_trace  # noqa: E402
 from hindsight.operations import enqueue_operation, execute_operation, preview_rewind  # noqa: E402
 from hindsight.tracing import configure_tracing_from_env  # noqa: E402
+from hindsight.trace_contract import decision_influence  # noqa: E402
 
 
 def main() -> None:
@@ -46,7 +46,6 @@ def main() -> None:
 
     diagnose_cmd = subparsers.add_parser("diagnose", help="show a decision-to-memory trace")
     diagnose_cmd.add_argument("--decision-id", required=True)
-    diagnose_cmd.add_argument("--limit", type=int, default=20)
 
     rewind_cmd = subparsers.add_parser("rewind", help="rewind a namespace to an ISO timestamp")
     rewind_cmd.add_argument("--namespace", default=DEMO_NAMESPACE)
@@ -74,11 +73,8 @@ def main() -> None:
             reasoning_provider=MemoryBiasedDemoReasoningProvider(),
         )
     elif command == "diagnose":
-        result = inspect_decision_trace(
+        result = decision_influence(
             decision_id=args.decision_id,
-            limit=args.limit,
-            actor="demo.operator",
-            purpose="Diagnose poisoned recommendation from CLI",
         )
     elif command == "rewind":
         from datetime import datetime
