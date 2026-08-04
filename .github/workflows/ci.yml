@@ -127,8 +127,6 @@ jobs:
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_research
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_research_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_research_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -139,7 +137,7 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - run: docker compose up -d crdb
-      - name: Initialize research database
+      - name: Run isolated research and diagnostic groups
         run: |
           ready=false
           for _ in $(seq 1 30); do
@@ -152,16 +150,37 @@ jobs:
           test "$ready" = true
           docker compose exec -T crdb cockroach sql --insecure \
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
-          uv run python scripts/migrate.py
-          uv run python scripts/initialize_agent_storage.py
-      - run: uv run python scripts/ci_test_groups.py run research
-      - name: Run deterministic research smoke checks
-        run: |
-          uv run python scripts/run_rank_diagnostics.py synthetic \
-            --code-sha "$GITHUB_SHA" \
-            --max-distance 0.35 \
-            --require-target-rank-one
-          uv run python scripts/run_learning_benchmark.py ci-smoke
+          mkdir -p build/research
+          research_url="postgresql://root@localhost:26257/hindsight_research_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
+          diagnostic_url="postgresql://root@localhost:26257/hindsight_diagnostic_research_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
+
+          (
+            DATABASE_URL="$research_url" uv run python scripts/migrate.py
+            DATABASE_URL="$research_url" uv run python scripts/initialize_agent_storage.py
+            DATABASE_URL="$research_url" uv run python scripts/ci_test_groups.py run research
+          ) >build/research/tests.log 2>&1 &
+          research_pid=$!
+          (
+            DATABASE_URL="$diagnostic_url" uv run python scripts/migrate.py
+            DATABASE_URL="$diagnostic_url" DIAGNOSTIC_DATABASE_URL="$diagnostic_url" \
+              uv run python scripts/run_rank_diagnostics.py synthetic \
+                --code-sha "$GITHUB_SHA" \
+                --max-distance 0.35 \
+                --require-target-rank-one
+            DATABASE_URL="$diagnostic_url" \
+              uv run python scripts/run_learning_benchmark.py ci-smoke
+          ) >build/research/diagnostics.log 2>&1 &
+          diagnostic_pid=$!
+
+          set +e
+          wait "$research_pid"
+          research_status=$?
+          wait "$diagnostic_pid"
+          diagnostic_status=$?
+          set -e
+          cat build/research/tests.log build/research/diagnostics.log
+          test "$research_status" -eq 0
+          test "$diagnostic_status" -eq 0
       - name: Remove research database container
         if: always()
         run: docker compose down --volumes --remove-orphans

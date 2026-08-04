@@ -95,7 +95,8 @@ def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
 
     assert f"hindsight_core_a{shell_suffix}" in workflow
     assert f"hindsight_core_b{shell_suffix}" in workflow
-    assert f"hindsight_diagnostic_research{suffix}" in workflow
+    assert f"hindsight_research{shell_suffix}" in workflow
+    assert f"hindsight_diagnostic_research{shell_suffix}" in workflow
     assert f"hindsight_diagnostic_fresh{suffix}" in workflow
     assert f"hindsight_populated{suffix}" in workflow
 
@@ -150,6 +151,25 @@ def test_fast_product_groups_share_one_server_and_use_isolated_databases():
         assert f"scripts/ci_test_groups.py run {group}" in group_step["run"]
         assert f'{group}_pid=$!' in group_step["run"]
         assert f'wait "${group}_pid"' in group_step["run"]
+
+
+def test_research_and_diagnostics_share_one_server_but_not_database_state():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    research_job = workflow["jobs"]["research"]
+    group_step = next(
+        step
+        for step in research_job["steps"]
+        if step.get("name") == "Run isolated research and diagnostic groups"
+    )
+
+    assert sum(
+        step.get("run") == "docker compose up -d crdb"
+        for step in research_job["steps"]
+    ) == 1
+    assert "hindsight_research_${GITHUB_RUN_ID}" in group_step["run"]
+    assert "hindsight_diagnostic_research_${GITHUB_RUN_ID}" in group_step["run"]
+    assert 'wait "$research_pid"' in group_step["run"]
+    assert 'wait "$diagnostic_pid"' in group_step["run"]
 
 
 def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
