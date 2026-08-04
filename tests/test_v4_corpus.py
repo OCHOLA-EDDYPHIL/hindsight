@@ -392,6 +392,8 @@ def test_construction_workflow_is_owner_only_and_artifacts_contain_only_receipt(
     assert '"$ACTOR" == "$REPOSITORY_OWNER"' in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
     assert "verify_ci_provenance.py" in workflow
+    assert "--fetch" in workflow
+    assert "gh api" not in workflow
     assert "manage_v4_corpus.py construct" in workflow
     assert "construction-receipt.json" in workflow
     artifact = workflow.split("uses: actions/upload-artifact@v4", 1)[1]
