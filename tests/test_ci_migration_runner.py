@@ -41,4 +41,4 @@ def test_runner_executes_every_case_and_reports_any_failure(monkeypatch):
     assert runner.run_all(base_url="postgresql://unused", run_token="test", workers=2) == 1
     assert created == [tuple(runner.MIGRATION_CASES)]
     assert set(executed) == set(runner.MIGRATION_CASES)
-    assert executed[-2:] == list(runner.ROLE_SENSITIVE_CASES)
+    assert executed.index("agent_runtime_roles") < executed.index("populated_roles")

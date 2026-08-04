@@ -61,19 +61,30 @@ def run_case(case: str, *, base_url: str, run_token: str) -> tuple[str, int, str
     return case, result.returncode, output
 
 
+def run_role_sensitive_cases(*, base_url: str, run_token: str) -> list[tuple[str, int, str]]:
+    return [
+        run_case(case, base_url=base_url, run_token=run_token)
+        for case in ROLE_SENSITIVE_CASES
+    ]
+
+
 def run_all(*, base_url: str, run_token: str, workers: int) -> int:
     cases = tuple(MIGRATION_CASES)
     create_case_databases(base_url, cases, run_token)
     results: list[tuple[str, int, str]] = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    with ThreadPoolExecutor(max_workers=workers + 1) as executor:
         futures = {
             executor.submit(run_case, case, base_url=base_url, run_token=run_token): case
             for case in PARALLEL_CASES
         }
+        role_future = executor.submit(
+            run_role_sensitive_cases,
+            base_url=base_url,
+            run_token=run_token,
+        )
         for future in as_completed(futures):
             results.append(future.result())
-    for case in ROLE_SENSITIVE_CASES:
-        results.append(run_case(case, base_url=base_url, run_token=run_token))
+        results.extend(role_future.result())
 
     failures: list[str] = []
     for case, returncode, output in results:
