@@ -215,6 +215,29 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
   });
 
+  it("shows the bounded action request before execution is approved", () => {
+    const { container } = render(
+      <OutcomeComparison
+        scenario={null}
+        activeRun={{
+          id: "run-awaiting-approval",
+          status: "awaiting_approval",
+          action_trace: {
+            request: {
+              id: "action-awaiting-approval",
+              tool: "deterministic_incident_simulator",
+              actions: ["scale_workers"],
+            },
+          },
+        }}
+      />,
+    );
+
+    const request = container.querySelector(".action-execution");
+    expect(request).toHaveAttribute("data-execution-status", "awaiting_approval");
+    expect(request).toHaveTextContent("deterministic_incident_simulator · scale_workers");
+  });
+
   it("renders model Markdown without exposing syntax as the primary presentation", () => {
     const markdownScenario: SignatureScenario = {
       ...scenario,
