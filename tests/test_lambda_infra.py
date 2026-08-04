@@ -239,7 +239,7 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     assert 'output "learning_evidence_bucket"' in outputs
 
 
-def test_protected_corpus_uses_rotating_kms_and_pinned_bedrock_profiles():
+def test_protected_corpus_uses_rotating_kms_and_no_bedrock_permissions():
     bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
     outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
     policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[1].split(
@@ -249,13 +249,9 @@ def test_protected_corpus_uses_rotating_kms_and_pinned_bedrock_profiles():
     assert 'resource "aws_kms_key" "learning_corpus"' in bootstrap
     assert "enable_key_rotation     = true" in bootstrap
     assert "prevent_destroy = true" in bootstrap
-    for model in (
-        "us.anthropic.claude-sonnet-4-6",
-        "us.amazon.nova-pro-v1:0",
-        "us.meta.llama4-maverick-17b-instruct-v1:0",
-    ):
-        assert model in policy
-    assert 'actions = ["bedrock:InvokeModel"]' in policy
+    assert "bedrock:" not in policy.lower()
+    assert "gemini-api-keys" in bootstrap
+    assert 'actions   = ["ssm:GetParameter", "ssm:GetParameters"]' in policy
     assert 'sid = "ProtectedCorpusEncryption"' in policy
     assert 'output "learning_corpus_kms_key_arn"' in outputs
 

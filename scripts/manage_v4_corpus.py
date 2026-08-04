@@ -15,10 +15,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from hindsight.aws import aws_client_config  # noqa: E402
 from hindsight.evidence_archive import EvidenceArchive  # noqa: E402
+from hindsight.gemini import gemini_pool_from_env  # noqa: E402
 from hindsight.v4_corpus import (  # noqa: E402
-    BedrockJsonModel,
-    DRAFTER_MODEL,
     ADJUDICATOR_MODELS,
+    ADJUDICATOR_ROLES,
+    DRAFTER_MODEL,
+    DRAFTER_ROLE,
+    GeminiJsonModel,
     build_review_packet,
     build_study_manifest,
     construct_pool,
@@ -88,22 +91,27 @@ def main() -> int:
         return 0
     if args.command == "construct":
         _require_private_path(args.output)
-        session = boto3.session.Session()
-        _preflight_bedrock(session)
-        drafter = BedrockJsonModel.create(
+        credential_pool = gemini_pool_from_env()
+        drafter = GeminiJsonModel.create(
+            role_id=DRAFTER_ROLE,
             model_id=DRAFTER_MODEL,
             max_tokens=1800,
             temperature=0.2,
-            client_factory=session.client,
+            credential_pool=credential_pool,
         )
         adjudicators = tuple(
-            BedrockJsonModel.create(
+            GeminiJsonModel.create(
+                role_id=role_id,
                 model_id=model_id,
                 max_tokens=1200,
                 temperature=0.0,
-                client_factory=session.client,
+                credential_pool=credential_pool,
             )
-            for model_id in ADJUDICATOR_MODELS
+            for role_id, model_id in zip(
+                ADJUDICATOR_ROLES,
+                ADJUDICATOR_MODELS,
+                strict=True,
+            )
         )
         pool = construct_pool(
             pool_id=str(args.pool_id or uuid4()),
@@ -114,12 +122,14 @@ def main() -> int:
         _write_private_json(args.output, pool)
         _print_json(
             {
+                "status": pool["status"],
+                "terminal_reason": pool["terminal_reason"],
                 "pool_sha256": pool["pool_sha256"],
                 "selected_items": len(pool["items"]),
                 "slot_records": len(pool["slot_audit"]),
             }
         )
-        return 0
+        return 0 if pool["status"] == "accepted" else 2
     if args.command == "prepare-review":
         for path in (args.pool, args.packet, args.state):
             _require_private_path(path)
@@ -284,23 +294,6 @@ def _digest(payload: Any) -> str:
     from hindsight.evidence_archive import canonical_json_bytes, sha256_hex
 
     return sha256_hex(canonical_json_bytes(payload))
-
-
-def _preflight_bedrock(session: Any) -> None:
-    control = session.client("bedrock", config=aws_client_config(read_timeout=30))
-    logging = control.get_model_invocation_logging_configuration().get("loggingConfig")
-    if logging:
-        raise RuntimeError("corpus construction requires model invocation logging to be disabled")
-    active = {
-        str(item.get("inferenceProfileId") or "")
-        for item in control.get_paginator("list_inference_profiles")
-        .paginate(typeEquals="SYSTEM_DEFINED")
-        .search("inferenceProfileSummaries[?status == 'ACTIVE'][]")
-        if item
-    }
-    required = {DRAFTER_MODEL, *ADJUDICATOR_MODELS}
-    if not required.issubset(active):
-        raise RuntimeError("one or more pinned Bedrock inference profiles are unavailable")
 
 
 def _print_json(payload: Any) -> None:

@@ -90,14 +90,12 @@ run "isolated_bootstrap" {
   }
 
   assert {
-    condition = length([
-      for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
-      if statement.sid == "PinnedCorpusConstructionModels"
-      ]) == 1 && toset(one([
-        for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
-        if statement.sid == "PinnedCorpusConstructionModels"
-    ]).actions) == toset(["bedrock:InvokeModel"])
-    error_message = "Corpus construction must invoke only the three pinned Bedrock profiles."
+    condition = length(flatten([
+      for statement in data.aws_iam_policy_document.github_evidence[0].statement : [
+        for action in statement.actions : action if startswith(lower(action), "bedrock:")
+      ]
+    ])) == 0
+    error_message = "The evidence role must not contain Bedrock permissions."
   }
 
   assert {

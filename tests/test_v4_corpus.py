@@ -9,11 +9,13 @@ import pytest
 
 from hindsight import v4_corpus
 from hindsight.evidence_archive import canonical_json_bytes, sha256_hex
+from hindsight.reasoning import ReasoningProviderError, ReasoningResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class _DraftModel:
+    role_id = v4_corpus.DRAFTER_ROLE
     model_id = v4_corpus.DRAFTER_MODEL
 
     def __init__(self):
@@ -45,7 +47,8 @@ class _DraftModel:
 
 
 class _AdjudicatorModel:
-    def __init__(self, model_id):
+    def __init__(self, role_id, model_id):
+        self.role_id = role_id
         self.model_id = model_id
         self.calls = 0
 
@@ -83,7 +86,14 @@ class _AdjudicatorModel:
 @pytest.fixture(scope="module")
 def constructed_pool():
     draft = _DraftModel()
-    adjudicators = tuple(_AdjudicatorModel(model_id) for model_id in v4_corpus.ADJUDICATOR_MODELS)
+    adjudicators = tuple(
+        _AdjudicatorModel(role_id, model_id)
+        for role_id, model_id in zip(
+            v4_corpus.ADJUDICATOR_ROLES,
+            v4_corpus.ADJUDICATOR_MODELS,
+            strict=True,
+        )
+    )
     pool = v4_corpus.construct_pool(
         pool_id="fixed-test-pool",
         drafter=draft,
@@ -100,9 +110,29 @@ def test_protocol_pins_models_slots_selection_and_public_randomness():
 
     assert protocol["slots_per_family"] == 15
     assert protocol["accepted_per_family"] == 10
-    assert protocol["models"]["drafter"]["id"] == "us.anthropic.claude-sonnet-4-6"
+    assert protocol["protocol_revision"] == "v4-gemini-construction-v2"
+    assert protocol["models"]["drafter"] == {
+        "provider": "gemini",
+        "role": "drafter",
+        "id": "gemini-3.1-flash-lite",
+        "temperature": 0.2,
+        "max_tokens": 1800,
+        "thinking_budget": 0,
+        "response_schema_sha256": protocol["models"]["drafter"]["response_schema_sha256"],
+    }
+    assert len(protocol["models"]["drafter"]["response_schema_sha256"]) == 64
+    assert [row["provider"] for row in protocol["models"]["adjudicators"]] == [
+        "gemini",
+        "gemini",
+    ]
+    assert [row["role"] for row in protocol["models"]["adjudicators"]] == list(
+        v4_corpus.ADJUDICATOR_ROLES
+    )
     assert [row["id"] for row in protocol["models"]["adjudicators"]] == list(
         v4_corpus.ADJUDICATOR_MODELS
+    )
+    assert all(
+        len(row["response_schema_sha256"]) == 64 for row in protocol["models"]["adjudicators"]
     )
     assert protocol["selection"] == "first-ten-eligible-in-fixed-slot-order"
     assert protocol["split"]["method"] == "post-seal-public-randomness-sha256-v1"
@@ -114,32 +144,54 @@ def test_protocol_pins_models_slots_selection_and_public_randomness():
     )
 
 
-def test_bedrock_caller_uses_converse_with_explicit_limits_and_adaptive_retries():
-    calls = []
+def test_gemini_caller_uses_pinned_identity_schema_and_limits():
+    requests = []
 
-    class Client:
-        def converse(self, **kwargs):
-            calls.append(kwargs)
-            return {
-                "stopReason": "end_turn",
-                "output": {"message": {"content": [{"text": '{"answer":true}'}]}},
-            }
+    class Provider:
+        provider_name = "gemini"
+        model_name = v4_corpus.DRAFTER_MODEL
 
-    def client_factory(service, *, config):
-        assert service == "bedrock-runtime"
-        assert config.retries == {"max_attempts": 5, "mode": "adaptive"}
-        return Client()
+        def generate(self, request):
+            requests.append(request)
+            return ReasoningResponse(
+                text='{"answer":true}',
+                provider=self.provider_name,
+                model=self.model_name,
+            )
 
-    model = v4_corpus.BedrockJsonModel.create(
+    model = v4_corpus.GeminiJsonModel(
+        role_id=v4_corpus.DRAFTER_ROLE,
         model_id=v4_corpus.DRAFTER_MODEL,
+        provider=Provider(),
         max_tokens=713,
         temperature=0.2,
-        client_factory=client_factory,
     )
     assert model.generate(system="Return JSON", payload={"input": "value"}) == {"answer": True}
-    assert calls[0]["modelId"] == v4_corpus.DRAFTER_MODEL
-    assert calls[0]["inferenceConfig"] == {"maxTokens": 713, "temperature": 0.2}
-    assert calls[0]["requestMetadata"] == {"hindsight-purpose": "corpus-construction"}
+    assert requests[0].max_output_tokens == 713
+    assert requests[0].temperature == 0.2
+    assert requests[0].thinking_budget == 0
+    assert requests[0].response_json_schema["additionalProperties"] is False
+    assert requests[0].routing_key.startswith("v4-gemini-construction-v2:drafter:")
+
+
+def test_gemini_provider_failure_is_terminal_and_sanitized():
+    class Provider:
+        provider_name = "gemini"
+        model_name = v4_corpus.DRAFTER_MODEL
+
+        def generate(self, _request):
+            raise ReasoningProviderError("secret provider detail")
+
+    model = v4_corpus.GeminiJsonModel(
+        role_id=v4_corpus.DRAFTER_ROLE,
+        model_id=v4_corpus.DRAFTER_MODEL,
+        provider=Provider(),
+        max_tokens=713,
+        temperature=0.2,
+    )
+
+    with pytest.raises(v4_corpus.CorpusProviderUnavailable, match="provider is unavailable"):
+        model.generate(system="Return JSON", payload={"input": "value"})
 
 
 def test_constructed_pool_is_balanced_simulator_grounded_and_cross_adjudicatord(
@@ -147,6 +199,8 @@ def test_constructed_pool_is_balanced_simulator_grounded_and_cross_adjudicatord(
 ):
     pool = constructed_pool
 
+    assert pool["status"] == "accepted"
+    assert pool["terminal_reason"] is None
     assert len(pool["items"]) == 60
     assert len(pool["slot_audit"]) == 90
     for kind in v4_corpus.SIMULATOR_KINDS:
@@ -158,6 +212,91 @@ def test_constructed_pool_is_balanced_simulator_grounded_and_cross_adjudicatord(
         assert len({row["source_summary"] for row in family}) == 10
         assert all(row["reference_lesson"] not in row["source_summary"] for row in family)
         assert all(row["reference_source"] == v4_corpus.REFERENCE_SOURCE for row in family)
+        assert {
+            (item["role"], item["model"], item["provider"])
+            for row in family
+            for item in row["adjudications"]
+        } == {
+            ("adjudicator_primary", "gemini-3.1-flash-lite", "gemini"),
+            ("adjudicator_secondary", "gemini-3.1-flash-lite", "gemini"),
+        }
+
+
+def test_insufficient_fixed_slots_return_one_terminal_scientific_record():
+    class RejectedDraft:
+        role_id = v4_corpus.DRAFTER_ROLE
+        model_id = v4_corpus.DRAFTER_MODEL
+
+        def generate(self, **_kwargs):
+            return {"invalid": "schema"}
+
+    adjudicators = tuple(
+        _AdjudicatorModel(role_id, model_id)
+        for role_id, model_id in zip(
+            v4_corpus.ADJUDICATOR_ROLES,
+            v4_corpus.ADJUDICATOR_MODELS,
+            strict=True,
+        )
+    )
+
+    result = v4_corpus.construct_pool(
+        pool_id="terminal-test-pool",
+        drafter=RejectedDraft(),
+        adjudicators=adjudicators,
+        v3_corpus={"variants": []},
+    )
+
+    assert result["status"] == "scientific_failed"
+    assert result["terminal_reason"] == "insufficient_eligible_retry_amplification"
+    assert result["items"] == []
+    assert len(result["slot_audit"]) == 15
+    assert len(result["pool_sha256"]) == 64
+
+
+def test_provider_failure_returns_one_terminal_infrastructure_record():
+    class UnavailableDraft:
+        role_id = v4_corpus.DRAFTER_ROLE
+        model_id = v4_corpus.DRAFTER_MODEL
+
+        def generate(self, **_kwargs):
+            raise v4_corpus.CorpusProviderUnavailable("hidden provider detail")
+
+    adjudicators = tuple(
+        _AdjudicatorModel(role_id, model_id)
+        for role_id, model_id in zip(
+            v4_corpus.ADJUDICATOR_ROLES,
+            v4_corpus.ADJUDICATOR_MODELS,
+            strict=True,
+        )
+    )
+
+    result = v4_corpus.construct_pool(
+        pool_id="provider-failure-pool",
+        drafter=UnavailableDraft(),
+        adjudicators=adjudicators,
+        v3_corpus={"variants": []},
+    )
+
+    assert result["status"] == "infrastructure_failed"
+    assert result["terminal_reason"] == "gemini_provider_unavailable"
+    assert result["slot_audit"][0]["reason"] == "gemini_provider_unavailable"
+    assert "hidden provider detail" not in json.dumps(result)
+
+
+def test_adjudicator_roles_have_distinct_choice_identities(constructed_pool):
+    item = constructed_pool["items"][0]
+    primary = v4_corpus._adjudicator_candidates(
+        item=item,
+        secret="fixed-role-test-secret",
+        adjudicator_role=v4_corpus.ADJUDICATOR_ROLES[0],
+    )
+    secondary = v4_corpus._adjudicator_candidates(
+        item=item,
+        secret="fixed-role-test-secret",
+        adjudicator_role=v4_corpus.ADJUDICATOR_ROLES[1],
+    )
+
+    assert {row["choice"] for row in primary}.isdisjoint({row["choice"] for row in secondary})
 
 
 def test_owner_review_is_blinded_irreversible_and_all_or_nothing(constructed_pool):
@@ -394,6 +533,14 @@ def test_construction_workflow_is_owner_only_and_artifacts_contain_only_receipt(
     assert "verify_ci_provenance.py" in workflow
     assert "--fetch" in workflow
     assert "gh api" not in workflow
+    assert "GEMINI_PARAMETER" in workflow
+    assert "GEMINI_API_KEYS" in workflow
+    assert "bedrock" not in workflow.lower()
+    assert "corpus/v4/gemini-attempt/claim" in workflow
+    assert "corpus/v4/gemini-attempt/result" in workflow
+    assert workflow.index("Claim the sole construction attempt") < workflow.index(
+        "Construct the fixed candidate slots"
+    )
     assert "manage_v4_corpus.py construct" in workflow
     assert "construction-receipt.json" in workflow
     artifact = workflow.split("uses: actions/upload-artifact@v4", 1)[1]
