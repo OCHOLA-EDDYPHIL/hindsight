@@ -129,6 +129,7 @@ def test_historical_migrations_share_one_manual_container():
         "scripts/run_migration_compatibility.py" in step.get("run", "")
         for step in job["steps"]
     )
+    assert any("--workers 7" in step.get("run", "") for step in job["steps"])
     assert "matrix" not in job.get("strategy", {})
 
 

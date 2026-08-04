@@ -38,7 +38,7 @@ jobs:
           docker compose exec -T crdb cockroach sql --insecure \
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
       - name: Run isolated historical migration cases
-        run: uv run python scripts/run_migration_compatibility.py --workers 3
+        run: uv run python scripts/run_migration_compatibility.py --workers 7
       - name: Remove migration compatibility container
         if: always()
         run: docker compose down --volumes --remove-orphans

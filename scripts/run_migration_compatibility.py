@@ -68,6 +68,12 @@ def run_role_sensitive_cases(*, base_url: str, run_token: str) -> list[tuple[str
     ]
 
 
+def emit_result(result: tuple[str, int, str]) -> None:
+    case, _returncode, output = result
+    print(f"--- migration case: {case} ---")
+    print(output, end="" if output.endswith("\n") else "\n", flush=True)
+
+
 def run_all(*, base_url: str, run_token: str, workers: int) -> int:
     cases = tuple(MIGRATION_CASES)
     create_case_databases(base_url, cases, run_token)
@@ -83,13 +89,16 @@ def run_all(*, base_url: str, run_token: str, workers: int) -> int:
             run_token=run_token,
         )
         for future in as_completed(futures):
-            results.append(future.result())
-        results.extend(role_future.result())
+            result = future.result()
+            results.append(result)
+            emit_result(result)
+        role_results = role_future.result()
+        results.extend(role_results)
+        for result in role_results:
+            emit_result(result)
 
     failures: list[str] = []
-    for case, returncode, output in results:
-        print(f"--- migration case: {case} ---")
-        print(output, end="" if output.endswith("\n") else "\n")
+    for case, returncode, _output in results:
         if returncode:
             failures.append(case)
     if failures:
