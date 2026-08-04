@@ -51,22 +51,16 @@ jobs:
           persist-credentials: false
       - name: Require unique successful exact-main CI
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ needs.authorize.outputs.construction_sha }}
         shell: bash
         run: |
-          gh api --method GET \
-            "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
-            -f branch=main \
-            -f event=push \
-            -f head_sha="$SHA" \
-            -f per_page=100 \
-            > "$RUNNER_TEMP/exact-main-ci.json"
           python scripts/verify_ci_provenance.py \
             --repository "$REPOSITORY" \
             --sha "$SHA" \
-            < "$RUNNER_TEMP/exact-main-ci.json"
+            --fetch
 
   construct:
     needs: [authorize, exact_main_ci]
