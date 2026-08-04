@@ -51,31 +51,33 @@ MIGRATION_CASES = {
 }
 
 DATABASE_GROUPS = {
-    "database_a": (
+    "product": (
         "tests/test_agent.py",
-        "tests/test_benchmark_protocol_migrations.py",
+        "tests/test_consolidation.py",
         "tests/test_governed_memory.py",
         "tests/test_memory.py",
+        "tests/test_operation_retries.py",
+        "tests/test_poison_rewind_demo.py",
         "tests/test_run_attempts.py",
+        "tests/test_run_dispatch.py",
         "tests/test_runs.py",
+        "tests/test_smoke.py",
+        "tests/test_system_of_record.py",
         "tests/test_tenant_isolation.py",
         "tests/test_trace_contract.py",
     ),
-    "database_b": (
-        "tests/test_consolidation.py",
+    "main_extended": (
+        "tests/test_embedding_rotation.py",
+        "tests/test_migrations_and_roles.py",
+    ),
+    "research": (
+        "tests/test_benchmark_protocol_migrations.py",
         "tests/test_cross_episode_demo.py",
         "tests/test_dashboard.py",
-        "tests/test_embedding_rotation.py",
         "tests/test_learning_benchmark_setup.py",
         "tests/test_learning_evidence_foundation.py",
         "tests/test_learning_orchestration.py",
         "tests/test_mcp_server.py",
-        "tests/test_migrations_and_roles.py",
-        "tests/test_operation_retries.py",
-        "tests/test_poison_rewind_demo.py",
-        "tests/test_run_dispatch.py",
-        "tests/test_smoke.py",
-        "tests/test_system_of_record.py",
         "tests/test_telemetry.py",
     ),
 }
@@ -85,8 +87,9 @@ def all_test_files() -> set[str]:
     return {str(path.relative_to(ROOT)) for path in TESTS.glob("test_*.py") if path.is_file()}
 
 
-def database_test_files() -> set[str]:
-    return {path for paths in DATABASE_GROUPS.values() for path in paths}
+def database_test_files(group: str | None = None) -> set[str]:
+    groups = DATABASE_GROUPS.values() if group is None else (DATABASE_GROUPS[group],)
+    return {path for paths in groups for path in paths}
 
 
 def unit_test_files() -> tuple[str, ...]:

@@ -101,7 +101,7 @@ def test_required_ci_status_aggregates_lock_web_database_and_lambda_checks():
     workflow = pathlib.Path(".github/workflows/ci.yml").read_text()
     static_job = workflow.split("  python_static:\n", 1)[1].split("  database:\n", 1)[0]
     database_job = workflow.split("  database:\n", 1)[1].split(
-        "  migration_replay:\n", 1
+        "  main_qualification:\n", 1
     )[0]
     frontend_job = workflow.split("  frontend:\n", 1)[1].split(
         "  lambda_artifacts:\n", 1
@@ -114,7 +114,7 @@ def test_required_ci_status_aggregates_lock_web_database_and_lambda_checks():
     assert "uv lock --check" in static_job
     assert "scripts/ci_test_groups.py run unit" in static_job
     assert "docker compose up -d crdb" in database_job
-    assert 'scripts/ci_test_groups.py run "${{ matrix.group }}"' in database_job
+    assert "scripts/ci_test_groups.py run product" in database_job
     for command in (
         "npm ci",
         "npm run check:web",

@@ -48,7 +48,12 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
     assert aggregate["if"] == "always()"
     assert set(aggregate["needs"]) == set(jobs) - {"test"}
     assert aggregate["steps"][-1]["run"] == "python scripts/verify_ci_components.py"
-    assert set(jobs["migration_replay"]["strategy"]["matrix"]["case"]) == {
+    assert "migration_compatibility" not in jobs
+    assert "research" not in jobs
+    migration_runner = _load_script("run_migration_compatibility")
+    assert set(migration_runner.PARALLEL_CASES).union(
+        migration_runner.ROLE_SENSITIVE_CASES
+    ) == {
         "benchmark_upgrade",
         "benchmark_fresh",
         "benchmark_preparation",
@@ -80,37 +85,107 @@ def test_reusable_deploy_workflow_preserves_hosted_runner_default():
     assert "runs-on: ubuntu-latest" not in workflow
 
 
+def test_historical_migration_qualification_uses_durable_hosted_runner():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
+    )
+
+    assert workflow["jobs"]["migration_compatibility"]["runs-on"] == "ubuntu-latest"
+
+
 def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
     workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = workflow_path.read_text()
     suffix = "_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable"
-
-    assert f"${{{{ matrix.database }}}}{suffix}" in workflow
-    for database_name in (
-        "hindsight_diagnostic_ci",
-        "hindsight_schema_fresh",
-        "hindsight_schema_populated",
-    ):
-        assert f"{database_name}{suffix}" in workflow
+    assert f"hindsight_product{suffix}" in workflow
+    assert f"hindsight_fresh{suffix}" in workflow
+    assert f"hindsight_populated{suffix}" in workflow
+    assert f"hindsight_extended{suffix}" in workflow
 
     jobs = yaml.safe_load(workflow)["jobs"]
     compose_scopes = {
-        "database": "${{ matrix.group }}",
-        "migration_replay": "${{ matrix.case }}",
-        "diagnostics": "diagnostics",
-        "schema_fresh": "schema_fresh",
-        "schema_populated": "schema_populated",
+        "database": "database",
+        "main_qualification": "main",
     }
     for job_name, scope in compose_scopes.items():
         job = jobs[job_name]
         assert job["env"]["COMPOSE_PROJECT_NAME"] == (
             "hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_" + scope
         )
-        assert job["steps"][-1] == {
-            "name": "Remove isolated database container",
-            "if": "always()",
-            "run": "docker compose down --volumes --remove-orphans",
-        }
+        assert job["steps"][-1]["if"] == "always()"
+        assert job["steps"][-1]["run"] == (
+            "docker compose down --volumes --remove-orphans"
+        )
+        assert sum(step.get("run") == "docker compose up -d crdb" for step in job["steps"]) == 1
+
+
+def test_historical_migrations_share_one_manual_container():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
+    )
+    job = workflow["jobs"]["migration_compatibility"]
+
+    assert sum(step.get("run") == "docker compose up -d crdb" for step in job["steps"]) == 1
+    assert any(
+        "scripts/run_migration_compatibility.py" in step.get("run", "")
+        for step in job["steps"]
+    )
+    assert any("--workers 4" in step.get("run", "") for step in job["steps"])
+    assert "matrix" not in job.get("strategy", {})
+
+
+def test_fast_product_checks_use_exactly_one_server_and_database():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    database_job = workflow["jobs"]["database"]
+    group_step = next(
+        step
+        for step in database_job["steps"]
+        if step.get("name") == "Run affected product checks"
+    )
+
+    assert sum(
+        step.get("run") == "docker compose up -d crdb"
+        for step in database_job["steps"]
+    ) == 1
+    assert "scripts/ci_test_groups.py run product" in group_step["run"]
+    assert "main_extended" not in group_step["run"]
+
+
+def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    main_job = workflow["jobs"]["main_qualification"]
+    schema_step = next(
+        step
+        for step in main_job["steps"]
+        if step.get("name") == "Verify populated upgrade and schema parity"
+    )
+
+    assert "fresh_pid=$!" in schema_step["run"]
+    assert "populated_pid=$!" in schema_step["run"]
+    assert "extended_pid=$!" in schema_step["run"]
+    assert 'wait "$fresh_pid"' in schema_step["run"]
+    assert 'wait "$populated_pid"' in schema_step["run"]
+    assert 'wait "$extended_pid"' in schema_step["run"]
+    assert "scripts/schema_manifest.py compare" in schema_step["run"]
+    smoke_step = next(
+        step
+        for step in main_job["steps"]
+        if step.get("name") == "Run deterministic benchmark smoke"
+    )
+    assert "scripts/migrate.py" not in smoke_step["run"]
+    assert 'DATABASE_URL="$FRESH_DATABASE_URL"' in smoke_step["run"]
+
+
+def test_expensive_qualification_is_manual_only():
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    migrations = (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
+    learning = (ROOT / ".github/workflows/learning-qualification.yml").read_text()
+
+    assert "run_migration_compatibility.py" not in ci
+    assert "run_rank_diagnostics.py" not in ci
+    assert "workflow_call:" not in migrations
+    assert "workflow_dispatch:" in migrations
+    assert "workflow_dispatch:" in learning
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):

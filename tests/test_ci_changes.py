@@ -18,19 +18,19 @@ ci_test_groups = importlib.util.module_from_spec(GROUP_SPEC)
 GROUP_SPEC.loader.exec_module(ci_test_groups)
 
 
-def test_main_always_runs_every_component():
+def test_main_adds_product_schema_lambda_and_benchmark_qualification():
     assert classify_paths(["docs/architecture.md"], event_name="push") == {
-        component: True for component in COMPONENTS
+        "database": True,
+        "main_qualification": True,
+        "frontend": False,
+        "lambda_artifacts": True,
+        "terraform": False,
     }
 
 
-def test_path_classifier_tracks_database_and_migration_test_inventory():
-    assert ci_changes.DATABASE_TEST_FILES == {
-        Path(path).name for path in ci_test_groups.database_test_files()
-    }
-    assert ci_changes.MIGRATION_TEST_FILES == {
-        Path(node.split("::", 1)[0]).name
-        for node in ci_test_groups.MIGRATION_CASES.values()
+def test_path_classifier_tracks_only_fast_product_test_inventory():
+    assert ci_changes.PRODUCT_TEST_FILES == {
+        Path(path).name for path in ci_test_groups.database_test_files("product")
     }
 
 
@@ -42,112 +42,76 @@ def test_frontend_and_terraform_paths_select_only_their_dependencies():
 
     assert selected == {
         "database": False,
-        "migrations": False,
-        "diagnostics": False,
+        "main_qualification": False,
         "frontend": True,
         "lambda_artifacts": True,
         "terraform": True,
     }
 
 
-def test_built_web_assets_require_frontend_freshness_and_lambda_packaging():
-    selected = classify_paths(
-        ["./src/hindsight/web/assets/app.js"], event_name="pull_request"
-    )
-
-    assert selected == {
-        "database": False,
-        "migrations": False,
-        "diagnostics": False,
-        "frontend": True,
-        "lambda_artifacts": True,
-        "terraform": False,
-    }
+def test_backend_and_fresh_migration_paths_select_product_and_packaging_only():
+    for path in ("src/hindsight/memory.py", "migrations/0026_future.sql"):
+        selected = classify_paths([path], event_name="pull_request")
+        assert selected == {
+            "database": True,
+            "main_qualification": False,
+            "frontend": False,
+            "lambda_artifacts": True,
+            "terraform": False,
+        }
 
 
-def test_backend_paths_select_database_and_lambda_with_targeted_diagnostics():
-    ordinary = classify_paths(
-        ["src/hindsight/trace_contract.py"], event_name="pull_request"
-    )
-    diagnostic = classify_paths(
-        ["src/hindsight/embeddings.py"], event_name="pull_request"
-    )
-
-    assert ordinary["database"] is True
-    assert ordinary["lambda_artifacts"] is True
-    assert ordinary["diagnostics"] is False
-    assert diagnostic["diagnostics"] is True
-
-
-def test_ci_control_and_unknown_paths_fail_safe_to_full_matrix():
+def test_research_inputs_never_enter_normal_ci_qualification():
     for path in (
-        ".github/workflows/ci.yml",
-        "tests/test_ci_changes.py",
-        "unclassified.config",
+        "src/hindsight/benchmark.py",
+        "scripts/run_rank_diagnostics.py",
+        "fixtures/v4/corpus.json",
+        "tests/test_learning_orchestration.py",
     ):
         selected = classify_paths([path], event_name="pull_request")
-        assert all(selected.values()), path
+        assert not any(selected.values()), path
 
 
-def test_ordinary_unit_and_deployment_tool_changes_use_static_ci_only():
-    selected = classify_paths(
-        ["tests/test_api.py", "tests/test_deployment_tools.py", "scripts/configure_changefeed.py"],
-        event_name="pull_request",
-    )
-
-    assert not any(selected.values())
-
-
-def test_database_tests_do_not_select_migrations_unless_migration_sensitive():
-    ordinary = classify_paths(["tests/test_memory.py"], event_name="pull_request")
-    migration = classify_paths(
-        ["tests/test_migrations_and_roles.py"], event_name="pull_request"
-    )
-
-    assert ordinary["database"] is True
-    assert ordinary["migrations"] is False
-    assert migration["database"] is True
-    assert migration["migrations"] is True
-    assert migration["diagnostics"] is False
+def test_ci_control_changes_do_not_force_expensive_jobs():
+    for path in (
+        ".github/workflows/ci.yml",
+        ".github/workflows/migration-compatibility.yml",
+        "scripts/ci_changes.py",
+        "scripts/run_affected_ci.py",
+        "tests/test_ci_contracts.py",
+    ):
+        selected = classify_paths([path], event_name="pull_request")
+        assert not any(selected.values()), path
 
 
-def test_migration_paths_select_database_replay_and_packaging_only():
-    selected = classify_paths(
-        ["migrations/0026_future.sql"], event_name="pull_request"
-    )
+def test_test_group_ownership_change_selects_one_database_job_only():
+    selected = classify_paths(["scripts/ci_test_groups.py"], event_name="pull_request")
 
     assert selected == {
         "database": True,
-        "migrations": True,
-        "diagnostics": False,
+        "main_qualification": False,
         "frontend": False,
-        "lambda_artifacts": True,
+        "lambda_artifacts": False,
         "terraform": False,
     }
 
 
-def test_research_checks_run_only_for_their_own_inputs():
-    ordinary = classify_paths(
-        ["scripts/configure_changefeed.py"], event_name="pull_request"
-    )
-    research = classify_paths(
-        ["scripts/run_rank_diagnostics.py"], event_name="pull_request"
-    )
-
-    assert ordinary["diagnostics"] is False
-    assert research["diagnostics"] is True
+def test_unknown_and_empty_diffs_fail_safe_to_product_database_only():
+    expected = {
+        "database": True,
+        "main_qualification": False,
+        "frontend": False,
+        "lambda_artifacts": False,
+        "terraform": False,
+    }
+    assert classify_paths(["unclassified.config"], event_name="pull_request") == expected
+    assert classify_paths([], event_name="pull_request") == expected
 
 
 def test_documentation_only_pull_request_keeps_component_jobs_disabled():
     selected = classify_paths(["docs/architecture.md"], event_name="pull_request")
 
     assert not any(selected.values())
-
-
-def test_empty_pull_request_diff_fails_safe_to_full_matrix():
-    selected = classify_paths([], event_name="pull_request")
-
-    assert all(selected.values())
 
 
 def test_github_outputs_are_explicit_booleans(tmp_path: Path):

@@ -10,11 +10,7 @@ import sys
 ALWAYS_REQUIRED = ("changes", "python_static")
 JOB_SELECTIONS = {
     "database": "database",
-    "migration_replay": "migrations",
-    "schema_fresh": "migrations",
-    "schema_populated": "migrations",
-    "schema_parity": "migrations",
-    "diagnostics": "diagnostics",
+    "main_qualification": "main_qualification",
     "frontend": "frontend",
     "lambda_artifacts": "lambda_artifacts",
     "terraform": "terraform",
@@ -34,9 +30,6 @@ def verify(
         result = results.get(job, "missing")
         if selected not in {"true", "false"}:
             errors.append(f"component {selection} has invalid selection {selected!r}")
-            continue
-        if event_name != "pull_request" and selected != "true":
-            errors.append(f"main event disabled required component {selection}")
             continue
         if selected == "true" and result != "success":
             errors.append(f"selected job {job} ended as {result}")
