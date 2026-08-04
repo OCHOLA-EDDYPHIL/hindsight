@@ -14,7 +14,6 @@ RUNNER_ROUTED_WORKFLOWS = (
     "live-acceptance.yml",
     "learning-qualification.yml",
     "learning-evidence.yml",
-    "migration-compatibility.yml",
     "v4-corpus-construction.yml",
 )
 
@@ -85,6 +84,14 @@ def test_reusable_deploy_workflow_preserves_hosted_runner_default():
     assert "workflow_call:" in workflow
     assert RUNNER_EXPRESSION in workflow
     assert "runs-on: ubuntu-latest" not in workflow
+
+
+def test_historical_migration_qualification_uses_durable_hosted_runner():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
+    )
+
+    assert workflow["jobs"]["migration_compatibility"]["runs-on"] == "ubuntu-latest"
 
 
 def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
