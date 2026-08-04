@@ -78,7 +78,7 @@ from hindsight.runs import (
     resolve_incident,
 )
 from hindsight.trace_contract import (
-    governed_decision_trace,
+    decision_influence,
     lesson_identity_trace,
     lesson_identity_traces,
     signature_scenario_trace,
@@ -602,38 +602,9 @@ def memories_get(memory_kind: Literal["episodic", "semantic"], memory_id: str) -
 
 @app.get(f"{API_PREFIX}/decisions/{{decision_id}}/influence", tags=["memory"])
 def decisions_influence(decision_id: str) -> dict[str, Any]:
-    db_url = _api_database_url()
-    with connect(db_url, application_name="hindsight-api") as conn:
-        store = MemoryStore(conn=conn)
-        reads = store.reads_for_decision(decision_id=decision_id)
-        memories = []
-        for read in reads:
-            kind = read["memory_kind"]
-            memory_id = str(read["memory_id"])
-            memory = store.audit_memory(memory_kind=kind, memory_id=memory_id)
-            provenance = store.provenance_for_memory(
-                memory_kind=kind,
-                memory_id=memory_id,
-            )
-            memories.append(
-                {
-                    "read": read,
-                    "memory": memory,
-                    "provenance": provenance,
-                    "status": "invalidated"
-                    if provenance and provenance.get("invalidated_at")
-                    else "current",
-                }
-            )
-    trace = governed_decision_trace(decision_id=decision_id, db_url=db_url)
-    return {
-        "decision_id": decision_id,
-        "count": len(memories),
-        "memories": _jsonable(memories),
-        "decision": _jsonable(trace["decision"]) if trace else None,
-        "retrievals": _jsonable(trace["retrievals"]) if trace else [],
-        "trace": _jsonable(trace) if trace else None,
-    }
+    return _jsonable(
+        decision_influence(decision_id=decision_id, db_url=_api_database_url())
+    )
 
 
 @app.get(f"{API_PREFIX}/lesson-traces", tags=["memory"])

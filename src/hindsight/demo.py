@@ -19,12 +19,12 @@ from hindsight.demo_state import (
     POISONED_MEMORY_CONTENT,
 )
 from hindsight.embeddings import embedding_provider_from_env
-from hindsight.mcp_server import inspect_decision_trace
 from hindsight.memory import MemoryStore, Provenance, RewindResult
 from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
 from hindsight.simulator import BoundedActionRequest, DeterministicIncidentSimulator
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
+from hindsight.trace_contract import decision_influence
 
 GOOD_RECOMMENDATION = (
     "Suspected cause: retry fanout is amplifying downstream payment processor "
@@ -132,10 +132,8 @@ def run_poison_rewind_demo(
             db_url=resolved_db_url,
             reasoning_provider=provider,
         )
-        diagnosis = inspect_decision_trace(
+        diagnosis = decision_influence(
             decision_id=bad_run.decision_id,
-            actor="demo.operator",
-            purpose="Diagnose poisoned recommendation before rewind",
             db_url=resolved_db_url,
         )
 

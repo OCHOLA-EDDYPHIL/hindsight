@@ -15,7 +15,7 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
     from hindsight.db import database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
-    from hindsight.trace_contract import governed_decision_trace
+    from hindsight.trace_contract import decision_influence, governed_decision_trace
 
     namespace = f"trace-contract:{uuid4()}"
     decision_id = f"trace-decision:{uuid4()}"
@@ -100,6 +100,15 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
     repeated = governed_decision_trace(decision_id=decision_id, db_url=database_url())
     assert repeated is not None
     assert [str(edge["id"]) for edge in repeated["lineage_edges"]] == lineage_ids
+
+    direct = decision_influence(decision_id=decision_id, db_url=database_url())
+    assert direct["decision_id"] == decision_id
+    assert direct["count"] == 2
+    assert {row["memory"]["content"] for row in direct["memories"]} == {
+        source["content"],
+        second_source["content"],
+    }
+    assert direct["trace"]["reads"][0]["belief_id"] == source["belief_id"]
 
     from hindsight import api
 

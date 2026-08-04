@@ -9,6 +9,44 @@ from psycopg.rows import dict_row
 
 from hindsight.db import connect
 from hindsight.demo_state import DEMO_NAMESPACE
+from hindsight.memory import MemoryStore
+
+
+def decision_influence(
+    *, decision_id: str, db_url: str | None = None
+) -> dict[str, Any]:
+    """Return cited memories, provenance, retrievals, and lineage for one decision."""
+
+    with connect(db_url, application_name="hindsight-decision-influence") as conn:
+        store = MemoryStore(conn=conn)
+        memories = []
+        for read in store.reads_for_decision(decision_id=decision_id):
+            kind = read["memory_kind"]
+            memory_id = str(read["memory_id"])
+            memory = store.audit_memory(memory_kind=kind, memory_id=memory_id)
+            provenance = store.provenance_for_memory(
+                memory_kind=kind,
+                memory_id=memory_id,
+            )
+            memories.append(
+                {
+                    "read": read,
+                    "memory": memory,
+                    "provenance": provenance,
+                    "status": "invalidated"
+                    if provenance and provenance.get("invalidated_at")
+                    else "current",
+                }
+            )
+        trace = _governed_decision_trace(conn, decision_id=decision_id)
+    return {
+        "decision_id": decision_id,
+        "count": len(memories),
+        "memories": memories,
+        "decision": trace["decision"] if trace else None,
+        "retrievals": trace["retrievals"] if trace else [],
+        "trace": trace,
+    }
 
 
 def governed_decision_trace(
