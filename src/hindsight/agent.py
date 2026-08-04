@@ -25,7 +25,11 @@ from hindsight.db import TenantConnection, connect, database_url, database_url_w
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
-from hindsight.simulator import score_action_sequence
+from hindsight.simulator import (
+    BoundedActionRequest,
+    BoundedActionTool,
+    DeterministicIncidentSimulator,
+)
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 from hindsight.tenant import current_tenant_id
 
@@ -119,6 +123,7 @@ class IncidentAgentState(TypedDict, total=False):
     proposed_action: str
     action_trace: NotRequired[dict[str, Any]]
     action_approved: bool
+    guidance_eligible: bool
     reflected_memory: dict[str, Any]
     retrieval_id: NotRequired[str | None]
 
@@ -136,6 +141,7 @@ def run_incident_agent(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    action_tool: BoundedActionTool | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Start or continue an incident thread with a new user incident turn."""
@@ -163,6 +169,7 @@ def run_incident_agent(
         db_url=db_url,
         reasoning_provider=reasoning_provider,
         embedding_provider=embedding_provider,
+        action_tool=action_tool,
         progress_callback=progress_callback,
     )
     return _agent_result(resolved_thread_id, state)
@@ -178,6 +185,7 @@ async def run_incident_agent_async(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    action_tool: BoundedActionTool | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Async-safe wrapper for starting or continuing an incident thread."""
@@ -193,6 +201,7 @@ async def run_incident_agent_async(
             db_url=db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
+            action_tool=action_tool,
             progress_callback=progress_callback,
         )
     )
@@ -205,6 +214,7 @@ def resume_incident_agent(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    action_tool: BoundedActionTool | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Resume an interrupted incident thread in a fresh graph context."""
@@ -216,6 +226,7 @@ def resume_incident_agent(
         db_url=db_url,
         reasoning_provider=reasoning_provider,
         embedding_provider=embedding_provider,
+        action_tool=action_tool,
         progress_callback=progress_callback,
     )
     return _agent_result(thread_id, state)
@@ -228,6 +239,7 @@ async def resume_incident_agent_async(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    action_tool: BoundedActionTool | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> IncidentAgentResult:
     """Async-safe wrapper for resuming an interrupted incident thread."""
@@ -240,6 +252,7 @@ async def resume_incident_agent_async(
             db_url=db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
+            action_tool=action_tool,
             progress_callback=progress_callback,
         )
     )
@@ -250,12 +263,14 @@ def build_incident_graph(
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    action_tool: BoundedActionTool | None = None,
     progress_callback: ProgressCallback | None = None,
 ):
     """Build the incident graph; compile it with a checkpointer before use."""
 
     resolved_db_url = db_url or database_url()
     resolved_embedding_provider = embedding_provider or embedding_provider_from_env()
+    resolved_action_tool = action_tool or DeterministicIncidentSimulator()
 
     def triage(state: IncidentAgentState) -> dict[str, Any]:
         history = _chat_history(
@@ -363,7 +378,12 @@ def build_incident_graph(
 
     def act(state: IncidentAgentState) -> dict[str, Any]:
         proposed_action = _proposed_action(state)
-        action_trace = _bounded_action_trace(state)
+        actions = _signature_actions(state)
+        action_trace = _bounded_action_request(
+            state,
+            actions=actions,
+            tool_name=resolved_action_tool.name,
+        )
         approved = True
         if state.get("pause_before_act"):
             _report_progress(
@@ -390,13 +410,53 @@ def build_incident_graph(
                     "approved": approved,
                     "disposition": "approved" if approved else "rejected",
                 },
+                "execution": {
+                    "status": "pending" if approved else "not_executed",
+                    "tool": resolved_action_tool.name,
+                },
             }
+        if approved and actions:
+            pending = {
+                "proposed_action": proposed_action,
+                "action_trace": {
+                    **action_trace,
+                    "execution": {
+                        "status": "executing",
+                        "tool": resolved_action_tool.name,
+                    },
+                },
+                "action_approved": True,
+            }
+            _report_progress(progress_callback, "action", "reflecting", state, pending)
+            action_trace = _execute_bounded_action(
+                state,
+                actions=actions,
+                trace=action_trace,
+                tool=resolved_action_tool,
+            )
+            _report_progress(
+                progress_callback,
+                "observation",
+                "reflecting",
+                state,
+                {
+                    "proposed_action": proposed_action,
+                    "action_trace": action_trace,
+                    "action_approved": True,
+                },
+            )
+        guidance_eligible = _guidance_eligible(
+            action_approved=approved,
+            action_trace=action_trace,
+        )
         update = {
             "proposed_action": proposed_action,
             "action_trace": action_trace,
             "action_approved": approved,
+            "guidance_eligible": guidance_eligible,
         }
-        _report_progress(progress_callback, "action", "reflecting", state, update)
+        if not actions and approved:
+            _report_progress(progress_callback, "action", "reflecting", state, update)
         return update
 
     def reflect(state: IncidentAgentState) -> dict[str, Any]:
@@ -429,6 +489,7 @@ def build_incident_graph(
                     "plan": state.get("plan", "").strip(),
                     "proposed_action": state.get("proposed_action", "").strip(),
                     "action_approved": bool(state.get("action_approved")),
+                    "guidance_eligible": bool(state.get("guidance_eligible")),
                     "retrieval_id": state.get("retrieval_id"),
                     "recalled_memory_ids": parent_memory_ids,
                     "action_trace": state.get("action_trace") or {},
@@ -443,6 +504,7 @@ def build_incident_graph(
                     plan=str(structured_payload["plan"]),
                     proposed_action=str(structured_payload["proposed_action"]),
                     action_approved=bool(structured_payload["action_approved"]),
+                    guidance_eligible=bool(structured_payload["guidance_eligible"]),
                     content=content,
                     provenance=Provenance(
                         writer="agent.reflect",
@@ -456,11 +518,11 @@ def build_incident_graph(
                         "recalled_memory_ids": parent_memory_ids,
                         "action_approved": state.get("action_approved", False),
                         "operator_disposition": (
-                            "approved" if state.get("action_approved") else "rejected"
+                            "approved" if state.get("guidance_eligible") else "rejected"
                         ),
                         "usage_instruction": (
                             "positive_guidance"
-                            if state.get("action_approved")
+                            if state.get("guidance_eligible")
                             else "audit_only"
                         ),
                         "kind": "incident_reflection",
@@ -575,6 +637,7 @@ def _invoke_graph(
     db_url: str | None,
     reasoning_provider: ReasoningProvider | None,
     embedding_provider: EmbeddingProvider | None,
+    action_tool: BoundedActionTool | None,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     resolved_db_url = db_url or database_url()
@@ -584,6 +647,7 @@ def _invoke_graph(
             db_url=resolved_db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
+            action_tool=action_tool,
             progress_callback=progress_callback,
         ).compile(checkpointer=checkpointer)
         return graph.invoke(
@@ -735,14 +799,10 @@ def _governed_guidance_envelope(memory: dict[str, Any]) -> dict[str, Any]:
     else:
         disposition = str(metadata.get("operator_disposition") or "unreviewed")
     trust = str(memory.get("trust_status") or "review_required")
-    usage_instruction = str(
-        metadata.get("usage_instruction")
-        or (
-            "audit_only"
-            if trust != "active" or disposition == "rejected"
-            else "positive_guidance"
-        )
-    )
+    if trust != "active" or disposition == "rejected":
+        usage_instruction = "audit_only"
+    else:
+        usage_instruction = str(metadata.get("usage_instruction") or "positive_guidance")
     return {
         "memory_id": str(memory.get("id") or memory.get("memory_id") or ""),
         "belief_id": str(memory.get("belief_id") or ""),
@@ -796,36 +856,84 @@ def _signature_actions(state: IncidentAgentState) -> tuple[str, ...]:
     return ("scale_workers",) if poisoned else ("inspect_dependency", "throttle_retries")
 
 
-def _bounded_action_trace(state: IncidentAgentState) -> dict[str, Any]:
-    actions = _signature_actions(state)
+def _bounded_action_request(
+    state: IncidentAgentState,
+    *,
+    actions: tuple[str, ...],
+    tool_name: str,
+) -> dict[str, Any]:
     if not actions:
         return {}
-    scored = score_action_sequence(actions)
     run_id = state["run_id"]
     return {
         "schema_version": 1,
         "request": {
             "id": f"action:{run_id}:request",
             "mode": "bounded_deterministic_simulator",
+            "tool": tool_name,
             "actions": list(actions),
+        },
+        "execution": {"status": "awaiting_approval", "tool": tool_name},
+    }
+
+
+def _execute_bounded_action(
+    state: IncidentAgentState,
+    *,
+    actions: tuple[str, ...],
+    trace: dict[str, Any],
+    tool: BoundedActionTool,
+) -> dict[str, Any]:
+    request_id = str(trace["request"]["id"])
+    result = tool.execute(BoundedActionRequest(request_id=request_id, actions=actions))
+    run_id = state["run_id"]
+    return {
+        **trace,
+        "execution": {
+            "status": "completed",
+            "tool": result.tool,
+            "allowed_actions": list(result.allowed_actions),
         },
         "initial_observation": {
             "id": f"observation:{run_id}:initial",
-            **scored["initial_observation"],
+            **result.initial_observation,
         },
         "observations": [
             {"id": f"observation:{run_id}:{index}", **observation}
-            for index, observation in enumerate(scored["observations"], start=1)
+            for index, observation in enumerate(result.observations, start=1)
         ],
         "score": {
-            "recovered": scored["recovered"],
-            "unsafe_action_count": scored["unsafe_action_count"],
+            "recovered": result.recovered,
+            "unsafe_action_count": result.unsafe_action_count,
         },
     }
 
 
+def _guidance_eligible(
+    *,
+    action_approved: bool,
+    action_trace: dict[str, Any],
+) -> bool:
+    if not action_approved:
+        return False
+    if not action_trace:
+        return True
+    execution = action_trace.get("execution") or {}
+    score = action_trace.get("score") or {}
+    return (
+        execution.get("status") == "completed"
+        and score.get("recovered") is True
+        and int(score.get("unsafe_action_count") or 0) == 0
+    )
+
+
 def _reflection_content(state: IncidentAgentState) -> str:
-    status = "approved" if state.get("action_approved") else "not approved"
+    if not state.get("action_approved"):
+        status = "not approved"
+    elif state.get("guidance_eligible"):
+        status = "approved with a safe recovered outcome"
+    else:
+        status = "approved for bounded execution; outcome rejected"
     return (
         f"Incident {state['incident_id']} plan: {state.get('plan', '').strip()} "
         f"Proposed action ({status}): {state.get('proposed_action', '').strip()}"

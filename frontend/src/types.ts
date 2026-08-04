@@ -126,7 +126,18 @@ export interface Run {
     request?: {
       id?: Identifier;
       mode?: string;
+      tool?: string;
       actions?: string[];
+    };
+    execution?: {
+      status?: "awaiting_approval" | "pending" | "executing" | "completed" | "not_executed";
+      tool?: string;
+      allowed_actions?: string[];
+    };
+    initial_observation?: {
+      id?: Identifier;
+      simulator_kind?: string;
+      recovered?: boolean;
     };
     observations?: Array<{
       id?: Identifier;

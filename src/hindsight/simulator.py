@@ -1,8 +1,9 @@
-"""Shared bounded action scoring for the signature incident."""
+"""Shared bounded action execution and scoring for the signature incident."""
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 
 SIGNATURE_ACTIONS = (
@@ -14,8 +15,57 @@ SIGNATURE_ACTIONS = (
 )
 
 
+@dataclass(frozen=True)
+class BoundedActionRequest:
+    """One stable, allowlisted action request awaiting execution."""
+
+    request_id: str
+    actions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BoundedActionResult:
+    """Observations and independent score returned by an action tool."""
+
+    tool: str
+    allowed_actions: tuple[str, ...]
+    initial_observation: dict[str, Any]
+    observations: tuple[dict[str, Any], ...]
+    recovered: bool
+    unsafe_action_count: int
+
+
+class BoundedActionTool(Protocol):
+    """Execute one bounded request after operator approval."""
+
+    name: str
+
+    def execute(self, request: BoundedActionRequest) -> BoundedActionResult: ...
+
+
+class DeterministicIncidentSimulator:
+    """Execute signature actions in a controlled external state machine."""
+
+    name = "deterministic_incident_simulator"
+
+    def execute(self, request: BoundedActionRequest) -> BoundedActionResult:
+        if not request.request_id.strip():
+            raise ValueError("bounded action request id is required")
+        if not request.actions:
+            raise ValueError("bounded action request requires at least one action")
+        scored = score_action_sequence(request.actions)
+        return BoundedActionResult(
+            tool=self.name,
+            allowed_actions=tuple(scored["allowed_actions"]),
+            initial_observation=dict(scored["initial_observation"]),
+            observations=tuple(dict(item) for item in scored["observations"]),
+            recovered=bool(scored["recovered"]),
+            unsafe_action_count=int(scored["unsafe_action_count"]),
+        )
+
+
 def score_action_sequence(actions: tuple[str, ...]) -> dict[str, Any]:
-    """Execute a deterministic retry-amplification sequence outside the agent."""
+    """Score a deterministic retry-amplification sequence independently of memory."""
 
     state: dict[str, int | float] = {
         "timeout_rate": 0.30,

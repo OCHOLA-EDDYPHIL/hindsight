@@ -350,13 +350,20 @@ def _process_tenant_message(
 
     reasoning = result.state.get("reasoning") or {}
     approved = bool(result.state.get("action_approved", True))
-    status = "completed" if approved else "rejected"
+    guidance_eligible = bool(result.state.get("guidance_eligible", approved))
+    status = "completed" if approved and guidance_eligible else "rejected"
+    if not approved:
+        summary = "Agent recommendation was rejected"
+    elif not guidance_eligible:
+        summary = "Bounded action outcome was rejected"
+    else:
+        summary = "Agent run completed"
     return finish_run_attempt(
         run_id=run_id,
         attempt_id=attempt_id,
         status=status,
         phase="completion",
-        summary="Agent run completed" if approved else "Agent recommendation was rejected",
+        summary=summary,
         fields={
             "plan": result.plan,
             "proposed_action": result.proposed_action,
@@ -381,7 +388,8 @@ def _phase_summary(phase: str, status: str) -> str:
         "recall": "Relevant memories recalled",
         "plan": "Agent plan generated",
         "approval": "Plan is waiting for operator review",
-        "action": "Operator decision recorded",
+        "action": "Approved bounded action started",
+        "observation": "Bounded action observation recorded",
         "reflection": "Outcome reflected into long-term memory",
     }
     return summaries.get(phase, f"Agent run entered {status.replace('_', ' ')}")

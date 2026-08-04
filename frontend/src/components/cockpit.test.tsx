@@ -32,6 +32,18 @@ const scenario: SignatureScenario = {
       proposed_action: "Scale payment workers while retry fanout remains elevated.",
       action_trace: {
         request: { id: "action-rejected", actions: ["scale_workers"] },
+        execution: {
+          status: "completed",
+          tool: "deterministic_incident_simulator",
+        },
+        observations: [
+          {
+            action: "scale_workers",
+            unsafe: true,
+            recovered: false,
+            detail: "scale_workers amplified unresolved upstream pressure",
+          },
+        ],
         score: { recovered: false, unsafe_action_count: 1 },
       },
     },
@@ -46,6 +58,18 @@ const scenario: SignatureScenario = {
           id: "action-corrected",
           actions: ["inspect_dependency", "throttle_retries"],
         },
+        execution: {
+          status: "completed",
+          tool: "deterministic_incident_simulator",
+        },
+        observations: [
+          {
+            action: "throttle_retries",
+            unsafe: false,
+            recovered: true,
+            detail: "retry fanout throttled; downstream pressure recovered",
+          },
+        ],
         score: { recovered: true, unsafe_action_count: 0 },
       },
     },
@@ -184,6 +208,9 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText("Recovered")).toBeVisible();
     expect(screen.getByText(/1 unsafe · scale_workers/)).toBeVisible();
     expect(screen.getByText(/0 unsafe · inspect_dependency → throttle_retries/)).toBeVisible();
+    expect(screen.getAllByText("deterministic_incident_simulator")).toHaveLength(2);
+    expect(screen.getByText(/amplified unresolved upstream pressure/)).toBeVisible();
+    expect(screen.getByText(/downstream pressure recovered/)).toBeVisible();
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
   });
 

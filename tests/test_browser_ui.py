@@ -231,12 +231,16 @@ def test_operator_can_run_and_explain_signature_workflow():
         )
         bad_plan = driver.find_element(By.ID, "planText").text
         assert "scale payment workers" in bad_plan.lower()
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
+        driver.find_element(By.ID, "approveRun").click()
+        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
         bad_score = wait.until(
             expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.not-recovered"))
         )
         assert "1 unsafe" in bad_score.text
-        driver.find_element(By.ID, "rejectRun").click()
-        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
+        assert "amplified unresolved upstream pressure" in driver.find_element(
+            By.CSS_SELECTOR, ".action-observation"
+        ).text
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "3 live · 0 invalid"
@@ -289,12 +293,13 @@ def test_operator_can_run_and_explain_signature_workflow():
         corrected_plan = driver.find_element(By.ID, "planText").text
         assert "retry" in corrected_plan.lower()
         assert "scale payment workers" not in corrected_plan.lower()
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score.recovered")
+        driver.find_element(By.ID, "approveRun").click()
+        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
         corrected_score = wait.until(
             expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.recovered"))
         )
         assert "0 unsafe" in corrected_score.text
-        driver.find_element(By.ID, "approveRun").click()
-        wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "2 live · 2 invalid"

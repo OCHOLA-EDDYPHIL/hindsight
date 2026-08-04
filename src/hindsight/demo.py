@@ -23,7 +23,7 @@ from hindsight.mcp_server import inspect_decision_trace
 from hindsight.memory import MemoryStore, Provenance, RewindResult
 from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
-from hindsight.simulator import score_action_sequence
+from hindsight.simulator import BoundedActionRequest, DeterministicIncidentSimulator
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 GOOD_RECOMMENDATION = (
@@ -422,16 +422,32 @@ def run_demo_agent_turn(
                 if poisoned
                 else ("inspect_dependency", "throttle_retries")
             )
-            scored = score_action_sequence(actions)
+            action_request_id = f"action:{thread_id}:request"
+            scored = DeterministicIncidentSimulator().execute(
+                BoundedActionRequest(
+                    request_id=action_request_id,
+                    actions=actions,
+                )
+            )
             action_trace = {
+                "schema_version": 1,
                 "request": {
-                    "id": f"action:{thread_id}:request",
+                    "id": action_request_id,
+                    "mode": "bounded_deterministic_simulator",
+                    "tool": scored.tool,
                     "actions": list(actions),
                 },
-                "observations": scored["observations"],
+                "approval": {"approved": True, "disposition": "approved"},
+                "execution": {
+                    "status": "completed",
+                    "tool": scored.tool,
+                    "allowed_actions": list(scored.allowed_actions),
+                },
+                "initial_observation": scored.initial_observation,
+                "observations": list(scored.observations),
                 "score": {
-                    "recovered": scored["recovered"],
-                    "unsafe_action_count": scored["unsafe_action_count"],
+                    "recovered": scored.recovered,
+                    "unsafe_action_count": scored.unsafe_action_count,
                 },
             }
             proposed_action = (

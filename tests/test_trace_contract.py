@@ -351,9 +351,11 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert default["stages"]["influenced_decision_id"] == bad["decision_id"]
     assert default["stages"]["rewind_operation_id"] == operation
     assert default["stages"]["corrected_decision_id"] == corrected["decision_id"]
-    bad_trace = next(run for run in default["runs"] if run["id"] == bad["id"])
+    bad_trace = next(
+        run for run in default["runs"] if str(run["id"]) == bad["id"]
+    )
     corrected_trace = next(
-        run for run in default["runs"] if run["id"] == corrected["id"]
+        run for run in default["runs"] if str(run["id"]) == corrected["id"]
     )
     assert bad_trace["action_trace"]["score"] == {
         "recovered": False,

@@ -232,7 +232,7 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
                 "proposed_action": "review throttle",
                 "action_trace": {
                     "request": {"id": "action:run-1:request"},
-                    "score": {"recovered": True, "unsafe_action_count": 0},
+                    "execution": {"status": "awaiting_approval"},
                 },
             },
             state={},
@@ -255,7 +255,10 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     assert [item["status"] for item in transitions] == ["planning", "awaiting_approval"]
     assert {item["db_url"] for item in transitions} == {"postgresql://db"}
     assert transitions[0]["fields"]["plan"] == "throttle retries"
-    assert transitions[1]["metadata"]["action_trace"]["score"]["recovered"] is True
+    assert transitions[1]["metadata"]["action_trace"]["execution"]["status"] == (
+        "awaiting_approval"
+    )
+    assert "score" not in transitions[1]["metadata"]["action_trace"]
     assert result["status"] == "awaiting_approval"
 
 

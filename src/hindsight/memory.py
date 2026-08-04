@@ -1577,10 +1577,14 @@ class MemoryStore:
         structured_payload: dict[str, Any],
         provenance: Provenance,
         parent_memory_ids: Iterable[str],
+        guidance_eligible: bool | None = None,
     ) -> dict[str, Any]:
         """Atomically persist a reflection memory and its typed projection."""
 
         embedding, _ = self._prepare_semantic_embedding(content=content)
+        eligible = action_approved if guidance_eligible is None else guidance_eligible
+        if eligible and not action_approved:
+            raise ProvenanceError("unapproved reflection cannot become positive guidance")
         with self._conn.transaction():
             memory = self.write_semantic(
                 namespace=namespace,
@@ -1592,7 +1596,7 @@ class MemoryStore:
                 producer_decision_id=decision_id,
                 parent_memory_ids=parent_memory_ids,
                 precomputed_embedding=embedding,
-                trust_status="active" if action_approved else "review_required",
+                trust_status="active" if eligible else "review_required",
             )
             self.record_agent_reflection(
                 decision_id=decision_id,

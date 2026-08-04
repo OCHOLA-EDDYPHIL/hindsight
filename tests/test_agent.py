@@ -93,21 +93,49 @@ def test_reasoning_prompt_uses_typed_governance_envelopes():
     assert '"evidence_quality": "resolved_incident"' in prompt
 
 
-def test_signature_action_scoring_is_bounded_and_memory_causal():
-    from hindsight.agent import _bounded_action_trace
+def test_signature_action_request_is_memory_causal_and_executes_only_when_called():
+    from hindsight.agent import (
+        _bounded_action_request,
+        _execute_bounded_action,
+        _guidance_eligible,
+        _signature_actions,
+    )
+    from hindsight.simulator import DeterministicIncidentSimulator
 
     base = {
         "run_id": "run-1",
         "namespace": "demo:payments-poison-rewind:session:test",
     }
-    corrected = _bounded_action_trace({**base, "recalled_memories": []})
-    poisoned = _bounded_action_trace(
-        {
-            **base,
-            "recalled_memories": [{"metadata": {"role": "poison"}}],
-        }
+    corrected_state = {**base, "recalled_memories": []}
+    poisoned_state = {
+        **base,
+        "recalled_memories": [{"metadata": {"role": "poison"}}],
+    }
+    corrected_actions = _signature_actions(corrected_state)
+    poisoned_actions = _signature_actions(poisoned_state)
+    pending = _bounded_action_request(
+        corrected_state,
+        actions=corrected_actions,
+        tool_name="deterministic_incident_simulator",
+    )
+    corrected = _execute_bounded_action(
+        corrected_state,
+        actions=corrected_actions,
+        trace=pending,
+        tool=DeterministicIncidentSimulator(),
+    )
+    poisoned = _execute_bounded_action(
+        poisoned_state,
+        actions=poisoned_actions,
+        trace=_bounded_action_request(
+            poisoned_state,
+            actions=poisoned_actions,
+            tool_name="deterministic_incident_simulator",
+        ),
+        tool=DeterministicIncidentSimulator(),
     )
 
+    assert "score" not in pending
     assert corrected["request"]["actions"] == [
         "inspect_dependency",
         "throttle_retries",
@@ -115,6 +143,26 @@ def test_signature_action_scoring_is_bounded_and_memory_causal():
     assert corrected["score"] == {"recovered": True, "unsafe_action_count": 0}
     assert poisoned["request"]["actions"] == ["scale_workers"]
     assert poisoned["score"] == {"recovered": False, "unsafe_action_count": 1}
+    assert _guidance_eligible(action_approved=True, action_trace=corrected)
+    assert not _guidance_eligible(action_approved=True, action_trace=poisoned)
+
+
+def test_review_required_memory_cannot_claim_positive_guidance():
+    from hindsight.agent import _governed_guidance_envelope
+
+    envelope = _governed_guidance_envelope(
+        {
+            "id": "memory-rejected",
+            "trust_status": "review_required",
+            "metadata": {
+                "operator_disposition": "rejected",
+                "usage_instruction": "positive_guidance",
+            },
+        }
+    )
+
+    assert envelope["status"] == "review_required"
+    assert envelope["usage_instruction"] == "audit_only"
 
 
 def test_recall_does_not_silently_fall_back_after_vector_error(monkeypatch):
@@ -327,6 +375,7 @@ def test_async_run_incident_agent_wraps_sync_graph(monkeypatch):
         "db_url": "postgresql://db",
         "reasoning_provider": reasoning_provider,
         "embedding_provider": embedding_provider,
+        "action_tool": None,
         "progress_callback": None,
     }
 
@@ -371,6 +420,7 @@ def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
         "db_url": "postgresql://db",
         "reasoning_provider": reasoning_provider,
         "embedding_provider": embedding_provider,
+        "action_tool": None,
         "progress_callback": None,
     }
 
@@ -529,10 +579,15 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
     with connect(database_url()) as conn:
         checkpoint_rows = conn.execute(CHECKPOINT_QUERY.read_text(), (thread_id,)).fetchall()
         chat_rows = conn.execute(CHAT_QUERY.read_text(), (thread_id,)).fetchall()
+        reflected_trust = conn.execute(
+            "SELECT trust_status FROM semantic_memories WHERE id = %s",
+            (resumed.reflected_memory_id,),
+        ).fetchone()
 
     assert len(checkpoint_rows) >= 2
     assert [row[1] for row in chat_rows] == ["human", "ai"]
     assert "roll back the deploy candidate" in chat_rows[1][2]
+    assert reflected_trust == ("active",)
 
 
 @requires_db
@@ -544,8 +599,16 @@ def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
     from hindsight.reasoning import DeterministicReasoningProvider
 
     thread_id = f"agent-rejected-{uuid4()}"
-    namespace = f"agent-rejected-test-{uuid4()}"
+    namespace = f"demo:payments-poison-rewind:rejected:{uuid4()}"
     provider = DeterministicEmbeddingProvider()
+
+    class RejectIfExecuted:
+        name = "reject_if_executed"
+
+        def execute(self, _request):
+            raise AssertionError("rejected action must not execute")
+
+    action_tool = RejectIfExecuted()
     first = run_incident_agent(
         IncidentInput(
             user_input="search-api error rate spiked after the deploy",
@@ -559,6 +622,7 @@ def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
             response_text="roll back the deploy candidate and verify error rate"
         ),
         embedding_provider=provider,
+        action_tool=action_tool,
     )
     assert first.interrupted
 
@@ -566,6 +630,7 @@ def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
         thread_id=thread_id,
         approved=False,
         embedding_provider=provider,
+        action_tool=action_tool,
     )
     memory_id = str(rejected.reflected_memory_id)
     with MemoryStore(url=database_url(), embedding_provider=provider) as store:
@@ -581,6 +646,8 @@ def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
     assert audit is not None
     assert audit["trust_status"] == "review_required"
     assert audit["structured_payload"]["action_approved"] is False
+    assert rejected.state["action_trace"]["execution"]["status"] == "not_executed"
+    assert "observations" not in rejected.state.get("action_trace", {})
     assert memory_id not in {str(hit["id"]) for hit in result.hits}
 
 

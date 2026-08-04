@@ -79,6 +79,7 @@ ARTIFACTS = {
             "runtime.py",
             "security.py",
             "server_tenants.py",
+            "simulator.py",
             "tenant.py",
             "tracing.py",
             "worker.py",

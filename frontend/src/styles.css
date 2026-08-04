@@ -495,6 +495,32 @@ main {
   color: var(--color-danger);
 }
 
+.action-execution,
+.action-observation {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.65rem;
+  border: 1px solid var(--color-line);
+  padding: 0.55rem 0.65rem;
+  color: var(--color-muted);
+  font: 600 0.62rem/1.35 var(--font-mono);
+}
+
+.action-execution > span:first-child,
+.action-observation > span:first-child {
+  color: var(--color-faint);
+  text-transform: uppercase;
+}
+
+.action-execution > span:last-child,
+.action-observation > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 .markdown-content {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -1007,7 +1033,7 @@ textarea:focus-visible {
 
 .phase-rail {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   margin: 1rem 0 0;
   padding: 0;
   list-style: none;
