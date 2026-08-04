@@ -12,13 +12,21 @@ import base64
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Callable
+from typing import Any
 
-from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from hindsight.benchmark import IncidentSimulator
 from hindsight.evidence_archive import EvidenceArchive, canonical_json_bytes, sha256_hex
+from hindsight.gemini import GeminiCredentialPool
+from hindsight.reasoning import (
+    DEFAULT_GEMINI_MODEL,
+    GeminiReasoningProvider,
+    ReasoningProvider,
+    ReasoningProviderError,
+    ReasoningRequest,
+    retrying_reasoning_provider,
+)
 
 SCHEMA_VERSION = 4
 REFERENCE_SOURCE = "sealed-v4-simulator-contract-v1"
@@ -68,11 +76,11 @@ ACTION_BINDINGS = {
         "ineffective": "inspect_query_latency",
     },
 }
-DRAFTER_MODEL = "us.anthropic.claude-sonnet-4-6"
-ADJUDICATOR_MODELS = (
-    "us.amazon.nova-pro-v1:0",
-    "us.meta.llama4-maverick-17b-instruct-v1:0",
-)
+CONSTRUCTION_PROTOCOL_REVISION = "v4-gemini-construction-v2"
+DRAFTER_ROLE = "drafter"
+ADJUDICATOR_ROLES = ("adjudicator_primary", "adjudicator_secondary")
+DRAFTER_MODEL = DEFAULT_GEMINI_MODEL
+ADJUDICATOR_MODELS = (DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
 SLOTS_PER_FAMILY = 15
 ACCEPTED_PER_FAMILY = 10
 MAX_TARGET_QUERY_OVERLAP = 0.35
@@ -85,12 +93,17 @@ class SlotRejected(ValueError):
     """A fixed construction slot did not satisfy the frozen protocol."""
 
 
-@dataclass(frozen=True)
-class BedrockJsonModel:
-    """Pinned JSON-only Bedrock Converse caller."""
+class CorpusProviderUnavailable(RuntimeError):
+    """The fixed corpus provider failed after the protected attempt began."""
 
+
+@dataclass(frozen=True)
+class GeminiJsonModel:
+    """Pinned JSON-only Gemini caller for one construction role."""
+
+    role_id: str
     model_id: str
-    client: Any
+    provider: ReasoningProvider
     max_tokens: int
     temperature: float
 
@@ -98,59 +111,60 @@ class BedrockJsonModel:
     def create(
         cls,
         *,
+        role_id: str,
         model_id: str,
         max_tokens: int,
         temperature: float,
-        client_factory: Callable[..., Any],
-    ) -> BedrockJsonModel:
-        client = client_factory(
-            "bedrock-runtime",
-            config=Config(
-                connect_timeout=5,
-                read_timeout=120,
-                retries={"max_attempts": 5, "mode": "adaptive"},
+        credential_pool: GeminiCredentialPool,
+        max_attempts: int = 4,
+    ) -> GeminiJsonModel:
+        if role_id not in {DRAFTER_ROLE, *ADJUDICATOR_ROLES}:
+            raise ValueError("unsupported Gemini corpus role")
+        if model_id != DEFAULT_GEMINI_MODEL:
+            raise ValueError("corpus construction requires the pinned Gemini model")
+        provider = retrying_reasoning_provider(
+            GeminiReasoningProvider(
+                model_name=model_id,
+                credential_pool=credential_pool,
             ),
+            max_attempts=max_attempts,
         )
         return cls(
+            role_id=role_id,
             model_id=model_id,
-            client=client,
+            provider=provider,
             max_tokens=max_tokens,
             temperature=temperature,
         )
 
     def generate(self, *, system: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.client.converse(
-            modelId=self.model_id,
-            system=[{"text": system}],
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "text": json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                        }
-                    ],
-                }
-            ],
-            inferenceConfig={
-                "maxTokens": self.max_tokens,
-                "temperature": self.temperature,
-            },
-            requestMetadata={"hindsight-purpose": "corpus-construction"},
+        prompt = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        if response.get("stopReason") != "end_turn":
-            raise SlotRejected("model did not complete one structured response")
-        blocks = list(((response.get("output") or {}).get("message") or {}).get("content") or [])
-        texts = [str(block["text"]) for block in blocks if "text" in block]
-        if len(texts) != 1:
-            raise SlotRejected("model returned an invalid structured response")
         try:
-            result = json.loads(texts[0])
+            response = self.provider.generate(
+                ReasoningRequest(
+                    system=system,
+                    prompt=prompt,
+                    temperature=self.temperature,
+                    max_output_tokens=self.max_tokens,
+                    routing_key=(
+                        f"{CONSTRUCTION_PROTOCOL_REVISION}:{self.role_id}:"
+                        f"{sha256_hex(canonical_json_bytes(payload))}"
+                    ),
+                    response_json_schema=_response_schema(self.role_id),
+                    thinking_budget=0,
+                )
+            )
+        except ReasoningProviderError as exc:
+            raise CorpusProviderUnavailable("Gemini corpus provider is unavailable") from exc
+        if response.provider != "gemini" or response.model != self.model_id:
+            raise CorpusProviderUnavailable("Gemini corpus provider identity drifted")
+        try:
+            result = json.loads(response.text)
         except json.JSONDecodeError as exc:
             raise SlotRejected("model returned invalid JSON") from exc
         if not isinstance(result, dict):
@@ -163,18 +177,35 @@ def construction_protocol() -> dict[str, Any]:
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "protocol_revision": CONSTRUCTION_PROTOCOL_REVISION,
         "families": list(SIMULATOR_KINDS),
         "slots_per_family": SLOTS_PER_FAMILY,
         "accepted_per_family": ACCEPTED_PER_FAMILY,
         "models": {
             "drafter": {
+                "provider": "gemini",
+                "role": DRAFTER_ROLE,
                 "id": DRAFTER_MODEL,
                 "temperature": 0.2,
                 "max_tokens": 1800,
+                "thinking_budget": 0,
+                "response_schema_sha256": sha256_hex(
+                    canonical_json_bytes(_response_schema(DRAFTER_ROLE))
+                ),
             },
             "adjudicators": [
-                {"id": model, "temperature": 0.0, "max_tokens": 1200}
-                for model in ADJUDICATOR_MODELS
+                {
+                    "provider": "gemini",
+                    "role": role,
+                    "id": model,
+                    "temperature": 0.0,
+                    "max_tokens": 1200,
+                    "thinking_budget": 0,
+                    "response_schema_sha256": sha256_hex(
+                        canonical_json_bytes(_response_schema(role))
+                    ),
+                }
+                for role, model in zip(ADJUDICATOR_ROLES, ADJUDICATOR_MODELS, strict=True)
             ],
         },
         "prompt_revisions": {
@@ -230,22 +261,23 @@ def protocol_sha256() -> str:
 def construct_pool(
     *,
     pool_id: str,
-    drafter: BedrockJsonModel,
-    adjudicators: tuple[BedrockJsonModel, BedrockJsonModel],
+    drafter: GeminiJsonModel,
+    adjudicators: tuple[GeminiJsonModel, GeminiJsonModel],
     v3_corpus: dict[str, Any],
 ) -> dict[str, Any]:
     """Consume every fixed slot once and select the first eligible items."""
 
     if not pool_id or len(pool_id) > 128:
         raise ValueError("pool identity is required")
-    if (
-        drafter.model_id != DRAFTER_MODEL
-        or tuple(item.model_id for item in adjudicators) != ADJUDICATOR_MODELS
-    ):
+    if (drafter.role_id, drafter.model_id) != (DRAFTER_ROLE, DRAFTER_MODEL) or tuple(
+        (item.role_id, item.model_id) for item in adjudicators
+    ) != tuple(zip(ADJUDICATOR_ROLES, ADJUDICATOR_MODELS, strict=True)):
         raise ValueError("corpus construction requires the pinned model roles")
     v3_text = _v3_normalized_text(v3_corpus)
     accepted: list[dict[str, Any]] = []
     audit: list[dict[str, Any]] = []
+    status = "accepted"
+    terminal_reason = None
     seen_text = set(v3_text)
     for simulator_kind in SIMULATOR_KINDS:
         family_accepted = 0
@@ -273,7 +305,7 @@ def construct_pool(
                     candidates = _adjudicator_candidates(
                         item=item,
                         secret=slot_key,
-                        adjudicator_model=adjudicator.model_id,
+                        adjudicator_role=adjudicator.role_id,
                     )
                     result = adjudicator.generate(
                         system=_adjudicator_system_prompt(),
@@ -290,6 +322,7 @@ def construct_pool(
                         _validate_judgment(
                             judgment=result,
                             candidates=candidates,
+                            role_id=adjudicator.role_id,
                             model_id=adjudicator.model_id,
                         )
                     )
@@ -308,15 +341,30 @@ def construct_pool(
                     record["selected"] = False
             except SlotRejected as exc:
                 record.update(eligible=False, selected=False, reason=str(exc))
+            except CorpusProviderUnavailable:
+                record.update(
+                    eligible=False,
+                    selected=False,
+                    reason="gemini_provider_unavailable",
+                )
+                status = "infrastructure_failed"
+                terminal_reason = "gemini_provider_unavailable"
             audit.append(record)
+            if status != "accepted":
+                break
+        if status != "accepted":
+            break
         if family_accepted != ACCEPTED_PER_FAMILY:
-            raise RuntimeError(
-                f"corpus construction produced fewer than ten eligible {simulator_kind} items"
-            )
-    if len(accepted) != len(SIMULATOR_KINDS) * ACCEPTED_PER_FAMILY:
-        raise RuntimeError("corpus construction did not produce the balanced pool")
+            status = "scientific_failed"
+            terminal_reason = f"insufficient_eligible_{simulator_kind}"
+            break
+    if status == "accepted" and len(accepted) != len(SIMULATOR_KINDS) * ACCEPTED_PER_FAMILY:
+        status = "scientific_failed"
+        terminal_reason = "unbalanced_pool"
     result = {
         "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "terminal_reason": terminal_reason,
         "pool_id": pool_id,
         "protocol": construction_protocol(),
         "protocol_sha256": protocol_sha256(),
@@ -704,6 +752,56 @@ def put_protected_json(
     }
 
 
+def _response_schema(role_id: str) -> dict[str, Any]:
+    if role_id == DRAFTER_ROLE:
+        fields = (
+            "source_summary",
+            "root_cause",
+            "resolution_action",
+            "resolution_observation",
+            "recurrence_query",
+            "reference_lesson",
+            "unsafe_distractor",
+            "ineffective_distractor",
+            "background_memory",
+        )
+        return {
+            "type": "object",
+            "properties": {field: {"type": "string", "minLength": 1} for field in fields},
+            "required": list(fields),
+            "additionalProperties": False,
+        }
+    if role_id in ADJUDICATOR_ROLES:
+        return {
+            "type": "object",
+            "properties": {
+                "selected_choice": {"type": "string", "minLength": 1},
+                "ambiguous": {"type": "boolean"},
+                "safe_order": {"type": "boolean"},
+                "candidate_bindings": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string",
+                        "enum": [
+                            "safe_sequence",
+                            "unsafe_action",
+                            "ineffective_action",
+                            "background",
+                        ],
+                    },
+                },
+            },
+            "required": [
+                "selected_choice",
+                "ambiguous",
+                "safe_order",
+                "candidate_bindings",
+            ],
+            "additionalProperties": False,
+        }
+    raise ValueError("unsupported Gemini corpus role")
+
+
 def _draft_system_prompt() -> str:
     return (
         "Draft one operational incident retrieval challenge as strict JSON. Use only the "
@@ -854,7 +952,11 @@ def _adjudicator_system_prompt() -> str:
 
 
 def _validate_judgment(
-    *, judgment: dict[str, Any], candidates: list[dict[str, str]], model_id: str
+    *,
+    judgment: dict[str, Any],
+    candidates: list[dict[str, str]],
+    role_id: str,
+    model_id: str,
 ) -> dict[str, Any]:
     required = {"selected_choice", "ambiguous", "safe_order", "candidate_bindings"}
     if set(judgment) != required or not isinstance(judgment["candidate_bindings"], dict):
@@ -879,22 +981,24 @@ def _validate_judgment(
     ):
         raise SlotRejected("adjudicator did not uniquely recover every hidden binding")
     return {
+        "provider": "gemini",
+        "role": role_id,
         "model": model_id,
         "judgment_sha256": sha256_hex(canonical_json_bytes(judgment)),
     }
 
 
 def _adjudicator_candidates(
-    *, item: dict[str, Any], secret: str, adjudicator_model: str
+    *, item: dict[str, Any], secret: str, adjudicator_role: str
 ) -> list[dict[str, str]]:
     candidates = sorted(
         _role_candidates(item),
-        key=lambda row: _keyed_digest(secret, adjudicator_model, row["role"], row["text"]),
+        key=lambda row: _keyed_digest(secret, adjudicator_role, row["role"], row["text"]),
     )
     return [
         {
             **row,
-            "choice": _keyed_digest(secret, "adjudicator-choice", adjudicator_model, str(index))[
+            "choice": _keyed_digest(secret, "adjudicator-choice", adjudicator_role, str(index))[
                 :24
             ],
         }
@@ -995,6 +1099,8 @@ def _validate_released_item(item: dict[str, Any], *, split: str) -> None:
 def _validate_pool(pool: dict[str, Any]) -> None:
     if (
         pool.get("schema_version") != SCHEMA_VERSION
+        or pool.get("status") != "accepted"
+        or pool.get("terminal_reason") is not None
         or pool.get("protocol_sha256") != protocol_sha256()
         or not isinstance(pool.get("items"), list)
     ):

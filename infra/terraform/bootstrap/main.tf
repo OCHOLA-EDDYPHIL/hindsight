@@ -462,28 +462,6 @@ data "aws_iam_policy_document" "github_evidence" {
   }
 
   statement {
-    sid = "CorpusConstructionPreflight"
-    actions = [
-      "bedrock:GetModelInvocationLoggingConfiguration",
-      "bedrock:ListInferenceProfiles",
-    ]
-    resources = ["*"]
-  }
-
-  statement {
-    sid     = "PinnedCorpusConstructionModels"
-    actions = ["bedrock:InvokeModel"]
-    resources = [
-      "arn:${data.aws_partition.current.partition}:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-4-6",
-      "arn:${data.aws_partition.current.partition}:bedrock:*:*:inference-profile/us.amazon.nova-pro-v1:0",
-      "arn:${data.aws_partition.current.partition}:bedrock:*:*:inference-profile/us.meta.llama4-maverick-17b-instruct-v1:0",
-      "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6*",
-      "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/amazon.nova-pro-v1:0",
-      "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/meta.llama4-maverick-17b-instruct-v1:0",
-    ]
-  }
-
-  statement {
     sid = "ProtectedCorpusEncryption"
     actions = [
       "kms:Decrypt",

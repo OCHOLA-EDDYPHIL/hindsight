@@ -11,6 +11,7 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
 
 jobs:
   authorize:
@@ -81,27 +82,86 @@ jobs:
         with:
           role-to-assume: ${{ vars.HINDSIGHT_EVIDENCE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Construct the fixed candidate slots
+      - name: Load and mask Gemini credentials from SSM
+        shell: bash
+        run: |
+          GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$GEMINI_MATERIAL" && "$GEMINI_MATERIAL" != "None" ]] || exit 1
+          echo "::add-mask::$GEMINI_MATERIAL"
+          while IFS= read -r api_key; do
+            [[ -n "$api_key" ]] && echo "::add-mask::$api_key"
+          done < <(
+            GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
+              'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
+          )
+          delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
+          {
+            echo "GEMINI_API_KEYS<<$delimiter"
+            printf '%s\n' "$GEMINI_MATERIAL"
+            echo "$delimiter"
+          } >> "$GITHUB_ENV"
+      - id: claim
+        name: Claim the sole construction attempt
+        env:
+          CONSTRUCTION_SHA: ${{ needs.authorize.outputs.construction_sha }}
+          EVIDENCE_BUCKET: ${{ vars.HINDSIGHT_EVIDENCE_BUCKET }}
+        shell: bash
+        run: |
+          uv run python scripts/manage_v4_corpus.py protocol \
+            > "$RUNNER_TEMP/construction-protocol.json"
+          PROTOCOL_SHA256="$(jq -r .protocol_sha256 "$RUNNER_TEMP/construction-protocol.json")"
+          jq -n \
+            --arg code_sha "$CONSTRUCTION_SHA" \
+            --arg protocol_sha256 "$PROTOCOL_SHA256" \
+            --argjson workflow_run_id "$GITHUB_RUN_ID" \
+            --argjson workflow_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schema_version:1,provider:"gemini",code_sha:$code_sha,protocol_sha256:$protocol_sha256,workflow_run_id:$workflow_run_id,workflow_run_attempt:$workflow_run_attempt}' \
+            > "$RUNNER_TEMP/construction-claim.json"
+          uv run python scripts/seal_learning_evidence.py \
+            --bucket "$EVIDENCE_BUCKET" \
+            --evidence-id "corpus/v4/gemini-attempt/claim" \
+            --object claim="$RUNNER_TEMP/construction-claim.json" \
+            --object protocol="$RUNNER_TEMP/construction-protocol.json" \
+            --receipt "$RUNNER_TEMP/construction-claim-receipt.json"
+      - id: construction
+        name: Construct the fixed candidate slots
+        continue-on-error: true
         run: |
           uv run python scripts/manage_v4_corpus.py construct \
             --pool-id "run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}" \
             --output "$RUNNER_TEMP/construction-pool.json"
-          uv run python scripts/manage_v4_corpus.py protocol \
-            > "$RUNNER_TEMP/construction-protocol.json"
-      - name: Seal the private construction pool
+      - name: Preserve an unexpected terminal failure
+        if: always() && steps.claim.outcome == 'success'
+        shell: bash
+        run: |
+          if [[ ! -s "$RUNNER_TEMP/construction-pool.json" ]]; then
+            jq -n \
+              --arg pool_id "run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}" \
+              '{schema_version:4,status:"infrastructure_failed",terminal_reason:"construction_command_failed",pool_id:$pool_id,items:[],slot_audit:[]}' \
+              > "$RUNNER_TEMP/construction-pool.json"
+          fi
+      - name: Seal the terminal construction record
+        if: always() && steps.claim.outcome == 'success'
         env:
           EVIDENCE_BUCKET: ${{ vars.HINDSIGHT_EVIDENCE_BUCKET }}
         run: |
           uv run python scripts/seal_learning_evidence.py \
             --bucket "$EVIDENCE_BUCKET" \
-            --evidence-id "corpus/v4/construction/run-${GITHUB_RUN_ID}/attempt-${GITHUB_RUN_ATTEMPT}" \
+            --evidence-id "corpus/v4/gemini-attempt/result" \
+            --object claim="$RUNNER_TEMP/construction-claim.json" \
             --object construction_pool="$RUNNER_TEMP/construction-pool.json" \
             --object protocol="$RUNNER_TEMP/construction-protocol.json" \
             --receipt "$RUNNER_TEMP/construction-receipt.json"
+      - name: Require an accepted construction pool
+        if: steps.claim.outcome == 'success' && steps.construction.outcome != 'success'
+        run: exit 1
       - name: Preserve only the private archive receipt
+        if: always() && steps.claim.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: v4-corpus-construction-receipt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/construction-receipt.json
+          path: |
+            ${{ runner.temp }}/construction-claim-receipt.json
+            ${{ runner.temp }}/construction-receipt.json
           if-no-files-found: error
           retention-days: 30
