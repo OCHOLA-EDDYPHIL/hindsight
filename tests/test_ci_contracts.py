@@ -91,12 +91,13 @@ def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
     workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = workflow_path.read_text()
     suffix = "_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable"
-
-    assert f"hindsight_core{suffix}" in workflow
-    assert f"hindsight_research{suffix}" in workflow
     shell_suffix = "_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
-    for database_name in ("hindsight_fresh", "hindsight_populated"):
-        assert f"{database_name}{shell_suffix}" in workflow
+
+    assert f"hindsight_core_a{shell_suffix}" in workflow
+    assert f"hindsight_core_b{shell_suffix}" in workflow
+    assert f"hindsight_diagnostic_research{suffix}" in workflow
+    assert f"hindsight_diagnostic_fresh{suffix}" in workflow
+    assert f"hindsight_populated{suffix}" in workflow
 
     jobs = yaml.safe_load(workflow)["jobs"]
     compose_scopes = {
@@ -130,6 +131,27 @@ def test_historical_migrations_share_one_manual_container():
     assert "matrix" not in job.get("strategy", {})
 
 
+def test_fast_product_groups_share_one_server_and_use_isolated_databases():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    database_job = workflow["jobs"]["database"]
+    group_step = next(
+        step
+        for step in database_job["steps"]
+        if step.get("name") == "Run isolated product database groups"
+    )
+
+    assert sum(
+        step.get("run") == "docker compose up -d crdb"
+        for step in database_job["steps"]
+    ) == 1
+    for group in ("core_a", "core_b"):
+        database = f"hindsight_{group}_${{GITHUB_RUN_ID}}_${{GITHUB_RUN_ATTEMPT}}"
+        assert database in group_step["run"]
+        assert f"scripts/ci_test_groups.py run {group}" in group_step["run"]
+        assert f'{group}_pid=$!' in group_step["run"]
+        assert f'wait "${group}_pid"' in group_step["run"]
+
+
 def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     main_job = workflow["jobs"]["main_qualification"]
@@ -144,6 +166,13 @@ def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
     assert 'wait "$fresh_pid"' in schema_step["run"]
     assert 'wait "$populated_pid"' in schema_step["run"]
     assert "scripts/schema_manifest.py compare" in schema_step["run"]
+    smoke_step = next(
+        step
+        for step in main_job["steps"]
+        if step.get("name") == "Run deterministic benchmark smoke checks"
+    )
+    assert "scripts/migrate.py" not in smoke_step["run"]
+    assert 'DATABASE_URL="$FRESH_DATABASE_URL"' in smoke_step["run"]
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):

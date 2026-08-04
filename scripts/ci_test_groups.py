@@ -51,22 +51,24 @@ MIGRATION_CASES = {
 }
 
 DATABASE_GROUPS = {
-    "core": (
+    "core_a": (
         "tests/test_agent.py",
-        "tests/test_consolidation.py",
-        "tests/test_embedding_rotation.py",
         "tests/test_governed_memory.py",
         "tests/test_memory.py",
+        "tests/test_run_attempts.py",
+        "tests/test_runs.py",
+        "tests/test_tenant_isolation.py",
+        "tests/test_trace_contract.py",
+    ),
+    "core_b": (
+        "tests/test_consolidation.py",
+        "tests/test_embedding_rotation.py",
         "tests/test_migrations_and_roles.py",
         "tests/test_operation_retries.py",
         "tests/test_poison_rewind_demo.py",
-        "tests/test_run_attempts.py",
         "tests/test_run_dispatch.py",
-        "tests/test_runs.py",
         "tests/test_smoke.py",
         "tests/test_system_of_record.py",
-        "tests/test_tenant_isolation.py",
-        "tests/test_trace_contract.py",
     ),
     "research": (
         "tests/test_benchmark_protocol_migrations.py",

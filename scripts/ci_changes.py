@@ -21,7 +21,11 @@ COMPONENTS = (
     "lambda_artifacts",
     "terraform",
 )
-DATABASE_TEST_FILES = frozenset(Path(path).name for path in database_test_files("core"))
+DATABASE_TEST_FILES = frozenset(
+    Path(path).name
+    for group in ("core_a", "core_b")
+    for path in database_test_files(group)
+)
 RESEARCH_TEST_FILES = frozenset(Path(path).name for path in database_test_files("research"))
 MIGRATION_TEST_FILES = frozenset(
     {

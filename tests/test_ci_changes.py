@@ -32,7 +32,9 @@ def test_main_always_runs_core_database_artifacts_and_schema_qualification():
 
 def test_path_classifier_tracks_database_and_migration_test_inventory():
     assert ci_changes.DATABASE_TEST_FILES == {
-        Path(path).name for path in ci_test_groups.database_test_files("core")
+        Path(path).name
+        for group in ("core_a", "core_b")
+        for path in ci_test_groups.database_test_files(group)
     }
     assert ci_changes.RESEARCH_TEST_FILES == {
         Path(path).name for path in ci_test_groups.database_test_files("research")

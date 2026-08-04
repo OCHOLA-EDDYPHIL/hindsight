@@ -112,7 +112,8 @@ def test_required_ci_status_aggregates_lock_web_database_and_lambda_checks():
     assert "uv lock --check" in static_job
     assert "scripts/ci_test_groups.py run unit" in static_job
     assert "docker compose up -d crdb" in database_job
-    assert "scripts/ci_test_groups.py run core" in database_job
+    assert "scripts/ci_test_groups.py run core_a" in database_job
+    assert "scripts/ci_test_groups.py run core_b" in database_job
     for command in (
         "npm ci",
         "npm run check:web",
