@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from hindsight import v4_corpus
+from hindsight.evidence_archive import canonical_json_bytes, sha256_hex
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,6 +32,10 @@ class _DraftModel:
         self.calls += 1
         suffix = f"case{self.calls}"
         return {
+            "source_summary": f"A bounded source incident showed a causal failure during {suffix}.",
+            "root_cause": f"A confirmed dependency mechanism caused the symptoms in {suffix}.",
+            "resolution_action": f"Inspect the causal signal and apply the bounded repair in {suffix}.",
+            "resolution_observation": f"The service recovered after the bounded repair in {suffix}.",
             "recurrence_query": f"Service behavior changed during {suffix}.",
             "reference_lesson": f"Confirm the causal signal, then apply its bounded repair for {suffix}.",
             "unsafe_distractor": f"Add capacity immediately without causal confirmation for {suffix}.",
@@ -103,6 +109,9 @@ def test_protocol_pins_models_slots_selection_and_public_randomness():
     assert protocol["split"]["beacon_source"] == "nist-randomness-beacon-v2"
     assert protocol["prompt_revisions"]["draft"]["sha256"]
     assert protocol["prompt_revisions"]["adjudicator"]["sha256"]
+    assert protocol["released_item_contract"]["reference_source"] == (
+        "sealed-v4-simulator-contract-v1"
+    )
 
 
 def test_bedrock_caller_uses_converse_with_explicit_limits_and_adaptive_retries():
@@ -146,6 +155,9 @@ def test_constructed_pool_is_balanced_simulator_grounded_and_cross_adjudicatord(
         assert all(row["simulator_replay"]["target_result"]["recovered"] for row in family)
         assert all(row["simulator_replay"]["unsafe_result"]["unsafe"] for row in family)
         assert all(len(row["adjudications"]) == 2 for row in family)
+        assert len({row["source_summary"] for row in family}) == 10
+        assert all(row["reference_lesson"] not in row["source_summary"] for row in family)
+        assert all(row["reference_source"] == v4_corpus.REFERENCE_SOURCE for row in family)
 
 
 def test_owner_review_is_blinded_irreversible_and_all_or_nothing(constructed_pool):
@@ -238,6 +250,105 @@ def test_post_seal_split_is_balanced_and_keeps_retired_content_out(constructed_p
         for item in result[split]
     }
     assert len(released_ids) == 42
+    for item in result["development"]:
+        assert item["source_summary"]
+        assert item["root_cause"]
+        assert item["resolution_action"]
+        assert item["resolution_observation"]
+        assert item["reference_source"] == v4_corpus.REFERENCE_SOURCE
+
+
+def test_manifest_reader_binds_code_corpus_split_and_selected_profile(constructed_pool):
+    packet = v4_corpus.build_review_packet(
+        pool=constructed_pool,
+        review_secret="manifest-review-secret-that-is-long-enough",
+    )
+    state = v4_corpus.new_review_state(packet=packet)
+    for item in packet["items"]:
+        state = v4_corpus.record_review_decision(
+            packet=packet,
+            state=state,
+            index=item["index"],
+            choice=item["target_choice"],
+            ambiguous=False,
+        )
+    reviewed = v4_corpus.finalize_review(
+        pool=constructed_pool,
+        packet=packet,
+        state=state,
+    )
+    sealed_at = datetime.now(UTC)
+    split = v4_corpus.split_reviewed_pool(
+        reviewed_pool=reviewed,
+        sealed_manifest_sha256="a" * 64,
+        sealed_at=sealed_at,
+        beacon={
+            "source": "nist-randomness-beacon-v2",
+            "round": 18,
+            "value": "c" * 64,
+            "published_at": (sealed_at + timedelta(seconds=1)).isoformat(),
+            "pulse_uri": "https://beacon.nist.gov/beacon/2.0/pulse/time/1234567891",
+        },
+    )
+    packages = {
+        name: {"schema_version": 4, "split": name, "variants": split[name]}
+        for name in ("development", "pilot", "confirmation")
+    }
+    split_receipt = {
+        "schema_version": 1,
+        "reviewed_pool_sha256": split["reviewed_pool_sha256"],
+        "sealed_manifest_sha256": split["sealed_manifest_sha256"],
+        "beacon": split["beacon"],
+        "development_sha256": sha256_hex(canonical_json_bytes(packages["development"])),
+        "protected": {
+            name: {"sha256": sha256_hex(canonical_json_bytes(packages[name]))}
+            for name in ("pilot", "confirmation")
+        },
+        "retired_sha256": split["retired_sha256"],
+    }
+    selection = {
+        "schema_version": 2,
+        "development_sha256": split_receipt["development_sha256"],
+        "representation_matrix_sha256": "d" * 64,
+        "selected_representation": "applicability_instruction",
+        "embedding_profile": {
+            "profile_id": "profile-v4",
+            "provider": "gemini",
+            "model": "gemini-embedding-2",
+            "dimensions": 1024,
+            "capability": "semantic",
+            "encoder_revision": "gemini-retrieval-task-v2-applicability_instruction",
+            "configuration": {},
+            "max_distance": 0.35,
+            "representation": "applicability_instruction",
+        },
+        "max_distance": 0.35,
+        "reranking": False,
+        "fallback": False,
+    }
+    manifest = v4_corpus.build_study_manifest(
+        code_sha="e" * 40,
+        split_receipt=split_receipt,
+        representation_selection=selection,
+    )
+
+    variants = v4_corpus.read_study_split(
+        manifest=manifest,
+        split="confirmation",
+        package=packages["confirmation"],
+    )
+
+    assert len(variants) == 18
+    assert manifest["code_sha"] == "e" * 40
+    assert manifest["retrieval"]["embedding_profile"]["profile_id"] == "profile-v4"
+    changed = json.loads(json.dumps(packages["confirmation"]))
+    changed["variants"][0]["root_cause"] = "changed"
+    with pytest.raises(ValueError, match="differs from the study manifest"):
+        v4_corpus.read_study_split(
+            manifest=manifest,
+            split="confirmation",
+            package=changed,
+        )
 
 
 def test_review_server_exposes_no_answer_feedback_or_hidden_roles(constructed_pool):

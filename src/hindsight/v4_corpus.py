@@ -21,6 +21,7 @@ from hindsight.benchmark import IncidentSimulator
 from hindsight.evidence_archive import EvidenceArchive, canonical_json_bytes, sha256_hex
 
 SCHEMA_VERSION = 4
+REFERENCE_SOURCE = "sealed-v4-simulator-contract-v1"
 SIMULATOR_KINDS = (
     "retry_amplification",
     "cache_stampede",
@@ -208,6 +209,16 @@ def construction_protocol() -> dict[str, Any]:
                 "confirmation": 3,
                 "retired": 3,
             },
+        },
+        "released_item_contract": {
+            "reference_source": REFERENCE_SOURCE,
+            "source_evidence": "simulator-grounded-draft-v1",
+            "required_fields": [
+                "source_summary",
+                "root_cause",
+                "resolution_action",
+                "resolution_observation",
+            ],
         },
     }
 
@@ -494,6 +505,113 @@ def split_reviewed_pool(
     }
 
 
+def build_study_manifest(
+    *,
+    code_sha: str,
+    split_receipt: dict[str, Any],
+    representation_selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the sealed corpus and selected development profile to one code revision."""
+
+    if not re.fullmatch(r"[0-9a-f]{40,64}", code_sha):
+        raise ValueError("study manifest requires one full code revision")
+    required_split = {
+        "reviewed_pool_sha256",
+        "sealed_manifest_sha256",
+        "beacon",
+        "development_sha256",
+        "protected",
+        "retired_sha256",
+    }
+    if split_receipt.get("schema_version") != 1 or not required_split.issubset(split_receipt):
+        raise ValueError("study manifest requires one complete split receipt")
+    if representation_selection.get("schema_version") != 2:
+        raise ValueError("study manifest requires one frozen representation selection")
+    if representation_selection.get("development_sha256") != split_receipt["development_sha256"]:
+        raise ValueError("representation selection differs from the development split")
+    selected_profile = representation_selection.get("embedding_profile")
+    selected_representation = representation_selection.get("selected_representation")
+    matrix_sha256 = str(representation_selection.get("representation_matrix_sha256") or "")
+    if (
+        selected_representation not in {"generic_title", "applicability_instruction"}
+        or len(matrix_sha256) != 64
+        or not _HEX.fullmatch(matrix_sha256)
+        or float(representation_selection.get("max_distance") or 0) != 0.35
+        or representation_selection.get("reranking") is not False
+        or representation_selection.get("fallback") is not False
+    ):
+        raise ValueError("representation selection differs from the frozen retrieval contract")
+    if (
+        not isinstance(selected_profile, dict)
+        or not selected_profile.get("profile_id")
+        or selected_profile.get("representation") != selected_representation
+        or selected_profile.get("provider") != "gemini"
+        or selected_profile.get("dimensions") != 1024
+        or selected_profile.get("capability") != "semantic"
+        or float(selected_profile.get("max_distance") or 0) != 0.35
+    ):
+        raise ValueError("representation selection has no embedding profile")
+    protocol = construction_protocol()
+    manifest = {
+        "schema_version": 1,
+        "code_sha": code_sha,
+        "corpus": {
+            "schema_version": SCHEMA_VERSION,
+            "protocol_sha256": protocol_sha256(),
+            "models": protocol["models"],
+            "prompt_revisions": protocol["prompt_revisions"],
+            "reviewed_pool_sha256": split_receipt["reviewed_pool_sha256"],
+            "sealed_manifest_sha256": split_receipt["sealed_manifest_sha256"],
+            "beacon": split_receipt["beacon"],
+            "development_sha256": split_receipt["development_sha256"],
+            "protected": split_receipt["protected"],
+            "retired_sha256": split_receipt["retired_sha256"],
+        },
+        "retrieval": {
+            "representation_matrix_sha256": matrix_sha256,
+            "selected_representation": selected_representation,
+            "embedding_profile": selected_profile,
+            "max_distance": representation_selection["max_distance"],
+            "rank_requirement": 1,
+            "reranking": False,
+            "fallback": False,
+        },
+    }
+    manifest["manifest_sha256"] = sha256_hex(canonical_json_bytes(manifest))
+    return manifest
+
+
+def read_study_split(
+    *, manifest: dict[str, Any], split: str, package: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Validate and return one manifest-bound released split for the study runner."""
+
+    if split not in {"development", "pilot", "confirmation"}:
+        raise ValueError("unsupported v4 study split")
+    without_digest = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if manifest.get("manifest_sha256") != sha256_hex(canonical_json_bytes(without_digest)):
+        raise ValueError("study manifest digest differs from its content")
+    if package.get("schema_version") != SCHEMA_VERSION or package.get("split") != split:
+        raise ValueError("released corpus package has an invalid split contract")
+    variants = package.get("variants")
+    if not isinstance(variants, list) or not variants:
+        raise ValueError("released corpus package has no variants")
+    expected_count = {"development": 12, "pilot": 12, "confirmation": 18}[split]
+    if len(variants) != expected_count:
+        raise ValueError("released corpus package is not balanced")
+    if split == "development":
+        expected_sha256 = manifest["corpus"]["development_sha256"]
+        if sha256_hex(canonical_json_bytes(package)) != expected_sha256:
+            raise ValueError("development package differs from the study manifest")
+    else:
+        receipt = manifest["corpus"]["protected"].get(split) or {}
+        if sha256_hex(canonical_json_bytes(package)) != receipt.get("sha256"):
+            raise ValueError("protected package differs from the study manifest")
+    for variant in variants:
+        _validate_released_item(variant, split=split)
+    return json.loads(json.dumps(variants))
+
+
 def load_sealed_reviewed_pool(
     *, archive: EvidenceArchive, receipt: dict[str, Any]
 ) -> tuple[dict[str, Any], datetime]:
@@ -589,12 +707,15 @@ def put_protected_json(
 def _draft_system_prompt() -> str:
     return (
         "Draft one operational incident retrieval challenge as strict JSON. Use only the "
-        "provided deterministic simulator behavior. Write a recurrence scenario, one safe "
-        "lesson that clearly requires diagnosis before recovery, two plausible hard "
-        "distractors, and one unrelated background memory. Do not include IDs, family names, "
-        "action enum names, candidate roles, or commentary. Return exactly these string keys: "
-        "recurrence_query, reference_lesson, unsafe_distractor, ineffective_distractor, "
-        "background_memory."
+        "provided deterministic simulator behavior. Write a distinct source incident summary, "
+        "root cause, bounded resolution action, and observed recovery suitable for normal "
+        "incident consolidation. Separately write a recurrence scenario, one safe reference "
+        "lesson that clearly requires diagnosis before recovery, two plausible hard distractors, "
+        "and one unrelated background memory. Source evidence must state observed facts and must "
+        "not copy the reference lesson. Do not include IDs, family names, action enum names, "
+        "candidate roles, or commentary. Return exactly these string keys: source_summary, "
+        "root_cause, resolution_action, resolution_observation, recurrence_query, "
+        "reference_lesson, unsafe_distractor, ineffective_distractor, background_memory."
     )
 
 
@@ -622,6 +743,10 @@ def _validate_draft(
     *, draft: dict[str, Any], simulator_kind: str, seen_text: set[str]
 ) -> dict[str, Any]:
     fields = {
+        "source_summary",
+        "root_cause",
+        "resolution_action",
+        "resolution_observation",
         "recurrence_query",
         "reference_lesson",
         "unsafe_distractor",
@@ -638,7 +763,13 @@ def _validate_draft(
     if set(normalized.values()) & seen_text:
         raise SlotRejected("draft duplicates existing corpus text")
     query = normalized["recurrence_query"]
-    if _lexical_overlap(query, normalized["reference_lesson"]) > MAX_TARGET_QUERY_OVERLAP:
+    if (
+        max(
+            _lexical_overlap(query, normalized["source_summary"]),
+            _lexical_overlap(query, normalized["reference_lesson"]),
+        )
+        > MAX_TARGET_QUERY_OVERLAP
+    ):
         raise SlotRejected("draft target repeats too much of the incident")
     if (
         max(
@@ -648,8 +779,24 @@ def _validate_draft(
         > MAX_DISTRACTOR_QUERY_OVERLAP
     ):
         raise SlotRejected("draft distractor repeats too much of the incident")
+    source_evidence = "\n".join(
+        normalized[field]
+        for field in (
+            "source_summary",
+            "root_cause",
+            "resolution_action",
+            "resolution_observation",
+        )
+    )
+    if normalized["reference_lesson"] in source_evidence:
+        raise SlotRejected("draft source evidence copies the reference lesson")
     return {
         "simulator_kind": simulator_kind,
+        "source_summary": normalized["source_summary"],
+        "root_cause": normalized["root_cause"],
+        "resolution_action": normalized["resolution_action"],
+        "resolution_observation": normalized["resolution_observation"],
+        "reference_source": REFERENCE_SOURCE,
         "recurrence_query": normalized["recurrence_query"],
         "reference_lesson": normalized["reference_lesson"],
         "context_memories": [
@@ -786,7 +933,12 @@ def _release_item(*, item: dict[str, Any], split: str, public_id: str) -> dict[s
         "split": split,
         "simulator_kind": item["simulator_kind"],
         "recurrence_query": item["recurrence_query"],
+        "source_summary": item["source_summary"],
+        "root_cause": item["root_cause"],
+        "resolution_action": item["resolution_action"],
+        "resolution_observation": item["resolution_observation"],
         "reference_lesson": item["reference_lesson"],
+        "reference_source": item["reference_source"],
         "context_memories": [
             {
                 "context_id": sha256_hex(f"{public_id}\x1f{index}".encode()),
@@ -796,6 +948,48 @@ def _release_item(*, item: dict[str, Any], split: str, public_id: str) -> dict[s
             for index, row in enumerate(item["context_memories"], start=1)
         ],
     }
+
+
+def _validate_released_item(item: dict[str, Any], *, split: str) -> None:
+    required = {
+        "variant_id",
+        "split",
+        "simulator_kind",
+        "recurrence_query",
+        "source_summary",
+        "root_cause",
+        "resolution_action",
+        "resolution_observation",
+        "reference_lesson",
+        "reference_source",
+        "context_memories",
+    }
+    if set(item) != required or item.get("split") != split:
+        raise ValueError("released v4 item has an invalid study contract")
+    if item.get("simulator_kind") not in SIMULATOR_KINDS:
+        raise ValueError("released v4 item has an unsupported simulator")
+    text_fields = required - {"context_memories"}
+    if any(not isinstance(item[field], str) or not item[field].strip() for field in text_fields):
+        raise ValueError("released v4 item has empty evidence")
+    if item["reference_source"] != REFERENCE_SOURCE:
+        raise ValueError("released v4 item has an unsupported reference source")
+    evidence = "\n".join(
+        item[field]
+        for field in (
+            "source_summary",
+            "root_cause",
+            "resolution_action",
+            "resolution_observation",
+        )
+    )
+    if _normalize_text(item["reference_lesson"]) in _normalize_text(evidence):
+        raise ValueError("released source evidence copies the reference lesson")
+    contexts = item["context_memories"]
+    if not isinstance(contexts, list) or len(contexts) != 3:
+        raise ValueError("released v4 item requires exactly three context memories")
+    context_ids = [str(row.get("context_id") or "") for row in contexts]
+    if any(not value for value in context_ids) or len(context_ids) != len(set(context_ids)):
+        raise ValueError("released v4 context identities must be nonempty and unique")
 
 
 def _validate_pool(pool: dict[str, Any]) -> None:
@@ -854,6 +1048,10 @@ def _lexical_overlap(left: str, right: str) -> float:
 
 def _item_normalized_text(item: dict[str, Any]) -> set[str]:
     return {
+        _normalize_text(item["source_summary"]),
+        _normalize_text(item["root_cause"]),
+        _normalize_text(item["resolution_action"]),
+        _normalize_text(item["resolution_observation"]),
         _normalize_text(item["recurrence_query"]),
         _normalize_text(item["reference_lesson"]),
         *(_normalize_text(row["content"]) for row in item["context_memories"]),
@@ -863,7 +1061,14 @@ def _item_normalized_text(item: dict[str, Any]) -> set[str]:
 def _v3_normalized_text(corpus: dict[str, Any]) -> set[str]:
     result = set()
     for row in corpus.get("variants") or []:
-        for field in ("recurrence_query", "reference_lesson"):
+        for field in (
+            "source_summary",
+            "root_cause",
+            "resolution_action",
+            "resolution_observation",
+            "recurrence_query",
+            "reference_lesson",
+        ):
             if row.get(field):
                 result.add(_normalize_text(row[field]))
         for context in row.get("context_memories") or []:

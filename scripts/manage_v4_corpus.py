@@ -20,6 +20,7 @@ from hindsight.v4_corpus import (  # noqa: E402
     DRAFTER_MODEL,
     ADJUDICATOR_MODELS,
     build_review_packet,
+    build_study_manifest,
     construct_pool,
     construction_protocol,
     finalize_review,
@@ -74,6 +75,12 @@ def main() -> int:
     split.add_argument("--kms-key-id", required=True)
     split.add_argument("--development-output", type=pathlib.Path, required=True)
     split.add_argument("--split-receipt", type=pathlib.Path, required=True)
+
+    freeze = subparsers.add_parser("freeze-study")
+    freeze.add_argument("--code-sha", required=True)
+    freeze.add_argument("--split-receipt", type=pathlib.Path, required=True)
+    freeze.add_argument("--representation-selection", type=pathlib.Path, required=True)
+    freeze.add_argument("--output", type=pathlib.Path, required=True)
 
     args = parser.parse_args()
     if args.command == "protocol":
@@ -140,6 +147,17 @@ def main() -> int:
         _write_private_json(args.output, reviewed)
         _print_json({"reviewed_pool_sha256": reviewed["reviewed_pool_sha256"]})
         return 0
+    if args.command == "freeze-study":
+        for path in (args.split_receipt, args.representation_selection, args.output):
+            _require_private_path(path)
+        manifest = build_study_manifest(
+            code_sha=args.code_sha,
+            split_receipt=_load_json(args.split_receipt),
+            representation_selection=_load_json(args.representation_selection),
+        )
+        _write_private_json(args.output, manifest)
+        _print_json({"manifest_sha256": manifest["manifest_sha256"]})
+        return 0
 
     s3 = boto3.client("s3", config=aws_client_config(read_timeout=60, max_attempts=5))
     archive = EvidenceArchive(bucket=args.bucket, client=s3)
@@ -186,6 +204,7 @@ def main() -> int:
 
     _require_private_path(args.receipt)
     _require_private_path(args.beacon)
+    _require_private_path(args.development_output)
     _require_private_path(args.split_receipt)
     reviewed, sealed_at = load_sealed_reviewed_pool(
         archive=archive,
@@ -217,10 +236,7 @@ def main() -> int:
         "split": "development",
         "variants": split_result["development"],
     }
-    args.development_output.write_text(
-        json.dumps(development, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_private_json(args.development_output, development)
     split_receipt = {
         "schema_version": 1,
         "reviewed_pool_sha256": split_result["reviewed_pool_sha256"],
