@@ -76,7 +76,15 @@ export function OperatorAccess({
   );
 }
 
-const phases = ["triage", "recall", "plan", "approval", "reflection"];
+const phases = [
+  { key: "triage", label: "triage" },
+  { key: "recall", label: "recall" },
+  { key: "plan", label: "cited proposal" },
+  { key: "approval", label: "approval" },
+  { key: "action", label: "bounded action" },
+  { key: "observation", label: "observation" },
+  { key: "reflection", label: "reflection" },
+];
 
 const walkthroughSteps = [
   {
@@ -92,7 +100,7 @@ const walkthroughSteps = [
   {
     id: "poison",
     label: "Inject poison",
-    detail: "Add the traced certificate memory that should influence the first decision.",
+    detail: "Add traced retry-amplifying guidance that should influence the first decision.",
   },
   {
     id: "analyze",
@@ -101,8 +109,8 @@ const walkthroughSteps = [
   },
   {
     id: "reject",
-    label: "Reject the bad plan",
-    detail: "Reject the influenced recommendation while retaining it in the audit trail.",
+    label: "Run the bounded action",
+    detail: "Approve the controlled simulator run, then inspect its independent safety result.",
   },
   {
     id: "preview",
@@ -353,12 +361,17 @@ export function OperatorConsole({
 
       <ol id="phaseRail" className="phase-rail" aria-label="Agent run phases">
         {phases.map((phase) => {
-          const complete = eventPhases.has(phase) && phase !== currentPhase;
-          const active = phase === currentPhase && !run?.status.match(/completed|rejected|failed/);
+          const complete = eventPhases.has(phase.key) && phase.key !== currentPhase;
+          const active =
+            phase.key === currentPhase && !run?.status.match(/completed|rejected|failed/);
           return (
-            <li key={phase} data-phase={phase} className={complete ? "complete" : active ? "active" : ""}>
+            <li
+              key={phase.key}
+              data-phase={phase.key}
+              className={complete ? "complete" : active ? "active" : ""}
+            >
               <span aria-hidden="true" />
-              {phase}
+              {phase.label}
             </li>
           );
         })}
@@ -376,9 +389,8 @@ export function OperatorConsole({
           data-operator
           disabled={!operator || busy === "reject"}
           onClick={() => onDecision(false)}
-          {...currentControl("reject")}
         >
-          Reject
+          Reject without running
         </Button>
         <Button
           id="approveRun"
@@ -387,9 +399,9 @@ export function OperatorConsole({
           data-operator
           disabled={!operator || busy === "approve"}
           onClick={() => onDecision(true)}
-          {...currentControl("reanalyze")}
+          {...currentControl(walkthroughStep === "reject" ? "reject" : "reanalyze")}
         >
-          Approve recommendation
+          Approve &amp; run
         </Button>
       </div>
 

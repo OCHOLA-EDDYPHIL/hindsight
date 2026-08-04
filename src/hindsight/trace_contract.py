@@ -108,6 +108,19 @@ def signature_scenario_trace(
                 (session["namespace"],),
             )
             runs = [dict(row) for row in cur.fetchall()]
+            run_events: dict[str, list[dict[str, Any]]] = {}
+            if runs:
+                cur.execute(
+                    """
+                        SELECT run_id, sequence, phase, status, summary, metadata, created_at
+                        FROM agent_run_events
+                        WHERE run_id = ANY(%s)
+                        ORDER BY run_id, sequence
+                    """,
+                    ([run["id"] for run in runs],),
+                )
+                for event in cur.fetchall():
+                    run_events.setdefault(str(event["run_id"]), []).append(dict(event))
             cur.execute(
                 """
                     SELECT id, operation_type, actor, reason, target_timestamp,
@@ -163,6 +176,16 @@ def signature_scenario_trace(
 
         for run in runs:
             run["trace"] = _governed_decision_trace(conn, decision_id=run["decision_id"])
+            run["events"] = run_events.get(str(run["id"]), [])
+            run["action_trace"] = next(
+                (
+                    event["metadata"]["action_trace"]
+                    for event in reversed(run["events"])
+                    if isinstance(event.get("metadata"), dict)
+                    and event["metadata"].get("action_trace")
+                ),
+                None,
+            )
 
         rejected = next((run for run in runs if run["status"] == "rejected"), None)
         corrected = next(

@@ -292,6 +292,11 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
 
 function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "current" }) {
   const historical = mode === "historical";
+  const score = run?.action_trace?.score;
+  const actions = run?.action_trace?.request?.actions || [];
+  const execution = run?.action_trace?.execution;
+  const observations = run?.action_trace?.observations || [];
+  const latestObservation = observations.at(-1);
   return (
     <article className={cn("outcome", historical ? "outcome-historical" : "outcome-current")}>
       <header>
@@ -304,6 +309,35 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
       <PlanSections run={run} primary={!historical} />
+      {execution ? (
+        <div className="action-execution" data-execution-status={execution.status}>
+          <span>Bounded action</span>
+          <strong>{humanStatus(execution.status)}</strong>
+          <span>{execution.tool || "tool identity pending"}</span>
+        </div>
+      ) : null}
+      {score ? (
+        <div
+          className={cn("action-score", score.recovered ? "recovered" : "not-recovered")}
+          data-recovered={String(Boolean(score.recovered))}
+          data-unsafe-action-count={score.unsafe_action_count || 0}
+        >
+          <span>External score</span>
+          <strong>{score.recovered ? "Recovered" : "Not recovered"}</strong>
+          <span>
+            {score.unsafe_action_count || 0} unsafe · {actions.join(" → ") || "No action"}
+          </span>
+        </div>
+      ) : null}
+      {latestObservation ? (
+        <div className="action-observation">
+          <span>Observed result</span>
+          <strong>{latestObservation.detail || "Observation recorded"}</strong>
+          <span>
+            {latestObservation.action || "initial state"} · {latestObservation.recovered ? "recovered" : "not recovered"}
+          </span>
+        </div>
+      ) : null}
       <footer>
         <span>decision</span>
         <IdentifierValue value={run?.decision_id} label={`${mode} decision`} />

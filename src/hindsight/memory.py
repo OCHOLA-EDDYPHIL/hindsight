@@ -36,6 +36,7 @@ from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 MemoryKind = Literal["episodic", "semantic"]
 RetrievalPolicy = Literal["semantic_strict", "semantic_then_keyword"]
+TrustStatus = Literal["active", "review_required"]
 MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS = 3
 RecallMode = Literal[
     "semantic_strict",
@@ -954,6 +955,7 @@ class MemoryStore:
         belief_id: str | None = None,
         previous_version_id: str | None = None,
         transition_kind: Literal["assertion", "supersession", "rewind_reassertion"] = "assertion",
+        trust_status: TrustStatus = "active",
         created_by_operation_id: str | None = None,
         precomputed_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
@@ -971,6 +973,8 @@ class MemoryStore:
             provenance.validate()
             if not namespace or not namespace.strip():
                 raise ProvenanceError("namespace is required")
+            if trust_status not in {"active", "review_required"}:
+                raise ProvenanceError(f"unsupported semantic trust status: {trust_status}")
             memory_id = uuid4()
             resolved_belief_id = belief_id or str(uuid4())
             producer_id = producer_decision_id or f"memory:write:{memory_id}"
@@ -1012,7 +1016,7 @@ class MemoryStore:
                     %s, %s,
                     COALESCE((SELECT max(version_number) + 1 FROM semantic_memories WHERE belief_id = %s), 1),
                     %s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s,
-                    %s, %s, %s, %s, %s, 'complete', 'active', %s
+                    %s, %s, %s, %s, %s, 'complete', %s, %s
                 )
                 RETURNING *
             """
@@ -1033,6 +1037,7 @@ class MemoryStore:
                 content_schema,
                 Jsonb(payload),
                 digest,
+                trust_status,
                 created_by_operation_id,
             )
 
@@ -1572,10 +1577,14 @@ class MemoryStore:
         structured_payload: dict[str, Any],
         provenance: Provenance,
         parent_memory_ids: Iterable[str],
+        guidance_eligible: bool | None = None,
     ) -> dict[str, Any]:
         """Atomically persist a reflection memory and its typed projection."""
 
         embedding, _ = self._prepare_semantic_embedding(content=content)
+        eligible = action_approved if guidance_eligible is None else guidance_eligible
+        if eligible and not action_approved:
+            raise ProvenanceError("unapproved reflection cannot become positive guidance")
         with self._conn.transaction():
             memory = self.write_semantic(
                 namespace=namespace,
@@ -1587,6 +1596,7 @@ class MemoryStore:
                 producer_decision_id=decision_id,
                 parent_memory_ids=parent_memory_ids,
                 precomputed_embedding=embedding,
+                trust_status="active" if eligible else "review_required",
             )
             self.record_agent_reflection(
                 decision_id=decision_id,

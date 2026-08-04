@@ -249,6 +249,8 @@ def _process_tenant_message(
                 for item in recalled
                 if item.get("memory_id") or item.get("id")
             ]
+        if state.get("action_trace"):
+            metadata["action_trace"] = state["action_trace"]
         reflected = state.get("reflected_memory") or {}
         if reflected.get("id"):
             fields["reflected_memory_id"] = reflected["id"]
@@ -325,6 +327,11 @@ def _process_tenant_message(
 
     if result.interrupted:
         interrupt_value = result.interrupt or {}
+        action_trace = (
+            interrupt_value.get("action_trace")
+            if isinstance(interrupt_value, dict)
+            else None
+        )
         return finish_run_attempt(
             run_id=run_id,
             attempt_id=attempt_id,
@@ -337,18 +344,26 @@ def _process_tenant_message(
                 if isinstance(interrupt_value, dict)
                 else result.proposed_action,
             },
+            metadata={"action_trace": action_trace} if action_trace else None,
             db_url=db_url,
         )
 
     reasoning = result.state.get("reasoning") or {}
     approved = bool(result.state.get("action_approved", True))
-    status = "completed" if approved else "rejected"
+    guidance_eligible = bool(result.state.get("guidance_eligible", approved))
+    status = "completed" if approved and guidance_eligible else "rejected"
+    if not approved:
+        summary = "Agent recommendation was rejected"
+    elif not guidance_eligible:
+        summary = "Bounded action outcome was rejected"
+    else:
+        summary = "Agent run completed"
     return finish_run_attempt(
         run_id=run_id,
         attempt_id=attempt_id,
         status=status,
         phase="completion",
-        summary="Agent run completed" if approved else "Agent recommendation was rejected",
+        summary=summary,
         fields={
             "plan": result.plan,
             "proposed_action": result.proposed_action,
@@ -358,6 +373,11 @@ def _process_tenant_message(
             "usage": reasoning.get("usage") or {},
             "reflected_memory_id": result.reflected_memory_id,
         },
+        metadata=(
+            {"action_trace": result.state["action_trace"]}
+            if result.state.get("action_trace")
+            else None
+        ),
         db_url=db_url,
     )
 
@@ -368,7 +388,8 @@ def _phase_summary(phase: str, status: str) -> str:
         "recall": "Relevant memories recalled",
         "plan": "Agent plan generated",
         "approval": "Plan is waiting for operator review",
-        "action": "Operator decision recorded",
+        "action": "Approved bounded action started",
+        "observation": "Bounded action observation recorded",
         "reflection": "Outcome reflected into long-term memory",
     }
     return summaries.get(phase, f"Agent run entered {status.replace('_', ' ')}")

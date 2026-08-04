@@ -163,6 +163,7 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     from hindsight.memory import MemoryStore
     from hindsight.runs import create_run
     from hindsight.trace_contract import signature_scenario_trace
+    from psycopg.types.json import Jsonb
 
     provider = DeterministicEmbeddingProvider()
     fixture_id = uuid4()
@@ -217,6 +218,36 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
                 """,
                 (corrected["id"],),
             )
+            for run, trace in (
+                (
+                    bad,
+                    {
+                        "request": {"id": "action:bad", "actions": ["scale_workers"]},
+                        "score": {"recovered": False, "unsafe_action_count": 1},
+                    },
+                ),
+                (
+                    corrected,
+                    {
+                        "request": {
+                            "id": "action:corrected",
+                            "actions": ["inspect_dependency", "throttle_retries"],
+                        },
+                        "score": {"recovered": True, "unsafe_action_count": 0},
+                    },
+                ),
+            ):
+                conn.execute(
+                    """
+                        INSERT INTO agent_run_events (
+                            run_id, sequence, phase, status, summary, metadata
+                        )
+                        SELECT %s, COALESCE(max(sequence), 0) + 1,
+                               'completion', 'completed', 'Externally scored action', %s
+                        FROM agent_run_events WHERE run_id = %s
+                    """,
+                    (run["id"], Jsonb({"action_trace": trace}), run["id"]),
+                )
             operation = conn.execute(
                 """
                     INSERT INTO memory_operations (
@@ -320,6 +351,20 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert default["stages"]["influenced_decision_id"] == bad["decision_id"]
     assert default["stages"]["rewind_operation_id"] == operation
     assert default["stages"]["corrected_decision_id"] == corrected["decision_id"]
+    bad_trace = next(
+        run for run in default["runs"] if str(run["id"]) == bad["id"]
+    )
+    corrected_trace = next(
+        run for run in default["runs"] if str(run["id"]) == corrected["id"]
+    )
+    assert bad_trace["action_trace"]["score"] == {
+        "recovered": False,
+        "unsafe_action_count": 1,
+    }
+    assert corrected_trace["action_trace"]["score"] == {
+        "recovered": True,
+        "unsafe_action_count": 0,
+    }
     assert next(row for row in default["memories"] if row["id"] == poison["id"])[
         "t_invalid"
     ] is not None

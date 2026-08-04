@@ -230,9 +230,17 @@ def test_operator_can_run_and_explain_signature_workflow():
             in browser.find_element(By.ID, "influenceList").text
         )
         bad_plan = driver.find_element(By.ID, "planText").text
-        assert "certificate" in bad_plan.lower()
-        driver.find_element(By.ID, "rejectRun").click()
+        assert "scale payment workers" in bad_plan.lower()
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
+        driver.find_element(By.ID, "approveRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
+        bad_score = wait.until(
+            expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.not-recovered"))
+        )
+        assert "1 unsafe" in bad_score.text
+        assert "amplified unresolved upstream pressure" in driver.find_element(
+            By.CSS_SELECTOR, ".action-observation"
+        ).text
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "3 live · 0 invalid"
@@ -284,9 +292,14 @@ def test_operator_can_run_and_explain_signature_workflow():
         assert "Poisoned memory" not in driver.find_element(By.ID, "influenceList").text
         corrected_plan = driver.find_element(By.ID, "planText").text
         assert "retry" in corrected_plan.lower()
-        assert "certificate" not in corrected_plan.lower()
+        assert "scale payment workers" not in corrected_plan.lower()
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score.recovered")
         driver.find_element(By.ID, "approveRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
+        corrected_score = wait.until(
+            expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.recovered"))
+        )
+        assert "0 unsafe" in corrected_score.text
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text
             == "2 live · 2 invalid"
@@ -428,7 +441,7 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     with connect(database_url(), application_name="hindsight-browser-signature") as conn:
         run_rows = conn.execute(
             """
-                SELECT run.id, run.decision_id, run.status, run.plan,
+                SELECT run.id, run.decision_id, run.status, run.plan, run.proposed_action,
                        run.reflected_memory_id, read.id, read.memory_id,
                        memory.writer, read.rank, read.distance
                 FROM agent_runs AS run
@@ -436,6 +449,16 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
                 LEFT JOIN semantic_memories AS memory ON memory.id = read.semantic_memory_id
                 WHERE run.namespace = %s
                 ORDER BY run.created_at, read.rank
+            """,
+            (namespace,),
+        ).fetchall()
+        event_rows = conn.execute(
+            """
+                SELECT event.run_id, event.metadata
+                FROM agent_run_events AS event
+                JOIN agent_runs AS run ON run.id = event.run_id
+                WHERE run.namespace = %s
+                ORDER BY event.run_id, event.sequence
             """,
             (namespace,),
         ).fetchall()
@@ -458,30 +481,42 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
                 "decision_id": row[1],
                 "status": row[2],
                 "plan": row[3],
-                "reflected_memory_id": str(row[4]) if row[4] else None,
+                "proposed_action": row[4],
+                "reflected_memory_id": str(row[5]) if row[5] else None,
                 "reads": [],
             },
         )
-        if row[5] is not None:
+        if row[6] is not None:
             run["reads"].append(
                 {
-                    "read_id": str(row[5]),
-                    "memory_id": str(row[6]),
-                    "writer": row[7],
-                    "rank": row[8],
-                    "distance": row[9],
+                    "read_id": str(row[6]),
+                    "memory_id": str(row[7]),
+                    "writer": row[8],
+                    "rank": row[9],
+                    "distance": row[10],
                 }
             )
+    for run_id, metadata in event_rows:
+        action_trace = (metadata or {}).get("action_trace")
+        if action_trace and str(run_id) in grouped:
+            grouped[str(run_id)]["action_trace"] = action_trace
 
     runs = list(grouped.values())
     assert len(runs) == 2
     bad, corrected = runs
     assert bad["status"] == "rejected"
-    assert "certificate" in bad["plan"].lower()
+    assert "scale payment workers" in bad["proposed_action"].lower()
+    assert bad["action_trace"]["score"] == {
+        "recovered": False,
+        "unsafe_action_count": 1,
+    }
     assert any(read["writer"] == "demo.poison" for read in bad["reads"])
     assert corrected["status"] == "completed"
     assert "retry" in corrected["plan"].lower()
-    assert "certificate" not in corrected["plan"].lower()
+    assert corrected["action_trace"]["score"] == {
+        "recovered": True,
+        "unsafe_action_count": 0,
+    }
     assert any(read["writer"] == "demo.seed" for read in corrected["reads"])
     assert all(read["writer"] != "demo.poison" for read in corrected["reads"])
     assert operation is not None and operation[2] == "completed"

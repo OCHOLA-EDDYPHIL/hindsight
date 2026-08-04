@@ -589,7 +589,7 @@ export function useCockpit() {
         body: JSON.stringify({ namespace: namespaceRef.current }),
       });
       await loadSnapshot();
-      announce("Poisoned certificate memory inserted with provenance.");
+      announce("Poisoned retry-amplifying memory inserted with provenance.");
     } catch (error) {
       announce(`Poison injection failed: ${(error as Error).message}`, "error");
     } finally {

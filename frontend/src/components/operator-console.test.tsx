@@ -63,6 +63,34 @@ describe("operator separation", () => {
     expect(screen.getByRole("button", { name: "Execute rewind" })).toBeEnabled();
   });
 
+  it("shows the complete governed action and observation sequence", () => {
+    render(
+      <OperatorConsole
+        {...props}
+        operator
+        run={{
+          id: "run-1",
+          status: "reflecting",
+          events: [
+            { phase: "triage" },
+            { phase: "recall" },
+            { phase: "plan" },
+            { phase: "approval" },
+            { phase: "action" },
+            { phase: "observation" },
+            { phase: "reflection" },
+          ],
+        }}
+      />,
+    );
+
+    const rail = screen.getByRole("list", { name: "Agent run phases" });
+    expect(rail.querySelectorAll("li")).toHaveLength(7);
+    expect(screen.getByText("cited proposal")).toBeVisible();
+    expect(screen.getByText("bounded action")).toBeVisible();
+    expect(screen.getByText("observation")).toBeVisible();
+  });
+
   it("keeps the walkthrough optional and never invokes mutation callbacks", () => {
     render(<OperatorConsole {...props} operator />);
 
