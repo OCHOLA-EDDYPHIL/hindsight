@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from collections.abc import Callable
+import json
 from typing import Any, NotRequired, TypedDict
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ from hindsight.db import TenantConnection, connect, database_url, database_url_w
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
+from hindsight.simulator import score_action_sequence
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 from hindsight.tenant import current_tenant_id
 
@@ -115,6 +117,7 @@ class IncidentAgentState(TypedDict, total=False):
     plan: str
     reasoning: dict[str, Any]
     proposed_action: str
+    action_trace: NotRequired[dict[str, Any]]
     action_approved: bool
     reflected_memory: dict[str, Any]
     retrieval_id: NotRequired[str | None]
@@ -326,8 +329,10 @@ def build_incident_graph(
                 ReasoningRequest(
                     system=(
                         "You are Hindsight, an incident-response copilot. "
-                        "Use recalled memories as context, but propose only reversible, "
-                        "operator-reviewable remediation steps."
+                        "Use only memories whose usage_instruction is positive_guidance. "
+                        "Treat audit_only and negative_example memories as evidence, never "
+                        "as recommendations. Propose only reversible, operator-reviewable "
+                        "remediation steps."
                     ),
                     prompt=_plan_prompt(state),
                     max_output_tokens=512,
@@ -358,6 +363,7 @@ def build_incident_graph(
 
     def act(state: IncidentAgentState) -> dict[str, Any]:
         proposed_action = _proposed_action(state)
+        action_trace = _bounded_action_trace(state)
         approved = True
         if state.get("pause_before_act"):
             _report_progress(
@@ -373,11 +379,21 @@ def build_incident_graph(
                         "thread_id": state["thread_id"],
                         "incident_id": state["incident_id"],
                         "proposed_action": proposed_action,
+                        "action_trace": action_trace,
                     }
                 )
             )
+        if action_trace:
+            action_trace = {
+                **action_trace,
+                "approval": {
+                    "approved": approved,
+                    "disposition": "approved" if approved else "rejected",
+                },
+            }
         update = {
             "proposed_action": proposed_action,
+            "action_trace": action_trace,
             "action_approved": approved,
         }
         _report_progress(progress_callback, "action", "reflecting", state, update)
@@ -415,6 +431,7 @@ def build_incident_graph(
                     "action_approved": bool(state.get("action_approved")),
                     "retrieval_id": state.get("retrieval_id"),
                     "recalled_memory_ids": parent_memory_ids,
+                    "action_trace": state.get("action_trace") or {},
                 }
                 memory = store.remember_agent_reflection(
                     decision_id=state["decision_id"],
@@ -438,6 +455,17 @@ def build_incident_graph(
                         "service_slug": state.get("service_slug"),
                         "recalled_memory_ids": parent_memory_ids,
                         "action_approved": state.get("action_approved", False),
+                        "operator_disposition": (
+                            "approved" if state.get("action_approved") else "rejected"
+                        ),
+                        "usage_instruction": (
+                            "positive_guidance"
+                            if state.get("action_approved")
+                            else "audit_only"
+                        ),
+                        "kind": "incident_reflection",
+                        "evidence_quality": "operator_reviewed",
+                        "action_trace": state.get("action_trace") or {},
                     },
                     structured_payload=structured_payload,
                     parent_memory_ids=parent_memory_ids,
@@ -673,12 +701,8 @@ def _plan_prompt(state: IncidentAgentState) -> str:
     recalled = state.get("recalled_memories", [])
     memory_lines = []
     for idx, memory in enumerate(recalled, start=1):
-        content = memory.get("memory_content") or memory.get("content") or ""
-        incident = memory.get("incident_slug")
-        prefix = f"{idx}. "
-        if incident:
-            prefix += f"[{incident}] "
-        memory_lines.append(prefix + str(content))
+        envelope = _governed_guidance_envelope(memory)
+        memory_lines.append(f"{idx}. {json.dumps(envelope, sort_keys=True)}")
     if not memory_lines:
         memory_lines.append("No prior memories were recalled.")
 
@@ -698,12 +722,106 @@ def _plan_prompt(state: IncidentAgentState) -> str:
     )
 
 
+def _governed_guidance_envelope(memory: dict[str, Any]) -> dict[str, Any]:
+    metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+    payload = (
+        memory.get("structured_payload")
+        if isinstance(memory.get("structured_payload"), dict)
+        else {}
+    )
+    action_approved = payload.get("action_approved")
+    if isinstance(action_approved, bool):
+        disposition = "approved" if action_approved else "rejected"
+    else:
+        disposition = str(metadata.get("operator_disposition") or "unreviewed")
+    trust = str(memory.get("trust_status") or "review_required")
+    usage_instruction = str(
+        metadata.get("usage_instruction")
+        or (
+            "audit_only"
+            if trust != "active" or disposition == "rejected"
+            else "positive_guidance"
+        )
+    )
+    return {
+        "memory_id": str(memory.get("id") or memory.get("memory_id") or ""),
+        "belief_id": str(memory.get("belief_id") or ""),
+        "version": memory.get("version_number"),
+        "content": str(memory.get("memory_content") or memory.get("content") or ""),
+        "kind": str(
+            metadata.get("kind")
+            or (
+                "incident_reflection"
+                if memory.get("content_schema") == "agent_reflection.v1"
+                else "procedural_lesson"
+            )
+        ),
+        "status": "review_required" if trust != "active" else "active",
+        "trust": trust,
+        "transition": str(memory.get("transition_kind") or "assertion"),
+        "operator_disposition": disposition,
+        "evidence_quality": str(metadata.get("evidence_quality") or "provenance_only"),
+        "evidence": [
+            {
+                "writer": str(memory.get("writer") or ""),
+                "source_ref": str(memory.get("source_ref") or ""),
+                "justification": str(memory.get("justification") or ""),
+            }
+        ],
+        "usage_instruction": usage_instruction,
+    }
+
+
 def _proposed_action(state: IncidentAgentState) -> str:
+    actions = _signature_actions(state)
+    if actions == ("scale_workers",):
+        return "Scale payment workers while retry fanout remains elevated."
+    if actions == ("inspect_dependency", "throttle_retries"):
+        return "Inspect downstream processor health, then throttle retry fanout."
     service = state.get("service_slug") or "affected service"
     plan = (state.get("plan") or "").strip()
     if plan:
         return f"Review and execute the safest reversible step for {service}: {plan}"
     return f"Review telemetry for {service} and prepare a reversible mitigation."
+
+
+def _signature_actions(state: IncidentAgentState) -> tuple[str, ...]:
+    if not state.get("namespace", "").startswith("demo:payments-poison-rewind"):
+        return ()
+    poisoned = any(
+        isinstance(memory.get("metadata"), dict)
+        and memory["metadata"].get("role") == "poison"
+        for memory in state.get("recalled_memories", [])
+    )
+    return ("scale_workers",) if poisoned else ("inspect_dependency", "throttle_retries")
+
+
+def _bounded_action_trace(state: IncidentAgentState) -> dict[str, Any]:
+    actions = _signature_actions(state)
+    if not actions:
+        return {}
+    scored = score_action_sequence(actions)
+    run_id = state["run_id"]
+    return {
+        "schema_version": 1,
+        "request": {
+            "id": f"action:{run_id}:request",
+            "mode": "bounded_deterministic_simulator",
+            "actions": list(actions),
+        },
+        "initial_observation": {
+            "id": f"observation:{run_id}:initial",
+            **scored["initial_observation"],
+        },
+        "observations": [
+            {"id": f"observation:{run_id}:{index}", **observation}
+            for index, observation in enumerate(scored["observations"], start=1)
+        ],
+        "score": {
+            "recovered": scored["recovered"],
+            "unsafe_action_count": scored["unsafe_action_count"],
+        },
+    }
 
 
 def _reflection_content(state: IncidentAgentState) -> str:

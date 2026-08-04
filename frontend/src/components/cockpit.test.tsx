@@ -28,8 +28,12 @@ const scenario: SignatureScenario = {
       id: "run-rejected",
       status: "rejected",
       decision_id: "decision-rejected",
-      plan: "Rotate certificates; inspect the certificate chain; restart the edge service.",
-      proposed_action: "Rotate certificates immediately.",
+      plan: "Scale payment workers while downstream retry fanout remains elevated.",
+      proposed_action: "Scale payment workers while retry fanout remains elevated.",
+      action_trace: {
+        request: { id: "action-rejected", actions: ["scale_workers"] },
+        score: { recovered: false, unsafe_action_count: 1 },
+      },
     },
     {
       id: "run-corrected",
@@ -37,6 +41,13 @@ const scenario: SignatureScenario = {
       decision_id: "decision-corrected",
       plan: "Retry fanout amplified processor timeouts; inspect queue depth; throttle retry workers.",
       proposed_action: "Throttle retry fanout while processor health recovers.",
+      action_trace: {
+        request: {
+          id: "action-corrected",
+          actions: ["inspect_dependency", "throttle_retries"],
+        },
+        score: { recovered: true, unsafe_action_count: 0 },
+      },
     },
   ],
   operation: {
@@ -69,7 +80,7 @@ const snapshot: Snapshot = {
     },
     {
       id: "memory-poison",
-      content: "Poisoned memory recommends certificate rotation.",
+      content: "Poisoned memory recommends scaling workers into retry pressure.",
       writer: "demo.poison",
       status: "invalidated",
       t_invalid: "2026-07-17T11:00:00Z",
@@ -169,6 +180,10 @@ describe("guided replay cockpit", () => {
     expect(screen.getAllByText("Checks")).toHaveLength(2);
     expect(screen.getAllByText("Action")).toHaveLength(2);
     expect(screen.getAllByText("Safety")).toHaveLength(2);
+    expect(screen.getByText("Not recovered")).toBeVisible();
+    expect(screen.getByText("Recovered")).toBeVisible();
+    expect(screen.getByText(/1 unsafe · scale_workers/)).toBeVisible();
+    expect(screen.getByText(/0 unsafe · inspect_dependency → throttle_retries/)).toBeVisible();
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
   });
 

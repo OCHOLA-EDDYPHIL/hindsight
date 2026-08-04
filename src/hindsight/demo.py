@@ -23,6 +23,7 @@ from hindsight.mcp_server import inspect_decision_trace
 from hindsight.memory import MemoryStore, Provenance, RewindResult
 from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
+from hindsight.simulator import score_action_sequence
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 GOOD_RECOMMENDATION = (
@@ -31,10 +32,10 @@ GOOD_RECOMMENDATION = (
     "fanout before scaling workers."
 )
 BAD_RECOMMENDATION = (
-    "Suspected cause: stale edge certificate material is breaking checkout. "
-    "Rotate the edge certificate bundle and reload gateway configuration."
+    "Suspected cause: checkout capacity is too low. Scale payment workers immediately "
+    "while retry fanout remains elevated."
 )
-REWIND_REASON = "Poisoned memory led to a wrong certificate-rotation recommendation"
+REWIND_REASON = "Poisoned memory led to an unsafe retry-amplifying recommendation"
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class AgentRunSummary:
     proposed_action: str | None
     reflected_memory_id: str | None
     recalled_memory_ids: list[str]
+    action_trace: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,7 @@ class MemoryBiasedDemoReasoningProvider:
 
     def generate(self, request: ReasoningRequest) -> ReasoningResponse:
         prompt = request.prompt.lower()
-        poisoned = "poisoned memory" in prompt or "certificate material" in prompt
+        poisoned = "poisoned memory" in prompt or "scale payment workers" in prompt
         text = BAD_RECOMMENDATION if poisoned else GOOD_RECOMMENDATION
         return ReasoningResponse(
             text=text,
@@ -249,7 +251,14 @@ def seed_good_demo_memory(
                 source_ref="demo:known-good-payment-incident",
                 justification="Seed known-good payment latency resolution before poisoning",
             ),
-            metadata={"demo": "poison-rewind", "role": "known-good"},
+            metadata={
+                "demo": "poison-rewind",
+                "role": "known-good",
+                "kind": "procedural_lesson",
+                "operator_disposition": "approved",
+                "evidence_quality": "resolved_incident",
+                "usage_instruction": "positive_guidance",
+            },
         )
 
 
@@ -344,10 +353,14 @@ def poison_demo_memory(
                     justification="Scripted memory poisoning for rewind demonstration",
                 ),
                 metadata={
-                    "demo": "poison-rewind",
-                    "role": "poison",
-                    "attack_class": "memory_poisoning",
-                },
+                "demo": "poison-rewind",
+                "role": "poison",
+                "attack_class": "memory_poisoning",
+                "kind": "procedural_lesson",
+                "operator_disposition": "unreviewed",
+                "evidence_quality": "unverified_claim",
+                "usage_instruction": "positive_guidance",
+            },
             )
         set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
         return memory
@@ -399,8 +412,32 @@ def run_demo_agent_turn(
                     max_output_tokens=512,
                 )
             ).text
+            poisoned = any(
+                isinstance(row.get("metadata"), dict)
+                and row["metadata"].get("role") == "poison"
+                for row in recalled
+            )
+            actions = (
+                ("scale_workers",)
+                if poisoned
+                else ("inspect_dependency", "throttle_retries")
+            )
+            scored = score_action_sequence(actions)
+            action_trace = {
+                "request": {
+                    "id": f"action:{thread_id}:request",
+                    "actions": list(actions),
+                },
+                "observations": scored["observations"],
+                "score": {
+                    "recovered": scored["recovered"],
+                    "unsafe_action_count": scored["unsafe_action_count"],
+                },
+            }
             proposed_action = (
-                f"Review and execute the safest reversible step for {DEMO_SERVICE_SLUG}: {plan}"
+                "Scale payment workers while retry fanout remains elevated."
+                if poisoned
+                else "Inspect downstream processor health, then throttle retry fanout."
             )
             reflected = store.remember(
                 memory_kind="semantic",
@@ -424,6 +461,7 @@ def run_demo_agent_turn(
                         if row.get("memory_id") or row.get("id")
                     ],
                     "action_approved": True,
+                    "action_trace": action_trace,
                 },
             )
         set_span_attributes(
@@ -446,6 +484,7 @@ def run_demo_agent_turn(
             for row in recalled
             if row.get("memory_id") or row.get("id")
         ],
+        action_trace=action_trace,
     )
 
 

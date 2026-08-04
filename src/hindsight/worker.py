@@ -249,6 +249,8 @@ def _process_tenant_message(
                 for item in recalled
                 if item.get("memory_id") or item.get("id")
             ]
+        if state.get("action_trace"):
+            metadata["action_trace"] = state["action_trace"]
         reflected = state.get("reflected_memory") or {}
         if reflected.get("id"):
             fields["reflected_memory_id"] = reflected["id"]
@@ -325,6 +327,11 @@ def _process_tenant_message(
 
     if result.interrupted:
         interrupt_value = result.interrupt or {}
+        action_trace = (
+            interrupt_value.get("action_trace")
+            if isinstance(interrupt_value, dict)
+            else None
+        )
         return finish_run_attempt(
             run_id=run_id,
             attempt_id=attempt_id,
@@ -337,6 +344,7 @@ def _process_tenant_message(
                 if isinstance(interrupt_value, dict)
                 else result.proposed_action,
             },
+            metadata={"action_trace": action_trace} if action_trace else None,
             db_url=db_url,
         )
 
@@ -358,6 +366,11 @@ def _process_tenant_message(
             "usage": reasoning.get("usage") or {},
             "reflected_memory_id": result.reflected_memory_id,
         },
+        metadata=(
+            {"action_trace": result.state["action_trace"]}
+            if result.state.get("action_trace")
+            else None
+        ),
         db_url=db_url,
     )
 

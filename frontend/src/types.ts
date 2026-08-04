@@ -121,6 +121,29 @@ export interface Run {
   completed_at?: string | null;
   events?: Array<{ phase: string; created_at?: string }>;
   trace?: DecisionTrace | null;
+  action_trace?: {
+    schema_version?: number;
+    request?: {
+      id?: Identifier;
+      mode?: string;
+      actions?: string[];
+    };
+    observations?: Array<{
+      id?: Identifier;
+      action?: string;
+      unsafe?: boolean;
+      recovered?: boolean;
+      detail?: string;
+    }>;
+    score?: {
+      recovered?: boolean;
+      unsafe_action_count?: number;
+    };
+    approval?: {
+      approved?: boolean;
+      disposition?: string;
+    };
+  } | null;
 }
 
 export interface MemoryRecord {

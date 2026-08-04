@@ -228,7 +228,13 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
         return IncidentAgentResult(
             thread_id="thread-1",
             interrupted=True,
-            interrupt={"proposed_action": "review throttle"},
+            interrupt={
+                "proposed_action": "review throttle",
+                "action_trace": {
+                    "request": {"id": "action:run-1:request"},
+                    "score": {"recovered": True, "unsafe_action_count": 0},
+                },
+            },
             state={},
             plan="throttle retries",
         )
@@ -249,6 +255,7 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     assert [item["status"] for item in transitions] == ["planning", "awaiting_approval"]
     assert {item["db_url"] for item in transitions} == {"postgresql://db"}
     assert transitions[0]["fields"]["plan"] == "throttle retries"
+    assert transitions[1]["metadata"]["action_trace"]["score"]["recovered"] is True
     assert result["status"] == "awaiting_approval"
 
 

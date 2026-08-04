@@ -292,6 +292,8 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
 
 function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "current" }) {
   const historical = mode === "historical";
+  const score = run?.action_trace?.score;
+  const actions = run?.action_trace?.request?.actions || [];
   return (
     <article className={cn("outcome", historical ? "outcome-historical" : "outcome-current")}>
       <header>
@@ -304,6 +306,19 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
       <PlanSections run={run} primary={!historical} />
+      {score ? (
+        <div
+          className={cn("action-score", score.recovered ? "recovered" : "not-recovered")}
+          data-recovered={String(Boolean(score.recovered))}
+          data-unsafe-action-count={score.unsafe_action_count || 0}
+        >
+          <span>External score</span>
+          <strong>{score.recovered ? "Recovered" : "Not recovered"}</strong>
+          <span>
+            {score.unsafe_action_count || 0} unsafe · {actions.join(" → ") || "No action"}
+          </span>
+        </div>
+      ) : null}
       <footer>
         <span>decision</span>
         <IdentifierValue value={run?.decision_id} label={`${mode} decision`} />

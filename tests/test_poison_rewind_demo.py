@@ -28,6 +28,10 @@ def test_poison_rewind_demo_runs_bad_trace_rewind_and_corrected_turn():
     assert result.namespace.startswith(f"{namespace}:session:")
     assert result.clean_run.plan == GOOD_RECOMMENDATION
     assert result.bad_run.plan == BAD_RECOMMENDATION
+    assert result.bad_run.action_trace["score"] == {
+        "recovered": False,
+        "unsafe_action_count": 1,
+    }
     assert str(result.poison_memory["id"]) in result.bad_run.recalled_memory_ids
     assert result.diagnosis["decision_id"] == result.bad_run.decision_id
     assert any(
@@ -42,6 +46,10 @@ def test_poison_rewind_demo_runs_bad_trace_rewind_and_corrected_turn():
     assert str(result.poison_memory["id"]) in invalidated_ids
     assert result.bad_run.reflected_memory_id in invalidated_ids
     assert result.corrected_run.plan == GOOD_RECOMMENDATION
+    assert result.corrected_run.action_trace["score"] == {
+        "recovered": True,
+        "unsafe_action_count": 0,
+    }
     assert str(result.poison_memory["id"]) not in result.corrected_run.recalled_memory_ids
 
     with MemoryStore(url=database_url()) as store:

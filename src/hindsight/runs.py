@@ -395,6 +395,15 @@ def _read_run(*, run_id: str | UUID, db_url: str | None) -> dict[str, Any] | Non
                 (run_id,),
             )
             run["events"] = [dict(item) for item in cur.fetchall()]
+            run["action_trace"] = next(
+                (
+                    event["metadata"]["action_trace"]
+                    for event in reversed(run["events"])
+                    if isinstance(event.get("metadata"), dict)
+                    and event["metadata"].get("action_trace")
+                ),
+                None,
+            )
             return _jsonable(run)
 
 

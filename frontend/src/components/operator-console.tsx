@@ -92,7 +92,7 @@ const walkthroughSteps = [
   {
     id: "poison",
     label: "Inject poison",
-    detail: "Add the traced certificate memory that should influence the first decision.",
+    detail: "Add traced retry-amplifying guidance that should influence the first decision.",
   },
   {
     id: "analyze",

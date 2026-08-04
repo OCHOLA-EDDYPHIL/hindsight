@@ -57,6 +57,66 @@ def test_async_sqlalchemy_url_uses_async_psycopg_driver():
     )
 
 
+def test_reasoning_prompt_uses_typed_governance_envelopes():
+    from hindsight.agent import _plan_prompt
+
+    prompt = _plan_prompt(
+        {
+            "incident_id": "incident-1",
+            "namespace": "namespace-1",
+            "user_input": "checkout latency",
+            "recalled_memories": [
+                {
+                    "id": "memory-1",
+                    "belief_id": "belief-1",
+                    "version_number": 2,
+                    "content": "Throttle retries after inspecting the dependency.",
+                    "content_schema": "semantic.v1",
+                    "transition_kind": "supersession",
+                    "trust_status": "active",
+                    "writer": "operator",
+                    "source_ref": "incident:resolved",
+                    "justification": "Resolved incident evidence",
+                    "metadata": {
+                        "operator_disposition": "approved",
+                        "evidence_quality": "resolved_incident",
+                        "usage_instruction": "positive_guidance",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert '"operator_disposition": "approved"' in prompt
+    assert '"transition": "supersession"' in prompt
+    assert '"usage_instruction": "positive_guidance"' in prompt
+    assert '"evidence_quality": "resolved_incident"' in prompt
+
+
+def test_signature_action_scoring_is_bounded_and_memory_causal():
+    from hindsight.agent import _bounded_action_trace
+
+    base = {
+        "run_id": "run-1",
+        "namespace": "demo:payments-poison-rewind:session:test",
+    }
+    corrected = _bounded_action_trace({**base, "recalled_memories": []})
+    poisoned = _bounded_action_trace(
+        {
+            **base,
+            "recalled_memories": [{"metadata": {"role": "poison"}}],
+        }
+    )
+
+    assert corrected["request"]["actions"] == [
+        "inspect_dependency",
+        "throttle_retries",
+    ]
+    assert corrected["score"] == {"recovered": True, "unsafe_action_count": 0}
+    assert poisoned["request"]["actions"] == ["scale_workers"]
+    assert poisoned["score"] == {"recovered": False, "unsafe_action_count": 1}
+
+
 def test_recall_does_not_silently_fall_back_after_vector_error(monkeypatch):
     import hindsight.agent as agent
     from hindsight.embeddings import DeterministicEmbeddingProvider
@@ -473,6 +533,55 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
     assert len(checkpoint_rows) >= 2
     assert [row[1] for row in chat_rows] == ["human", "ai"]
     assert "roll back the deploy candidate" in chat_rows[1][2]
+
+
+@requires_db
+def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
+    from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore
+    from hindsight.reasoning import DeterministicReasoningProvider
+
+    thread_id = f"agent-rejected-{uuid4()}"
+    namespace = f"agent-rejected-test-{uuid4()}"
+    provider = DeterministicEmbeddingProvider()
+    first = run_incident_agent(
+        IncidentInput(
+            user_input="search-api error rate spiked after the deploy",
+            incident_id=f"incident-{uuid4()}",
+            namespace=namespace,
+            service_slug="search-api",
+        ),
+        thread_id=thread_id,
+        pause_before_act=True,
+        reasoning_provider=DeterministicReasoningProvider(
+            response_text="roll back the deploy candidate and verify error rate"
+        ),
+        embedding_provider=provider,
+    )
+    assert first.interrupted
+
+    rejected = resume_incident_agent(
+        thread_id=thread_id,
+        approved=False,
+        embedding_provider=provider,
+    )
+    memory_id = str(rejected.reflected_memory_id)
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        audit = store.audit_memory(memory_kind="semantic", memory_id=memory_id)
+        result = store.retrieve_semantic(
+            namespace=namespace,
+            query="roll back deploy candidate",
+            decision_id=f"rejected-retrieval:{uuid4()}",
+            reader="pytest",
+            purpose="prove rejected reflections are not positive guidance",
+        )
+
+    assert audit is not None
+    assert audit["trust_status"] == "review_required"
+    assert audit["structured_payload"]["action_approved"] is False
+    assert memory_id not in {str(hit["id"]) for hit in result.hits}
 
 
 @requires_db

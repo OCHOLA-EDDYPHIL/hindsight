@@ -26,7 +26,7 @@ def test_memory_biased_demo_reasoning_changes_recommendation_from_prompt():
 
     clean = provider.generate(ReasoningRequest(prompt="Recalled memories:\nretry fanout"))
     poisoned = provider.generate(
-        ReasoningRequest(prompt="Recalled memories:\nPoisoned memory: certificate material")
+        ReasoningRequest(prompt="Recalled memories:\nPoisoned memory: scale payment workers")
     )
 
     assert clean.text == GOOD_RECOMMENDATION
