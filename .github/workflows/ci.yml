@@ -180,17 +180,33 @@ jobs:
           fresh_url="postgresql://root@localhost:26257/hindsight_fresh_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
           populated_url="postgresql://root@localhost:26257/hindsight_populated_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
 
-          DATABASE_URL="$fresh_url" uv run python scripts/migrate.py
-          DATABASE_URL="$fresh_url" uv run python scripts/initialize_agent_storage.py
+          (
+            DATABASE_URL="$fresh_url" uv run python scripts/migrate.py
+            DATABASE_URL="$fresh_url" uv run python scripts/initialize_agent_storage.py
+          ) >build/schema/fresh.log 2>&1 &
+          fresh_pid=$!
+          (
+            DATABASE_URL="$populated_url" uv run python scripts/migrate.py \
+              --through 0018_agent_run_attempt_fencing.sql
+            DATABASE_URL="$populated_url" uv run python scripts/populated_upgrade_fixture.py seed
+            DATABASE_URL="$populated_url" uv run python scripts/migrate.py
+            DATABASE_URL="$populated_url" uv run python scripts/initialize_agent_storage.py
+            DATABASE_URL="$populated_url" uv run python scripts/populated_upgrade_fixture.py verify
+          ) >build/schema/populated.log 2>&1 &
+          populated_pid=$!
+
+          set +e
+          wait "$fresh_pid"
+          fresh_status=$?
+          wait "$populated_pid"
+          populated_status=$?
+          set -e
+          cat build/schema/fresh.log build/schema/populated.log
+          test "$fresh_status" -eq 0
+          test "$populated_status" -eq 0
+
           DATABASE_URL="$fresh_url" uv run python scripts/schema_manifest.py export \
             --apply-roles --output build/schema/fresh.json
-
-          DATABASE_URL="$populated_url" uv run python scripts/migrate.py \
-            --through 0018_agent_run_attempt_fencing.sql
-          DATABASE_URL="$populated_url" uv run python scripts/populated_upgrade_fixture.py seed
-          DATABASE_URL="$populated_url" uv run python scripts/migrate.py
-          DATABASE_URL="$populated_url" uv run python scripts/initialize_agent_storage.py
-          DATABASE_URL="$populated_url" uv run python scripts/populated_upgrade_fixture.py verify
           DATABASE_URL="$populated_url" uv run python scripts/schema_manifest.py export \
             --apply-roles --output build/schema/populated.json
 

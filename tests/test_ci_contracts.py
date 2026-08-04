@@ -130,6 +130,22 @@ def test_historical_migrations_share_one_manual_container():
     assert "matrix" not in job.get("strategy", {})
 
 
+def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    main_job = workflow["jobs"]["main_qualification"]
+    schema_step = next(
+        step
+        for step in main_job["steps"]
+        if step.get("name") == "Verify populated upgrade and schema parity"
+    )
+
+    assert "fresh_pid=$!" in schema_step["run"]
+    assert "populated_pid=$!" in schema_step["run"]
+    assert 'wait "$fresh_pid"' in schema_step["run"]
+    assert 'wait "$populated_pid"' in schema_step["run"]
+    assert "scripts/schema_manifest.py compare" in schema_step["run"]
+
+
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):
     migrate = _load_script("migrate")
     for name in ("0001_one.sql", "0002_two.sql", "0003_three.sql"):
