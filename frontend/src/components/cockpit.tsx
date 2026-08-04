@@ -293,7 +293,8 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
 function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "current" }) {
   const historical = mode === "historical";
   const score = run?.action_trace?.score;
-  const actions = run?.action_trace?.request?.actions || [];
+  const request = run?.action_trace?.request;
+  const actions = request?.actions || [];
   const execution = run?.action_trace?.execution;
   const observations = run?.action_trace?.observations || [];
   const latestObservation = observations.at(-1);
@@ -309,12 +310,16 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
       <PlanSections run={run} primary={!historical} />
-      {execution ? (
-        <div className="action-execution" data-execution-status={execution.status}>
+      {request ? (
+        <div
+          className="action-execution"
+          data-execution-status={execution?.status || "awaiting_approval"}
+        >
           <span>Bounded action</span>
-          <strong>{humanStatus(execution.status)}</strong>
+          <strong>{humanStatus(execution?.status || "awaiting_approval")}</strong>
           <span>
-            {execution.tool || "tool identity pending"} · {actions.join(" → ") || "action pending"}
+            {request.tool || execution?.tool || "tool identity pending"} ·{" "}
+            {actions.join(" → ") || "action pending"}
           </span>
         </div>
       ) : null}
