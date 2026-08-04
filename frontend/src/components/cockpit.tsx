@@ -313,7 +313,9 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
         <div className="action-execution" data-execution-status={execution.status}>
           <span>Bounded action</span>
           <strong>{humanStatus(execution.status)}</strong>
-          <span>{execution.tool || "tool identity pending"}</span>
+          <span>
+            {execution.tool || "tool identity pending"} · {actions.join(" → ") || "action pending"}
+          </span>
         </div>
       ) : null}
       {score ? (
