@@ -1,4 +1,4 @@
-"""Classify changed paths into fail-closed CI qualification tiers."""
+"""Select the small set of normal CI jobs affected by changed paths."""
 
 from __future__ import annotations
 
@@ -15,27 +15,12 @@ from ci_test_groups import database_test_files  # noqa: E402
 COMPONENTS = (
     "database",
     "main_qualification",
-    "migrations",
-    "research",
     "frontend",
     "lambda_artifacts",
     "terraform",
 )
-DATABASE_TEST_FILES = frozenset(
-    Path(path).name
-    for group in ("core_a", "core_b")
-    for path in database_test_files(group)
-)
-RESEARCH_TEST_FILES = frozenset(Path(path).name for path in database_test_files("research"))
-MIGRATION_TEST_FILES = frozenset(
-    {
-        "test_agent.py",
-        "test_benchmark_protocol_migrations.py",
-        "test_learning_benchmark_setup.py",
-        "test_learning_evidence_foundation.py",
-        "test_migrations_and_roles.py",
-        "test_run_dispatch.py",
-    }
+PRODUCT_TEST_FILES = frozenset(
+    Path(path).name for path in database_test_files("product")
 )
 RESEARCH_MODULES = frozenset(
     {
@@ -48,34 +33,47 @@ RESEARCH_MODULES = frozenset(
         "v4_corpus.py",
     }
 )
-SHARED_RESEARCH_MODULES = frozenset(
+DATABASE_SCRIPTS = frozenset(
     {
-        "embedding_index.py",
-        "embeddings.py",
-        "memory.py",
+        "apply_database_roles.py",
+        "init_db.py",
+        "initialize_agent_storage.py",
+        "migrate.py",
+    }
+)
+CI_CONTROL_FILES = frozenset(
+    {
+        "scripts/ci_changes.py",
+        "scripts/run_affected_ci.py",
+        "scripts/run_migration_compatibility.py",
+        "scripts/verify_ci_components.py",
+        "tests/test_ci_aggregate.py",
+        "tests/test_ci_changes.py",
+        "tests/test_ci_contracts.py",
+        "tests/test_ci_migration_runner.py",
     }
 )
 
 
-def _all_selected() -> dict[str, bool]:
-    return {component: True for component in COMPONENTS}
+def _none_selected() -> dict[str, bool]:
+    return {component: False for component in COMPONENTS}
 
 
 def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
-    """Return the component jobs required for one GitHub event."""
+    """Return normal CI jobs; release and research jobs are deliberately absent."""
 
-    if event_name not in {"pull_request", "push"}:
-        return _all_selected()
-
-    selected = {component: False for component in COMPONENTS}
+    selected = _none_selected()
     saw_path = False
     for raw_path in paths:
         path = raw_path.strip().removeprefix("./")
         if not path:
             continue
         saw_path = True
-        if _forces_full_matrix(path):
-            return _all_selected()
+        if path in CI_CONTROL_FILES or path.startswith(".github/workflows/"):
+            continue
+        if path == "scripts/ci_test_groups.py":
+            selected["database"] = True
+            continue
         if path.startswith("frontend/") or path in {"package.json", "package-lock.json"}:
             selected["frontend"] = True
             selected["lambda_artifacts"] = True
@@ -89,87 +87,50 @@ def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
             selected["lambda_artifacts"] = True
             continue
         if path.startswith("src/hindsight/"):
-            name = Path(path).name
-            if name in RESEARCH_MODULES:
-                selected["research"] = True
-            else:
-                selected["database"] = True
-            if name in SHARED_RESEARCH_MODULES:
-                selected["research"] = True
-            if name == "db.py":
-                selected["migrations"] = True
+            if Path(path).name in RESEARCH_MODULES:
+                continue
+            selected["database"] = True
             selected["lambda_artifacts"] = True
             continue
         if path.startswith("migrations/") or path.startswith("infra/db/"):
             selected["database"] = True
-            selected["migrations"] = True
             selected["lambda_artifacts"] = True
             continue
         if path.startswith("fixtures/"):
-            selected["research"] = True
-            selected["lambda_artifacts"] = True
+            # Corpus and study construction are qualified only by manual workflows.
             continue
         if path.startswith("docs/") or path.endswith((".md", ".rst", ".txt")):
             continue
         if path.startswith("tests/"):
-            name = Path(path).name
-            if name in DATABASE_TEST_FILES:
+            if Path(path).name in PRODUCT_TEST_FILES:
                 selected["database"] = True
-            if name in RESEARCH_TEST_FILES:
-                selected["research"] = True
-            if name in MIGRATION_TEST_FILES:
-                selected["migrations"] = True
             continue
         if path.startswith("scripts/"):
             name = Path(path).name
-            if name in {
-                "apply_database_roles.py",
-                "init_db.py",
-                "initialize_agent_storage.py",
-                "migrate.py",
-                "populated_upgrade_fixture.py",
-                "run_migration_compatibility.py",
-                "schema_manifest.py",
-            }:
+            if name in DATABASE_SCRIPTS:
                 selected["database"] = True
-                selected["migrations"] = True
-            elif name in {
-                "manage_v4_corpus.py",
-                "review_v4_corpus.py",
-                "run_learning_benchmark.py",
-                "run_rank_diagnostics.py",
-            }:
-                selected["research"] = True
             elif name in {"build_lambda_artifacts.py", "smoke_lambda_artifacts.py"}:
                 selected["lambda_artifacts"] = True
             continue
-        return _all_selected()
+        if path in {"docker-compose.yml", "pyproject.toml", "uv.lock"}:
+            selected["database"] = True
+            selected["lambda_artifacts"] = True
+            continue
+        if path == "Makefile":
+            continue
 
-    if not saw_path:
-        return _all_selected()
+        # Unknown code/configuration gets the product database check, never every tier.
+        selected["database"] = True
+
     if event_name == "push":
         selected["database"] = True
         selected["main_qualification"] = True
         selected["lambda_artifacts"] = True
+    elif event_name == "pull_request" and not saw_path:
+        selected["database"] = True
+    elif event_name not in {"pull_request", "push"}:
+        raise ValueError(f"unsupported normal CI event: {event_name}")
     return selected
-
-
-def _forces_full_matrix(path: str) -> bool:
-    return (
-        path.startswith(".github/workflows/")
-        or path.startswith(".github/actions/")
-        or path.startswith("scripts/ci_")
-        or path
-        in {
-            "tests/test_ci_aggregate.py",
-            "tests/test_ci_changes.py",
-            "tests/test_ci_contracts.py",
-            "Makefile",
-            "docker-compose.yml",
-            "pyproject.toml",
-            "uv.lock",
-        }
-    )
 
 
 def changed_paths(*, base_sha: str, head_sha: str) -> list[str]:

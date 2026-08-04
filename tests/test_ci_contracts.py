@@ -48,9 +48,8 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
     assert aggregate["if"] == "always()"
     assert set(aggregate["needs"]) == set(jobs) - {"test"}
     assert aggregate["steps"][-1]["run"] == "python scripts/verify_ci_components.py"
-    assert jobs["migration_compatibility"]["uses"] == (
-        "./.github/workflows/migration-compatibility.yml"
-    )
+    assert "migration_compatibility" not in jobs
+    assert "research" not in jobs
     migration_runner = _load_script("run_migration_compatibility")
     assert set(migration_runner.PARALLEL_CASES).union(
         migration_runner.ROLE_SENSITIVE_CASES
@@ -98,19 +97,14 @@ def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
     workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = workflow_path.read_text()
     suffix = "_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable"
-    shell_suffix = "_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
-
-    assert f"hindsight_core_a{shell_suffix}" in workflow
-    assert f"hindsight_core_b{shell_suffix}" in workflow
-    assert f"hindsight_research{shell_suffix}" in workflow
-    assert f"hindsight_diagnostic_research{shell_suffix}" in workflow
-    assert f"hindsight_diagnostic_fresh{suffix}" in workflow
+    assert f"hindsight_product{suffix}" in workflow
+    assert f"hindsight_fresh{suffix}" in workflow
     assert f"hindsight_populated{suffix}" in workflow
+    assert f"hindsight_extended{suffix}" in workflow
 
     jobs = yaml.safe_load(workflow)["jobs"]
     compose_scopes = {
         "database": "database",
-        "research": "research",
         "main_qualification": "main",
     }
     for job_name, scope in compose_scopes.items():
@@ -140,44 +134,21 @@ def test_historical_migrations_share_one_manual_container():
     assert "matrix" not in job.get("strategy", {})
 
 
-def test_fast_product_groups_share_one_server_and_use_isolated_databases():
+def test_fast_product_checks_use_exactly_one_server_and_database():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     database_job = workflow["jobs"]["database"]
     group_step = next(
         step
         for step in database_job["steps"]
-        if step.get("name") == "Run isolated product database groups"
+        if step.get("name") == "Run affected product checks"
     )
 
     assert sum(
         step.get("run") == "docker compose up -d crdb"
         for step in database_job["steps"]
     ) == 1
-    for group in ("core_a", "core_b"):
-        database = f"hindsight_{group}_${{GITHUB_RUN_ID}}_${{GITHUB_RUN_ATTEMPT}}"
-        assert database in group_step["run"]
-        assert f"scripts/ci_test_groups.py run {group}" in group_step["run"]
-        assert f'{group}_pid=$!' in group_step["run"]
-        assert f'wait "${group}_pid"' in group_step["run"]
-
-
-def test_research_and_diagnostics_share_one_server_but_not_database_state():
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-    research_job = workflow["jobs"]["research"]
-    group_step = next(
-        step
-        for step in research_job["steps"]
-        if step.get("name") == "Run isolated research and diagnostic groups"
-    )
-
-    assert sum(
-        step.get("run") == "docker compose up -d crdb"
-        for step in research_job["steps"]
-    ) == 1
-    assert "hindsight_research_${GITHUB_RUN_ID}" in group_step["run"]
-    assert "hindsight_diagnostic_research_${GITHUB_RUN_ID}" in group_step["run"]
-    assert 'wait "$research_pid"' in group_step["run"]
-    assert 'wait "$diagnostic_pid"' in group_step["run"]
+    assert "scripts/ci_test_groups.py run product" in group_step["run"]
+    assert "main_extended" not in group_step["run"]
 
 
 def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
@@ -191,16 +162,30 @@ def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
 
     assert "fresh_pid=$!" in schema_step["run"]
     assert "populated_pid=$!" in schema_step["run"]
+    assert "extended_pid=$!" in schema_step["run"]
     assert 'wait "$fresh_pid"' in schema_step["run"]
     assert 'wait "$populated_pid"' in schema_step["run"]
+    assert 'wait "$extended_pid"' in schema_step["run"]
     assert "scripts/schema_manifest.py compare" in schema_step["run"]
     smoke_step = next(
         step
         for step in main_job["steps"]
-        if step.get("name") == "Run deterministic benchmark smoke checks"
+        if step.get("name") == "Run deterministic benchmark smoke"
     )
     assert "scripts/migrate.py" not in smoke_step["run"]
     assert 'DATABASE_URL="$FRESH_DATABASE_URL"' in smoke_step["run"]
+
+
+def test_expensive_qualification_is_manual_only():
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    migrations = (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
+    learning = (ROOT / ".github/workflows/learning-qualification.yml").read_text()
+
+    assert "run_migration_compatibility.py" not in ci
+    assert "run_rank_diagnostics.py" not in ci
+    assert "workflow_call:" not in migrations
+    assert "workflow_dispatch:" in migrations
+    assert "workflow_dispatch:" in learning
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):

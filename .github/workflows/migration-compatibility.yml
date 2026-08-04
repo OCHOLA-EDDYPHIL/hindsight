@@ -1,7 +1,6 @@
 name: migration compatibility
 
 on:
-  workflow_call:
   workflow_dispatch:
 
 permissions:

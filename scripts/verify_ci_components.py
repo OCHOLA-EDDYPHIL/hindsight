@@ -10,9 +10,7 @@ import sys
 ALWAYS_REQUIRED = ("changes", "python_static")
 JOB_SELECTIONS = {
     "database": "database",
-    "research": "research",
     "main_qualification": "main_qualification",
-    "migration_compatibility": "migrations",
     "frontend": "frontend",
     "lambda_artifacts": "lambda_artifacts",
     "terraform": "terraform",

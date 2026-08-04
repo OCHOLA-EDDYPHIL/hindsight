@@ -22,16 +22,16 @@ def _results(value: str = "success") -> dict[str, str]:
     }
 
 
-def test_main_requires_every_component_successful():
+def test_main_requires_every_selected_component_successful():
     assert aggregate.verify(
         event_name="push", selections=_selections(), results=_results()
     ) == []
 
     results = _results()
-    results["migration_compatibility"] = "skipped"
+    results["main_qualification"] = "skipped"
     assert aggregate.verify(
         event_name="push", selections=_selections(), results=results
-    ) == ["selected job migration_compatibility ended as skipped"]
+    ) == ["selected job main_qualification ended as skipped"]
 
 
 def test_pull_request_accepts_only_explicitly_disabled_skips():
