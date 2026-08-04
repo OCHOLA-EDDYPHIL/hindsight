@@ -28,10 +28,10 @@ def test_main_requires_every_component_successful():
     ) == []
 
     results = _results()
-    results["migration_replay"] = "skipped"
+    results["migration_compatibility"] = "skipped"
     assert aggregate.verify(
         event_name="push", selections=_selections(), results=results
-    ) == ["selected job migration_replay ended as skipped"]
+    ) == ["selected job migration_compatibility ended as skipped"]
 
 
 def test_pull_request_accepts_only_explicitly_disabled_skips():

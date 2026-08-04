@@ -18,15 +18,24 @@ ci_test_groups = importlib.util.module_from_spec(GROUP_SPEC)
 GROUP_SPEC.loader.exec_module(ci_test_groups)
 
 
-def test_main_always_runs_every_component():
+def test_main_always_runs_core_database_artifacts_and_schema_qualification():
     assert classify_paths(["docs/architecture.md"], event_name="push") == {
-        component: True for component in COMPONENTS
+        "database": True,
+        "main_qualification": True,
+        "migrations": False,
+        "research": False,
+        "frontend": False,
+        "lambda_artifacts": True,
+        "terraform": False,
     }
 
 
 def test_path_classifier_tracks_database_and_migration_test_inventory():
     assert ci_changes.DATABASE_TEST_FILES == {
-        Path(path).name for path in ci_test_groups.database_test_files()
+        Path(path).name for path in ci_test_groups.database_test_files("core")
+    }
+    assert ci_changes.RESEARCH_TEST_FILES == {
+        Path(path).name for path in ci_test_groups.database_test_files("research")
     }
     assert ci_changes.MIGRATION_TEST_FILES == {
         Path(node.split("::", 1)[0]).name
@@ -42,8 +51,9 @@ def test_frontend_and_terraform_paths_select_only_their_dependencies():
 
     assert selected == {
         "database": False,
+        "main_qualification": False,
         "migrations": False,
-        "diagnostics": False,
+        "research": False,
         "frontend": True,
         "lambda_artifacts": True,
         "terraform": True,
@@ -57,15 +67,16 @@ def test_built_web_assets_require_frontend_freshness_and_lambda_packaging():
 
     assert selected == {
         "database": False,
+        "main_qualification": False,
         "migrations": False,
-        "diagnostics": False,
+        "research": False,
         "frontend": True,
         "lambda_artifacts": True,
         "terraform": False,
     }
 
 
-def test_backend_paths_select_database_and_lambda_with_targeted_diagnostics():
+def test_backend_paths_select_database_and_lambda_with_targeted_research():
     ordinary = classify_paths(
         ["src/hindsight/trace_contract.py"], event_name="pull_request"
     )
@@ -75,8 +86,8 @@ def test_backend_paths_select_database_and_lambda_with_targeted_diagnostics():
 
     assert ordinary["database"] is True
     assert ordinary["lambda_artifacts"] is True
-    assert ordinary["diagnostics"] is False
-    assert diagnostic["diagnostics"] is True
+    assert ordinary["research"] is False
+    assert diagnostic["research"] is True
 
 
 def test_ci_control_and_unknown_paths_fail_safe_to_full_matrix():
@@ -108,7 +119,7 @@ def test_database_tests_do_not_select_migrations_unless_migration_sensitive():
     assert ordinary["migrations"] is False
     assert migration["database"] is True
     assert migration["migrations"] is True
-    assert migration["diagnostics"] is False
+    assert migration["research"] is False
 
 
 def test_migration_paths_select_database_replay_and_packaging_only():
@@ -118,8 +129,9 @@ def test_migration_paths_select_database_replay_and_packaging_only():
 
     assert selected == {
         "database": True,
+        "main_qualification": False,
         "migrations": True,
-        "diagnostics": False,
+        "research": False,
         "frontend": False,
         "lambda_artifacts": True,
         "terraform": False,
@@ -134,8 +146,8 @@ def test_research_checks_run_only_for_their_own_inputs():
         ["scripts/run_rank_diagnostics.py"], event_name="pull_request"
     )
 
-    assert ordinary["diagnostics"] is False
-    assert research["diagnostics"] is True
+    assert ordinary["research"] is False
+    assert research["research"] is True
 
 
 def test_documentation_only_pull_request_keeps_component_jobs_disabled():

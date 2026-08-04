@@ -20,8 +20,9 @@ jobs:
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
       database: ${{ steps.classify.outputs.database }}
+      main_qualification: ${{ steps.classify.outputs.main_qualification }}
       migrations: ${{ steps.classify.outputs.migrations }}
-      diagnostics: ${{ steps.classify.outputs.diagnostics }}
+      research: ${{ steps.classify.outputs.research }}
       frontend: ${{ steps.classify.outputs.frontend }}
       lambda_artifacts: ${{ steps.classify.outputs.lambda_artifacts }}
       terraform: ${{ steps.classify.outputs.terraform }}
@@ -32,7 +33,7 @@ jobs:
       - id: classify
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: >-
           python scripts/ci_changes.py
@@ -62,18 +63,11 @@ jobs:
   database:
     needs: changes
     if: needs.changes.outputs.database == 'true'
-    strategy:
-      fail-fast: ${{ github.event_name == 'pull_request' }}
-      matrix:
-        include:
-          - group: database_a
-            database: hindsight_ci_a
-          - group: database_b
-            database: hindsight_ci_b
+    timeout-minutes: 15
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
-      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.group }}
-      DATABASE_URL: postgresql://root@localhost:26257/${{ matrix.database }}_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_database
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_core_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -84,7 +78,7 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - run: docker compose up -d crdb
-      - name: Initialize isolated database
+      - name: Initialize product database
         run: |
           ready=false
           for _ in $(seq 1 30); do
@@ -99,31 +93,64 @@ jobs:
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
           uv run python scripts/migrate.py
           uv run python scripts/initialize_agent_storage.py
-      - run: uv run python scripts/ci_test_groups.py run "${{ matrix.group }}"
-      - name: Remove isolated database container
+      - run: uv run python scripts/ci_test_groups.py run core
+      - name: Remove product database container
         if: always()
         run: docker compose down --volumes --remove-orphans
 
-  migration_replay:
+  research:
     needs: changes
-    if: needs.changes.outputs.migrations == 'true'
-    strategy:
-      fail-fast: ${{ github.event_name == 'pull_request' }}
-      matrix:
-        case:
-          - benchmark_upgrade
-          - benchmark_fresh
-          - benchmark_preparation
-          - benchmark_finalizer
-          - benchmark_retry
-          - agent_runtime_roles
-          - populated_roles
-          - dispatch_upgrade
-          - qualification_authority
+    if: needs.changes.outputs.research == 'true'
+    timeout-minutes: 15
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
-      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.case }}
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_migration_${{ matrix.case }}?sslmode=disable
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_research
+      DATABASE_URL: postgresql://root@localhost:26257/hindsight_research_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
+      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_research_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
+      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: deterministic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - run: docker compose up -d crdb
+      - name: Initialize research database
+        run: |
+          ready=false
+          for _ in $(seq 1 30); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+          uv run python scripts/migrate.py
+          uv run python scripts/initialize_agent_storage.py
+      - run: uv run python scripts/ci_test_groups.py run research
+      - name: Run deterministic research smoke checks
+        run: |
+          uv run python scripts/run_rank_diagnostics.py synthetic \
+            --code-sha "$GITHUB_SHA" \
+            --max-distance 0.35 \
+            --require-target-rank-one
+          uv run python scripts/run_learning_benchmark.py ci-smoke
+      - name: Remove research database container
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  main_qualification:
+    needs: changes
+    if: needs.changes.outputs.main_qualification == 'true'
+    timeout-minutes: 15
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    env:
+      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_main
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -147,55 +174,46 @@ jobs:
           test "$ready" = true
           docker compose exec -T crdb cockroach sql --insecure \
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
-      - run: >-
-          uv run python scripts/ci_test_groups.py run migration
-          --case "${{ matrix.case }}"
-      - name: Remove isolated database container
+      - name: Verify populated upgrade and schema parity
+        run: |
+          mkdir -p build/schema
+          fresh_url="postgresql://root@localhost:26257/hindsight_fresh_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
+          populated_url="postgresql://root@localhost:26257/hindsight_populated_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
+
+          DATABASE_URL="$fresh_url" uv run python scripts/migrate.py
+          DATABASE_URL="$fresh_url" uv run python scripts/initialize_agent_storage.py
+          DATABASE_URL="$fresh_url" uv run python scripts/schema_manifest.py export \
+            --apply-roles --output build/schema/fresh.json
+
+          DATABASE_URL="$populated_url" uv run python scripts/migrate.py \
+            --through 0018_agent_run_attempt_fencing.sql
+          DATABASE_URL="$populated_url" uv run python scripts/populated_upgrade_fixture.py seed
+          DATABASE_URL="$populated_url" uv run python scripts/migrate.py
+          DATABASE_URL="$populated_url" uv run python scripts/initialize_agent_storage.py
+          DATABASE_URL="$populated_url" uv run python scripts/populated_upgrade_fixture.py verify
+          DATABASE_URL="$populated_url" uv run python scripts/schema_manifest.py export \
+            --apply-roles --output build/schema/populated.json
+
+          uv run python scripts/schema_manifest.py compare \
+            build/schema/fresh.json build/schema/populated.json
+      - name: Run deterministic benchmark smoke checks
+        run: |
+          diagnostic_url="postgresql://root@localhost:26257/hindsight_diagnostic_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
+          DATABASE_URL="$diagnostic_url" uv run python scripts/migrate.py
+          DATABASE_URL="$diagnostic_url" DIAGNOSTIC_DATABASE_URL="$diagnostic_url" \
+            uv run python scripts/run_rank_diagnostics.py synthetic \
+              --code-sha "$GITHUB_SHA" \
+              --max-distance 0.35 \
+              --require-target-rank-one
+          DATABASE_URL="$diagnostic_url" uv run python scripts/run_learning_benchmark.py ci-smoke
+      - name: Remove main qualification container
         if: always()
         run: docker compose down --volumes --remove-orphans
 
-  diagnostics:
+  migration_compatibility:
     needs: changes
-    if: needs.changes.outputs.diagnostics == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    env:
-      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_diagnostics
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-      DIAGNOSTIC_DATABASE_URL: postgresql://root@localhost:26257/hindsight_diagnostic_ci_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-      EMBEDDING_PROVIDER: deterministic
-      LLM_PROVIDER: deterministic
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - run: uv sync --frozen
-      - run: docker compose up -d crdb
-      - name: Initialize diagnostic database
-        run: |
-          ready=false
-          for _ in $(seq 1 30); do
-            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" = true
-          docker compose exec -T crdb cockroach sql --insecure \
-            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
-          uv run python scripts/migrate.py
-      - name: Run outcome-free vector ordering diagnostic
-        run: >-
-          uv run python scripts/run_rank_diagnostics.py synthetic
-          --code-sha "$GITHUB_SHA"
-          --max-distance 0.35
-          --require-target-rank-one
-      - run: uv run python scripts/run_learning_benchmark.py ci-smoke
-      - name: Remove isolated database container
-        if: always()
-        run: docker compose down --volumes --remove-orphans
+    if: needs.changes.outputs.migrations == 'true'
+    uses: ./.github/workflows/migration-compatibility.yml
 
   frontend:
     needs: changes
@@ -254,140 +272,25 @@ jobs:
       - run: terraform -chdir=infra/terraform/edge validate
       - run: terraform -chdir=infra/terraform/edge test
 
-  schema_fresh:
-    needs: changes
-    if: needs.changes.outputs.migrations == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    env:
-      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_schema_fresh
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_fresh_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - run: uv sync --frozen
-      - run: docker compose up -d crdb
-      - name: Build fresh schema manifest
-        run: |
-          ready=false
-          for _ in $(seq 1 30); do
-            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" = true
-          docker compose exec -T crdb cockroach sql --insecure \
-            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
-          uv run python scripts/migrate.py
-          uv run python scripts/initialize_agent_storage.py
-          mkdir -p build/schema
-          uv run python scripts/schema_manifest.py export \
-            --apply-roles --output build/schema/fresh.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: schema-fresh-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/schema/fresh.json
-          retention-days: 7
-      - name: Remove isolated database container
-        if: always()
-        run: docker compose down --volumes --remove-orphans
-
-  schema_populated:
-    needs: changes
-    if: needs.changes.outputs.migrations == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    env:
-      COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_schema_populated
-      DATABASE_URL: postgresql://root@localhost:26257/hindsight_schema_populated_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - run: uv sync --frozen
-      - run: docker compose up -d crdb
-      - name: Build populated upgrade schema manifest
-        run: |
-          ready=false
-          for _ in $(seq 1 30); do
-            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" = true
-          docker compose exec -T crdb cockroach sql --insecure \
-            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
-          uv run python scripts/migrate.py --through 0018_agent_run_attempt_fencing.sql
-          uv run python scripts/populated_upgrade_fixture.py seed
-          uv run python scripts/migrate.py
-          uv run python scripts/initialize_agent_storage.py
-          uv run python scripts/populated_upgrade_fixture.py verify
-          mkdir -p build/schema
-          uv run python scripts/schema_manifest.py export \
-            --apply-roles --output build/schema/populated.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: schema-populated-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/schema/populated.json
-          retention-days: 7
-      - name: Remove isolated database container
-        if: always()
-        run: docker compose down --volumes --remove-orphans
-
-  schema_parity:
-    needs: [changes, schema_fresh, schema_populated]
-    if: >-
-      ${{ always()
-        && needs.changes.outputs.migrations == 'true'
-        && needs.schema_fresh.result == 'success'
-        && needs.schema_populated.result == 'success' }}
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - run: uv sync --frozen
-      - uses: actions/download-artifact@v4
-        with:
-          name: schema-fresh-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/schema
-      - uses: actions/download-artifact@v4
-        with:
-          name: schema-populated-${{ github.run_id }}-${{ github.run_attempt }}
-          path: build/schema
-      - run: >-
-          uv run python scripts/schema_manifest.py compare
-          build/schema/fresh.json build/schema/populated.json
-
   test:
     if: always()
     needs:
       - changes
       - python_static
       - database
-      - migration_replay
-      - diagnostics
+      - research
+      - main_qualification
+      - migration_compatibility
       - frontend
       - lambda_artifacts
       - terraform
-      - schema_fresh
-      - schema_populated
-      - schema_parity
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       CI_SELECTIONS: >-
         {"database":"${{ needs.changes.outputs.database }}",
+        "research":"${{ needs.changes.outputs.research }}",
+        "main_qualification":"${{ needs.changes.outputs.main_qualification }}",
         "migrations":"${{ needs.changes.outputs.migrations }}",
-        "diagnostics":"${{ needs.changes.outputs.diagnostics }}",
         "frontend":"${{ needs.changes.outputs.frontend }}",
         "lambda_artifacts":"${{ needs.changes.outputs.lambda_artifacts }}",
         "terraform":"${{ needs.changes.outputs.terraform }}"}
@@ -395,14 +298,12 @@ jobs:
         {"changes":"${{ needs.changes.result }}",
         "python_static":"${{ needs.python_static.result }}",
         "database":"${{ needs.database.result }}",
-        "migration_replay":"${{ needs.migration_replay.result }}",
-        "diagnostics":"${{ needs.diagnostics.result }}",
+        "research":"${{ needs.research.result }}",
+        "main_qualification":"${{ needs.main_qualification.result }}",
+        "migration_compatibility":"${{ needs.migration_compatibility.result }}",
         "frontend":"${{ needs.frontend.result }}",
         "lambda_artifacts":"${{ needs.lambda_artifacts.result }}",
-        "terraform":"${{ needs.terraform.result }}",
-        "schema_fresh":"${{ needs.schema_fresh.result }}",
-        "schema_populated":"${{ needs.schema_populated.result }}",
-        "schema_parity":"${{ needs.schema_parity.result }}"}
+        "terraform":"${{ needs.terraform.result }}"}
     steps:
       - uses: actions/checkout@v4
       - run: python scripts/verify_ci_components.py

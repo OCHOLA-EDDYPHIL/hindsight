@@ -14,6 +14,7 @@ RUNNER_ROUTED_WORKFLOWS = (
     "live-acceptance.yml",
     "learning-qualification.yml",
     "learning-evidence.yml",
+    "migration-compatibility.yml",
     "v4-corpus-construction.yml",
 )
 
@@ -48,7 +49,13 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
     assert aggregate["if"] == "always()"
     assert set(aggregate["needs"]) == set(jobs) - {"test"}
     assert aggregate["steps"][-1]["run"] == "python scripts/verify_ci_components.py"
-    assert set(jobs["migration_replay"]["strategy"]["matrix"]["case"]) == {
+    assert jobs["migration_compatibility"]["uses"] == (
+        "./.github/workflows/migration-compatibility.yml"
+    )
+    migration_runner = _load_script("run_migration_compatibility")
+    assert set(migration_runner.PARALLEL_CASES).union(
+        migration_runner.ROLE_SENSITIVE_CASES
+    ) == {
         "benchmark_upgrade",
         "benchmark_fresh",
         "benchmark_preparation",
@@ -85,32 +92,42 @@ def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
     workflow = workflow_path.read_text()
     suffix = "_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable"
 
-    assert f"${{{{ matrix.database }}}}{suffix}" in workflow
-    for database_name in (
-        "hindsight_diagnostic_ci",
-        "hindsight_schema_fresh",
-        "hindsight_schema_populated",
-    ):
-        assert f"{database_name}{suffix}" in workflow
+    assert f"hindsight_core{suffix}" in workflow
+    assert f"hindsight_research{suffix}" in workflow
+    shell_suffix = "_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}?sslmode=disable"
+    for database_name in ("hindsight_fresh", "hindsight_populated"):
+        assert f"{database_name}{shell_suffix}" in workflow
 
     jobs = yaml.safe_load(workflow)["jobs"]
     compose_scopes = {
-        "database": "${{ matrix.group }}",
-        "migration_replay": "${{ matrix.case }}",
-        "diagnostics": "diagnostics",
-        "schema_fresh": "schema_fresh",
-        "schema_populated": "schema_populated",
+        "database": "database",
+        "research": "research",
+        "main_qualification": "main",
     }
     for job_name, scope in compose_scopes.items():
         job = jobs[job_name]
         assert job["env"]["COMPOSE_PROJECT_NAME"] == (
             "hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_" + scope
         )
-        assert job["steps"][-1] == {
-            "name": "Remove isolated database container",
-            "if": "always()",
-            "run": "docker compose down --volumes --remove-orphans",
-        }
+        assert job["steps"][-1]["if"] == "always()"
+        assert job["steps"][-1]["run"] == (
+            "docker compose down --volumes --remove-orphans"
+        )
+        assert sum(step.get("run") == "docker compose up -d crdb" for step in job["steps"]) == 1
+
+
+def test_historical_migrations_share_one_manual_container():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
+    )
+    job = workflow["jobs"]["migration_compatibility"]
+
+    assert sum(step.get("run") == "docker compose up -d crdb" for step in job["steps"]) == 1
+    assert any(
+        "scripts/run_migration_compatibility.py" in step.get("run", "")
+        for step in job["steps"]
+    )
+    assert "matrix" not in job.get("strategy", {})
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):
