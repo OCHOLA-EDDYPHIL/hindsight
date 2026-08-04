@@ -208,7 +208,8 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText("Recovered")).toBeVisible();
     expect(screen.getByText(/1 unsafe · scale_workers/)).toBeVisible();
     expect(screen.getByText(/0 unsafe · inspect_dependency → throttle_retries/)).toBeVisible();
-    expect(screen.getAllByText("deterministic_incident_simulator")).toHaveLength(2);
+    expect(screen.getAllByText(/deterministic_incident_simulator/)).toHaveLength(2);
+    expect(screen.getByText(/deterministic_incident_simulator · scale_workers/)).toBeVisible();
     expect(screen.getByText(/amplified unresolved upstream pressure/)).toBeVisible();
     expect(screen.getByText(/downstream pressure recovered/)).toBeVisible();
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();

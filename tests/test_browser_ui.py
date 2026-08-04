@@ -229,8 +229,8 @@ def test_operator_can_run_and_explain_signature_workflow():
             lambda browser: "Poisoned memory"
             in browser.find_element(By.ID, "influenceList").text
         )
-        bad_plan = driver.find_element(By.ID, "planText").text
-        assert "scale payment workers" in bad_plan.lower()
+        bad_action = driver.find_element(By.CSS_SELECTOR, ".action-execution").text
+        assert "scale_workers" in bad_action
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         driver.find_element(By.ID, "approveRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
@@ -290,9 +290,10 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text)
         wait.until(lambda browser: "1 read" in browser.find_element(By.ID, "influenceCount").text)
         assert "Poisoned memory" not in driver.find_element(By.ID, "influenceList").text
-        corrected_plan = driver.find_element(By.ID, "planText").text
-        assert "retry" in corrected_plan.lower()
-        assert "scale payment workers" not in corrected_plan.lower()
+        corrected_action = driver.find_element(By.CSS_SELECTOR, ".action-execution").text
+        assert "inspect_dependency" in corrected_action
+        assert "throttle_retries" in corrected_action
+        assert "scale_workers" not in corrected_action
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score.recovered")
         driver.find_element(By.ID, "approveRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
