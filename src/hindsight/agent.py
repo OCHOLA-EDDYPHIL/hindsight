@@ -846,7 +846,12 @@ def _proposed_action(state: IncidentAgentState) -> str:
 
 
 def _signature_actions(state: IncidentAgentState) -> tuple[str, ...]:
-    if not state.get("namespace", "").startswith("demo:payments-poison-rewind"):
+    namespace = str(state.get("namespace") or "")
+    incident_id = str(state.get("incident_id") or "")
+    if not (
+        namespace.startswith("demo:payments-poison-rewind")
+        or incident_id.startswith("demo-payments-checkout-latency")
+    ):
         return ()
     poisoned = any(
         isinstance(memory.get("metadata"), dict)

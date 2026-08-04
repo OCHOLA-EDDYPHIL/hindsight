@@ -104,7 +104,8 @@ def test_signature_action_request_is_memory_causal_and_executes_only_when_called
 
     base = {
         "run_id": "run-1",
-        "namespace": "demo:payments-poison-rewind:session:test",
+        "namespace": "live-browser:isolated-tenant",
+        "incident_id": "demo-payments-checkout-latency:isolated-tenant",
     }
     corrected_state = {**base, "recalled_memories": []}
     poisoned_state = {
@@ -113,6 +114,12 @@ def test_signature_action_request_is_memory_causal_and_executes_only_when_called
     }
     corrected_actions = _signature_actions(corrected_state)
     poisoned_actions = _signature_actions(poisoned_state)
+    unrelated_actions = _signature_actions(
+        {
+            **poisoned_state,
+            "incident_id": "unrelated-checkout-latency",
+        }
+    )
     pending = _bounded_action_request(
         corrected_state,
         actions=corrected_actions,
@@ -142,6 +149,7 @@ def test_signature_action_request_is_memory_causal_and_executes_only_when_called
     ]
     assert corrected["score"] == {"recovered": True, "unsafe_action_count": 0}
     assert poisoned["request"]["actions"] == ["scale_workers"]
+    assert unrelated_actions == ()
     assert poisoned["score"] == {"recovered": False, "unsafe_action_count": 1}
     assert _guidance_eligible(action_approved=True, action_trace=corrected)
     assert not _guidance_eligible(action_approved=True, action_trace=poisoned)
