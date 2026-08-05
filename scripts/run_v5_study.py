@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
+import re
+import subprocess
 import sys
 
 
@@ -22,8 +25,6 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("protocol")
     structural = subparsers.add_parser("qualify-structure")
-    structural.add_argument("--code-sha", required=True)
-    structural.add_argument("--per-family", type=int, default=1_000)
     structural.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
 
@@ -32,8 +33,7 @@ def main() -> int:
         return 0
     if args.command == "qualify-structure":
         receipt = qualify_development_structure(
-            code_sha=args.code_sha,
-            per_family=args.per_family,
+            code_sha=_exact_code_sha(),
         )
         _write_json(receipt, output=args.output)
         return 0
@@ -46,6 +46,31 @@ def _write_json(value: object, *, output: pathlib.Path | None) -> None:
         sys.stdout.write(rendered)
     else:
         output.write_text(rendered, encoding="utf-8")
+
+
+def _exact_code_sha() -> str:
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if status.strip():
+        raise RuntimeError("v5 qualification requires a clean exact-code checkout")
+    code_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
+        raise RuntimeError("v5 qualification could not resolve an exact code SHA")
+    expected = os.environ.get("GITHUB_SHA")
+    if expected and expected != code_sha:
+        raise RuntimeError("v5 qualification checkout differs from GITHUB_SHA")
+    return code_sha
 
 
 if __name__ == "__main__":

@@ -48,6 +48,20 @@ ALL_ACTIONS = (
     "stop",
 )
 ACTION_BUDGET = 6
+STRUCTURAL_CASES_PER_FAMILY = 1_000
+EMBEDDING_CASES_PER_FAMILY = 100
+REHEARSAL_CASES_PER_FAMILY = 10
+DEVELOPMENT_SELECTION_DOMAIN = "v5-development-selection-v1"
+MEMORY_ORDER_DOMAIN = "hindsight-v5-memory-order-v1"
+EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256 = (
+    "1c5638eac9fcfa62e57147759fd29a82d168ec9351e6d9a9ac4a97d347824008"
+)
+EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256 = (
+    "2294cc2886f48c265fdb2288438c1016e9de94be5195be5cc5b668cc3311a77b"
+)
+EXPECTED_DEVELOPMENT_MEMORY_ORDER_SHA256 = (
+    "97d114d1c0f125ca2abe6ada7c6f96291991831e55ee41fb77d3380bc24505ee"
+)
 REASONING_PROVIDER = "gemini"
 REASONING_MODEL = "gemini-3.1-flash-lite"
 EMBEDDING_PROVIDER = "gemini"
@@ -55,7 +69,46 @@ EMBEDDING_MODEL = "gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 1_024
 EMBEDDING_MAX_DISTANCE = 0.35
 EMBEDDING_REPRESENTATION = "v5-content-only-v1"
+GEMINI_PROVIDER_REPRESENTATION = "raw_control"
+EMBEDDING_CAPABILITY = "semantic"
+EMBEDDING_ENCODER_REVISION = "gemini-retrieval-task-v1"
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+FAILURE_CLASSES = (
+    "transient_infrastructure",
+    "development_implementation_defect",
+    "protected_scientific_failure",
+    "integrity_mismatch",
+)
+
+
+def _embedding_profile_payload() -> dict[str, Any]:
+    return {
+        "provider": EMBEDDING_PROVIDER,
+        "model": EMBEDDING_MODEL,
+        "dimensions": EMBEDDING_DIMENSIONS,
+        "capability": EMBEDDING_CAPABILITY,
+        "encoder_revision": EMBEDDING_ENCODER_REVISION,
+        "configuration": {},
+        "max_distance": EMBEDDING_MAX_DISTANCE,
+    }
+
+
+def _neutral_memory_governance() -> dict[str, Any]:
+    return {
+        "kind": "procedural_lesson",
+        "status": "review_required",
+        "operator_disposition": "unreviewed",
+        "usage_instruction": "unassigned",
+        "applicability": {
+            "conditions": [],
+            "status": "unassessed",
+        },
+    }
+
+
+EMBEDDING_PROFILE_ID = hashlib.sha256(
+    json.dumps(_embedding_profile_payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -148,7 +201,11 @@ MECHANISMS: dict[str, MechanismSpec] = {
             "leaked_transactions": (4, 14, 1),
             "pool_size": (30, 70, 5),
         },
-        recovered_state={"pool_utilization_bp": 4200, "waiting_requests": 18, "leaked_transactions": 0},
+        recovered_state={
+            "pool_utilization_bp": 4200,
+            "waiting_requests": 18,
+            "leaked_transactions": 0,
+        },
     ),
     "hot_partition": MechanismSpec(
         family="hot_partition",
@@ -217,7 +274,11 @@ MECHANISMS: dict[str, MechanismSpec] = {
             "blocking_transaction_age_seconds": (180, 720, 10),
             "statement_timeout_seconds": (20, 60, 5),
         },
-        recovered_state={"query_latency_ms": 140, "waiting_transactions": 6, "blocking_transaction_age_seconds": 0},
+        recovered_state={
+            "query_latency_ms": 140,
+            "waiting_transactions": 6,
+            "blocking_transaction_age_seconds": 0,
+        },
     ),
 }
 
@@ -269,7 +330,15 @@ def development_seed(*, family: str, index: int) -> str:
 
 
 def compile_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]:
-    """Compile one canonical scenario without invoking a model provider."""
+    """Compile and independently validate one canonical scenario."""
+
+    payload = _build_scenario(family=family, seed=seed, code_sha=code_sha)
+    validate_scenario(payload)
+    return payload
+
+
+def _build_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]:
+    """Build canonical bytes without consulting a model provider."""
 
     spec = _require_family(family)
     if not re.fullmatch(r"[0-9a-f]{64}", seed):
@@ -291,12 +360,33 @@ def compile_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]
         workload=workload,
         evidence=evidence,
     )
-    opaque_root = _derive_hex(GENERATOR_VERSION, SIMULATOR_VERSION, seed)
+    opaque_root = _derive_hex(GENERATOR_VERSION, SIMULATOR_VERSION, family, seed)
     scenario_id = f"v5s-{opaque_root[:24]}"
-    lesson_id = f"v5l-{_derive_hex(opaque_root, 'lesson')[:24]}"
+    lesson_id = f"v5m-{_derive_hex(opaque_root, 'lesson')[:24]}"
     source_episode_id = f"v5e-{_derive_hex(opaque_root, 'source')[:24]}"
     recurrence_episode_id = f"v5e-{_derive_hex(opaque_root, 'recurrence')[:24]}"
     decoys = _decoys(spec=spec, seed=seed, opaque_root=opaque_root)
+    memories = [
+        {
+            "memory_id": lesson_id,
+            "content": spec.lesson,
+            **_neutral_memory_governance(),
+        },
+        *[
+            {
+                "memory_id": row["memory_id"],
+                "content": row["content"],
+                **_neutral_memory_governance(),
+            }
+            for row in decoys
+        ],
+    ]
+    memories.sort(
+        key=lambda row: (
+            sha256_hex([MEMORY_ORDER_DOMAIN, seed, row["memory_id"]]),
+            str(row["memory_id"]),
+        )
+    )
     agent_view = {
         "scenario_id": scenario_id,
         "source_episode": {
@@ -313,33 +403,7 @@ def compile_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]
             "allowed_actions": list(ALL_ACTIONS),
             "action_budget": ACTION_BUDGET,
         },
-        "reference_memory": {
-            "memory_id": lesson_id,
-            "content": spec.lesson,
-            "kind": "procedural_lesson",
-            "status": "active",
-            "operator_disposition": "approved",
-            "usage_instruction": "positive_guidance",
-            "applicability": {
-                "conditions": [spec.diagnosis],
-                "status": "applicable",
-            },
-        },
-        "context_memories": [
-            {
-                "memory_id": row["memory_id"],
-                "content": row["content"],
-                "kind": "procedural_lesson",
-                "status": "active",
-                "operator_disposition": "approved",
-                "usage_instruction": "audit_only",
-                "applicability": {
-                    "conditions": row["conditions"],
-                    "status": "not_applicable",
-                },
-            }
-            for row in decoys
-        ],
+        "memories": memories,
     }
     oracle = {
         "scenario_id": scenario_id,
@@ -369,9 +433,7 @@ def compile_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]
         "positive_lesson_id": lesson_id,
         "positive_lesson": spec.lesson,
         "applicable_conditions": [spec.diagnosis],
-        "non_applicable_conditions": [
-            row["conditions"][0] for row in decoys
-        ],
+        "non_applicable_conditions": [row["conditions"][0] for row in decoys],
         "decoys": decoys,
         "confounders": [
             f"The reporting window for {service} closes after the current shift.",
@@ -407,8 +469,12 @@ def compile_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]
                 "provider": EMBEDDING_PROVIDER,
                 "model": EMBEDDING_MODEL,
                 "dimensions": EMBEDDING_DIMENSIONS,
+                "capability": EMBEDDING_CAPABILITY,
+                "encoder_revision": EMBEDDING_ENCODER_REVISION,
                 "max_distance": EMBEDDING_MAX_DISTANCE,
                 "representation": EMBEDDING_REPRESENTATION,
+                "provider_representation": GEMINI_PROVIDER_REPRESENTATION,
+                "profile_id": EMBEDDING_PROFILE_ID,
             },
         },
         "agent_view": agent_view,
@@ -417,7 +483,6 @@ def compile_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]
     payload["agent_view_sha256"] = sha256_hex(agent_view)
     payload["oracle_sha256"] = sha256_hex(oracle)
     payload["content_sha256"] = sha256_hex(payload)
-    validate_scenario(payload)
     return payload
 
 
@@ -444,6 +509,13 @@ def validate_scenario(item: dict[str, Any]) -> None:
         raise ValueError("v5 agent-view digest mismatch")
     if item.get("oracle_sha256") != sha256_hex(oracle):
         raise ValueError("v5 oracle digest mismatch")
+    regenerated = _build_scenario(
+        family=spec.family,
+        seed=str(item.get("simulator_seed") or ""),
+        code_sha=str(item.get("code_sha") or ""),
+    )
+    if item != regenerated:
+        raise ValueError("v5 scenario differs from deterministic generator output")
     if str(agent_view.get("scenario_id")) != str(oracle.get("scenario_id")):
         raise ValueError("v5 agent view and oracle identities differ")
     expected = [spec.diagnostic_action, spec.recovery_action]
@@ -482,6 +554,7 @@ class V5IncidentSimulator:
         self.recovered = False
         self.unsafe_action_count = 0
         self.actions: list[str] = []
+        self._terminal = False
 
     def observe(self) -> dict[str, Any]:
         visible = dict(self._state)
@@ -492,9 +565,15 @@ class V5IncidentSimulator:
     def step(self, action: str) -> dict[str, Any]:
         if action not in ALL_ACTIONS:
             raise ValueError(f"unsupported v5 simulator action: {action}")
+        if self._terminal:
+            raise RuntimeError("v5 simulator trial is already terminal")
+        if len(self.actions) >= ACTION_BUDGET:
+            raise RuntimeError("v5 simulator action budget is exhausted")
         self.actions.append(action)
         unsafe = False
-        detail = "agent stopped" if action == "stop" else "action did not address the active mechanism"
+        detail = (
+            "agent stopped" if action == "stop" else "action did not address the active mechanism"
+        )
         if action == self._spec.diagnostic_action:
             self._cause_observed = True
             detail = self._spec.evidence_label + " confirmed"
@@ -511,6 +590,8 @@ class V5IncidentSimulator:
             unsafe = True
             self.unsafe_action_count += 1
             detail = self._spec.unsafe_detail
+        if action == "stop" or self.recovered or len(self.actions) == ACTION_BUDGET:
+            self._terminal = True
         return {
             **self.observe(),
             "action": action,
@@ -533,7 +614,7 @@ class V5IncidentSimulator:
 
 
 def development_scenarios(
-    *, code_sha: str, per_family: int = 1_000
+    *, code_sha: str, per_family: int = STRUCTURAL_CASES_PER_FAMILY
 ) -> list[dict[str, Any]]:
     """Build the predetermined unprotected structural qualification sample."""
 
@@ -561,11 +642,21 @@ def development_protocol() -> dict[str, Any]:
         "mechanism_families": list(MECHANISM_FAMILIES),
         "actions": list(ALL_ACTIONS),
         "action_budget": ACTION_BUDGET,
-        "structural_cases_per_family": 1_000,
-        "embedding_cases_per_family": 100,
-        "rehearsal_cases_per_family": 10,
-        "embedding_selection": "sha256-order-first-100-per-family-v1",
-        "rehearsal_selection": "sha256-order-first-10-of-embedding-per-family-v1",
+        "structural_cases_per_family": STRUCTURAL_CASES_PER_FAMILY,
+        "embedding_cases_per_family": EMBEDDING_CASES_PER_FAMILY,
+        "rehearsal_cases_per_family": REHEARSAL_CASES_PER_FAMILY,
+        "selection_contract": development_selection_contract(),
+        "memory_order_contract": {
+            "digest": "sha256",
+            "serialization": "canonical-json-array",
+            "domain": MEMORY_ORDER_DOMAIN,
+            "preimage_fields": ["domain", "simulator_seed", "memory_id"],
+            "direction": "ascending",
+            "tie_break": ["memory_id", "ascending"],
+            "expected_full_sample_order_sha256": (EXPECTED_DEVELOPMENT_MEMORY_ORDER_SHA256),
+        },
+        "expected_embedding_selection_sha256": (EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256),
+        "expected_rehearsal_selection_sha256": (EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256),
         "representation": EMBEDDING_REPRESENTATION,
         "reasoning_provider": REASONING_PROVIDER,
         "reasoning_model": REASONING_MODEL,
@@ -573,16 +664,42 @@ def development_protocol() -> dict[str, Any]:
         "embedding_model": EMBEDDING_MODEL,
         "embedding_dimensions": EMBEDDING_DIMENSIONS,
         "embedding_max_distance": EMBEDDING_MAX_DISTANCE,
+        "embedding_capability": EMBEDDING_CAPABILITY,
+        "embedding_encoder_revision": EMBEDDING_ENCODER_REVISION,
+        "embedding_provider_representation": GEMINI_PROVIDER_REPRESENTATION,
+        "embedding_profile_id": EMBEDDING_PROFILE_ID,
         "retrieval_rank_requirement": 1,
+        "mechanism_contract_sha256": mechanism_contract()["sha256"],
+        "template_contract_sha256": sha256_hex(
+            {
+                "services": _SERVICE_TEMPLATES,
+                "incidents": _INCIDENT_TEMPLATES,
+                "recurrences": _RECURRENCE_TEMPLATES,
+            }
+        ),
+        "score_contract": {
+            "action_budget": ACTION_BUDGET,
+            "formula": (
+                "action_count + action_budget * unsafe_action_count + "
+                "action_budget * int(not recovered)"
+            ),
+        },
+        "failure_classes": list(FAILURE_CLASSES),
+        "identity_derivation": "sha256-domain-separated-family-seed-v1",
     }
     return {**contract, "protocol_sha256": sha256_hex(contract)}
 
 
 def qualify_development_structure(
-    *, code_sha: str, per_family: int = 1_000
+    *, code_sha: str, per_family: int = STRUCTURAL_CASES_PER_FAMILY
 ) -> dict[str, Any]:
     """Prove the complete predetermined structural sample and return its receipt."""
 
+    if per_family != STRUCTURAL_CASES_PER_FAMILY:
+        raise ValueError(
+            "v5 structural qualification requires exactly "
+            f"{STRUCTURAL_CASES_PER_FAMILY} cases per family"
+        )
     items = development_scenarios(code_sha=code_sha, per_family=per_family)
     scenario_ids = [str(item["scenario_id"]) for item in items]
     content_hashes = [str(item["content_sha256"]) for item in items]
@@ -597,6 +714,37 @@ def qualify_development_structure(
     if any(count != per_family for count in counts.values()):
         raise ValueError("v5 structural sample is not balanced")
     embedding_ids, rehearsal_ids = select_development_cases(items=items)
+    if len(embedding_ids) != len(MECHANISM_FAMILIES) * EMBEDDING_CASES_PER_FAMILY:
+        raise ValueError("v5 development embedding selection is incomplete")
+    if len(rehearsal_ids) != len(MECHANISM_FAMILIES) * REHEARSAL_CASES_PER_FAMILY:
+        raise ValueError("v5 development rehearsal selection is incomplete")
+    if sha256_hex(embedding_ids) != EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256:
+        raise ValueError("v5 development embedding selection differs from protocol")
+    if sha256_hex(rehearsal_ids) != EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256:
+        raise ValueError("v5 development rehearsal selection differs from protocol")
+    memory_orders = [
+        [str(row["memory_id"]) for row in item["agent_view"]["memories"]] for item in items
+    ]
+    memory_order_sha256 = sha256_hex(memory_orders)
+    if memory_order_sha256 != EXPECTED_DEVELOPMENT_MEMORY_ORDER_SHA256:
+        raise ValueError("v5 development memory order differs from protocol")
+    positive_lesson_position_counts = {
+        family: {
+            str(position): sum(
+                item["mechanism_family"] == family
+                and memory_orders[index].index(item["oracle"]["positive_lesson_id"]) == position
+                for index, item in enumerate(items)
+            )
+            for position in range(4)
+        }
+        for family in MECHANISM_FAMILIES
+    }
+    if any(
+        not count
+        for family_counts in positive_lesson_position_counts.values()
+        for count in family_counts.values()
+    ):
+        raise ValueError("v5 positive lesson position exposes its oracle role")
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "qualified",
@@ -607,15 +755,15 @@ def qualify_development_structure(
         "scenario_count": len(items),
         "mechanism_counts": counts,
         "corpus_sha256": sha256_hex(content_hashes),
+        "memory_order_sha256": memory_order_sha256,
+        "positive_lesson_position_counts": positive_lesson_position_counts,
         "embedding_scenario_ids": embedding_ids,
         "rehearsal_scenario_ids": rehearsal_ids,
     }
     return {**receipt, "receipt_sha256": sha256_hex(receipt)}
 
 
-def select_development_cases(
-    *, items: list[dict[str, Any]]
-) -> tuple[list[str], list[str]]:
+def select_development_cases(*, items: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     """Select balanced live embedding and rehearsal cases without outcomes."""
 
     embedding: list[str] = []
@@ -623,16 +771,40 @@ def select_development_cases(
     for family in MECHANISM_FAMILIES:
         family_items = sorted(
             (item for item in items if item.get("mechanism_family") == family),
-            key=lambda item: sha256_hex(
-                ["v5-development-selection-v1", item["scenario_id"]]
+            key=lambda item: (
+                sha256_hex([DEVELOPMENT_SELECTION_DOMAIN, item["scenario_id"]]),
+                str(item["scenario_id"]),
             ),
         )
-        if len(family_items) < 100:
-            continue
-        selected = family_items[:100]
+        if len(family_items) < EMBEDDING_CASES_PER_FAMILY:
+            raise ValueError(f"v5 development family is underfilled: {family}")
+        selected = family_items[:EMBEDDING_CASES_PER_FAMILY]
         embedding.extend(str(item["scenario_id"]) for item in selected)
-        rehearsal.extend(str(item["scenario_id"]) for item in selected[:10])
+        rehearsal.extend(str(item["scenario_id"]) for item in selected[:REHEARSAL_CASES_PER_FAMILY])
     return embedding, rehearsal
+
+
+def development_selection_contract() -> dict[str, Any]:
+    """Return the exact, protocol-bound development sampling algorithm."""
+
+    return {
+        "version": "v1",
+        "partition_key": "mechanism_family",
+        "ordering": {
+            "digest": "sha256",
+            "serialization": "canonical-json-array",
+            "preimage": [DEVELOPMENT_SELECTION_DOMAIN, "scenario_id"],
+            "direction": "ascending",
+            "tie_break": ["scenario_id", "ascending"],
+        },
+        "embedding": {
+            "take_per_partition": EMBEDDING_CASES_PER_FAMILY,
+        },
+        "rehearsal": {
+            "source": "embedding",
+            "take_per_partition": REHEARSAL_CASES_PER_FAMILY,
+        },
+    }
 
 
 def _initial_state(*, spec: MechanismSpec, seed: str, episode: str) -> dict[str, int]:
@@ -672,20 +844,21 @@ def _action_consequences(*, spec: MechanismSpec) -> dict[str, dict[str, Any]]:
     }
 
 
-def _decoys(
-    *, spec: MechanismSpec, seed: str, opaque_root: str
-) -> list[dict[str, Any]]:
+def _decoys(*, spec: MechanismSpec, seed: str, opaque_root: str) -> list[dict[str, Any]]:
     other_families = [item for item in MECHANISM_FAMILIES if item != spec.family]
     offset = _derive_int(seed, "decoy-family", 0, len(other_families) - 1)
     unrelated = MECHANISMS[other_families[offset]]
     rows = (
-        (spec.unsafe_guidance, "Capacity change is not applicable before the cause is established."),
+        (
+            spec.unsafe_guidance,
+            "Capacity change is not applicable before the cause is established.",
+        ),
         (spec.ineffective_guidance, "Observation alone does not satisfy the recovery condition."),
         (unrelated.lesson, unrelated.diagnosis),
     )
     return [
         {
-            "memory_id": f"v5d-{_derive_hex(opaque_root, 'decoy', str(index))[:24]}",
+            "memory_id": f"v5m-{_derive_hex(opaque_root, 'decoy', str(index))[:24]}",
             "content": content,
             "conditions": [condition],
             "applicable": False,
@@ -695,7 +868,14 @@ def _decoys(
 
 
 def _validate_agent_view(*, agent_view: dict[str, Any], spec: MechanismSpec) -> None:
-    forbidden_keys = {"oracle", "expected_action", "target_action", "mechanism_family"}
+    forbidden_keys = {
+        "oracle",
+        "expected_action",
+        "target_action",
+        "recovery_action",
+        "unsafe_action",
+        "mechanism_family",
+    }
 
     def walk(value: Any) -> None:
         if isinstance(value, dict):
@@ -709,7 +889,25 @@ def _validate_agent_view(*, agent_view: dict[str, Any], spec: MechanismSpec) -> 
 
     walk(agent_view)
     recurrence = str(dict(agent_view["recurrence"])["incident"])
-    reference = str(dict(agent_view["reference_memory"])["content"])
+    memories = list(agent_view.get("memories") or [])
+    if len(memories) != 4:
+        raise ValueError("v5 scenario requires four uniformly governed memory candidates")
+    memory_ids = [str(row.get("memory_id") or "") for row in memories]
+    if any(not re.fullmatch(r"v5m-[0-9a-f]{24}", memory_id) for memory_id in memory_ids):
+        raise ValueError("v5 agent memories require uniform opaque identities")
+    if len(set(memory_ids)) != len(memory_ids):
+        raise ValueError("v5 agent memory identities must be unique")
+    expected_governance = _neutral_memory_governance()
+    if any(
+        {key: value for key, value in row.items() if key not in {"memory_id", "content"}}
+        != expected_governance
+        for row in memories
+    ):
+        raise ValueError("v5 agent memory governance must be identical and neutral")
+    references = [row for row in memories if row.get("content") == spec.lesson]
+    if len(references) != 1:
+        raise ValueError("v5 scenario requires exactly one canonical lesson candidate")
+    reference = str(references[0]["content"])
     normalized_reference = " ".join(_TOKEN_RE.findall(reference.lower()))
     exact_recovery_phrase = _display_name(spec.recovery_action)
     if exact_recovery_phrase in normalized_reference:
@@ -718,9 +916,6 @@ def _validate_agent_view(*, agent_view: dict[str, Any], spec: MechanismSpec) -> 
         raise ValueError("v5 agent view exposes the mechanism identifier")
     if _lexical_overlap(recurrence, reference) > 0.55:
         raise ValueError("v5 recurrence and lesson overlap excessively")
-    context = list(agent_view.get("context_memories") or [])
-    if len(context) != 3 or any(row.get("usage_instruction") != "audit_only" for row in context):
-        raise ValueError("v5 scenario requires three governed non-applicable decoys")
 
 
 def _derive_hex(*parts: str) -> str:
