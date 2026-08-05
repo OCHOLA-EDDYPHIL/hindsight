@@ -116,65 +116,6 @@ def test_reset_session_readiness_requires_new_namespace_and_known_good_snapshot(
 
 
 @requires_browser
-def test_cross_episode_lesson_identity_chain_is_inspectable():
-    from hindsight.cross_episode import run_cross_episode_demo
-    from hindsight.db import database_url
-    from hindsight.server_tenants import public_demo_tenant_id
-    from hindsight.tenant import tenant_scope
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.firefox.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-
-    with tenant_scope(public_demo_tenant_id()):
-        result = run_cross_episode_demo(
-            db_url=database_url(),
-            namespace=f"live-lesson-chain:{uuid4()}",
-        )
-    trace = result.lesson_trace
-    options = Options()
-    options.add_argument("-headless")
-    driver = webdriver.Firefox(options=options)
-    wait = WebDriverWait(driver, 90)
-    try:
-        driver.set_window_size(1440, 1000)
-        driver.get(_browser_url(namespace=result.namespace))
-        _capture_console_errors(driver)
-        chain = wait.until(
-            lambda browser: browser.find_element(By.ID, "lessonIdentityChain")
-            if browser.find_element(By.ID, "lessonTraceStatus").text == "Identity complete"
-            else False
-        )
-        expected = {
-            "data-incident-id": str(trace["source_incident"]["id"]),
-            "data-consolidation-id": str(trace["consolidation"]["job_id"]),
-            "data-producer-decision-id": str(
-                trace["consolidation"]["producer_decision_id"]
-            ),
-            "data-lesson-memory-id": str(trace["lesson"]["memory_id"]),
-            "data-lesson-belief-id": str(trace["lesson"]["belief_id"]),
-            "data-retrieval-id": str(trace["retrieval"]["retrieval_id"]),
-            "data-read-id": str(trace["retrieval"]["read_id"]),
-            "data-embedding-profile-id": str(trace["embedding_profile"]["id"]),
-            "data-consumer-decision-id": str(
-                trace["consumer_decision"]["decision_id"]
-            ),
-        }
-        for attribute, value in expected.items():
-            assert chain.get_attribute(attribute) == value
-        assert chain.get_attribute("data-lineage-edge-ids") == ",".join(
-            str(edge["id"]) for edge in trace["lineage_edges"]
-        )
-        assert "Version" in chain.text
-        assert "verified edge" in chain.text
-        assert "content" not in chain.text.lower()
-        assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
-        assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
-    finally:
-        driver.quit()
-
-
-@requires_browser
 def test_operator_can_run_and_explain_signature_workflow():
     from selenium import webdriver
     from selenium.webdriver.common.by import By

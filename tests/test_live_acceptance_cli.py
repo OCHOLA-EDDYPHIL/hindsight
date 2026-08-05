@@ -197,8 +197,6 @@ def test_browser_contract_inventories_have_explicit_local_hosted_parity():
     expected_shared = (
         "tests/test_browser_ui.py::test_operator_can_run_and_explain_signature_workflow",
         "tests/test_browser_ui.py::"
-        "test_cross_episode_lesson_identity_chain_is_inspectable",
-        "tests/test_browser_ui.py::"
         "test_review_required_memory_renders_as_active_in_its_historical_snapshot",
     )
     expected_infrastructure = (

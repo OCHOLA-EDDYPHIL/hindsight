@@ -5,7 +5,6 @@ import { isoToLocalInput, localInputToIso } from "@/lib/format";
 import type {
   Incident,
   InfluenceItem,
-  LessonIdentityTrace,
   MemoryOperation,
   RewindPreview,
   Run,
@@ -72,8 +71,6 @@ export function useCockpit() {
   const [run, setRun] = useState<Run | null>(null);
   const runRef = useRef<Run | null>(null);
   const [influence, setInfluence] = useState<InfluenceItem[]>([]);
-  const [lessonTrace, setLessonTrace] = useState<LessonIdentityTrace | null>(null);
-  const [lessonTraceState, setLessonTraceState] = useState<LoadState>("loading");
   const [operator, setOperator] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const noticeTimer = useRef<number>();
@@ -309,21 +306,6 @@ export function useCockpit() {
     }
   }, [announce, config]);
 
-  const loadLessonTrace = useCallback(async () => {
-    setLessonTraceState("loading");
-    try {
-      const payload = await requestJson<{
-        traces?: LessonIdentityTrace[];
-      }>(config, "/lesson-traces?limit=1");
-      const trace = payload.traces?.[0] || null;
-      setLessonTrace(trace);
-      setLessonTraceState(trace ? "ready" : "empty");
-    } catch {
-      setLessonTrace(null);
-      setLessonTraceState("error");
-    }
-  }, [config]);
-
   const retryInitialLoad = useCallback(async () => {
     setLoadState("loading");
     setLoadError("");
@@ -364,9 +346,8 @@ export function useCockpit() {
     void (async () => {
       await establishOperatorSession();
       await retryInitialLoad();
-      await loadLessonTrace();
     })();
-  }, [establishOperatorSession, loadLessonTrace, retryInitialLoad]);
+  }, [establishOperatorSession, retryInitialLoad]);
 
   const handleLiveEvent = useCallback(
     (payload: Record<string, any>) => {
@@ -766,8 +747,6 @@ export function useCockpit() {
     incident,
     run,
     influence,
-    lessonTrace,
-    lessonTraceState,
     operator,
     notice,
     incidentInput,

@@ -6,13 +6,12 @@ import {
   CausalRail,
   ErrorSurface,
   InfluenceLedger,
-  LessonIdentityChain,
   LoadingSurface,
   OperationLedger,
   OutcomeComparison,
   Timeline,
 } from "@/components/cockpit";
-import type { LessonIdentityTrace, SignatureScenario, Snapshot } from "@/types";
+import type { SignatureScenario, Snapshot } from "@/types";
 
 const scenario: SignatureScenario = {
   scenario_id: "49109a44-43e7-40de-b547-b4f9d0a387a2",
@@ -122,44 +121,6 @@ const snapshot: Snapshot = {
   ],
 };
 
-const lessonTrace: LessonIdentityTrace = {
-  source_incident: { id: "incident-source", slug: "checkout-latency" },
-  consolidation: {
-    job_id: "consolidation-job",
-    producer_decision_id: "decision-producer",
-  },
-  lesson: {
-    memory_id: "memory-lesson",
-    belief_id: "belief-lesson",
-    version_number: 2,
-    embedding_profile_id: "profile-gemini",
-  },
-  retrieval: {
-    retrieval_id: "retrieval-lesson",
-    read_id: "read-lesson",
-    embedding_profile_id: "profile-gemini",
-  },
-  embedding_profile: {
-    id: "profile-gemini",
-    provider: "gemini",
-    model: "gemini-embedding-001",
-    dimensions: 1024,
-    capability: "semantic",
-    encoder_revision: "v1",
-    max_distance: 0.35,
-  },
-  lineage_edges: [
-    {
-      id: "lineage-edge",
-      parent_read_id: "read-source",
-      parent_memory_id: "memory-source",
-      producer_decision_id: "decision-producer",
-      edge_type: "derived",
-    },
-  ],
-  consumer_decision: { decision_id: "decision-consumer" },
-};
-
 describe("guided replay cockpit", () => {
   it("renders the five durable causal identities in chronology", () => {
     render(<CausalRail scenario={scenario} />);
@@ -171,27 +132,6 @@ describe("guided replay cockpit", () => {
     expect(screen.getByLabelText(/Copy Influenced decision identity/)).toHaveAttribute(
       "title",
       "decision-rejected",
-    );
-  });
-
-  it("renders the content-free cross-episode identity chain", () => {
-    render(<LessonIdentityChain trace={lessonTrace} state="ready" />);
-
-    const chain = screen.getByRole("list", { name: "Lesson identity chain" });
-    expect(within(chain).getAllByRole("listitem")).toHaveLength(7);
-    expect(screen.getByText("Version 2")).toBeVisible();
-    expect(screen.getByText("1 verified edge")).toBeVisible();
-    expect(screen.getByLabelText(/Copy lesson belief identity/)).toHaveAttribute(
-      "title",
-      "belief-lesson",
-    );
-    expect(screen.getByLabelText(/Copy embedding profile identity/)).toHaveAttribute(
-      "title",
-      "profile-gemini",
-    );
-    expect(screen.getByLabelText(/Copy consumer decision identity/)).toHaveAttribute(
-      "title",
-      "decision-consumer",
     );
   });
 

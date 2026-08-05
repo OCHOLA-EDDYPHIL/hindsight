@@ -1,13 +1,174 @@
 """Tests for resolved-incident consolidation."""
 
+from datetime import UTC, datetime
 import os
+from typing import Any
 from uuid import uuid4
 
 import pytest
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 requires_db = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
 )
+
+SERVICE_SLUG = "payments-api"
+ROOT_CAUSE = "Retry fanout amplified downstream payment processor timeouts."
+RESOLUTION_SUMMARY = (
+    "Throttle retry fanout, watch processor timeout rate, and hold worker scaling "
+    "until downstream processor health recovers."
+)
+
+
+def open_demo_incident(
+    *,
+    label: str,
+    namespace: str,
+    summary: str,
+    db_url: str,
+    embedding_provider: Any | None = None,
+) -> dict[str, Any]:
+    """Build the governed incident evidence needed by consolidation tests."""
+
+    from hindsight.db import connect
+    from hindsight.embeddings import embedding_provider_from_env
+    from hindsight.memory import MemoryStore, Provenance
+
+    provider = embedding_provider or embedding_provider_from_env()
+    slug = f"{namespace}:{label}"
+    content = (
+        f"Telemetry summary for {slug}: {summary} Signals: checkout p99 above 2s, "
+        "processor timeouts rising, retry fanout high."
+    )
+    embedding = provider.embed_document(content)
+    with connect(db_url) as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                        INSERT INTO services (slug, name, owner_team, tier)
+                        VALUES (%s, 'Payments API', 'revenue-platform', 'critical')
+                        ON CONFLICT (tenant_id, slug) DO UPDATE SET
+                            name = excluded.name,
+                            owner_team = excluded.owner_team,
+                            tier = excluded.tier
+                        RETURNING *
+                    """,
+                    (SERVICE_SLUG,),
+                )
+                service = cur.fetchone()
+                cur.execute(
+                    """
+                        INSERT INTO incidents (
+                            slug, title, severity, status, started_at, summary
+                        )
+                        VALUES (%s, 'Checkout p99 latency above SLO', 'sev2', 'open', %s, %s)
+                        ON CONFLICT (tenant_id, slug) DO UPDATE SET
+                            title = excluded.title,
+                            severity = excluded.severity,
+                            status = excluded.status,
+                            started_at = excluded.started_at,
+                            summary = excluded.summary,
+                            resolved_at = NULL,
+                            root_cause = NULL
+                        RETURNING *
+                    """,
+                    (slug, datetime.now(UTC), summary),
+                )
+                incident = cur.fetchone()
+            assert service is not None and incident is not None
+            conn.execute(
+                """
+                    INSERT INTO incident_services (incident_id, service_id, impact)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (incident_id, service_id) DO UPDATE SET
+                        impact = excluded.impact
+                """,
+                (incident["id"], service["id"], "payments-api checkout latency breached SLO."),
+            )
+            conn.execute(
+                """
+                    INSERT INTO incident_events (
+                        incident_id, occurred_at, event_type, summary, metadata
+                    )
+                    VALUES (%s, %s, 'telemetry_alert', %s, %s)
+                """,
+                (
+                    incident["id"],
+                    datetime.now(UTC),
+                    summary,
+                    Jsonb({"namespace": namespace, "label": label}),
+                ),
+            )
+            memory = MemoryStore(conn=conn, embedding_provider=provider).remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content=content,
+                provenance=Provenance(
+                    writer="telemetry.ingest",
+                    source_ref=f"telemetry:{slug}",
+                    justification="Store incident evidence for consolidation testing",
+                ),
+                metadata={
+                    "role": "incident-summary",
+                    "incident_slug": slug,
+                    "service_slug": SERVICE_SLUG,
+                    "label": label,
+                },
+                precomputed_embedding=embedding,
+            )
+            conn.execute(
+                """
+                    INSERT INTO incident_semantic_memories (
+                        incident_id, memory_id, relationship
+                    )
+                    VALUES (%s, %s, 'summary')
+                    ON CONFLICT (incident_id, memory_id) DO UPDATE SET
+                        relationship = excluded.relationship
+                """,
+                (incident["id"], memory["id"]),
+            )
+    return dict(incident)
+
+
+def resolve_demo_incident(
+    *, incident_id: str, reflected_memory_id: str | None, db_url: str
+) -> dict[str, Any]:
+    """Resolve a test incident and attach optional resolution evidence."""
+
+    from hindsight.db import connect
+    from hindsight.runs import resolve_incident
+
+    with connect(db_url) as conn:
+        row = conn.execute(
+            "SELECT slug FROM incidents WHERE id = %s", (incident_id,)
+        ).fetchone()
+    assert row is not None
+    incident = resolve_incident(
+        slug=str(row[0]),
+        root_cause=ROOT_CAUSE,
+        action="Throttle retry fanout and hold worker scaling",
+        observation=RESOLUTION_SUMMARY,
+        recovered=True,
+        actor="test.operator",
+        db_url=db_url,
+    )["incident"]
+    if reflected_memory_id:
+        with connect(db_url) as conn:
+            conn.execute(
+                """
+                    INSERT INTO incident_semantic_memories (
+                        incident_id, memory_id, relationship
+                    )
+                    VALUES (%s, %s, 'resolution')
+                    ON CONFLICT (incident_id, memory_id) DO UPDATE SET
+                        relationship = excluded.relationship
+                """,
+                (incident["id"], reflected_memory_id),
+            )
+            conn.commit()
+    return incident
 
 
 def test_incident_changefeed_handler_ignores_non_resolved_rows(monkeypatch):
@@ -152,12 +313,10 @@ def test_lesson_generation_requests_the_validated_response_schema():
 @requires_db
 def test_consolidation_writes_idempotent_lesson_with_provenance():
     import hindsight.consolidation as consolidation
-    from hindsight.cross_episode import (
-        ROOT_CAUSE,
-        open_demo_incident,
-        resolve_demo_incident,
-    )
     from hindsight.db import connect, database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import MemoryStore
+    from hindsight.trace_contract import governed_decision_trace
 
     namespace = f"consolidation-test-{uuid4()}"
     incident = open_demo_incident(
@@ -192,6 +351,26 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
     assert second.reason == "lesson already exists"
     assert second.memory is not None
     assert second.memory["id"] == first.memory["id"]
+    decision_id = str(uuid4())
+    with MemoryStore(
+        url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ) as store:
+        retrieval = store.retrieve_semantic(
+            namespace=namespace,
+            query=first.memory["content"],
+            decision_id=decision_id,
+            reader="consolidation.regression",
+            purpose="prove a consolidated lesson reaches strict retrieval",
+            limit=5,
+        )
+    assert retrieval.status == "succeeded"
+    assert str(first.memory["id"]) in {str(hit["id"]) for hit in retrieval.hits}
+    trace = governed_decision_trace(decision_id=decision_id, db_url=database_url())
+    assert trace is not None
+    assert str(first.memory["id"]) in {
+        str(read["memory_id"]) for read in trace["reads"]
+    }
     with connect() as conn:
         conn.execute(
             """
@@ -209,25 +388,23 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
 
 
 @requires_db
-def test_cross_episode_embedding_failure_writes_no_incident_state(monkeypatch):
-    import hindsight.cross_episode as cross_episode
+def test_incident_evidence_embedding_failure_writes_no_state():
     from hindsight.db import connect, database_url
 
     class FailingProvider:
         def embed_document(self, _text):
             raise RuntimeError("document embedding unavailable")
 
-    namespace = f"cross-episode-embedding-failure-{uuid4()}"
+    namespace = f"consolidation-embedding-failure-{uuid4()}"
     label = "episode-one"
     slug = f"{namespace}:{label}"
-    monkeypatch.setattr(cross_episode, "embedding_provider_from_env", FailingProvider)
-
     with pytest.raises(RuntimeError, match="document embedding unavailable"):
-        cross_episode.open_demo_incident(
+        open_demo_incident(
             label=label,
             namespace=namespace,
             summary="retry fanout raised checkout latency",
             db_url=database_url(),
+            embedding_provider=FailingProvider(),
         )
 
     with connect(database_url()) as conn:
@@ -266,7 +443,6 @@ def test_invalid_model_output_publishes_no_lesson_and_records_terminal_reason(
     model_output, reason_fragment
 ):
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
@@ -322,7 +498,6 @@ def test_invalid_model_output_publishes_no_lesson_and_records_terminal_reason(
 @pytest.mark.parametrize("governance_state", ["invalidated", "review_required"])
 def test_consolidation_rejects_governed_invalid_source_evidence(governance_state):
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
 
@@ -394,7 +569,6 @@ def test_consolidation_excludes_quarantined_rows_from_mixed_source_evidence():
     import json
 
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
@@ -516,7 +690,6 @@ def test_governance_change_during_synthesis_prevents_lesson_publication():
     import json
 
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
@@ -609,7 +782,6 @@ def test_transient_consolidation_failure_reuses_open_decision_and_recovers():
     import json
 
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
@@ -711,7 +883,6 @@ def test_transient_consolidation_failure_reuses_open_decision_and_recovers():
 @requires_db
 def test_consolidation_exhaustion_fails_job_and_decision_together():
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
 
@@ -761,7 +932,6 @@ def test_consolidation_exhaustion_fails_job_and_decision_together():
 @requires_db
 def test_expired_last_attempt_is_terminalized_without_an_extra_retry():
     import hindsight.consolidation as consolidation
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
 
@@ -838,7 +1008,6 @@ def test_retry_that_becomes_ineligible_fails_linked_decision_atomically():
         process_consolidation_job,
         consolidate_resolved_incident,
     )
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
 
@@ -910,7 +1079,6 @@ def test_retry_that_becomes_ineligible_fails_linked_decision_atomically():
 @requires_db
 def test_retry_rejects_a_previously_read_source_after_quarantine():
     from hindsight.consolidation import consolidate_resolved_incident
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
 
@@ -994,7 +1162,6 @@ def test_expired_attempt_cannot_publish_or_transition_after_overlapping_claim():
     import json
 
     import hindsight.consolidation as consolidation
-    from hindsight.cross_episode import open_demo_incident, resolve_demo_incident
     from hindsight.db import connect, database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse

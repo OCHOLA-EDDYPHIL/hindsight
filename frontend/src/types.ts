@@ -59,50 +59,6 @@ export interface DecisionTrace {
   lineage_edges?: Array<{ id: Identifier }>;
 }
 
-export interface LessonIdentityTrace {
-  source_incident: {
-    id?: Identifier | null;
-    slug?: string | null;
-  };
-  consolidation: {
-    job_id?: Identifier | null;
-    producer_decision_id?: Identifier | null;
-  };
-  lesson: {
-    memory_id: Identifier;
-    belief_id: Identifier;
-    version_number: number;
-    embedding_profile_id?: Identifier | null;
-  };
-  retrieval: {
-    retrieval_id: Identifier;
-    read_id: Identifier;
-    embedding_profile_id?: Identifier | null;
-  };
-  embedding_profile?: {
-    id: Identifier;
-    provider?: string | null;
-    model?: string | null;
-    dimensions?: number | null;
-    capability?: string | null;
-    encoder_revision?: string | null;
-    max_distance?: number | null;
-  } | null;
-  lineage_edges: Array<{
-    id: Identifier;
-    parent_read_id: Identifier;
-    parent_memory_id: Identifier;
-    producer_decision_id: Identifier;
-    edge_type: string;
-  }>;
-  consumer_decision: {
-    decision_id: Identifier;
-    run_id?: Identifier | null;
-    incident_id?: Identifier | null;
-    incident_slug?: string | null;
-  };
-}
-
 export interface Run {
   id: Identifier;
   incident_slug?: string | null;
