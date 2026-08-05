@@ -65,6 +65,7 @@ def test_research_inputs_never_enter_normal_ci_qualification():
     for path in (
         "src/hindsight/benchmark.py",
         "src/hindsight/v5_corpus.py",
+        "src/hindsight/v5_qualification.py",
         "scripts/run_v5_study.py",
         "scripts/run_rank_diagnostics.py",
         "fixtures/v4/corpus.json",

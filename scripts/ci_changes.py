@@ -32,6 +32,7 @@ RESEARCH_MODULES = frozenset(
         "representation_selection.py",
         "v4_corpus.py",
         "v5_corpus.py",
+        "v5_qualification.py",
     }
 )
 DATABASE_SCRIPTS = frozenset(
