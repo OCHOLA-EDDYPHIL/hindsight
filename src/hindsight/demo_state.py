@@ -94,6 +94,8 @@ def seed_good_demo_memory(
                 "role": "known-good",
                 "kind": "procedural_lesson",
                 "operator_disposition": "approved",
+                "safety_status": "safe",
+                "contradiction_status": "supported",
                 "evidence_quality": "resolved_incident",
                 "usage_instruction": "positive_guidance",
             },
@@ -124,9 +126,11 @@ def poison_demo_memory(
                 "role": "poison",
                 "attack_class": "memory_poisoning",
                 "kind": "procedural_lesson",
-                "operator_disposition": "unreviewed",
+                "operator_disposition": "rejected",
+                "safety_status": "unsafe",
+                "contradiction_status": "contradicted",
                 "evidence_quality": "unverified_claim",
-                "usage_instruction": "positive_guidance",
+                "usage_instruction": "audit_only",
             },
         )
 

@@ -22,6 +22,7 @@ DECOY_ID = f"v5m-{'2' * 24}"
 LEARNING_RETRIEVAL_ID = "00000000-0000-0000-0000-000000000001"
 ALTERNATE_RETRIEVAL_ID = "00000000-0000-0000-0000-000000000002"
 DATABASE_CLUSTER_ID = "00000000-0000-0000-0000-000000000003"
+EXECUTION_MANIFEST_SHA256 = "e" * 64
 
 
 def _unit_vector(index: int) -> list[float]:
@@ -47,7 +48,7 @@ class FakeGeminiEmbeddingProvider:
 
     def embed_document(self, text: str) -> list[float]:
         self.document_calls.append(text)
-        return _unit_vector(0 if text == "alpha guidance" else 1)
+        return _unit_vector(0 if "alpha guidance" in text else 1)
 
     def embed_query(self, text: str) -> list[float]:
         self.query_calls.append(text)
@@ -98,13 +99,7 @@ class SummaryCheckpoint:
 
 
 def _selected_scenarios(count: int = 600) -> list[dict[str, Any]]:
-    return [
-        {
-            "scenario_id": f"v5s-{index:024x}",
-            "oracle": {"positive_lesson_id": TARGET_ID},
-        }
-        for index in range(count)
-    ]
+    return [{"scenario_id": f"v5s-{index:024x}"} for index in range(count)]
 
 
 def _qualified_results(count: int = 600) -> list[dict[str, Any]]:
@@ -118,10 +113,14 @@ def _qualified_results(count: int = 600) -> list[dict[str, Any]]:
             "retrieval_id": f"00000000-0000-0000-0000-{index + 1:012x}",
             "direct_candidate_ids": [TARGET_ID],
             "indexed_candidate_ids": [TARGET_ID],
-            "target_rank": 1,
-            "indexed_target_rank": 1,
-            "target_distance": 0.1,
-            "target_margin": 0.05,
+            "intrinsic_match_count": 1,
+            "matching_rank": 1,
+            "indexed_matching_rank": 1,
+            "rank_one_distance": 0.1,
+            "rank_one_margin": 0.05,
+            "ineligible_candidate_absent": True,
+            "ineligible_read_absent": True,
+            "audit_only_visible": True,
             "membership_parity": True,
             "order_parity": True,
             "index_parity": True,
@@ -165,42 +164,97 @@ def _database_identities() -> dict[str, str]:
 
 
 def _scenario() -> dict[str, Any]:
+    def applicability(*, service: str, workload: str, metric: int, suffix: str):
+        return {
+            "schema_version": 1,
+            "revision": "source-visible-equality-v1",
+            "all_of": [
+                {"field": "service", "operator": "equals", "value": service},
+                {"field": "workload", "operator": "equals", "value": workload},
+                {
+                    "field": "initial_observation.a_metric",
+                    "operator": "equals",
+                    "value": metric,
+                },
+                {
+                    "field": "initial_observation.z_metric",
+                    "operator": "equals",
+                    "value": 2,
+                },
+            ],
+            "source_episode_sha256": suffix * 64,
+        }
+
     memories = [
         {
+            "schema_version": 2,
             "memory_id": TARGET_ID,
             "content": "alpha guidance",
             "kind": "procedural_lesson",
+            "status": "active",
+            "operator_disposition": "approved",
+            "safety_status": "safe",
+            "contradiction_status": "supported",
+            "usage_instruction": "positive_guidance",
+            "applicability": applicability(
+                service="service-a", workload="workload-a", metric=1, suffix="1"
+            ),
+        },
+        {
+            "schema_version": 2,
+            "memory_id": f"v5m-{2:024x}",
+            "content": "same family approved distractor",
+            "kind": "procedural_lesson",
+            "status": "active",
+            "operator_disposition": "approved",
+            "safety_status": "safe",
+            "contradiction_status": "supported",
+            "usage_instruction": "positive_guidance",
+            "applicability": applicability(
+                service="service-a", workload="workload-a", metric=9, suffix="2"
+            ),
+        },
+        {
+            "schema_version": 2,
+            "memory_id": f"v5m-{3:024x}",
+            "content": "other family approved distractor",
+            "kind": "procedural_lesson",
+            "status": "active",
+            "operator_disposition": "approved",
+            "safety_status": "safe",
+            "contradiction_status": "supported",
+            "usage_instruction": "positive_guidance",
+            "applicability": applicability(
+                service="service-b", workload="workload-b", metric=1, suffix="3"
+            ),
+        },
+        {
+            "schema_version": 2,
+            "memory_id": f"v5m-{4:024x}",
+            "content": "review-required audit record",
+            "kind": "procedural_lesson",
             "status": "review_required",
             "operator_disposition": "unreviewed",
-            "usage_instruction": "unassigned",
-            "applicability": {"conditions": [], "status": "unassessed"},
+            "safety_status": "unassessed",
+            "contradiction_status": "unassessed",
+            "usage_instruction": "audit_only",
+            "applicability": applicability(
+                service="service-a", workload="workload-a", metric=1, suffix="4"
+            ),
         },
-        *[
-            {
-                "memory_id": f"v5m-{index:024x}",
-                "content": f"decoy guidance {index}",
-                "kind": "procedural_lesson",
-                "status": "review_required",
-                "operator_disposition": "unreviewed",
-                "usage_instruction": "unassigned",
-                "applicability": {"conditions": [], "status": "unassessed"},
-            }
-            for index in range(2, 5)
-        ],
     ]
     return {
         "scenario_id": SCENARIO_ID,
         "agent_view": {
             "recurrence": {
+                "service": "service-a",
+                "workload": "workload-a",
                 "incident": "A visible service symptom needs diagnosis.",
                 "initial_observation": {"z_metric": 2, "a_metric": 1},
             },
             "memories": memories,
         },
-        "oracle": {
-            "positive_lesson_id": TARGET_ID,
-            "hidden_causal_mechanism": "must never enter a query or database payload",
-        },
+        "oracle": {"hidden_causal_mechanism": "must never enter a query or database payload"},
     }
 
 
@@ -217,16 +271,48 @@ def _active_profile() -> dict[str, Any]:
     }
 
 
+def _patch_single_scenario_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: dict[str, Any],
+) -> None:
+    documents = {
+        qualification.render_retrieval_document(memory)
+        for memory in scenario["agent_view"]["memories"]
+    }
+    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
+    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", len(documents))
+    monkeypatch.setattr(
+        qualification,
+        "EXPECTED_DOCUMENT_INPUTS_SHA256",
+        sha256_hex(sorted(hashlib.sha256(item.encode("utf-8")).hexdigest() for item in documents)),
+    )
+    monkeypatch.setattr(
+        qualification,
+        "select_embedding_scenarios",
+        lambda *, code_sha: [scenario],
+    )
+
+
 def test_qualification_contract_binds_profile_query_selection_and_hash():
     contract = qualification.development_qualification_contract()
 
     assert contract == qualification.development_qualification_contract()
-    assert contract["revision"] == "v5-development-live-qualification-v2"
+    assert contract["revision"] == "v5-development-production-memory-boundary-v1"
     assert contract["sample"] == {
         "source_scenario_count": 6_000,
         "selected_scenario_count": 600,
         "cases_per_family": 100,
         "selection_sha256": "1c5638eac9fcfa62e57147759fd29a82d168ec9351e6d9a9ac4a97d347824008",
+        "database_record_count": 2_400,
+    }
+    assert contract["candidate_envelope"]["schema_version"] == 2
+    assert contract["governance"]["filter_stage"] == "cockroachdb-before-vector-order"
+    assert contract["applicability"]["recurrence_inputs"] is False
+    assert contract["approved_distractors"]["approved_same_family"] == 2
+    assert contract["document"]["expected_unique_count"] == 1_897
+    assert contract["interpretation"] == {
+        "claim_scope": "memory-treatment-delivery",
+        "learning_efficacy_measured": False,
     }
     assert contract["query"] == {
         "renderer_revision": "v5-recurrence-visible-observations-v1",
@@ -290,7 +376,7 @@ def test_query_renderer_uses_only_sorted_visible_recurrence_inputs():
     assert "hidden_causal_mechanism" not in rendered
     assert "must never enter" not in rendered
     altered = copy.deepcopy(scenario)
-    altered["oracle"] = {"positive_lesson_id": "changed", "secret": "changed"}
+    altered["oracle"] = {"secret": "changed"}
     assert qualification.render_retrieval_query(altered) == rendered
 
 
@@ -327,6 +413,7 @@ def test_run_rejects_receipt_anywhere_inside_checkpoint(tmp_path: Path):
             embedding_provider=FakeGeminiEmbeddingProvider(),
             checkpoint_attestor=FakeAttestor(),
             checkpoint_path=checkpoint_path,
+            execution_manifest_path=tmp_path / "execution-manifest.json",
             receipt_path=checkpoint_path / "nested" / "receipt.json",
             diagnostic_path=tmp_path / "diagnostic.json",
         )
@@ -685,6 +772,7 @@ def test_checkpoint_provider_rejects_every_frozen_provider_identity_mismatch(
             provider,
             tmp_path / "checkpoint",
             code_sha=CODE_SHA,
+            execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
             attestor=FakeAttestor(),
         )
 
@@ -696,6 +784,7 @@ def test_embedding_cache_deduplicates_resumes_and_separates_tasks(tmp_path: Path
         provider,
         checkpoint_path,
         code_sha=CODE_SHA,
+        execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
         attestor=FakeAttestor(),
     )
 
@@ -738,6 +827,7 @@ def test_embedding_cache_deduplicates_resumes_and_separates_tasks(tmp_path: Path
         resumed_delegate,
         checkpoint_path,
         code_sha=CODE_SHA,
+        execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
         attestor=FakeAttestor(),
     )
     assert resumed.embed_document("shared text") == document
@@ -764,6 +854,7 @@ def test_embedding_cache_deduplicates_resumes_and_separates_tasks(tmp_path: Path
             FakeGeminiEmbeddingProvider(),
             checkpoint_path,
             code_sha="b" * 40,
+            execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
             attestor=FakeAttestor(),
         )
 
@@ -774,6 +865,7 @@ def test_embedding_cache_fails_closed_on_integrity_or_contract_tampering(tmp_pat
         FakeGeminiEmbeddingProvider(),
         checkpoint_path,
         code_sha=CODE_SHA,
+        execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
         attestor=FakeAttestor(),
     )
     cache.embed_document("one document")
@@ -788,6 +880,7 @@ def test_embedding_cache_fails_closed_on_integrity_or_contract_tampering(tmp_pat
             FakeGeminiEmbeddingProvider(),
             checkpoint_path,
             code_sha=CODE_SHA,
+            execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
             attestor=FakeAttestor(),
         )
 
@@ -800,6 +893,7 @@ def test_embedding_cache_fails_closed_on_integrity_or_contract_tampering(tmp_pat
             FakeGeminiEmbeddingProvider(),
             checkpoint_path,
             code_sha=CODE_SHA,
+            execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
             attestor=FakeAttestor(),
         )
 
@@ -808,6 +902,7 @@ def test_embedding_cache_fails_closed_on_integrity_or_contract_tampering(tmp_pat
             FakeGeminiEmbeddingProvider(),
             checkpoint_path,
             code_sha=CODE_SHA,
+            execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
             attestor=FakeAttestor(),
             qualification_contract_sha256="c" * 64,
         )
@@ -821,6 +916,7 @@ def test_embedding_cache_resume_removes_only_recognized_private_atomic_orphans(
         FakeGeminiEmbeddingProvider(),
         checkpoint_path,
         code_sha=CODE_SHA,
+        execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
         attestor=FakeAttestor(),
     )
     cache.embed_document("one document")
@@ -834,6 +930,7 @@ def test_embedding_cache_resume_removes_only_recognized_private_atomic_orphans(
         FakeGeminiEmbeddingProvider(),
         checkpoint_path,
         code_sha=CODE_SHA,
+        execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
         attestor=FakeAttestor(),
     )
 
@@ -852,6 +949,7 @@ def test_embedding_cache_resume_removes_only_recognized_private_atomic_orphans(
             FakeGeminiEmbeddingProvider(),
             checkpoint_path,
             code_sha=CODE_SHA,
+            execution_manifest_sha256=EXECUTION_MANIFEST_SHA256,
             attestor=FakeAttestor(),
         )
 
@@ -864,16 +962,21 @@ def test_candidate_database_records_are_uniform_opaque_and_role_free():
         scenario_id=SCENARIO_ID,
         candidate_id=TARGET_ID,
         content_sha256=digest,
+        document_sha256=digest,
+        envelope_sha256=digest,
         qualification_contract_sha256=contract_digest,
     )
-    first_metadata = qualification.candidate_database_metadata()
-    second_metadata = qualification.candidate_database_metadata()
+    memory = _scenario()["agent_view"]["memories"][0]
+    first_metadata = qualification.candidate_database_metadata(memory)
+    second_metadata = qualification.candidate_database_metadata(memory)
 
     assert payload == {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario_id": SCENARIO_ID,
         "candidate_id": TARGET_ID,
         "content_sha256": digest,
+        "document_sha256": digest,
+        "envelope_sha256": digest,
         "qualification_contract_sha256": contract_digest,
     }
     assert (
@@ -881,13 +984,15 @@ def test_candidate_database_records_are_uniform_opaque_and_role_free():
         == second_metadata
         == {
             "kind": "procedural_lesson",
-            "operator_disposition": "unreviewed",
-            "usage_instruction": "unassigned",
-            "applicability": {"conditions": [], "status": "unassessed"},
+            "operator_disposition": "approved",
+            "safety_status": "safe",
+            "contradiction_status": "supported",
+            "usage_instruction": "positive_guidance",
+            "applicability": memory["applicability"],
         }
     )
-    first_metadata["applicability"]["status"] = "changed"
-    assert second_metadata["applicability"]["status"] == "unassessed"
+    first_metadata["applicability"]["revision"] = "changed"
+    assert second_metadata["applicability"]["revision"] == "source-visible-equality-v1"
     serialized = json.dumps({"payload": payload, "metadata": second_metadata}, sort_keys=True)
     assert "oracle" not in serialized
     assert "target" not in serialized
@@ -976,11 +1081,14 @@ def test_candidate_write_retry_does_not_retry_non_serialization_failure():
     [
         ({"policy": "semantic_then_keyword"}, "fallback retrieval policy"),
         ({"fallback_reason": "semantic_vector_empty"}, "fallback retrieval policy"),
-        ({"target_rank": 2}, "not uniquely rank one"),
-        ({"indexed_target_rank": 2}, "indexed target is not rank one"),
-        ({"target_distance": 0.3500001}, "exceeds the frozen cutoff"),
-        ({"target_margin": 0.0}, "margin is not positive"),
-        ({"target_margin": -0.01}, "margin is not positive"),
+        ({"matching_rank": 2}, "intrinsic applicability is not rank one"),
+        ({"indexed_matching_rank": 2}, "indexed intrinsic match is not rank one"),
+        ({"rank_one_distance": 0.3500001}, "exceeds the frozen cutoff"),
+        ({"rank_one_margin": 0.0}, "margin is not positive"),
+        ({"rank_one_margin": -0.01}, "margin is not positive"),
+        ({"ineligible_candidate_absent": False}, "entered semantic ranking"),
+        ({"ineligible_read_absent": False}, "entered the retrieval trace"),
+        ({"audit_only_visible": False}, "not audit-visible"),
         ({"membership_parity": False}, "membership differs"),
         ({"order_parity": False}, "order differs"),
         ({"index_parity": False}, "direct and indexed results differ"),
@@ -1049,7 +1157,7 @@ def test_summary_rejects_missing_retrieval_parity_or_isolation_evidence(
         )
 
 
-def test_summary_rejects_consistent_decoy_first_arrays_with_claimed_target_rank_one(
+def test_summary_rejects_consistent_distractor_first_arrays_with_claimed_intrinsic_rank_one(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
@@ -1060,8 +1168,9 @@ def test_summary_rejects_consistent_decoy_first_arrays_with_claimed_target_rank_
     results = _qualified_results()
     results[0]["direct_candidate_ids"] = [DECOY_ID, TARGET_ID]
     results[0]["indexed_candidate_ids"] = [DECOY_ID, TARGET_ID]
+    results[0]["matching_rank"] = 2
 
-    with pytest.raises(ValueError, match="rank-one target identity differs"):
+    with pytest.raises(ValueError, match="intrinsic applicability is not rank one"):
         qualification.summarize_qualification_results(
             code_sha=CODE_SHA,
             database_name="hindsight_v5_development_unit",
@@ -1299,7 +1408,15 @@ class _FakeStore:
             and self.state.alternate_audit_visible
         ):
             return {"id": self.state.database_ids[TARGET_ID]}
+        if current_tenant_id() != qualification.ACCEPTANCE_TENANT_ID:
+            memory_id = str(_kwargs.get("memory_id") or "")
+            audit_candidate = f"v5m-{4:024x}"
+            if memory_id == self.state.database_ids.get(audit_candidate):
+                return {"id": memory_id}
         return None
+
+    def invalidate(self, **kwargs: Any) -> dict[str, str]:
+        return {"id": str(kwargs["memory_id"])}
 
     def seal_decision(self, *, decision_id: str, failed: bool = False) -> dict[str, str]:
         assert failed is False
@@ -1311,13 +1428,7 @@ def test_full_fake_run_writes_role_free_payloads_checks_other_tenant_and_atomic_
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
-    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", 4)
-    monkeypatch.setattr(
-        qualification,
-        "select_embedding_scenarios",
-        lambda *, code_sha: [_scenario()],
-    )
+    _patch_single_scenario_inputs(monkeypatch, _scenario())
     state = _SharedStoreState()
     checkpoint_path = tmp_path / "checkpoint"
     receipt_path = tmp_path / "receipt.json"
@@ -1343,6 +1454,7 @@ def test_full_fake_run_writes_role_free_payloads_checks_other_tenant_and_atomic_
         embedding_provider=FakeGeminiEmbeddingProvider(),
         checkpoint_attestor=FakeAttestor(),
         checkpoint_path=checkpoint_path,
+        execution_manifest_path=tmp_path / "execution-manifest.json",
         receipt_path=receipt_path,
         diagnostic_path=diagnostic_path,
         database_validator_fn=lambda _url: _database_evidence(),
@@ -1384,6 +1496,12 @@ def test_full_fake_run_writes_role_free_payloads_checks_other_tenant_and_atomic_
         {key: value for key, value in diagnostic.items() if key != "diagnostic_sha256"}
     )
     assert stat.S_IMODE(diagnostic_path.stat().st_mode) == 0o600
+    execution_manifest_path = tmp_path / "execution-manifest.json"
+    execution_manifest = json.loads(execution_manifest_path.read_text(encoding="utf-8"))
+    assert stat.S_IMODE(execution_manifest_path.stat().st_mode) == 0o600
+    assert execution_manifest["code_sha"] == CODE_SHA
+    assert execution_manifest["input_summary"]["candidate_count"] == 4
+    assert receipt["execution_manifest_sha256"] == execution_manifest["execution_manifest_sha256"]
     assert not list(tmp_path.glob(f".{receipt_path.name}.*"))
     assert state.retrieval_tenants == [
         qualification.learning_tenant_id(),
@@ -1394,7 +1512,10 @@ def test_full_fake_run_writes_role_free_payloads_checks_other_tenant_and_atomic_
         f"v5-development-isolation:{SCENARIO_ID}",
     ]
     assert len(state.writes) == 4
-    assert all(write["metadata"] == state.writes[0]["metadata"] for write in state.writes)
+    assert [write["metadata"] for write in state.writes] == [
+        qualification.candidate_database_metadata(memory)
+        for memory in _scenario()["agent_view"]["memories"]
+    ]
     assert all(
         set(write["structured_payload"])
         == {
@@ -1402,6 +1523,8 @@ def test_full_fake_run_writes_role_free_payloads_checks_other_tenant_and_atomic_
             "scenario_id",
             "candidate_id",
             "content_sha256",
+            "document_sha256",
+            "envelope_sha256",
             "qualification_contract_sha256",
         }
         for write in state.writes
@@ -1437,6 +1560,7 @@ def test_runtime_identity_preflight_happens_before_any_provider_call(tmp_path: P
             embedding_provider=provider,
             checkpoint_attestor=FakeAttestor(),
             checkpoint_path=tmp_path / "checkpoint",
+            execution_manifest_path=tmp_path / "execution-manifest.json",
             receipt_path=tmp_path / "receipt.json",
             diagnostic_path=tmp_path / "diagnostic.json",
             database_validator_fn=lambda _url: _database_evidence(),
@@ -1453,13 +1577,7 @@ def test_full_fake_run_fails_if_database_stage_causes_embedding_cache_miss(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
-    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", 4)
-    monkeypatch.setattr(
-        qualification,
-        "select_embedding_scenarios",
-        lambda *, code_sha: [_scenario()],
-    )
+    _patch_single_scenario_inputs(monkeypatch, _scenario())
     monkeypatch.setattr(
         qualification,
         "qualify_development_structure",
@@ -1479,6 +1597,7 @@ def test_full_fake_run_fails_if_database_stage_causes_embedding_cache_miss(
             embedding_provider=FakeGeminiEmbeddingProvider(),
             checkpoint_attestor=FakeAttestor(),
             checkpoint_path=tmp_path / "checkpoint",
+            execution_manifest_path=tmp_path / "execution-manifest.json",
             receipt_path=tmp_path / "receipt.json",
             diagnostic_path=tmp_path / "diagnostic.json",
             database_validator_fn=lambda _url: _database_evidence(),
@@ -1495,14 +1614,8 @@ def test_full_fake_run_records_serialization_exhaustion_without_provider_reinvoc
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
-    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", 4)
     scenario = _scenario()
-    monkeypatch.setattr(
-        qualification,
-        "select_embedding_scenarios",
-        lambda *, code_sha: [scenario],
-    )
+    _patch_single_scenario_inputs(monkeypatch, scenario)
     monkeypatch.setattr(
         qualification,
         "qualify_development_structure",
@@ -1537,16 +1650,15 @@ def test_full_fake_run_records_serialization_exhaustion_without_provider_reinvoc
         qualification.run_development_qualification(
             code_sha=CODE_SHA,
             database_url=(
-                "postgresql://root@localhost:26257/"
-                "hindsight_v5_development_unit?sslmode=disable"
+                "postgresql://root@localhost:26257/hindsight_v5_development_unit?sslmode=disable"
             ),
             runtime_database_url=(
-                "postgresql://runtime@localhost:26257/"
-                "hindsight_v5_development_unit?sslmode=disable"
+                "postgresql://runtime@localhost:26257/hindsight_v5_development_unit?sslmode=disable"
             ),
             embedding_provider=provider,
             checkpoint_attestor=FakeAttestor(),
             checkpoint_path=tmp_path / "checkpoint",
+            execution_manifest_path=tmp_path / "execution-manifest.json",
             receipt_path=receipt_path,
             diagnostic_path=diagnostic_path,
             database_validator_fn=lambda _url: _database_evidence(),
@@ -1561,7 +1673,8 @@ def test_full_fake_run_records_serialization_exhaustion_without_provider_reinvoc
     assert write_attempts == qualification.DATABASE_WRITE_ATTEMPTS
     assert retry_delays == list(qualification.DATABASE_WRITE_RETRY_DELAYS_SECONDS)
     assert provider.document_calls == [
-        str(memory["content"]) for memory in scenario["agent_view"]["memories"]
+        qualification.render_retrieval_document(memory)
+        for memory in scenario["agent_view"]["memories"]
     ]
     assert provider.query_calls == [qualification.render_retrieval_query(scenario)]
     assert not receipt_path.exists()
@@ -1595,13 +1708,7 @@ def test_full_fake_run_fails_closed_on_alternate_tenant_retrieval_leak(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
-    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", 4)
-    monkeypatch.setattr(
-        qualification,
-        "select_embedding_scenarios",
-        lambda *, code_sha: [_scenario()],
-    )
+    _patch_single_scenario_inputs(monkeypatch, _scenario())
     monkeypatch.setattr(
         qualification,
         "qualify_development_structure",
@@ -1623,6 +1730,7 @@ def test_full_fake_run_fails_closed_on_alternate_tenant_retrieval_leak(
             embedding_provider=FakeGeminiEmbeddingProvider(),
             checkpoint_attestor=FakeAttestor(),
             checkpoint_path=tmp_path / "checkpoint",
+            execution_manifest_path=tmp_path / "execution-manifest.json",
             receipt_path=receipt_path,
             diagnostic_path=diagnostic_path,
             database_validator_fn=lambda _url: _database_evidence(),
@@ -1659,13 +1767,7 @@ def test_full_fake_run_fails_closed_on_missing_read_trace_or_unsealed_decision(
     state: _SharedStoreState,
     message: str,
 ):
-    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
-    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", 4)
-    monkeypatch.setattr(
-        qualification,
-        "select_embedding_scenarios",
-        lambda *, code_sha: [_scenario()],
-    )
+    _patch_single_scenario_inputs(monkeypatch, _scenario())
     monkeypatch.setattr(
         qualification,
         "qualify_development_structure",
@@ -1684,6 +1786,7 @@ def test_full_fake_run_fails_closed_on_missing_read_trace_or_unsealed_decision(
             embedding_provider=FakeGeminiEmbeddingProvider(),
             checkpoint_attestor=FakeAttestor(),
             checkpoint_path=tmp_path / "checkpoint",
+            execution_manifest_path=tmp_path / "execution-manifest.json",
             receipt_path=tmp_path / "receipt.json",
             diagnostic_path=tmp_path / "diagnostic.json",
             database_validator_fn=lambda _url: _database_evidence(),

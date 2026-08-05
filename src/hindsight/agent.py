@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from hindsight.db import TenantConnection, connect, database_url, database_url_with_tls_roots
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
-from hindsight.memory import MemoryStore, Provenance
+from hindsight.memory import MemoryStore, Provenance, positive_guidance_eligible
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.simulator import (
     BoundedActionRequest,
@@ -494,6 +494,10 @@ def build_incident_graph(
                     "recalled_memory_ids": parent_memory_ids,
                     "action_trace": state.get("action_trace") or {},
                 }
+                unsafe_action_count = int(
+                    (state.get("action_trace") or {}).get("score", {}).get("unsafe_action_count")
+                    or 0
+                )
                 memory = store.remember_agent_reflection(
                     decision_id=state["decision_id"],
                     run_id=state["run_id"],
@@ -520,10 +524,18 @@ def build_incident_graph(
                         "operator_disposition": (
                             "approved" if state.get("guidance_eligible") else "rejected"
                         ),
-                        "usage_instruction": (
-                            "positive_guidance"
+                        "safety_status": (
+                            "unsafe"
+                            if unsafe_action_count
+                            else "safe"
                             if state.get("guidance_eligible")
-                            else "audit_only"
+                            else "unassessed"
+                        ),
+                        "contradiction_status": (
+                            "supported" if state.get("guidance_eligible") else "unassessed"
+                        ),
+                        "usage_instruction": (
+                            "positive_guidance" if state.get("guidance_eligible") else "audit_only"
                         ),
                         "kind": "incident_reflection",
                         "evidence_quality": "operator_reviewed",
@@ -618,6 +630,7 @@ def _recall_for_state(
                 reader="agent.recall",
                 purpose="retrieve governed incident context",
                 policy=requested_policy,  # type: ignore[arg-type]
+                positive_guidance_only=True,
             )
             memories = list(result.hits)
             retrieval_id = result.retrieval_id
@@ -799,10 +812,7 @@ def _governed_guidance_envelope(memory: dict[str, Any]) -> dict[str, Any]:
     else:
         disposition = str(metadata.get("operator_disposition") or "unreviewed")
     trust = str(memory.get("trust_status") or "review_required")
-    if trust != "active" or disposition == "rejected":
-        usage_instruction = "audit_only"
-    else:
-        usage_instruction = str(metadata.get("usage_instruction") or "positive_guidance")
+    usage_instruction = "positive_guidance" if positive_guidance_eligible(memory) else "audit_only"
     return {
         "memory_id": str(memory.get("id") or memory.get("memory_id") or ""),
         "belief_id": str(memory.get("belief_id") or ""),
@@ -820,6 +830,9 @@ def _governed_guidance_envelope(memory: dict[str, Any]) -> dict[str, Any]:
         "trust": trust,
         "transition": str(memory.get("transition_kind") or "assertion"),
         "operator_disposition": disposition,
+        "safety_status": str(metadata.get("safety_status") or "unassessed"),
+        "contradiction_status": str(metadata.get("contradiction_status") or "unassessed"),
+        "applicability": metadata.get("applicability") or None,
         "evidence_quality": str(metadata.get("evidence_quality") or "provenance_only"),
         "evidence": [
             {

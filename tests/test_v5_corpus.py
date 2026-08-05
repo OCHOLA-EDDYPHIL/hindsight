@@ -145,14 +145,7 @@ def test_canonical_hashes_and_compilation_are_deterministic_and_code_bound():
         )
         for item in v5_corpus.MECHANISM_FAMILIES
     ]
-    identity_paths = (
-        lambda item: item["scenario_id"],
-        lambda item: item["lesson_id"],
-        lambda item: item["agent_view"]["source_episode"]["episode_id"],
-        lambda item: item["agent_view"]["recurrence"]["episode_id"],
-    )
-    for identity in identity_paths:
-        assert len({identity(item) for item in cross_family}) == len(MECHANISM_ACTIONS)
+    assert len({item["scenario_id"] for item in cross_family}) == len(MECHANISM_ACTIONS)
 
     contract = v5_corpus.mechanism_contract()
     assert tuple(contract["mechanisms"]) == tuple(MECHANISM_ACTIONS)
@@ -170,6 +163,7 @@ def test_all_mechanisms_have_one_safe_optimal_sequence_and_external_failures(
     actions: tuple[str, str, str, str],
 ):
     diagnostic, recovery, unsafe, ineffective = actions
+    spec = v5_corpus._require_family(family)
     scenario = _scenario(family)
     oracle = scenario["oracle"]
     hidden_key = oracle["hidden_causal_mechanism"]["state_key"]
@@ -198,22 +192,27 @@ def test_all_mechanisms_have_one_safe_optimal_sequence_and_external_failures(
     assert len(memories) == 4
     assert len({frozenset(memory) for memory in memories}) == 1
     assert len({frozenset(memory["applicability"]) for memory in memories}) == 1
-    governance = [
-        {key: value for key, value in memory.items() if key not in {"memory_id", "content"}}
+    assert all(memory["schema_version"] == 2 for memory in memories)
+    assert all(memory["kind"] == "procedural_lesson" for memory in memories)
+    approved = [
+        memory
         for memory in memories
+        if memory["status"] == "active"
+        and memory["operator_disposition"] == "approved"
+        and memory["safety_status"] == "safe"
+        and memory["contradiction_status"] == "supported"
+        and memory["usage_instruction"] == "positive_guidance"
     ]
-    assert (
-        governance
-        == [
-            {
-                "kind": "procedural_lesson",
-                "status": "review_required",
-                "operator_disposition": "unreviewed",
-                "usage_instruction": "unassigned",
-                "applicability": {"conditions": [], "status": "unassessed"},
-            }
-        ]
-        * 4
+    audit_only = [memory for memory in memories if memory not in approved]
+    assert len(approved) == 3
+    assert len(audit_only) == 1
+    assert audit_only[0]["usage_instruction"] == "audit_only"
+    assert all(
+        memory["applicability"]["schema_version"] == 1
+        and memory["applicability"]["revision"] == "source-visible-equality-v1"
+        and memory["applicability"]["all_of"]
+        and len(memory["applicability"]["source_episode_sha256"]) == 64
+        for memory in memories
     )
     assert all(
         str(memory["memory_id"]).startswith("v5m-")
@@ -226,19 +225,27 @@ def test_all_mechanisms_have_one_safe_optimal_sequence_and_external_failures(
         and all(character in "0123456789abcdef" for character in memory["memory_id"][4:])
         for memory in memories
     )
-    oracle_memory_ids = {
-        oracle["positive_lesson_id"],
-        *(row["memory_id"] for row in oracle["decoys"]),
-    }
-    assert {memory["memory_id"] for memory in memories} == oracle_memory_ids
-    oracle_conditions = {
-        *oracle["applicable_conditions"],
-        *oracle["non_applicable_conditions"],
-    }
-    visible_conditions = {
-        condition for memory in memories for condition in memory["applicability"]["conditions"]
-    }
-    assert visible_conditions.isdisjoint(oracle_conditions)
+    recurrence = agent_view["recurrence"]
+    matching_approved = [
+        memory
+        for memory in approved
+        if v5_corpus.applicability_matches(
+            memory["applicability"],
+            service=recurrence["service"],
+            workload=recurrence["workload"],
+            observations=recurrence["initial_observation"],
+        )
+    ]
+    assert len(matching_approved) == 1
+    same_family_approved = [memory for memory in approved if memory["content"] == spec.lesson]
+    assert len(same_family_approved) == 2
+    assert (
+        len({v5_corpus.sha256_hex(memory["applicability"]) for memory in same_family_approved}) == 2
+    )
+    assert all(
+        not ({"applicable", "candidate_role", "expected_rank", "oracle", "target"} & set(memory))
+        for memory in memories
+    )
 
     consequences = oracle["action_consequences"]
     assert tuple(consequences) == v5_corpus.ALL_ACTIONS
@@ -349,7 +356,7 @@ def test_scenario_validation_rejects_resigned_agent_view_tampering_and_leaks():
     positive_memory = next(
         memory
         for memory in action_leak["agent_view"]["memories"]
-        if memory["memory_id"] == action_leak["oracle"]["positive_lesson_id"]
+        if memory["usage_instruction"] == "positive_guidance"
     )
     positive_memory["content"] = "Inspect the dependency, then throttle_retries."
     _refresh_agent_and_content_digests(action_leak)
@@ -371,13 +378,11 @@ def test_agent_view_guard_directly_rejects_leaks_and_nonopaque_memory_ids():
     spec = v5_corpus._require_family(family)
 
     action_leak = copy.deepcopy(scenario["agent_view"])
-    target = next(
-        memory
-        for memory in action_leak["memories"]
-        if memory["memory_id"] == scenario["oracle"]["positive_lesson_id"]
-    )
-    target["content"] = f"{spec.lesson} {spec.recovery_action.replace('_', ' ')}"
-    leaking_spec = replace(spec, lesson=target["content"])
+    leaking_lesson = f"{spec.lesson} {spec.recovery_action.replace('_', ' ')}"
+    for memory in action_leak["memories"]:
+        if memory["content"] == spec.lesson:
+            memory["content"] = leaking_lesson
+    leaking_spec = replace(spec, lesson=leaking_lesson)
     with pytest.raises(ValueError, match="leaks the exact recovery action"):
         v5_corpus._validate_agent_view(agent_view=action_leak, spec=leaking_spec)
 
@@ -443,7 +448,7 @@ def test_corpus_module_has_only_standard_library_import_dependencies():
 def test_development_protocol_freezes_scale_selection_and_provider_identities():
     protocol = v5_corpus.development_protocol()
     assert protocol == v5_corpus.development_protocol()
-    assert protocol["schema_version"] == 5
+    assert protocol["schema_version"] == 6
     assert protocol["mechanism_families"] == list(MECHANISM_ACTIONS)
     assert protocol["actions"] == list(v5_corpus.ALL_ACTIONS)
     assert protocol["action_budget"] == 6
@@ -471,7 +476,7 @@ def test_development_protocol_freezes_scale_selection_and_provider_identities():
         "direction": "ascending",
         "tie_break": ["memory_id", "ascending"],
         "expected_full_sample_order_sha256": (
-            "97d114d1c0f125ca2abe6ada7c6f96291991831e55ee41fb77d3380bc24505ee"
+            "977444278fc2a670347cf28964853f10475037e9fa7c59bf67a60aefe99673c2"
         ),
     }
     assert protocol["expected_embedding_selection_sha256"] == (
@@ -481,7 +486,13 @@ def test_development_protocol_freezes_scale_selection_and_provider_identities():
         "2294cc2886f48c265fdb2288438c1016e9de94be5195be5cc5b668cc3311a77b"
     )
     assert protocol["representation"] == v5_corpus.EMBEDDING_REPRESENTATION
-    assert protocol["representation"] == "v5-content-only-v1"
+    assert protocol["representation"] == "v5-source-applicability-document-v1"
+    assert protocol["candidate_envelope_schema_version"] == 2
+    assert protocol["governance_revision"] == "positive-guidance-governance-v1"
+    assert protocol["applicability_schema_version"] == 1
+    assert protocol["applicability_revision"] == "source-visible-equality-v1"
+    assert protocol["approved_distractor_revision"] == "v5-source-peer-distractors-v1"
+    assert protocol["audit_states"] == list(v5_corpus.AUDIT_STATES)
     assert (protocol["reasoning_provider"], protocol["reasoning_model"]) == (
         "gemini",
         "gemini-3.1-flash-lite",
@@ -594,16 +605,13 @@ def test_full_development_sample_is_unique_seeded_balanced_and_receipted(monkeyp
     assert set(receipt["rehearsal_scenario_ids"]) <= set(receipt["embedding_scenario_ids"])
     assert receipt["corpus_sha256"] == _digest([item["content_sha256"] for item in items])
     assert receipt["memory_order_sha256"] == (
-        "97d114d1c0f125ca2abe6ada7c6f96291991831e55ee41fb77d3380bc24505ee"
+        "977444278fc2a670347cf28964853f10475037e9fa7c59bf67a60aefe99673c2"
     )
-    assert receipt["positive_lesson_position_counts"] == {
-        "retry_amplification": {"0": 230, "1": 256, "2": 257, "3": 257},
-        "cache_stampede": {"0": 248, "1": 240, "2": 259, "3": 253},
-        "connection_leak": {"0": 255, "1": 241, "2": 248, "3": 256},
-        "hot_partition": {"0": 248, "1": 245, "2": 272, "3": 235},
-        "poison_message": {"0": 249, "1": 256, "2": 239, "3": 256},
-        "lock_contention": {"0": 279, "1": 235, "2": 239, "3": 247},
-    }
+    assert receipt["approved_candidate_count"] == expected_count * 3
+    assert receipt["audit_only_candidate_count"] == expected_count
+    assert set(receipt["audit_state_counts"]) == set(v5_corpus.AUDIT_STATES)
+    assert sum(receipt["audit_state_counts"].values()) == expected_count
+    assert all(receipt["audit_state_counts"].values())
     assert receipt["receipt_sha256"] == _digest(
         {key: value for key, value in receipt.items() if key != "receipt_sha256"}
     )
@@ -724,8 +732,7 @@ def _patch_v5_embedding_cli_dependencies(monkeypatch: pytest.MonkeyPatch) -> dic
         captured["runtime_use_cache"] = use_cache
         return SimpleNamespace(
             database_url=(
-                "postgresql://deploy@localhost:26257/"
-                "hindsight_v5_development_cli?sslmode=disable"
+                "postgresql://deploy@localhost:26257/hindsight_v5_development_cli?sslmode=disable"
             ),
             provider_env=resolved_provider_env,
         )
@@ -792,8 +799,7 @@ def test_v5_embedding_cli_wires_exact_gemini_database_kms_and_artifact_inputs(
     study = _load_v5_study_script()
     captured = _patch_v5_embedding_cli_dependencies(monkeypatch)
     runtime_database_url = (
-        "postgresql://runtime@localhost:26257/"
-        "hindsight_v5_development_cli?sslmode=disable"
+        "postgresql://runtime@localhost:26257/hindsight_v5_development_cli?sslmode=disable"
     )
     key_id = "arn:aws:kms:us-east-1:111122223333:key/v5-qualification"
     monkeypatch.setenv("LLM_PROVIDER", "deterministic")
@@ -804,10 +810,12 @@ def test_v5_embedding_cli_wires_exact_gemini_database_kms_and_artifact_inputs(
     checkpoint = tmp_path / "checkpoint"
     output = tmp_path / "receipt.json"
     diagnostic_output = tmp_path / "diagnostic.json"
+    execution_manifest = tmp_path / "execution-manifest.json"
 
     receipt = study._qualify_embeddings(
         code_sha=CODE_SHA,
         checkpoint=checkpoint,
+        execution_manifest=execution_manifest,
         output=output,
         diagnostic_output=diagnostic_output,
     )
@@ -816,10 +824,7 @@ def test_v5_embedding_cli_wires_exact_gemini_database_kms_and_artifact_inputs(
     assert captured["runtime_use_cache"] is False
     assert captured["runtime_environ"]["LLM_PROVIDER"] == "gemini"
     assert captured["runtime_environ"]["EMBEDDING_PROVIDER"] == "gemini"
-    assert (
-        captured["runtime_environ"]["GEMINI_EMBEDDING_MODEL"]
-        == v5_corpus.EMBEDDING_MODEL
-    )
+    assert captured["runtime_environ"]["GEMINI_EMBEDDING_MODEL"] == v5_corpus.EMBEDDING_MODEL
     assert captured["pool_provider_env"] is captured["resolved_provider_env"]
     provider = captured["embedding_provider"]
     assert provider.provider_name == "gemini"
@@ -835,15 +840,16 @@ def test_v5_embedding_cli_wires_exact_gemini_database_kms_and_artifact_inputs(
     assert captured["qualification_kwargs"] == {
         "code_sha": CODE_SHA,
         "database_url": (
-            "postgresql://deploy@localhost:26257/"
-            "hindsight_v5_development_cli?sslmode=disable"
+            "postgresql://deploy@localhost:26257/hindsight_v5_development_cli?sslmode=disable"
         ),
         "runtime_database_url": runtime_database_url,
         "embedding_provider": provider,
         "checkpoint_attestor": attestor,
         "checkpoint_path": checkpoint,
+        "execution_manifest_path": execution_manifest,
         "receipt_path": output,
         "diagnostic_path": diagnostic_output,
+        "progress_callback": study._qualification_progress,
     }
 
 
@@ -870,8 +876,7 @@ def test_v5_embedding_cli_fails_closed_on_missing_runtime_or_hmac_input(
     captured = _patch_v5_embedding_cli_dependencies(monkeypatch)
     monkeypatch.setenv(
         "HINDSIGHT_V5_RUNTIME_DATABASE_URL",
-        "postgresql://runtime@localhost:26257/"
-        "hindsight_v5_development_cli?sslmode=disable",
+        "postgresql://runtime@localhost:26257/hindsight_v5_development_cli?sslmode=disable",
     )
     monkeypatch.setenv(
         "HINDSIGHT_QUALIFICATION_HMAC_KEY_ID",
@@ -883,6 +888,7 @@ def test_v5_embedding_cli_fails_closed_on_missing_runtime_or_hmac_input(
         study._qualify_embeddings(
             code_sha=CODE_SHA,
             checkpoint=tmp_path / "checkpoint",
+            execution_manifest=tmp_path / "execution-manifest.json",
             output=tmp_path / "receipt.json",
             diagnostic_output=tmp_path / "diagnostic.json",
         )
