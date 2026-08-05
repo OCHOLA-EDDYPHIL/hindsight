@@ -13,6 +13,7 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: hindsight_migrations_${{ github.run_id }}_${{ github.run_attempt }}
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+      EXTENDED_DATABASE_URL: postgresql://root@localhost:26257/migration_extended_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -38,6 +39,11 @@ jobs:
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
       - name: Run isolated historical migration cases
         run: uv run python scripts/run_migration_compatibility.py --workers 4
+      - name: Run extended database safeguards
+        run: |
+          DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/migrate.py
+          DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/initialize_agent_storage.py
+          DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/ci_test_groups.py run main_extended
       - name: Remove migration compatibility container
         if: always()
         run: docker compose down --volumes --remove-orphans

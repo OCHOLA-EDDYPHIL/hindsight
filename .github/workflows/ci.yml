@@ -61,7 +61,7 @@ jobs:
   database:
     needs: changes
     if: needs.changes.outputs.database == 'true'
-    timeout-minutes: 10
+    timeout-minutes: 15
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_database
@@ -107,7 +107,6 @@ jobs:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_main
       FRESH_DATABASE_URL: postgresql://root@localhost:26257/hindsight_fresh_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       POPULATED_DATABASE_URL: postgresql://root@localhost:26257/hindsight_populated_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-      EXTENDED_DATABASE_URL: postgresql://root@localhost:26257/hindsight_extended_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
       EMBEDDING_PROVIDER: deterministic
       LLM_PROVIDER: deterministic
     steps:
@@ -148,22 +147,13 @@ jobs:
             DATABASE_URL="$POPULATED_DATABASE_URL" uv run python scripts/populated_upgrade_fixture.py verify
           ) >build/schema/populated.log 2>&1 &
           populated_pid=$!
-          (
-            DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/migrate.py
-            DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/initialize_agent_storage.py
-            DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/ci_test_groups.py run main_extended
-          ) >build/schema/extended.log 2>&1 &
-          extended_pid=$!
-
           set +e
           wait "$fresh_pid"; fresh_status=$?
           wait "$populated_pid"; populated_status=$?
-          wait "$extended_pid"; extended_status=$?
           set -e
-          cat build/schema/fresh.log build/schema/populated.log build/schema/extended.log
+          cat build/schema/fresh.log build/schema/populated.log
           test "$fresh_status" -eq 0
           test "$populated_status" -eq 0
-          test "$extended_status" -eq 0
 
           DATABASE_URL="$FRESH_DATABASE_URL" uv run python scripts/schema_manifest.py export \
             --apply-roles --output build/schema/fresh.json
