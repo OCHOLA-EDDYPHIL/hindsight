@@ -33,7 +33,6 @@ from mangum import Mangum
 from psycopg import errors as psycopg_errors
 from pydantic import BaseModel, ConfigDict, Field
 
-from hindsight.dashboard import memory_snapshot
 from hindsight.db import connect
 from hindsight.demo_state import (
     DEMO_NAMESPACE,
@@ -65,6 +64,7 @@ from hindsight.runtime import (
 )
 from hindsight.realtime_ticket import issue_realtime_ticket
 from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, public_demo_tenant_id
+from hindsight.snapshots import memory_snapshot
 from hindsight.tenant import current_tenant_id, tenant_scope
 from hindsight.runs import (
     RunConflictError,

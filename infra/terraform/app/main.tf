@@ -146,7 +146,6 @@ resource "aws_s3_object" "ui_config" {
     window.HINDSIGHT_CONFIG = ${jsonencode({
   apiBase              = "/v1"
   snapshotBase         = null
-  eventsBase           = null
   websocketUrl         = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "https://", "wss://")}/${aws_apigatewayv2_stage.websocket.name}"
   defaultNamespace     = "demo:payments-poison-rewind"
   pollIntervalMs       = 4000

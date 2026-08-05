@@ -37,13 +37,25 @@ def test_static_bundle_has_stable_entrypoints_and_a_bounded_payload():
 
 def test_local_api_lambda_and_s3_use_the_same_static_output():
     api = (ROOT / "src/hindsight/api.py").read_text()
-    dashboard = (ROOT / "src/hindsight/dashboard.py").read_text()
     builder = (ROOT / "scripts/build_lambda_artifacts.py").read_text()
     terraform = (ROOT / "infra/terraform/app/main.tf").read_text()
 
     assert 'app.mount("/", StaticFiles(directory=WEB_ROOT, html=True)' in api
-    assert 'assets.joinpath("app.js")' in dashboard
-    assert 'assets.joinpath("styles.css")' in dashboard
     assert '"web",' in builder
     assert 'web_root     = "${path.module}/../../../src/hindsight/web"' in terraform
     assert 'fileset(local.web_root, "**")' in terraform
+
+
+def test_cockpit_uses_websockets_or_polling_without_a_legacy_sse_server():
+    hook = (ROOT / "frontend/src/hooks/use-cockpit.ts").read_text()
+    runtime_config = (ROOT / "frontend/public/config.js").read_text()
+    terraform = (ROOT / "infra/terraform/app/main.tf").read_text()
+
+    assert not (ROOT / "src/hindsight/dashboard.py").exists()
+    assert not (ROOT / "scripts/run_memory_dashboard.py").exists()
+    assert "EventSource" not in hook
+    assert "eventsBase" not in hook
+    assert "eventsBase" not in runtime_config
+    assert "eventsBase" not in terraform
+    assert "WebSocket" in hook
+    assert "window.setInterval" in hook

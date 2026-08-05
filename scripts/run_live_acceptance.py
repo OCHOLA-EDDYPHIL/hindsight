@@ -90,7 +90,7 @@ HOSTED_ONLY_INFRASTRUCTURE_SELECTORS = tuple(
 )
 LOCAL_BROWSER_PRODUCT_SELECTORS = (
     "tests/test_api.py",
-    "tests/test_dashboard.py",
+    "tests/test_snapshots.py",
     "tests/test_queueing.py",
     *SHARED_BROWSER_CONTRACT_SELECTORS,
 )

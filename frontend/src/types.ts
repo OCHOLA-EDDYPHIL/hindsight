@@ -3,7 +3,6 @@ export type Identifier = string;
 export interface RuntimeConfig {
   apiBase?: string;
   snapshotBase?: string | null;
-  eventsBase?: string | null;
   websocketUrl?: string | null;
   defaultNamespace?: string;
   pollIntervalMs?: number;

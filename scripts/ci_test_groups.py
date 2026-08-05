@@ -61,6 +61,7 @@ DATABASE_GROUPS = {
         "tests/test_run_attempts.py",
         "tests/test_run_dispatch.py",
         "tests/test_runs.py",
+        "tests/test_snapshots.py",
         "tests/test_smoke.py",
         "tests/test_system_of_record.py",
         "tests/test_tenant_isolation.py",
@@ -73,7 +74,6 @@ DATABASE_GROUPS = {
     "research": (
         "tests/test_benchmark_protocol_migrations.py",
         "tests/test_cross_episode_demo.py",
-        "tests/test_dashboard.py",
         "tests/test_learning_benchmark_setup.py",
         "tests/test_learning_evidence_foundation.py",
         "tests/test_learning_orchestration.py",
