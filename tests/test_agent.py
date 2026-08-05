@@ -79,6 +79,8 @@ def test_reasoning_prompt_uses_typed_governance_envelopes():
                     "justification": "Resolved incident evidence",
                     "metadata": {
                         "operator_disposition": "approved",
+                        "safety_status": "safe",
+                        "contradiction_status": "supported",
                         "evidence_quality": "resolved_incident",
                         "usage_instruction": "positive_guidance",
                     },

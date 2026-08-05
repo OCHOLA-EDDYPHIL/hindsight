@@ -29,6 +29,7 @@ def main() -> int:
     structural.add_argument("--output", type=pathlib.Path)
     embeddings = subparsers.add_parser("qualify-embeddings")
     embeddings.add_argument("--checkpoint", type=pathlib.Path, required=True)
+    embeddings.add_argument("--execution-manifest", type=pathlib.Path, required=True)
     embeddings.add_argument("--output", type=pathlib.Path, required=True)
     embeddings.add_argument("--diagnostic-output", type=pathlib.Path, required=True)
     args = parser.parse_args()
@@ -51,6 +52,7 @@ def main() -> int:
         receipt = _qualify_embeddings(
             code_sha=_exact_code_sha(),
             checkpoint=args.checkpoint,
+            execution_manifest=args.execution_manifest,
             output=args.output,
             diagnostic_output=args.diagnostic_output,
         )
@@ -106,6 +108,7 @@ def _qualify_embeddings(
     *,
     code_sha: str,
     checkpoint: pathlib.Path,
+    execution_manifest: pathlib.Path,
     output: pathlib.Path,
     diagnostic_output: pathlib.Path,
 ) -> dict[str, object]:
@@ -165,9 +168,17 @@ def _qualify_embeddings(
         embedding_provider=provider,
         checkpoint_attestor=checkpoint_attestor,
         checkpoint_path=checkpoint,
+        execution_manifest_path=execution_manifest,
         receipt_path=output,
         diagnostic_path=diagnostic_output,
+        progress_callback=_qualification_progress,
     )
+
+
+def _qualification_progress(stage: str, current: int, total: int) -> None:
+    if current == total or current % 100 == 0:
+        sys.stderr.write(f"v5 qualification {stage}: {current}/{total}\n")
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":

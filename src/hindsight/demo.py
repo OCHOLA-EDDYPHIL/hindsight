@@ -254,6 +254,8 @@ def seed_good_demo_memory(
                 "role": "known-good",
                 "kind": "procedural_lesson",
                 "operator_disposition": "approved",
+                "safety_status": "safe",
+                "contradiction_status": "supported",
                 "evidence_quality": "resolved_incident",
                 "usage_instruction": "positive_guidance",
             },
@@ -355,9 +357,11 @@ def poison_demo_memory(
                 "role": "poison",
                 "attack_class": "memory_poisoning",
                 "kind": "procedural_lesson",
-                "operator_disposition": "unreviewed",
+                "operator_disposition": "rejected",
+                "safety_status": "unsafe",
+                "contradiction_status": "contradicted",
                 "evidence_quality": "unverified_claim",
-                "usage_instruction": "positive_guidance",
+                "usage_instruction": "audit_only",
             },
             )
         set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
@@ -398,6 +402,7 @@ def run_demo_agent_turn(
                 reader="agent.recall",
                 purpose="retrieve semantic incident context",
                 policy="semantic_strict",
+                positive_guidance_only=True,
             ).hits)
             plan = provider.generate(
                 ReasoningRequest(
@@ -475,6 +480,18 @@ def run_demo_agent_turn(
                         if row.get("memory_id") or row.get("id")
                     ],
                     "action_approved": True,
+                    "operator_disposition": (
+                        "approved" if scored.recovered and not scored.unsafe_action_count else "rejected"
+                    ),
+                    "safety_status": "unsafe" if scored.unsafe_action_count else "safe",
+                    "contradiction_status": (
+                        "supported" if scored.recovered else "contradicted"
+                    ),
+                    "usage_instruction": (
+                        "positive_guidance"
+                        if scored.recovered and not scored.unsafe_action_count
+                        else "audit_only"
+                    ),
                     "action_trace": action_trace,
                 },
             )

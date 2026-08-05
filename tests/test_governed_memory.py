@@ -10,6 +10,86 @@ requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DAT
 
 
 @requires_db
+def test_positive_guidance_retrieval_filters_governance_before_vector_ranking():
+    from hindsight.db import database_url
+    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from hindsight.memory import (
+        APPROVED_POSITIVE_GUIDANCE,
+        MemoryGovernance,
+        MemoryStore,
+        Provenance,
+    )
+
+    namespace = f"positive-guidance-boundary-{uuid4()}"
+    provenance = Provenance("pytest", "evidence:governance", "exercise retrieval boundary")
+    audit_governance = {
+        "rejected": MemoryGovernance("rejected", "safe", "supported", "audit_only"),
+        "unsafe": MemoryGovernance("approved", "unsafe", "supported", "audit_only"),
+        "contradicted": MemoryGovernance(
+            "approved", "safe", "contradicted", "audit_only"
+        ),
+    }
+    provider = DeterministicEmbeddingProvider()
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        approved = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="retry fanout guidance",
+            provenance=provenance,
+            governance=APPROVED_POSITIVE_GUIDANCE,
+        )
+        excluded = [
+            store.remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content=f"retry fanout guidance {label}",
+                provenance=provenance,
+                governance=governance,
+            )
+            for label, governance in audit_governance.items()
+        ]
+        excluded.append(
+            store.remember(
+                memory_kind="semantic",
+                namespace=namespace,
+                content="retry fanout guidance review required",
+                provenance=provenance,
+                governance=APPROVED_POSITIVE_GUIDANCE,
+                trust_status="review_required",
+            )
+        )
+        invalidated = store.remember(
+            memory_kind="semantic",
+            namespace=namespace,
+            content="retry fanout guidance invalidated",
+            provenance=provenance,
+            governance=APPROVED_POSITIVE_GUIDANCE,
+        )
+        store.invalidate(
+            memory_kind="semantic",
+            memory_id=str(invalidated["id"]),
+            actor="pytest",
+            reason="exercise invalidation boundary",
+        )
+        excluded.append(invalidated)
+
+        result = store.retrieve_semantic(
+            namespace=namespace,
+            query="retry fanout guidance",
+            decision_id=f"decision:{uuid4()}",
+            reader="pytest.agent",
+            purpose="verify positive-guidance governance filtering",
+            positive_guidance_only=True,
+        )
+
+        assert [str(row["id"]) for row in result.hits] == [str(approved["id"])]
+        assert all(
+            store.audit_memory(memory_kind="semantic", memory_id=str(row["id"])) is not None
+            for row in excluded
+        )
+
+
+@requires_db
 def test_explicit_text_miss_stays_empty_and_strict_retrieval_is_audited():
     from hindsight.db import database_url
     from hindsight.embeddings import DeterministicEmbeddingProvider

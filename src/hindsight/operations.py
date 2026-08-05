@@ -16,7 +16,7 @@ from psycopg.types.json import Jsonb
 from hindsight.db import connect, database_url
 from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider
-from hindsight.memory import MemoryStore, Provenance
+from hindsight.memory import APPROVED_POSITIVE_GUIDANCE, MemoryStore, Provenance
 from hindsight.security import safe_error_detail
 
 OperationType = Literal["rewind", "retraction", "supersession", "review_resolution"]
@@ -1016,7 +1016,11 @@ def _apply_supersession(
             source_ref=f"memory:{source['id']}",
             justification=operation["reason"],
         ),
-        metadata={**dict(source.get("metadata") or {}), "supersession_intent": item["intent"]},
+        metadata={
+            **_without_governance(dict(source.get("metadata") or {})),
+            "supersession_intent": item["intent"],
+        },
+        governance=APPROVED_POSITIVE_GUIDANCE,
         content_schema="semantic.supersession.v1",
         structured_payload=dict(item["structured_payload"]),
         producer_decision_id=decision_id,
@@ -1126,7 +1130,11 @@ def _apply_review_resolution(
                 source_ref=f"review:{request['review_item_id']}",
                 justification=operation["reason"],
             ),
-            metadata={**dict(source.get("metadata") or {}), "review_confirmed": True},
+            metadata={
+                **_without_governance(dict(source.get("metadata") or {})),
+                "review_confirmed": True,
+            },
+            governance=APPROVED_POSITIVE_GUIDANCE,
             content_schema=source["content_schema"],
             structured_payload=dict(source["structured_payload"]),
             producer_decision_id=decision_id,
@@ -1299,6 +1307,17 @@ def _review_resolutions(
         }
         for row in cur.fetchall()
     ]
+
+
+def _without_governance(metadata: dict[str, Any]) -> dict[str, Any]:
+    for key in (
+        "operator_disposition",
+        "safety_status",
+        "contradiction_status",
+        "usage_instruction",
+    ):
+        metadata.pop(key, None)
+    return metadata
 
 
 def _effect_namespaces(cur: Any, effect: dict[str, Any]) -> set[str]:

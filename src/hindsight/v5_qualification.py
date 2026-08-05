@@ -25,10 +25,14 @@ from psycopg.errors import SerializationFailure
 from hindsight.db import connect
 from hindsight.embedding_index import activate_profile, begin_profile_build
 from hindsight.embeddings import EmbeddingProvider, embedding_profile
-from hindsight.memory import MemoryStore, Provenance
+from hindsight.memory import MemoryGovernance, MemoryStore, Provenance
 from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, learning_tenant_id
 from hindsight.tenant import tenant_scope
 from hindsight.v5_corpus import (
+    APPLICABILITY_REVISION,
+    APPLICABILITY_SCHEMA_VERSION,
+    APPROVED_DISTRACTOR_REVISION,
+    CANDIDATE_ENVELOPE_SCHEMA_VERSION,
     EMBEDDING_CAPABILITY,
     EMBEDDING_CASES_PER_FAMILY,
     EMBEDDING_DIMENSIONS,
@@ -41,6 +45,7 @@ from hindsight.v5_corpus import (
     GEMINI_PROVIDER_REPRESENTATION,
     MECHANISM_FAMILIES,
     STRUCTURAL_CASES_PER_FAMILY,
+    applicability_matches,
     development_protocol,
     development_scenarios,
     qualify_development_structure,
@@ -49,18 +54,21 @@ from hindsight.v5_corpus import (
 )
 
 
-QUALIFICATION_SCHEMA_VERSION = 1
-QUALIFICATION_REVISION = "v5-development-live-qualification-v2"
+QUALIFICATION_SCHEMA_VERSION = 2
+QUALIFICATION_REVISION = "v5-development-production-memory-boundary-v1"
 QUERY_RENDERER_REVISION = "v5-recurrence-visible-observations-v1"
-CACHE_SCHEMA_VERSION = 2
-RECEIPT_SCHEMA_VERSION = 1
-DIAGNOSTIC_SCHEMA_VERSION = 1
+DOCUMENT_RENDERER_REVISION = "v5-source-applicability-document-v1"
+CACHE_SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 2
+DIAGNOSTIC_SCHEMA_VERSION = 2
+EXECUTION_MANIFEST_SCHEMA_VERSION = 1
 DOCUMENT_TASK = "RETRIEVAL_DOCUMENT"
 QUERY_TASK = "RETRIEVAL_QUERY"
 CHECKPOINT_ATTESTATION_ALGORITHM = "AWS_KMS_HMAC_SHA_256"
 CHECKPOINT_ATTESTATION_KIND = "v5-embedding-entry"
 EXPECTED_SCENARIO_COUNT = len(MECHANISM_FAMILIES) * EMBEDDING_CASES_PER_FAMILY
-EXPECTED_UNIQUE_DOCUMENTS = 18
+EXPECTED_UNIQUE_DOCUMENTS = 1_897
+EXPECTED_DOCUMENT_INPUTS_SHA256 = "c0fb3d57b32f6cb973120e2a80e6c4d0172b8e196ab1c955657599ce37e41e6e"
 DATABASE_WRITE_ATTEMPTS = 3
 DATABASE_WRITE_RETRY_DELAYS_SECONDS = (0.25, 0.5)
 DEVELOPMENT_DATABASE_RE = re.compile(r"hindsight_v5_development_[a-z0-9_]+")
@@ -83,12 +91,19 @@ _FRESH_TABLES = (
     "memory_reads",
     "memory_retrievals",
 )
-_NEUTRAL_METADATA = {
-    "kind": "procedural_lesson",
-    "operator_disposition": "unreviewed",
-    "usage_instruction": "unassigned",
-    "applicability": {"conditions": [], "status": "unassessed"},
-}
+FORBIDDEN_CANDIDATE_KEYS = frozenset(
+    {
+        "applicable",
+        "candidate_role",
+        "expected_rank",
+        "mechanism_family",
+        "oracle",
+        "positive_lesson",
+        "positive_lesson_id",
+        "target",
+        "target_action",
+    }
+)
 
 
 class QualificationStore(Protocol):
@@ -109,6 +124,8 @@ class QualificationStore(Protocol):
     def current_semantic(self, **kwargs: Any) -> list[Mapping[str, Any]]: ...
 
     def audit_memory(self, **kwargs: Any) -> Mapping[str, Any] | None: ...
+
+    def invalidate(self, **kwargs: Any) -> Mapping[str, Any] | None: ...
 
 
 class CheckpointAttestor(Protocol):
@@ -132,6 +149,72 @@ def development_qualification_contract() -> dict[str, Any]:
             "selected_scenario_count": EXPECTED_SCENARIO_COUNT,
             "cases_per_family": EMBEDDING_CASES_PER_FAMILY,
             "selection_sha256": EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256,
+            "database_record_count": EXPECTED_SCENARIO_COUNT * 4,
+        },
+        "candidate_envelope": {
+            "schema_version": CANDIDATE_ENVELOPE_SCHEMA_VERSION,
+            "required_fields": [
+                "schema_version",
+                "memory_id",
+                "content",
+                "kind",
+                "status",
+                "operator_disposition",
+                "safety_status",
+                "contradiction_status",
+                "usage_instruction",
+                "applicability",
+            ],
+            "forbidden_keys": sorted(FORBIDDEN_CANDIDATE_KEYS),
+        },
+        "governance": {
+            "revision": "positive-guidance-governance-v1",
+            "positive_guidance_requires": {
+                "current": True,
+                "status": "active",
+                "operator_disposition": "approved",
+                "safety_status": "safe",
+                "contradiction_status": "supported",
+                "usage_instruction": "positive_guidance",
+            },
+            "missing_or_unknown": "ineligible",
+            "filter_stage": "cockroachdb-before-vector-order",
+        },
+        "applicability": {
+            "schema_version": APPLICABILITY_SCHEMA_VERSION,
+            "revision": APPLICABILITY_REVISION,
+            "operator": "equals",
+            "inputs": ["source.service", "source.workload", "source.observable_evidence"],
+            "recurrence_inputs": False,
+            "candidate_match_flag": False,
+        },
+        "approved_distractors": {
+            "revision": APPROVED_DISTRACTOR_REVISION,
+            "records_per_case": 4,
+            "approved_same_family": 2,
+            "approved_other_family": 1,
+            "audit_only_same_family": 1,
+            "audit_states": [
+                "rejected",
+                "review_required",
+                "invalidated",
+                "contradicted",
+                "unsafe",
+            ],
+        },
+        "document": {
+            "renderer_revision": DOCUMENT_RENDERER_REVISION,
+            "inputs": ["content", "applicability.all_of"],
+            "excluded": [
+                "memory_id",
+                "governance",
+                "source_episode_sha256",
+                "oracle",
+                "candidate_role",
+            ],
+            "task_type": DOCUMENT_TASK,
+            "expected_unique_count": EXPECTED_UNIQUE_DOCUMENTS,
+            "expected_inputs_sha256": EXPECTED_DOCUMENT_INPUTS_SHA256,
         },
         "query": {
             "renderer_revision": QUERY_RENDERER_REVISION,
@@ -184,6 +267,7 @@ def development_qualification_contract() -> dict[str, Any]:
         "checkpoint": {
             "schema_version": CACHE_SCHEMA_VERSION,
             "code_identity": "exact-lowercase-40-character-git-sha",
+            "execution_manifest_identity": "canonical-manifest-sha256",
             "document_identity": "code-profile-task-content-sha256",
             "query_identity": "code-profile-task-scenario-input-sha256",
             "attestation": {
@@ -194,6 +278,24 @@ def development_qualification_contract() -> dict[str, Any]:
             },
             "expected_unique_documents": EXPECTED_UNIQUE_DOCUMENTS,
             "expected_queries": EXPECTED_SCENARIO_COUNT,
+        },
+        "execution_manifest": {
+            "schema_version": EXECUTION_MANIFEST_SCHEMA_VERSION,
+            "write_boundary": "after-local-preflight-before-checkpoint-or-provider-calls",
+            "path_identity": "sha256-of-absolute-path",
+            "permissions": "0600-or-stricter",
+        },
+        "interpretation": {
+            "claim_scope": "memory-treatment-delivery",
+            "learning_efficacy_measured": False,
+        },
+        "stop_rules": {
+            "all_600_required": True,
+            "tie_is_failure": True,
+            "any_case_failure": "diagnostic-only",
+            "prompt_variants_after_failure": 0,
+            "threshold_changes_after_failure": 0,
+            "protected_work_before_rehearsals": False,
         },
     }
     return {**contract, "qualification_contract_sha256": sha256_hex(contract)}
@@ -253,6 +355,29 @@ def render_retrieval_query(scenario: Mapping[str, Any]) -> str:
             "",
             "Visible observations:",
             *rendered_observations,
+        ]
+    )
+
+
+def render_retrieval_document(memory: Mapping[str, Any]) -> str:
+    """Render guidance and source-visible applicability without identity or governance."""
+
+    _require_candidate_envelope(memory)
+    applicability = memory["applicability"]
+    assert isinstance(applicability, Mapping)
+    conditions = applicability["all_of"]
+    assert isinstance(conditions, list)
+    rendered_conditions = [
+        f"- {condition['field']}: {json.dumps(condition['value'], ensure_ascii=False, sort_keys=True)}"
+        for condition in conditions
+    ]
+    return "\n".join(
+        [
+            "Applicable incident context:",
+            *rendered_conditions,
+            "",
+            "Guidance:",
+            str(memory["content"]).strip(),
         ]
     )
 
@@ -331,6 +456,7 @@ class CheckpointedEmbeddingProvider:
         *,
         code_sha: str,
         attestor: CheckpointAttestor,
+        execution_manifest_sha256: str,
         qualification_contract_sha256: str | None = None,
     ) -> None:
         contract_sha256 = (
@@ -341,12 +467,15 @@ class CheckpointedEmbeddingProvider:
             raise ValueError("v5 qualification contract identity must be SHA-256")
         if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
             raise ValueError("v5 embedding checkpoint requires an exact lowercase code SHA")
+        if not re.fullmatch(r"[0-9a-f]{64}", execution_manifest_sha256):
+            raise ValueError("v5 embedding checkpoint requires an execution manifest identity")
         self._delegate = delegate
         self._directory = _require_private_directory(checkpoint_path)
         self._manifest_path = self._directory / "manifest.json"
         self._entries_directory = self._directory / "entries"
         self._contract_sha256 = contract_sha256
         self._code_sha = code_sha
+        self._execution_manifest_sha256 = execution_manifest_sha256
         self._identity = _require_exact_provider(delegate)
         attestation_key_id = str(getattr(attestor, "key_id", "")).strip()
         if not attestation_key_id:
@@ -462,6 +591,7 @@ class CheckpointedEmbeddingProvider:
             "schema_version": CACHE_SCHEMA_VERSION,
             "code_sha": self._code_sha,
             "qualification_contract_sha256": self._contract_sha256,
+            "execution_manifest_sha256": self._execution_manifest_sha256,
             "provider_identity": dict(self._identity),
             "profile_id": EMBEDDING_PROFILE_ID,
             "attestation": {
@@ -672,6 +802,8 @@ def candidate_database_payload(
     scenario_id: str,
     candidate_id: str,
     content_sha256: str,
+    document_sha256: str,
+    envelope_sha256: str,
     qualification_contract_sha256: str,
 ) -> dict[str, Any]:
     """Return an opaque-only database payload shared by every candidate role."""
@@ -680,22 +812,41 @@ def candidate_database_payload(
         raise ValueError("v5 database payload requires an opaque scenario identity")
     if not OPAQUE_MEMORY_RE.fullmatch(candidate_id):
         raise ValueError("v5 database payload requires an opaque candidate identity")
-    for value in (content_sha256, qualification_contract_sha256):
+    for value in (
+        content_sha256,
+        document_sha256,
+        envelope_sha256,
+        qualification_contract_sha256,
+    ):
         if not re.fullmatch(r"[0-9a-f]{64}", value):
             raise ValueError("v5 database payload digests must be SHA-256")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario_id": scenario_id,
         "candidate_id": candidate_id,
         "content_sha256": content_sha256,
+        "document_sha256": document_sha256,
+        "envelope_sha256": envelope_sha256,
         "qualification_contract_sha256": qualification_contract_sha256,
     }
 
 
-def candidate_database_metadata() -> dict[str, Any]:
-    """Return a fresh copy of the identical neutral candidate metadata."""
+def candidate_database_metadata(memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the typed, source-derived candidate governance projection."""
 
-    return json.loads(json.dumps(_NEUTRAL_METADATA))
+    _require_candidate_envelope(memory)
+    return json.loads(
+        json.dumps(
+            {
+                "kind": memory["kind"],
+                "operator_disposition": memory["operator_disposition"],
+                "safety_status": memory["safety_status"],
+                "contradiction_status": memory["contradiction_status"],
+                "usage_instruction": memory["usage_instruction"],
+                "applicability": memory["applicability"],
+            }
+        )
+    )
 
 
 def require_fresh_development_database(
@@ -949,21 +1100,15 @@ def summarize_qualification_results(
         raise ValueError("v5 qualification results are incomplete or out of protocol order")
     if len(set(observed_ids)) != EXPECTED_SCENARIO_COUNT:
         raise ValueError("v5 qualification results contain duplicate scenarios")
-    for scenario, row in zip(selected, results, strict=True):
-        oracle = scenario.get("oracle")
-        expected_target_id = (
-            str(oracle.get("positive_lesson_id") or "") if isinstance(oracle, Mapping) else ""
-        )
-        if not OPAQUE_MEMORY_RE.fullmatch(expected_target_id):
-            raise ValueError("v5 qualification selected target identity is invalid")
+    for _scenario, row in zip(selected, results, strict=True):
         if row.get("status") != "qualified":
             raise ValueError("v5 qualification contains a non-qualified scenario")
         if row.get("candidate_count") != 4:
             raise ValueError("v5 qualification scenario does not contain four candidates")
         if row.get("policy") != "semantic_strict" or row.get("fallback_reason") is not None:
             raise ValueError("v5 qualification used a fallback retrieval policy")
-        if row.get("target_rank") != 1:
-            raise ValueError("v5 qualification target is not uniquely rank one")
+        if row.get("intrinsic_match_count") != 1 or row.get("matching_rank") != 1:
+            raise ValueError("v5 qualification intrinsic applicability is not rank one")
         _require_uuid_identity(row.get("retrieval_id"), label="retrieval")
         direct_ids = row.get("direct_candidate_ids")
         indexed_ids = row.get("indexed_candidate_ids")
@@ -971,8 +1116,8 @@ def summarize_qualification_results(
             not isinstance(direct_ids, list)
             or not isinstance(indexed_ids, list)
             or not direct_ids
-            or len(direct_ids) > 4
-            or len(indexed_ids) > 4
+            or len(direct_ids) > 3
+            or len(indexed_ids) > 3
             or any(
                 not isinstance(item, str) or not OPAQUE_MEMORY_RE.fullmatch(item)
                 for item in direct_ids
@@ -989,13 +1134,17 @@ def summarize_qualification_results(
             raise ValueError("v5 qualification direct and indexed membership differs")
         if row.get("order_parity") is not True or direct_ids != indexed_ids:
             raise ValueError("v5 qualification direct and indexed order differs")
-        if direct_ids[0] != expected_target_id or indexed_ids[0] != expected_target_id:
-            raise ValueError("v5 qualification rank-one target identity differs")
-        target_distance = _finite_float(row.get("target_distance"), "target distance")
-        if target_distance > EMBEDDING_MAX_DISTANCE:
-            raise ValueError("v5 qualification target exceeds the frozen cutoff")
-        if _finite_float(row.get("target_margin"), "target margin") <= 0:
-            raise ValueError("v5 qualification target margin is not positive")
+        rank_one_distance = _finite_float(row.get("rank_one_distance"), "rank-one distance")
+        if rank_one_distance > EMBEDDING_MAX_DISTANCE:
+            raise ValueError("v5 qualification rank one exceeds the frozen cutoff")
+        if _finite_float(row.get("rank_one_margin"), "rank-one margin") <= 0:
+            raise ValueError("v5 qualification rank-one margin is not positive")
+        if row.get("ineligible_candidate_absent") is not True:
+            raise ValueError("v5 ineligible candidate entered semantic ranking")
+        if row.get("ineligible_read_absent") is not True:
+            raise ValueError("v5 ineligible candidate entered the retrieval trace")
+        if row.get("audit_only_visible") is not True:
+            raise ValueError("v5 ineligible candidate is not audit-visible")
         if row.get("index_parity") is not True:
             raise ValueError("v5 qualification direct and indexed results differ")
         if _finite_float(row.get("max_distance_delta"), "distance delta") > 1e-6:
@@ -1010,8 +1159,8 @@ def summarize_qualification_results(
         ):
             if row.get(field) is not False:
                 raise ValueError("v5 qualification tenant-isolation evidence is incomplete")
-        if row.get("indexed_target_rank") != 1:
-            raise ValueError("v5 indexed target is not rank one")
+        if row.get("indexed_matching_rank") != 1:
+            raise ValueError("v5 indexed intrinsic match is not rank one")
         if row.get("learning_decision_sealed") is not True:
             raise ValueError("v5 learning retrieval decision is not sealed")
         if row.get("alternate_decision_sealed") is not True:
@@ -1042,11 +1191,13 @@ def summarize_qualification_results(
         "embedding_max_distance": EMBEDDING_MAX_DISTANCE,
         "selection_sha256": EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256,
         "scenario_count": len(results),
-        "all_target_rank_one": True,
+        "claim_scope": "memory-treatment-delivery",
+        "learning_efficacy_measured": False,
+        "all_intrinsic_matches_rank_one": True,
         "all_index_parity": True,
         "alternate_tenant_invisible": True,
-        "minimum_target_margin": min(float(row["target_margin"]) for row in results),
-        "maximum_target_distance": max(float(row["target_distance"]) for row in results),
+        "minimum_rank_one_margin": min(float(row["rank_one_margin"]) for row in results),
+        "maximum_rank_one_distance": max(float(row["rank_one_distance"]) for row in results),
         "maximum_distance_delta": max(float(row["max_distance_delta"]) for row in results),
         "checkpoint_sha256": checkpoint.checkpoint_sha256,
         "checkpoint_attestation_key_id_sha256": checkpoint.attestation_key_id_sha256,
@@ -1065,6 +1216,7 @@ def _qualification_diagnostic(
     database_identities: Mapping[str, str],
     structural_receipt: Mapping[str, Any],
     checkpoint: CheckpointedEmbeddingProvider,
+    execution_manifest_sha256: str,
     results: Sequence[Mapping[str, Any]],
     failure: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1078,6 +1230,7 @@ def _qualification_diagnostic(
         "code_sha": code_sha,
         "qualification_contract_sha256": contract["qualification_contract_sha256"],
         "structural_receipt_sha256": structural_receipt["receipt_sha256"],
+        "execution_manifest_sha256": execution_manifest_sha256,
         "database_name": database_evidence["database_name"],
         "database_engine": database_evidence["engine"],
         "database_engine_version_sha256": hashlib.sha256(
@@ -1121,6 +1274,7 @@ def run_development_qualification(
     embedding_provider: EmbeddingProvider,
     checkpoint_attestor: CheckpointAttestor,
     checkpoint_path: str | os.PathLike[str],
+    execution_manifest_path: str | os.PathLike[str],
     receipt_path: str | os.PathLike[str],
     diagnostic_path: str | os.PathLike[str],
     connect_fn: Callable[..., Any] = connect,
@@ -1130,6 +1284,7 @@ def run_development_qualification(
     database_validator_fn: Callable[[str], Mapping[str, str]] | None = None,
     runtime_database_validator_fn: Callable[[str, str], Mapping[str, str]] | None = None,
     profile_initializer_fn: Callable[..., Mapping[str, Any]] | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Run the complete provider and strict CockroachDB development qualification."""
 
@@ -1137,19 +1292,20 @@ def run_development_qualification(
         raise ValueError("v5 qualification requires an exact lowercase code SHA")
     receipt = require_private_path(receipt_path)
     diagnostic = require_private_path(diagnostic_path)
-    if diagnostic == receipt:
-        raise ValueError("v5 qualification receipt and diagnostic paths must differ")
+    execution_manifest = require_private_path(execution_manifest_path)
+    if len({receipt, diagnostic, execution_manifest}) != 3:
+        raise ValueError("v5 qualification private artifact paths must differ")
     checkpoint_directory = _require_private_directory(checkpoint_path)
     _reject_checkpoint_descendant(receipt, checkpoint_directory, label="receipt")
     _reject_checkpoint_descendant(diagnostic, checkpoint_directory, label="diagnostic")
+    _reject_checkpoint_descendant(
+        execution_manifest,
+        checkpoint_directory,
+        label="execution manifest",
+    )
     _remove_private_file(receipt)
     _remove_private_file(diagnostic)
-    checkpoint = CheckpointedEmbeddingProvider(
-        embedding_provider,
-        checkpoint_directory,
-        code_sha=code_sha,
-        attestor=checkpoint_attestor,
-    )
+    _remove_private_file(execution_manifest)
     database_evidence = (
         database_validator_fn(database_url)
         if database_validator_fn is not None
@@ -1170,6 +1326,60 @@ def run_development_qualification(
     structural_receipt = qualify_development_structure(code_sha=code_sha)
     _require_structural_receipt(structural_receipt, code_sha=code_sha)
     selected = select_embedding_scenarios(code_sha=code_sha)
+    input_summary = _qualification_input_summary(selected)
+    provider_identity = _require_exact_provider(embedding_provider)
+    attestation_key_id = str(getattr(checkpoint_attestor, "key_id", "")).strip()
+    if not attestation_key_id:
+        raise ValueError("v5 qualification requires a KMS HMAC key identity")
+    manifest_body = {
+        "schema_version": EXECUTION_MANIFEST_SCHEMA_VERSION,
+        "code_sha": code_sha,
+        "qualification_contract_sha256": development_qualification_contract()[
+            "qualification_contract_sha256"
+        ],
+        "core_protocol_sha256": development_protocol()["protocol_sha256"],
+        "structural_receipt_sha256": structural_receipt["receipt_sha256"],
+        "selection_sha256": EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256,
+        "provider_identity": provider_identity,
+        "embedding_profile_id": EMBEDDING_PROFILE_ID,
+        "checkpoint_attestation_key_id_sha256": hashlib.sha256(
+            attestation_key_id.encode("utf-8")
+        ).hexdigest(),
+        "checkpoint_path_sha256": _path_identity(checkpoint_directory),
+        "receipt_path_sha256": _path_identity(receipt),
+        "diagnostic_path_sha256": _path_identity(diagnostic),
+        "execution_manifest_path_sha256": _path_identity(execution_manifest),
+        "database": {
+            "name": database_evidence["database_name"],
+            "engine": database_evidence["engine"],
+            "engine_version_sha256": _text_identity(database_evidence["engine_version"]),
+            "build_version_sha256": _text_identity(database_evidence["build_version"]),
+            "build_description_sha256": _text_identity(database_evidence["build_description"]),
+            "cluster_id_sha256": _text_identity(database_evidence["cluster_id"]),
+            "deploy_identity_sha256": _text_identity(database_identities["deploy_identity"]),
+            "runtime_identity_sha256": _text_identity(database_identities["runtime_identity"]),
+        },
+        "input_summary": input_summary,
+        "candidate_envelope": development_qualification_contract()["candidate_envelope"],
+        "governance": development_qualification_contract()["governance"],
+        "applicability": development_qualification_contract()["applicability"],
+        "approved_distractors": development_qualification_contract()["approved_distractors"],
+        "retrieval": development_qualification_contract()["retrieval"],
+        "stop_rules": development_qualification_contract()["stop_rules"],
+    }
+    execution_manifest_value = {
+        **manifest_body,
+        "execution_manifest_sha256": sha256_hex(manifest_body),
+    }
+    _atomic_write_json(execution_manifest, execution_manifest_value)
+    execution_manifest_sha256 = execution_manifest_value["execution_manifest_sha256"]
+    checkpoint = CheckpointedEmbeddingProvider(
+        embedding_provider,
+        checkpoint_directory,
+        code_sha=code_sha,
+        attestor=checkpoint_attestor,
+        execution_manifest_sha256=execution_manifest_sha256,
+    )
     _prewarm_embeddings(selected=selected, provider=checkpoint)
     if checkpoint.entry_counts != {
         DOCUMENT_TASK: EXPECTED_UNIQUE_DOCUMENTS,
@@ -1195,6 +1405,7 @@ def run_development_qualification(
             db_url=runtime_database_url,
             provider=checkpoint,
             store_factory=store_factory,
+            progress_callback=progress_callback,
         )
     except Exception as exc:
         if checkpoint.delegate_call_counts != calls_before_database:
@@ -1207,6 +1418,7 @@ def run_development_qualification(
             database_identities=database_identities,
             structural_receipt=structural_receipt,
             checkpoint=checkpoint,
+            execution_manifest_sha256=execution_manifest_sha256,
             results=[],
             failure={
                 "stage": "database_population_or_retrieval",
@@ -1222,6 +1434,7 @@ def run_development_qualification(
         database_identities=database_identities,
         structural_receipt=structural_receipt,
         checkpoint=checkpoint,
+        execution_manifest_sha256=execution_manifest_sha256,
         results=results,
     )
     _atomic_write_json(diagnostic, diagnostic_value)
@@ -1254,6 +1467,7 @@ def run_development_qualification(
         database_evidence["cluster_id"].encode("utf-8")
     ).hexdigest()
     value["checkpoint_attestation_key_id_sha256"] = checkpoint.attestation_key_id_sha256
+    value["execution_manifest_sha256"] = execution_manifest_sha256
     unsigned = {key: item for key, item in value.items() if key != "receipt_sha256"}
     value["receipt_sha256"] = sha256_hex(unsigned)
     _atomic_write_json(receipt, value)
@@ -1269,10 +1483,50 @@ def _prewarm_embeddings(
         scenario_id = str(scenario["scenario_id"])
         memories = _candidate_memories(scenario)
         for memory in memories:
-            provider.embed_document(str(memory["content"]))
+            provider.embed_document(render_retrieval_document(memory))
         query = render_retrieval_query(scenario)
         with provider.query_scope(scenario_id=scenario_id, query=query):
             provider.embed_query(query)
+
+
+def _qualification_input_summary(
+    selected: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    documents = {
+        render_retrieval_document(memory)
+        for scenario in selected
+        for memory in _candidate_memories(scenario)
+    }
+    document_inputs_sha256 = sha256_hex(
+        sorted(hashlib.sha256(item.encode("utf-8")).hexdigest() for item in documents)
+    )
+    queries = [render_retrieval_query(scenario) for scenario in selected]
+    summary = {
+        "scenario_count": len(selected),
+        "candidate_count": sum(len(_candidate_memories(scenario)) for scenario in selected),
+        "unique_document_count": len(documents),
+        "document_inputs_sha256": document_inputs_sha256,
+        "query_inputs_sha256": sha256_hex(
+            [hashlib.sha256(item.encode("utf-8")).hexdigest() for item in queries]
+        ),
+    }
+    if summary["scenario_count"] != EXPECTED_SCENARIO_COUNT:
+        raise RuntimeError("v5 qualification input scenario count differs")
+    if summary["candidate_count"] != EXPECTED_SCENARIO_COUNT * 4:
+        raise RuntimeError("v5 qualification input candidate count differs")
+    if summary["unique_document_count"] != EXPECTED_UNIQUE_DOCUMENTS:
+        raise RuntimeError("v5 qualification unique document count differs")
+    if summary["document_inputs_sha256"] != EXPECTED_DOCUMENT_INPUTS_SHA256:
+        raise RuntimeError("v5 qualification document input identity differs")
+    return summary
+
+
+def _text_identity(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _path_identity(path: pathlib.Path) -> str:
+    return _text_identity(str(path))
 
 
 def _initialize_exact_profile(
@@ -1303,6 +1557,7 @@ def _run_database_cases(
     db_url: str,
     provider: CheckpointedEmbeddingProvider,
     store_factory: Callable[..., QualificationStore],
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     contract_sha256 = development_qualification_contract()["qualification_contract_sha256"]
     loaded_cases: list[dict[str, Any]] = []
@@ -1311,7 +1566,7 @@ def _run_database_cases(
         with store_factory(url=db_url, embedding_provider=provider) as store:
             # Populate the complete 2,400-candidate corpus before any query so every
             # scenario is qualified against the same final CockroachDB index state.
-            for scenario in selected:
+            for index, scenario in enumerate(selected, start=1):
                 loaded_cases.append(
                     _load_database_case(
                         scenario=scenario,
@@ -1320,7 +1575,9 @@ def _run_database_cases(
                         contract_sha256=contract_sha256,
                     )
                 )
-            for loaded_case in loaded_cases:
+                if progress_callback is not None:
+                    progress_callback("database_population", index * 4, len(selected) * 4)
+            for index, loaded_case in enumerate(loaded_cases, start=1):
                 results.append(
                     _retrieve_database_case(
                         loaded_case=loaded_case,
@@ -1328,6 +1585,8 @@ def _run_database_cases(
                         provider=provider,
                     )
                 )
+                if progress_callback is not None:
+                    progress_callback("learning_retrieval", index, len(loaded_cases))
     with tenant_scope(ACCEPTANCE_TENANT_ID):
         with store_factory(url=db_url, embedding_provider=provider) as store:
             for loaded_case, result in zip(loaded_cases, results, strict=True):
@@ -1345,6 +1604,7 @@ def _run_database_cases(
                         purpose="Verify alternate-tenant invisibility",
                         policy="semantic_strict",
                         limit=4,
+                        positive_guidance_only=True,
                     )
                 _verify_retrieval_trace(
                     store=store,
@@ -1392,15 +1652,25 @@ def _load_database_case(
     scenario_id = str(scenario["scenario_id"])
     namespace = _scenario_namespace(scenario_id)
     memories = _candidate_memories(scenario)
-    expected_target_id = str(dict(scenario["oracle"])["positive_lesson_id"])
     vectors: dict[str, list[float]] = {}
     database_ids: dict[str, str] = {}
+    candidate_database_ids: dict[str, str] = {}
     for memory in memories:
         candidate_id = str(memory["memory_id"])
         content = str(memory["content"])
+        document = render_retrieval_document(memory)
         content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        vector = provider.embed_document(content)
+        document_sha256 = hashlib.sha256(document.encode("utf-8")).hexdigest()
+        envelope_sha256 = sha256_hex(dict(memory))
+        vector = provider.embed_document(document)
         vectors[candidate_id] = vector
+        governance = MemoryGovernance(
+            operator_disposition=str(memory["operator_disposition"]),  # type: ignore[arg-type]
+            safety_status=str(memory["safety_status"]),  # type: ignore[arg-type]
+            contradiction_status=str(memory["contradiction_status"]),  # type: ignore[arg-type]
+            usage_instruction=str(memory["usage_instruction"]),  # type: ignore[arg-type]
+        )
+        trust_status = "review_required" if memory["status"] == "review_required" else "active"
         row = _remember_candidate_with_retry(
             store=store,
             memory_kind="semantic",
@@ -1409,27 +1679,42 @@ def _load_database_case(
             provenance=Provenance(
                 writer="v5.development.qualification",
                 source_ref=f"v5-development:{scenario_id}:{candidate_id}",
-                justification="Store one neutral development retrieval candidate",
+                justification="Store one governed development retrieval candidate",
             ),
-            metadata=candidate_database_metadata(),
-            content_schema="v5_development_candidate.v1",
+            metadata=candidate_database_metadata(memory),
+            content_schema="v5_development_candidate.v2",
             structured_payload=candidate_database_payload(
                 scenario_id=scenario_id,
                 candidate_id=candidate_id,
                 content_sha256=content_sha256,
+                document_sha256=document_sha256,
+                envelope_sha256=envelope_sha256,
                 qualification_contract_sha256=contract_sha256,
             ),
             precomputed_embedding=vector,
+            trust_status=trust_status,
+            governance=governance,
         )
-        database_ids[str(row["id"])] = candidate_id
+        database_id = str(row["id"])
+        database_ids[database_id] = candidate_id
+        candidate_database_ids[candidate_id] = database_id
+        if memory["status"] == "invalidated":
+            invalidated = store.invalidate(
+                memory_id=database_id,
+                memory_kind="semantic",
+                actor="v5.development.qualification",
+                reason="Frozen development candidate invalidation state",
+            )
+            if invalidated is None:
+                raise RuntimeError("v5 invalidated candidate did not remain audit-visible")
     return {
         "scenario": scenario,
         "scenario_id": scenario_id,
         "namespace": namespace,
         "memories": memories,
-        "expected_target_id": expected_target_id,
         "vectors": vectors,
         "database_ids": database_ids,
+        "candidate_database_ids": candidate_database_ids,
     }
 
 
@@ -1461,16 +1746,36 @@ def _retrieve_database_case(
     scenario_id = str(loaded_case["scenario_id"])
     namespace = str(loaded_case["namespace"])
     memories = loaded_case["memories"]
-    expected_target_id = str(loaded_case["expected_target_id"])
     vectors = loaded_case["vectors"]
     database_ids = loaded_case["database_ids"]
+    candidate_database_ids = loaded_case["candidate_database_ids"]
     if (
         not isinstance(scenario, Mapping)
         or not isinstance(memories, list)
         or not isinstance(vectors, Mapping)
         or not isinstance(database_ids, Mapping)
+        or not isinstance(candidate_database_ids, Mapping)
     ):
         raise RuntimeError("v5 loaded database case is invalid")
+    recurrence = dict(dict(scenario["agent_view"])["recurrence"])
+    eligible_memories = [memory for memory in memories if _candidate_is_positive(memory)]
+    matching_memories = [
+        memory
+        for memory in eligible_memories
+        if applicability_matches(
+            dict(memory["applicability"]),
+            service=str(recurrence["service"]),
+            workload=str(recurrence["workload"]),
+            observations=dict(recurrence["initial_observation"]),
+        )
+    ]
+    if len(eligible_memories) != 3 or len(matching_memories) != 1:
+        raise RuntimeError("v5 intrinsic candidate eligibility is not unique")
+    matching_candidate_id = str(matching_memories[0]["memory_id"])
+    eligible_ids = {str(memory["memory_id"]) for memory in eligible_memories}
+    ineligible_ids = {
+        str(memory["memory_id"]) for memory in memories if not _candidate_is_positive(memory)
+    }
     query = render_retrieval_query(scenario)
     decision_id = f"v5-development-retrieval:{scenario_id}"
     with provider.query_scope(scenario_id=scenario_id, query=query):
@@ -1483,6 +1788,7 @@ def _retrieve_database_case(
             purpose="Qualify strict rank-one development retrieval",
             policy="semantic_strict",
             limit=4,
+            positive_guidance_only=True,
         )
     _verify_retrieval_trace(store=store, retrieval=retrieval, decision_id=decision_id)
     _seal_retrieval_decision(store=store, decision_id=decision_id)
@@ -1493,6 +1799,7 @@ def _retrieve_database_case(
                 "distance": _cosine_distance(query_vector, vector),
             }
             for candidate_id, vector in vectors.items()
+            if candidate_id in eligible_ids
         ),
         key=lambda row: (row["distance"], row["candidate_id"]),
     )
@@ -1518,26 +1825,30 @@ def _retrieve_database_case(
         if direct_row["candidate_id"] == indexed_row["candidate_id"]
     ]
     max_distance_delta = max(deltas, default=math.inf if direct_ids or indexed_ids else 0.0)
-    target_rank = next(
+    matching_rank = next(
         (
             index
             for index, row in enumerate(direct_all, start=1)
-            if row["candidate_id"] == expected_target_id
+            if row["candidate_id"] == matching_candidate_id
         ),
         None,
     )
-    target_distance = next(
-        (float(row["distance"]) for row in direct_all if row["candidate_id"] == expected_target_id),
+    rank_one_distance = next(
+        (
+            float(row["distance"])
+            for row in direct_all
+            if row["candidate_id"] == matching_candidate_id
+        ),
         math.inf,
     )
     competitor_distance = min(
-        float(row["distance"]) for row in direct_all if row["candidate_id"] != expected_target_id
+        float(row["distance"]) for row in direct_all if row["candidate_id"] != matching_candidate_id
     )
-    indexed_target_rank = next(
+    indexed_matching_rank = next(
         (
             index
             for index, row in enumerate(indexed, start=1)
-            if row["candidate_id"] == expected_target_id
+            if row["candidate_id"] == matching_candidate_id
         ),
         None,
     )
@@ -1549,15 +1860,31 @@ def _retrieve_database_case(
         and len(deltas) == len(direct) == len(indexed)
         and max_distance_delta <= 1e-6
     )
+    ineligible_absent = not (ineligible_ids & (set(direct_ids) | set(indexed_ids)))
+    reads = store.reads_for_decision(decision_id=decision_id)
+    read_database_ids = {
+        str(row.get("semantic_memory_id") or row.get("memory_id") or "") for row in reads
+    }
+    ineligible_database_ids = {
+        str(candidate_database_ids[candidate_id]) for candidate_id in ineligible_ids
+    }
+    ineligible_read_absent = not (ineligible_database_ids & read_database_ids)
+    audit_only_visible = all(
+        store.audit_memory(memory_kind="semantic", memory_id=database_id) is not None
+        for database_id in ineligible_database_ids
+    )
     qualified = (
         _result_value(retrieval, "status") == "succeeded"
         and policy == "semantic_strict"
         and fallback_reason is None
-        and target_rank == 1
-        and indexed_target_rank == 1
-        and target_distance <= EMBEDDING_MAX_DISTANCE
-        and competitor_distance - target_distance > 0
+        and matching_rank == 1
+        and indexed_matching_rank == 1
+        and rank_one_distance <= EMBEDDING_MAX_DISTANCE
+        and competitor_distance - rank_one_distance > 0
         and index_parity
+        and ineligible_absent
+        and ineligible_read_absent
+        and audit_only_visible
     )
     return {
         "scenario_id": scenario_id,
@@ -1568,10 +1895,14 @@ def _retrieve_database_case(
         "retrieval_id": str(_result_value(retrieval, "retrieval_id") or ""),
         "direct_candidate_ids": direct_ids,
         "indexed_candidate_ids": indexed_ids,
-        "target_rank": target_rank,
-        "indexed_target_rank": indexed_target_rank,
-        "target_distance": target_distance,
-        "target_margin": competitor_distance - target_distance,
+        "intrinsic_match_count": len(matching_memories),
+        "matching_rank": matching_rank,
+        "indexed_matching_rank": indexed_matching_rank,
+        "rank_one_distance": rank_one_distance,
+        "rank_one_margin": competitor_distance - rank_one_distance,
+        "ineligible_candidate_absent": ineligible_absent,
+        "ineligible_read_absent": ineligible_read_absent,
+        "audit_only_visible": audit_only_visible,
         "membership_parity": membership_parity,
         "order_parity": order_parity,
         "max_distance_delta": max_distance_delta,
@@ -1593,21 +1924,75 @@ def _candidate_memories(scenario: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     memories = agent_view.get("memories")
     if not isinstance(memories, list) or len(memories) != 4:
         raise ValueError("v5 qualification scenario requires four candidates")
-    governance = []
     for memory in memories:
         if not isinstance(memory, Mapping):
             raise ValueError("v5 qualification candidate is invalid")
-        memory_id = str(memory.get("memory_id") or "")
-        if not OPAQUE_MEMORY_RE.fullmatch(memory_id):
-            raise ValueError("v5 qualification candidate identity is not opaque")
-        if not isinstance(memory.get("content"), str) or not memory["content"]:
-            raise ValueError("v5 qualification candidate content is required")
-        governance.append(
-            {key: value for key, value in memory.items() if key not in {"memory_id", "content"}}
-        )
-    if any(value != governance[0] for value in governance[1:]):
-        raise ValueError("v5 qualification candidates do not have neutral uniform governance")
+        _require_candidate_envelope(memory)
+    if sum(_candidate_is_positive(memory) for memory in memories) != 3:
+        raise ValueError("v5 qualification requires three approved candidates")
     return memories
+
+
+def _require_candidate_envelope(memory: Mapping[str, Any]) -> None:
+    required = {
+        "schema_version",
+        "memory_id",
+        "content",
+        "kind",
+        "status",
+        "operator_disposition",
+        "safety_status",
+        "contradiction_status",
+        "usage_instruction",
+        "applicability",
+    }
+    if set(memory) != required:
+        raise ValueError("v5 candidate envelope fields differ")
+    if memory.get("schema_version") != CANDIDATE_ENVELOPE_SCHEMA_VERSION:
+        raise ValueError("v5 candidate envelope schema differs")
+    memory_id = str(memory.get("memory_id") or "")
+    if not OPAQUE_MEMORY_RE.fullmatch(memory_id):
+        raise ValueError("v5 qualification candidate identity is not opaque")
+    if not isinstance(memory.get("content"), str) or not memory["content"]:
+        raise ValueError("v5 qualification candidate content is required")
+    _reject_forbidden_candidate_fields(memory)
+    applicability = memory.get("applicability")
+    if not isinstance(applicability, Mapping):
+        raise ValueError("v5 candidate applicability is invalid")
+    if (
+        applicability.get("schema_version") != APPLICABILITY_SCHEMA_VERSION
+        or applicability.get("revision") != APPLICABILITY_REVISION
+        or not isinstance(applicability.get("all_of"), list)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(applicability.get("source_episode_sha256") or ""))
+    ):
+        raise ValueError("v5 candidate applicability identity differs")
+    MemoryGovernance(
+        operator_disposition=str(memory["operator_disposition"]),  # type: ignore[arg-type]
+        safety_status=str(memory["safety_status"]),  # type: ignore[arg-type]
+        contradiction_status=str(memory["contradiction_status"]),  # type: ignore[arg-type]
+        usage_instruction=str(memory["usage_instruction"]),  # type: ignore[arg-type]
+    )
+
+
+def _candidate_is_positive(memory: Mapping[str, Any]) -> bool:
+    return (
+        memory.get("status") == "active"
+        and memory.get("operator_disposition") == "approved"
+        and memory.get("safety_status") == "safe"
+        and memory.get("contradiction_status") == "supported"
+        and memory.get("usage_instruction") == "positive_guidance"
+    )
+
+
+def _reject_forbidden_candidate_fields(value: Any) -> None:
+    if isinstance(value, Mapping):
+        if FORBIDDEN_CANDIDATE_KEYS & set(value):
+            raise ValueError("v5 candidate envelope exposes forbidden retrieval truth")
+        for item in value.values():
+            _reject_forbidden_candidate_fields(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_forbidden_candidate_fields(item)
 
 
 def _require_exact_provider(provider: EmbeddingProvider) -> dict[str, Any]:
@@ -1900,6 +2285,7 @@ __all__ = [
     "candidate_database_metadata",
     "candidate_database_payload",
     "development_qualification_contract",
+    "render_retrieval_document",
     "render_retrieval_query",
     "require_fresh_development_database",
     "require_private_path",

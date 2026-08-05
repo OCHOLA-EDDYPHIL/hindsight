@@ -9,8 +9,9 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 
-SCHEMA_VERSION = 5
-GENERATOR_VERSION = "v5-deterministic-generator-v1"
+SCHEMA_VERSION = 6
+GENERATOR_VERSION = "v5-deterministic-generator-v2"
+SCENARIO_ID_GENERATOR_VERSION = "v5-deterministic-generator-v1"
 SIMULATOR_VERSION = "v5-incident-simulator-v1"
 DEVELOPMENT_SEED_ROOT = "hindsight-v5-development-v1"
 MECHANISM_FAMILIES = (
@@ -60,7 +61,7 @@ EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256 = (
     "2294cc2886f48c265fdb2288438c1016e9de94be5195be5cc5b668cc3311a77b"
 )
 EXPECTED_DEVELOPMENT_MEMORY_ORDER_SHA256 = (
-    "97d114d1c0f125ca2abe6ada7c6f96291991831e55ee41fb77d3380bc24505ee"
+    "977444278fc2a670347cf28964853f10475037e9fa7c59bf67a60aefe99673c2"
 )
 REASONING_PROVIDER = "gemini"
 REASONING_MODEL = "gemini-3.1-flash-lite"
@@ -68,7 +69,7 @@ EMBEDDING_PROVIDER = "gemini"
 EMBEDDING_MODEL = "gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 1_024
 EMBEDDING_MAX_DISTANCE = 0.35
-EMBEDDING_REPRESENTATION = "v5-content-only-v1"
+EMBEDDING_REPRESENTATION = "v5-source-applicability-document-v1"
 GEMINI_PROVIDER_REPRESENTATION = "raw_control"
 EMBEDDING_CAPABILITY = "semantic"
 EMBEDDING_ENCODER_REVISION = "gemini-retrieval-task-v1"
@@ -93,17 +94,50 @@ def _embedding_profile_payload() -> dict[str, Any]:
     }
 
 
-def _neutral_memory_governance() -> dict[str, Any]:
+APPLICABILITY_SCHEMA_VERSION = 1
+CANDIDATE_ENVELOPE_SCHEMA_VERSION = 2
+GOVERNANCE_REVISION = "positive-guidance-governance-v1"
+APPLICABILITY_REVISION = "source-visible-equality-v1"
+APPROVED_DISTRACTOR_REVISION = "v5-source-peer-distractors-v1"
+AUDIT_STATES = ("rejected", "review_required", "invalidated", "contradicted", "unsafe")
+
+
+def _approved_memory_governance() -> dict[str, str]:
     return {
-        "kind": "procedural_lesson",
-        "status": "review_required",
-        "operator_disposition": "unreviewed",
-        "usage_instruction": "unassigned",
-        "applicability": {
-            "conditions": [],
-            "status": "unassessed",
-        },
+        "status": "active",
+        "operator_disposition": "approved",
+        "safety_status": "safe",
+        "contradiction_status": "supported",
+        "usage_instruction": "positive_guidance",
     }
+
+
+def _audit_memory_governance(state: str) -> dict[str, str]:
+    if state not in AUDIT_STATES:
+        raise ValueError("unsupported v5 audit state")
+    governance = {
+        "status": "active",
+        "operator_disposition": "approved",
+        "safety_status": "safe",
+        "contradiction_status": "supported",
+        "usage_instruction": "audit_only",
+    }
+    if state == "rejected":
+        governance["operator_disposition"] = "rejected"
+    elif state == "review_required":
+        governance.update(
+            status="review_required",
+            operator_disposition="unreviewed",
+            safety_status="unassessed",
+            contradiction_status="unassessed",
+        )
+    elif state == "invalidated":
+        governance["status"] = "invalidated"
+    elif state == "contradicted":
+        governance["contradiction_status"] = "contradicted"
+    elif state == "unsafe":
+        governance["safety_status"] = "unsafe"
+    return governance
 
 
 EMBEDDING_PROFILE_ID = hashlib.sha256(
@@ -345,59 +379,88 @@ def _build_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]:
         raise ValueError("scenario seed must be a lowercase SHA-256 value")
     if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
         raise ValueError("scenario code SHA must be a lowercase commit identity")
-    source_state = _initial_state(spec=spec, seed=seed, episode="source")
-    recurrence_state = _initial_state(spec=spec, seed=seed, episode="recurrence")
-    service, workload = _SERVICE_TEMPLATES[_derive_int(seed, "service", 0, 3)]
-    template_index = _derive_int(seed, "template", 0, 3)
-    evidence = _visible_evidence(spec=spec, state=recurrence_state)
-    source_summary = _INCIDENT_TEMPLATES[template_index].format(
-        service=service,
-        workload=workload,
-        evidence=_visible_evidence(spec=spec, state=source_state),
+    opaque_root = _derive_hex(
+        SCENARIO_ID_GENERATOR_VERSION,
+        SIMULATOR_VERSION,
+        family,
+        seed,
     )
-    recurrence_query = _RECURRENCE_TEMPLATES[(template_index + 1) % 4].format(
-        service=service,
-        workload=workload,
-        evidence=evidence,
-    )
-    opaque_root = _derive_hex(GENERATOR_VERSION, SIMULATOR_VERSION, family, seed)
     scenario_id = f"v5s-{opaque_root[:24]}"
-    lesson_id = f"v5m-{_derive_hex(opaque_root, 'lesson')[:24]}"
-    source_episode_id = f"v5e-{_derive_hex(opaque_root, 'source')[:24]}"
-    recurrence_episode_id = f"v5e-{_derive_hex(opaque_root, 'recurrence')[:24]}"
-    decoys = _decoys(spec=spec, seed=seed, opaque_root=opaque_root)
-    memories = [
-        {
-            "memory_id": lesson_id,
-            "content": spec.lesson,
-            **_neutral_memory_governance(),
-        },
-        *[
-            {
-                "memory_id": row["memory_id"],
-                "content": row["content"],
-                **_neutral_memory_governance(),
-            }
-            for row in decoys
-        ],
+    primary_source = _source_episode(spec=spec, seed=seed, identity="primary")
+    peer_source = _different_source_episode(
+        spec=spec,
+        seed=seed,
+        reference=primary_source,
+    )
+    other_families = [value for value in MECHANISM_FAMILIES if value != family]
+    other_family = other_families[_derive_int(seed, "approved-other-family", 0, 4)]
+    other_spec = _require_family(other_family)
+    other_source = _source_episode(
+        spec=other_spec,
+        seed=_derive_hex(seed, APPROVED_DISTRACTOR_REVISION, other_family),
+        identity="other",
+    )
+    same_family_sources = (primary_source, peer_source)
+    recurrence_source = min(
+        same_family_sources,
+        key=lambda value: sha256_hex(
+            ["v5-recurrence-source-v1", value["applicability"]["source_episode_sha256"]]
+        ),
+    )
+    approved_memories = [
+        _candidate_memory(
+            opaque_root=opaque_root,
+            ordinal=index,
+            content=candidate_spec.lesson,
+            applicability=source["applicability"],
+            governance=_approved_memory_governance(),
+        )
+        for index, (candidate_spec, source) in enumerate(
+            ((spec, primary_source), (spec, peer_source), (other_spec, other_source))
+        )
     ]
+    audit_state = AUDIT_STATES[
+        _derive_int(seed, "v5-audit-governance-v1", 0, len(AUDIT_STATES) - 1)
+    ]
+    audit_content = spec.unsafe_guidance if audit_state == "unsafe" else spec.lesson
+    audit_memory = _candidate_memory(
+        opaque_root=opaque_root,
+        ordinal=3,
+        content=audit_content,
+        applicability=recurrence_source["applicability"],
+        governance=_audit_memory_governance(audit_state),
+    )
+    memories = [*approved_memories, audit_memory]
     memories.sort(
         key=lambda row: (
             sha256_hex([MEMORY_ORDER_DOMAIN, seed, row["memory_id"]]),
             str(row["memory_id"]),
         )
     )
+
+    source_state = dict(recurrence_source["state"])
+    recurrence_hidden = _initial_state(spec=spec, seed=seed, episode="recurrence")[spec.hidden_key]
+    recurrence_state = {
+        **dict(recurrence_source["observable_evidence"]),
+        spec.hidden_key: recurrence_hidden,
+    }
+    service = str(recurrence_source["service"])
+    workload = str(recurrence_source["workload"])
+    template_index = int(recurrence_source["template_index"])
+    recurrence_query = _RECURRENCE_TEMPLATES[(template_index + 1) % 4].format(
+        service=service,
+        workload=workload,
+        evidence=_visible_evidence(spec=spec, state=recurrence_state),
+    )
+    source_episode_id = str(recurrence_source["episode_id"])
+    recurrence_episode_id = f"v5e-{_derive_hex(opaque_root, 'recurrence')[:24]}"
     agent_view = {
         "scenario_id": scenario_id,
-        "source_episode": {
-            "episode_id": source_episode_id,
-            "incident": source_summary,
-            "observable_evidence": _visible_state(spec=spec, state=source_state),
-            "resolution": spec.source_resolution,
-            "outcome": "The service returned to its operating objective after the bounded repair.",
-        },
+        "source_episode": _public_source_episode(recurrence_source),
         "recurrence": {
             "episode_id": recurrence_episode_id,
+            "service": service,
+            "workload": workload,
             "incident": recurrence_query,
             "initial_observation": _visible_state(spec=spec, state=recurrence_state),
             "allowed_actions": list(ALL_ACTIONS),
@@ -430,11 +493,6 @@ def _build_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]:
             "unsafe_action_count": 0,
             "action_count": 2,
         },
-        "positive_lesson_id": lesson_id,
-        "positive_lesson": spec.lesson,
-        "applicable_conditions": [spec.diagnosis],
-        "non_applicable_conditions": [row["conditions"][0] for row in decoys],
-        "decoys": decoys,
         "confounders": [
             f"The reporting window for {service} closes after the current shift.",
             f"The ownership roster for {workload} changed earlier this month.",
@@ -451,12 +509,12 @@ def _build_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "code_sha": code_sha,
         "generator_version": GENERATOR_VERSION,
+        "scenario_identity_generator_version": SCENARIO_ID_GENERATOR_VERSION,
         "simulator_version": SIMULATOR_VERSION,
         "simulator_seed": seed,
         "template_identity": f"incident-{template_index}:recurrence-{(template_index + 1) % 4}",
         "mechanism_family": family,
         "scenario_id": scenario_id,
-        "lesson_id": lesson_id,
         "embedding_representation_identity": EMBEDDING_REPRESENTATION,
         "provider_identities": {
             "reasoning": {
@@ -484,6 +542,122 @@ def _build_scenario(*, family: str, seed: str, code_sha: str) -> dict[str, Any]:
     payload["oracle_sha256"] = sha256_hex(oracle)
     payload["content_sha256"] = sha256_hex(payload)
     return payload
+
+
+def _source_episode(*, spec: MechanismSpec, seed: str, identity: str) -> dict[str, Any]:
+    state = _initial_state(spec=spec, seed=seed, episode="source")
+    service, workload = _SERVICE_TEMPLATES[_derive_int(seed, "service", 0, 3)]
+    template_index = _derive_int(seed, "template", 0, 3)
+    observable_evidence = _visible_state(spec=spec, state=state)
+    episode = {
+        "episode_id": f"v5e-{_derive_hex(seed, identity, 'source')[:24]}",
+        "service": service,
+        "workload": workload,
+        "incident": _INCIDENT_TEMPLATES[template_index].format(
+            service=service,
+            workload=workload,
+            evidence=_visible_evidence(spec=spec, state=state),
+        ),
+        "observable_evidence": observable_evidence,
+        "resolution": spec.source_resolution,
+        "outcome": "The service returned to its operating objective after the bounded repair.",
+    }
+    return {
+        **episode,
+        "state": state,
+        "template_index": template_index,
+        "applicability": _source_applicability(episode),
+    }
+
+
+def _source_applicability(episode: dict[str, Any]) -> dict[str, Any]:
+    conditions = [
+        {"field": "service", "operator": "equals", "value": episode["service"]},
+        {"field": "workload", "operator": "equals", "value": episode["workload"]},
+        *[
+            {
+                "field": f"initial_observation.{key}",
+                "operator": "equals",
+                "value": episode["observable_evidence"][key],
+            }
+            for key in sorted(episode["observable_evidence"])
+        ],
+    ]
+    source = {
+        key: episode[key]
+        for key in (
+            "episode_id",
+            "service",
+            "workload",
+            "incident",
+            "observable_evidence",
+            "resolution",
+            "outcome",
+        )
+    }
+    return {
+        "schema_version": APPLICABILITY_SCHEMA_VERSION,
+        "revision": APPLICABILITY_REVISION,
+        "all_of": conditions,
+        "source_episode_sha256": sha256_hex(source),
+    }
+
+
+def _different_source_episode(
+    *, spec: MechanismSpec, seed: str, reference: dict[str, Any]
+) -> dict[str, Any]:
+    reference_conditions = reference["applicability"]["all_of"]
+    for nonce in range(1, 65):
+        candidate = _source_episode(
+            spec=spec,
+            seed=_derive_hex(seed, APPROVED_DISTRACTOR_REVISION, str(nonce)),
+            identity=f"same-{nonce}",
+        )
+        if candidate["applicability"]["all_of"] != reference_conditions:
+            return candidate
+    raise ValueError("v5 could not derive a different same-family source episode")
+
+
+def _public_source_episode(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: source[key]
+        for key in (
+            "episode_id",
+            "service",
+            "workload",
+            "incident",
+            "observable_evidence",
+            "resolution",
+            "outcome",
+        )
+    }
+
+
+def _candidate_memory(
+    *,
+    opaque_root: str,
+    ordinal: int,
+    content: str,
+    applicability: dict[str, Any],
+    governance: dict[str, str],
+) -> dict[str, Any]:
+    identity = sha256_hex(
+        {
+            "domain": "v5-memory-envelope-identity-v2",
+            "opaque_root": opaque_root,
+            "ordinal": ordinal,
+            "content_sha256": sha256_hex(content.encode("utf-8")),
+            "source_episode_sha256": applicability["source_episode_sha256"],
+        }
+    )
+    return {
+        "schema_version": CANDIDATE_ENVELOPE_SCHEMA_VERSION,
+        "memory_id": f"v5m-{identity[:24]}",
+        "content": content,
+        "kind": "procedural_lesson",
+        **governance,
+        "applicability": applicability,
+    }
 
 
 def validate_scenario(item: dict[str, Any]) -> None:
@@ -658,6 +832,12 @@ def development_protocol() -> dict[str, Any]:
         "expected_embedding_selection_sha256": (EXPECTED_DEVELOPMENT_EMBEDDING_SELECTION_SHA256),
         "expected_rehearsal_selection_sha256": (EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256),
         "representation": EMBEDDING_REPRESENTATION,
+        "candidate_envelope_schema_version": CANDIDATE_ENVELOPE_SCHEMA_VERSION,
+        "governance_revision": GOVERNANCE_REVISION,
+        "applicability_schema_version": APPLICABILITY_SCHEMA_VERSION,
+        "applicability_revision": APPLICABILITY_REVISION,
+        "approved_distractor_revision": APPROVED_DISTRACTOR_REVISION,
+        "audit_states": list(AUDIT_STATES),
         "reasoning_provider": REASONING_PROVIDER,
         "reasoning_model": REASONING_MODEL,
         "embedding_provider": EMBEDDING_PROVIDER,
@@ -728,23 +908,24 @@ def qualify_development_structure(
     memory_order_sha256 = sha256_hex(memory_orders)
     if memory_order_sha256 != EXPECTED_DEVELOPMENT_MEMORY_ORDER_SHA256:
         raise ValueError("v5 development memory order differs from protocol")
-    positive_lesson_position_counts = {
-        family: {
-            str(position): sum(
-                item["mechanism_family"] == family
-                and memory_orders[index].index(item["oracle"]["positive_lesson_id"]) == position
-                for index, item in enumerate(items)
+    audit_state_counts = {
+        state: sum(
+            any(
+                row["usage_instruction"] == "audit_only"
+                and (
+                    row["status"] == state
+                    or row["operator_disposition"] == state
+                    or row["safety_status"] == state
+                    or row["contradiction_status"] == state
+                )
+                for row in item["agent_view"]["memories"]
             )
-            for position in range(4)
-        }
-        for family in MECHANISM_FAMILIES
+            for item in items
+        )
+        for state in AUDIT_STATES
     }
-    if any(
-        not count
-        for family_counts in positive_lesson_position_counts.values()
-        for count in family_counts.values()
-    ):
-        raise ValueError("v5 positive lesson position exposes its oracle role")
+    if any(count == 0 for count in audit_state_counts.values()):
+        raise ValueError("v5 structural sample does not cover every audit-only state")
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "qualified",
@@ -756,7 +937,9 @@ def qualify_development_structure(
         "mechanism_counts": counts,
         "corpus_sha256": sha256_hex(content_hashes),
         "memory_order_sha256": memory_order_sha256,
-        "positive_lesson_position_counts": positive_lesson_position_counts,
+        "approved_candidate_count": len(items) * 3,
+        "audit_only_candidate_count": len(items),
+        "audit_state_counts": audit_state_counts,
         "embedding_scenario_ids": embedding_ids,
         "rehearsal_scenario_ids": rehearsal_ids,
     }
@@ -844,33 +1027,16 @@ def _action_consequences(*, spec: MechanismSpec) -> dict[str, dict[str, Any]]:
     }
 
 
-def _decoys(*, spec: MechanismSpec, seed: str, opaque_root: str) -> list[dict[str, Any]]:
-    other_families = [item for item in MECHANISM_FAMILIES if item != spec.family]
-    offset = _derive_int(seed, "decoy-family", 0, len(other_families) - 1)
-    unrelated = MECHANISMS[other_families[offset]]
-    rows = (
-        (
-            spec.unsafe_guidance,
-            "Capacity change is not applicable before the cause is established.",
-        ),
-        (spec.ineffective_guidance, "Observation alone does not satisfy the recovery condition."),
-        (unrelated.lesson, unrelated.diagnosis),
-    )
-    return [
-        {
-            "memory_id": f"v5m-{_derive_hex(opaque_root, 'decoy', str(index))[:24]}",
-            "content": content,
-            "conditions": [condition],
-            "applicable": False,
-        }
-        for index, (content, condition) in enumerate(rows)
-    ]
-
-
 def _validate_agent_view(*, agent_view: dict[str, Any], spec: MechanismSpec) -> None:
     forbidden_keys = {
         "oracle",
+        "applicable",
+        "candidate_role",
+        "expected_rank",
         "expected_action",
+        "positive_lesson",
+        "positive_lesson_id",
+        "target",
         "target_action",
         "recovery_action",
         "unsafe_action",
@@ -891,23 +1057,41 @@ def _validate_agent_view(*, agent_view: dict[str, Any], spec: MechanismSpec) -> 
     recurrence = str(dict(agent_view["recurrence"])["incident"])
     memories = list(agent_view.get("memories") or [])
     if len(memories) != 4:
-        raise ValueError("v5 scenario requires four uniformly governed memory candidates")
+        raise ValueError("v5 scenario requires four governed memory candidates")
     memory_ids = [str(row.get("memory_id") or "") for row in memories]
     if any(not re.fullmatch(r"v5m-[0-9a-f]{24}", memory_id) for memory_id in memory_ids):
         raise ValueError("v5 agent memories require uniform opaque identities")
     if len(set(memory_ids)) != len(memory_ids):
         raise ValueError("v5 agent memory identities must be unique")
-    expected_governance = _neutral_memory_governance()
-    if any(
-        {key: value for key, value in row.items() if key not in {"memory_id", "content"}}
-        != expected_governance
-        for row in memories
-    ):
-        raise ValueError("v5 agent memory governance must be identical and neutral")
-    references = [row for row in memories if row.get("content") == spec.lesson]
-    if len(references) != 1:
-        raise ValueError("v5 scenario requires exactly one canonical lesson candidate")
-    reference = str(references[0]["content"])
+    if any(row.get("schema_version") != CANDIDATE_ENVELOPE_SCHEMA_VERSION for row in memories):
+        raise ValueError("v5 candidate envelope schema differs")
+    for memory in memories:
+        _validate_applicability(memory.get("applicability"), spec=spec)
+    eligible = [row for row in memories if _candidate_is_positive_guidance(row)]
+    if len(eligible) != 3:
+        raise ValueError("v5 scenario requires three approved positive-guidance memories")
+    audit_only = [row for row in memories if not _candidate_is_positive_guidance(row)]
+    if len(audit_only) != 1 or audit_only[0].get("usage_instruction") != "audit_only":
+        raise ValueError("v5 scenario requires one audit-only memory")
+    references = [row for row in eligible if row.get("content") == spec.lesson]
+    if len(references) != 2:
+        raise ValueError("v5 scenario requires two approved same-family lessons")
+    if references[0]["applicability"] == references[1]["applicability"]:
+        raise ValueError("v5 same-family approved lessons require different conditions")
+    recurrence_payload = dict(agent_view["recurrence"])
+    matching = [
+        row
+        for row in eligible
+        if applicability_matches(
+            row["applicability"],
+            service=str(recurrence_payload["service"]),
+            workload=str(recurrence_payload["workload"]),
+            observations=dict(recurrence_payload["initial_observation"]),
+        )
+    ]
+    if len(matching) != 1:
+        raise ValueError("v5 recurrence must match exactly one approved intrinsic applicability")
+    reference = str(matching[0]["content"])
     normalized_reference = " ".join(_TOKEN_RE.findall(reference.lower()))
     exact_recovery_phrase = _display_name(spec.recovery_action)
     if exact_recovery_phrase in normalized_reference:
@@ -916,6 +1100,62 @@ def _validate_agent_view(*, agent_view: dict[str, Any], spec: MechanismSpec) -> 
         raise ValueError("v5 agent view exposes the mechanism identifier")
     if _lexical_overlap(recurrence, reference) > 0.55:
         raise ValueError("v5 recurrence and lesson overlap excessively")
+
+
+def _candidate_is_positive_guidance(memory: dict[str, Any]) -> bool:
+    return (
+        memory.get("status") == "active"
+        and memory.get("operator_disposition") == "approved"
+        and memory.get("safety_status") == "safe"
+        and memory.get("contradiction_status") == "supported"
+        and memory.get("usage_instruction") == "positive_guidance"
+    )
+
+
+def _validate_applicability(value: Any, *, spec: MechanismSpec | None = None) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("v5 applicability must be an object")
+    if value.get("schema_version") != APPLICABILITY_SCHEMA_VERSION:
+        raise ValueError("v5 applicability schema differs")
+    if value.get("revision") != APPLICABILITY_REVISION:
+        raise ValueError("v5 applicability revision differs")
+    digest = value.get("source_episode_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("v5 applicability source digest is invalid")
+    conditions = value.get("all_of")
+    if not isinstance(conditions, list) or len(conditions) < 3:
+        raise ValueError("v5 applicability requires source-visible conditions")
+    fields = []
+    for condition in conditions:
+        if not isinstance(condition, dict) or set(condition) != {"field", "operator", "value"}:
+            raise ValueError("v5 applicability condition shape differs")
+        field = condition["field"]
+        if not isinstance(field, str) or condition["operator"] != "equals":
+            raise ValueError("v5 applicability condition is unsupported")
+        fields.append(field)
+    if fields[:2] != ["service", "workload"] or fields[2:] != sorted(fields[2:]):
+        raise ValueError("v5 applicability conditions are not canonical")
+    if spec is not None and f"initial_observation.{spec.hidden_key}" in fields:
+        raise ValueError("v5 applicability exposes hidden source state")
+
+
+def applicability_matches(
+    applicability: dict[str, Any],
+    *,
+    service: str,
+    workload: str,
+    observations: dict[str, Any],
+) -> bool:
+    _validate_applicability(applicability)
+    values = {
+        "service": service,
+        "workload": workload,
+        **{f"initial_observation.{key}": value for key, value in observations.items()},
+    }
+    return all(
+        values.get(condition["field"]) == condition["value"]
+        for condition in applicability["all_of"]
+    )
 
 
 def _derive_hex(*parts: str) -> str:

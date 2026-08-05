@@ -15,7 +15,7 @@ from psycopg.rows import dict_row
 from hindsight.db import connect, database_url
 from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
-from hindsight.memory import MemoryStore, Provenance
+from hindsight.memory import APPROVED_POSITIVE_GUIDANCE, MemoryStore, Provenance
 from hindsight.reasoning import (
     DeterministicReasoningProvider,
     ReasoningProvider,
@@ -387,6 +387,7 @@ def process_consolidation_job(
                         "source_incident_slug": context["incident"]["slug"],
                         "source_memory_ids": [str(row["id"]) for row in source_memories],
                     },
+                    governance=APPROVED_POSITIVE_GUIDANCE,
                     content_schema=LESSON_SCHEMA,
                     structured_payload=lesson,
                     producer_decision_id=decision_id,

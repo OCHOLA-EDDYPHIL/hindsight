@@ -37,6 +37,10 @@ from hindsight.tracing import memory_ids, set_span_attributes, start_span
 MemoryKind = Literal["episodic", "semantic"]
 RetrievalPolicy = Literal["semantic_strict", "semantic_then_keyword"]
 TrustStatus = Literal["active", "review_required"]
+OperatorDisposition = Literal["approved", "rejected", "unreviewed"]
+SafetyStatus = Literal["safe", "unsafe", "unassessed"]
+ContradictionStatus = Literal["supported", "contradicted", "unassessed"]
+UsageInstruction = Literal["positive_guidance", "audit_only"]
 MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS = 3
 RecallMode = Literal[
     "semantic_strict",
@@ -49,6 +53,43 @@ RecallMode = Literal[
 
 class ProvenanceError(ValueError):
     """Raised when a memory write or read record lacks required provenance."""
+
+
+@dataclass(frozen=True)
+class MemoryGovernance:
+    """Typed governance projected into immutable semantic-memory metadata."""
+
+    operator_disposition: OperatorDisposition
+    safety_status: SafetyStatus
+    contradiction_status: ContradictionStatus
+    usage_instruction: UsageInstruction
+
+    def __post_init__(self) -> None:
+        allowed = {
+            "operator_disposition": {"approved", "rejected", "unreviewed"},
+            "safety_status": {"safe", "unsafe", "unassessed"},
+            "contradiction_status": {"supported", "contradicted", "unassessed"},
+            "usage_instruction": {"positive_guidance", "audit_only"},
+        }
+        for name, values in allowed.items():
+            if getattr(self, name) not in values:
+                raise ProvenanceError(f"unsupported memory governance field: {name}")
+
+    def metadata(self) -> dict[str, str]:
+        return {
+            "operator_disposition": self.operator_disposition,
+            "safety_status": self.safety_status,
+            "contradiction_status": self.contradiction_status,
+            "usage_instruction": self.usage_instruction,
+        }
+
+
+APPROVED_POSITIVE_GUIDANCE = MemoryGovernance(
+    operator_disposition="approved",
+    safety_status="safe",
+    contradiction_status="supported",
+    usage_instruction="positive_guidance",
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +201,8 @@ class MemoryStore:
         producer_decision_id: str | None = None,
         parent_memory_ids: Iterable[str] | None = None,
         precomputed_embedding: list[float] | None = None,
+        trust_status: TrustStatus = "active",
+        governance: MemoryGovernance | None = None,
     ) -> dict[str, Any]:
         """Persist a new belief with provenance.
 
@@ -169,8 +212,12 @@ class MemoryStore:
         reconstructable.
         """
 
-        if memory_kind != "semantic" and precomputed_embedding is not None:
-            raise ValueError("precomputed embeddings are supported only for semantic memory")
+        if memory_kind != "semantic" and (
+            precomputed_embedding is not None or governance is not None or trust_status != "active"
+        ):
+            raise ValueError(
+                "semantic trust, governance, and precomputed embeddings require semantic memory"
+            )
 
         prepared_embedding = None
         if memory_kind == "semantic":
@@ -212,6 +259,8 @@ class MemoryStore:
                                 producer_decision_id=producer_decision_id,
                                 parent_memory_ids=parent_memory_ids,
                                 precomputed_embedding=prepared_embedding,
+                                trust_status=trust_status,
+                                governance=governance,
                             )
                             set_span_attributes(
                                 span, {"hindsight.memory.id": str(memory["id"])}
@@ -420,18 +469,19 @@ class MemoryStore:
         query: str,
         limit: int = 5,
         read_context: ReadContext | None = None,
+        positive_guidance_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Search current trusted semantic content without fallback."""
 
         _require_query(query)
         rows = self._fetch_all(
-            """
-                SELECT *, NULL::FLOAT8 AS distance
-                FROM current_semantic_memories
-                WHERE namespace = %s
-                    AND trust_status = 'active'
-                    AND content ILIKE %s ESCAPE '\\'
-                ORDER BY t_valid DESC, written_at DESC
+            f"""
+                SELECT memory.*, NULL::FLOAT8 AS distance
+                FROM current_semantic_memories AS memory
+                WHERE memory.namespace = %s
+                    {_semantic_eligibility_sql("memory", positive_guidance_only)}
+                    AND memory.content ILIKE %s ESCAPE '\\'
+                ORDER BY memory.t_valid DESC, memory.written_at DESC
                 LIMIT %s
             """,
             (namespace, f"%{_escape_like(query)}%", limit),
@@ -486,6 +536,7 @@ class MemoryStore:
         limit: int = 5,
         service_slug: str | None = None,
         read_context: ReadContext | None = None,
+        positive_guidance_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Search one exact vector profile and return no unrelated fallback rows."""
 
@@ -533,7 +584,7 @@ class MemoryStore:
                 JOIN embedding_profiles AS profile ON profile.id = vector.profile_id
                 {service_join}
                 WHERE memory.namespace = %s
-                    AND memory.trust_status = 'active'
+                    {_semantic_eligibility_sql("memory", positive_guidance_only)}
                     AND vector.profile_id = %s
                     {service_filter}
                     {distance_filter}
@@ -556,6 +607,7 @@ class MemoryStore:
         policy: RetrievalPolicy = "semantic_strict",
         limit: int = 5,
         service_slug: str | None = None,
+        positive_guidance_only: bool = False,
     ) -> RetrievalResult:
         """Execute and audit an explicit semantic retrieval policy.
 
@@ -600,6 +652,7 @@ class MemoryStore:
                     profile_id=profile.profile_id,
                     limit=limit,
                     service_slug=service_slug,
+                    positive_guidance_only=positive_guidance_only,
                 )
             attempts.append(
                 RetrievalAttempt(
@@ -631,6 +684,7 @@ class MemoryStore:
                         namespace=namespace,
                         query=query,
                         limit=limit,
+                        positive_guidance_only=positive_guidance_only,
                     )
                 attempts.append(
                     RetrievalAttempt(
@@ -956,6 +1010,7 @@ class MemoryStore:
         previous_version_id: str | None = None,
         transition_kind: Literal["assertion", "supersession", "rewind_reassertion"] = "assertion",
         trust_status: TrustStatus = "active",
+        governance: MemoryGovernance | None = None,
         created_by_operation_id: str | None = None,
         precomputed_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
@@ -975,11 +1030,16 @@ class MemoryStore:
                 raise ProvenanceError("namespace is required")
             if trust_status not in {"active", "review_required"}:
                 raise ProvenanceError(f"unsupported semantic trust status: {trust_status}")
+            resolved_metadata = _governed_metadata(metadata, governance)
             memory_id = uuid4()
             resolved_belief_id = belief_id or str(uuid4())
             producer_id = producer_decision_id or f"memory:write:{memory_id}"
-            payload = structured_payload or {"content": content, **(metadata or {})}
-            digest = _payload_digest(content=content, payload=payload, metadata=metadata or {})
+            payload = structured_payload or {"content": content, **resolved_metadata}
+            digest = _payload_digest(
+                content=content,
+                payload=payload,
+                metadata=resolved_metadata,
+            )
             embedding, profile = self._prepare_semantic_embedding(
                 content=content,
                 precomputed_embedding=precomputed_embedding,
@@ -1027,7 +1087,7 @@ class MemoryStore:
                 previous_version_id,
                 namespace,
                 content,
-                Jsonb(metadata or {}),
+                Jsonb(resolved_metadata),
                 t_valid,
                 provenance.writer,
                 provenance.source_ref,
@@ -1347,6 +1407,7 @@ class MemoryStore:
         decision_id: str | None = None,
         reader: str | None = None,
         purpose: str | None = None,
+        positive_guidance_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Find similar current memories and join them to incident facts.
 
@@ -1427,7 +1488,7 @@ class MemoryStore:
                             AND (r.service_id = s.id OR r.service_id IS NULL)
                         WHERE m.namespace = %s
                             AND s.slug = %s
-                            AND m.trust_status = 'active'
+                            {_semantic_eligibility_sql("m", positive_guidance_only)}
                             AND vector.profile_id = %s
                         ORDER BY vector.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
                         LIMIT %s
@@ -1585,6 +1646,23 @@ class MemoryStore:
         eligible = action_approved if guidance_eligible is None else guidance_eligible
         if eligible and not action_approved:
             raise ProvenanceError("unapproved reflection cannot become positive guidance")
+        governance = MemoryGovernance(
+            operator_disposition=str(
+                metadata.get("operator_disposition")
+                or ("approved" if eligible else "rejected")
+            ),  # type: ignore[arg-type]
+            safety_status=str(
+                metadata.get("safety_status") or ("safe" if eligible else "unassessed")
+            ),  # type: ignore[arg-type]
+            contradiction_status=str(
+                metadata.get("contradiction_status")
+                or ("supported" if eligible else "unassessed")
+            ),  # type: ignore[arg-type]
+            usage_instruction=str(
+                metadata.get("usage_instruction")
+                or ("positive_guidance" if eligible else "audit_only")
+            ),  # type: ignore[arg-type]
+        )
         with self._conn.transaction():
             memory = self.write_semantic(
                 namespace=namespace,
@@ -1597,6 +1675,7 @@ class MemoryStore:
                 parent_memory_ids=parent_memory_ids,
                 precomputed_embedding=embedding,
                 trust_status="active" if eligible else "review_required",
+                governance=governance,
             )
             self.record_agent_reflection(
                 decision_id=decision_id,
@@ -2290,6 +2369,65 @@ def _payload_digest(
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _governed_metadata(
+    metadata: dict[str, Any] | None,
+    governance: MemoryGovernance | None,
+) -> dict[str, Any]:
+    resolved = dict(metadata or {})
+    if governance is None:
+        return resolved
+    for key, value in governance.metadata().items():
+        existing = resolved.get(key)
+        if existing is not None and existing != value:
+            raise ProvenanceError(f"semantic metadata conflicts with governance field: {key}")
+        resolved[key] = value
+    return resolved
+
+
+def positive_guidance_eligible(memory: dict[str, Any]) -> bool:
+    """Return the same fail-closed eligibility used by semantic retrieval SQL."""
+
+    if memory.get("t_invalid") is not None or memory.get("trust_status") != "active":
+        return False
+    metadata = memory.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    if any(
+        metadata.get(key) != value for key, value in APPROVED_POSITIVE_GUIDANCE.metadata().items()
+    ):
+        return False
+    if memory.get("content_schema") == "agent_reflection.v1":
+        payload = memory.get("structured_payload")
+        return (
+            isinstance(payload, dict)
+            and payload.get("action_approved") is True
+            and payload.get("guidance_eligible") is True
+        )
+    return True
+
+
+def _semantic_eligibility_sql(alias: str, positive_guidance_only: bool) -> str:
+    if alias not in {"memory", "m"}:
+        raise ValueError("unsupported semantic-memory SQL alias")
+    prefix = f"{alias}."
+    if not positive_guidance_only:
+        return f"AND {prefix}trust_status = 'active'"
+    return f"""
+        AND {prefix}trust_status = 'active'
+        AND {prefix}metadata->>'operator_disposition' = 'approved'
+        AND {prefix}metadata->>'safety_status' = 'safe'
+        AND {prefix}metadata->>'contradiction_status' = 'supported'
+        AND {prefix}metadata->>'usage_instruction' = 'positive_guidance'
+        AND (
+            {prefix}content_schema != 'agent_reflection.v1'
+            OR (
+                {prefix}structured_payload->'action_approved' = 'true'::JSONB
+                AND {prefix}structured_payload->'guidance_eligible' = 'true'::JSONB
+            )
+        )
+    """
 
 
 def _project_historical_rows(
