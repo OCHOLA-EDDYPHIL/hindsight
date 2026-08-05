@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from psycopg.errors import SerializationFailure
 
 from hindsight import v5_qualification as qualification
 from hindsight.tenant import current_tenant_id
@@ -220,6 +221,7 @@ def test_qualification_contract_binds_profile_query_selection_and_hash():
     contract = qualification.development_qualification_contract()
 
     assert contract == qualification.development_qualification_contract()
+    assert contract["revision"] == "v5-development-live-qualification-v2"
     assert contract["sample"] == {
         "source_scenario_count": 6_000,
         "selected_scenario_count": 600,
@@ -262,6 +264,12 @@ def test_qualification_contract_binds_profile_query_selection_and_hash():
     }
     assert contract["database"]["engine"] == "cockroachdb"
     assert contract["database"]["separate_deploy_and_runtime_identities"] is True
+    assert contract["database"]["candidate_write_retry"] == {
+        "outer_attempts": 3,
+        "delays_seconds": [0.25, 0.5],
+        "retryable_error": "psycopg.errors.SerializationFailure",
+        "provider_reinvocation": False,
+    }
     assert contract["qualification_contract_sha256"] == sha256_hex(
         {key: value for key, value in contract.items() if key != "qualification_contract_sha256"}
     )
@@ -886,6 +894,83 @@ def test_candidate_database_records_are_uniform_opaque_and_role_free():
     assert "positive_lesson" not in serialized
 
 
+def test_candidate_write_retry_uses_exact_budget_delays_and_precomputed_vector():
+    vector = _unit_vector(7)
+    remember_kwargs = {
+        "memory_kind": "semantic",
+        "namespace": "v5-development-retry",
+        "content": "retry candidate",
+        "precomputed_embedding": vector,
+    }
+    calls: list[dict[str, Any]] = []
+    delays: list[float] = []
+
+    class Store:
+        def remember(self, **kwargs: Any) -> dict[str, str]:
+            calls.append(kwargs)
+            if len(calls) < qualification.DATABASE_WRITE_ATTEMPTS:
+                raise SerializationFailure("restart transaction")
+            return {"id": "database-memory"}
+
+    row = qualification._remember_candidate_with_retry(
+        store=Store(),
+        sleep_fn=delays.append,
+        **remember_kwargs,
+    )
+
+    assert row == {"id": "database-memory"}
+    assert len(calls) == qualification.DATABASE_WRITE_ATTEMPTS
+    assert calls == [remember_kwargs] * qualification.DATABASE_WRITE_ATTEMPTS
+    assert all(call["precomputed_embedding"] is vector for call in calls)
+    assert delays == list(qualification.DATABASE_WRITE_RETRY_DELAYS_SECONDS)
+
+
+def test_candidate_write_retry_reraises_persistent_serialization_failure():
+    calls = 0
+    delays: list[float] = []
+
+    class Store:
+        def remember(self, **_kwargs: Any) -> dict[str, str]:
+            nonlocal calls
+            calls += 1
+            raise SerializationFailure("persistent restart transaction")
+
+    with pytest.raises(SerializationFailure, match="persistent restart transaction"):
+        qualification._remember_candidate_with_retry(
+            store=Store(),
+            sleep_fn=delays.append,
+            memory_kind="semantic",
+            content="persistent retry candidate",
+            precomputed_embedding=_unit_vector(8),
+        )
+
+    assert calls == qualification.DATABASE_WRITE_ATTEMPTS
+    assert delays == list(qualification.DATABASE_WRITE_RETRY_DELAYS_SECONDS)
+
+
+def test_candidate_write_retry_does_not_retry_non_serialization_failure():
+    calls = 0
+    delays: list[float] = []
+
+    class Store:
+        def remember(self, **_kwargs: Any) -> dict[str, str]:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("candidate is invalid")
+
+    with pytest.raises(RuntimeError, match="candidate is invalid"):
+        qualification._remember_candidate_with_retry(
+            store=Store(),
+            sleep_fn=delays.append,
+            memory_kind="semantic",
+            content="invalid candidate",
+            precomputed_embedding=_unit_vector(9),
+        )
+
+    assert calls == 1
+    assert delays == []
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
@@ -1404,6 +1489,106 @@ def test_full_fake_run_fails_if_database_stage_causes_embedding_cache_miss(
                 embedding_provider=kwargs.get("embedding_provider"),
             ),
         )
+
+
+def test_full_fake_run_records_serialization_exhaustion_without_provider_reinvocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(qualification, "EXPECTED_SCENARIO_COUNT", 1)
+    monkeypatch.setattr(qualification, "EXPECTED_UNIQUE_DOCUMENTS", 4)
+    scenario = _scenario()
+    monkeypatch.setattr(
+        qualification,
+        "select_embedding_scenarios",
+        lambda *, code_sha: [scenario],
+    )
+    monkeypatch.setattr(
+        qualification,
+        "qualify_development_structure",
+        lambda *, code_sha: _structural_receipt(),
+    )
+    retry_delays: list[float] = []
+    retry_candidate = qualification._remember_candidate_with_retry
+    monkeypatch.setattr(
+        qualification,
+        "_remember_candidate_with_retry",
+        lambda **kwargs: retry_candidate(sleep_fn=retry_delays.append, **kwargs),
+    )
+    state = _SharedStoreState()
+    write_attempts = 0
+    failure_message = "persistent candidate serialization failure"
+
+    class SerializationFailureStore(_FakeStore):
+        def remember(self, **_kwargs: Any) -> dict[str, str]:
+            nonlocal write_attempts
+            write_attempts += 1
+            raise SerializationFailure(failure_message)
+
+    provider = FakeGeminiEmbeddingProvider()
+    receipt_path = tmp_path / "receipt.json"
+    diagnostic_path = tmp_path / "diagnostic.json"
+    receipt_path.write_text('{"stale": true}\n', encoding="utf-8")
+    receipt_path.chmod(0o600)
+    diagnostic_path.write_text('{"stale": true}\n', encoding="utf-8")
+    diagnostic_path.chmod(0o600)
+
+    with pytest.raises(SerializationFailure, match=failure_message):
+        qualification.run_development_qualification(
+            code_sha=CODE_SHA,
+            database_url=(
+                "postgresql://root@localhost:26257/"
+                "hindsight_v5_development_unit?sslmode=disable"
+            ),
+            runtime_database_url=(
+                "postgresql://runtime@localhost:26257/"
+                "hindsight_v5_development_unit?sslmode=disable"
+            ),
+            embedding_provider=provider,
+            checkpoint_attestor=FakeAttestor(),
+            checkpoint_path=tmp_path / "checkpoint",
+            receipt_path=receipt_path,
+            diagnostic_path=diagnostic_path,
+            database_validator_fn=lambda _url: _database_evidence(),
+            runtime_database_validator_fn=lambda _deploy, _runtime: _database_identities(),
+            profile_initializer_fn=lambda **_kwargs: _active_profile(),
+            store_factory=lambda **kwargs: SerializationFailureStore(
+                state,
+                embedding_provider=kwargs.get("embedding_provider"),
+            ),
+        )
+
+    assert write_attempts == qualification.DATABASE_WRITE_ATTEMPTS
+    assert retry_delays == list(qualification.DATABASE_WRITE_RETRY_DELAYS_SECONDS)
+    assert provider.document_calls == [
+        str(memory["content"]) for memory in scenario["agent_view"]["memories"]
+    ]
+    assert provider.query_calls == [qualification.render_retrieval_query(scenario)]
+    assert not receipt_path.exists()
+    assert diagnostic_path.exists()
+    assert stat.S_IMODE(diagnostic_path.stat().st_mode) == 0o600
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["status"] == "diagnostic_only"
+    assert diagnostic["qualification_claim"] is False
+    assert diagnostic["scenario_count"] == 0
+    assert diagnostic["qualified_row_count"] == 0
+    assert diagnostic["results"] == []
+    assert diagnostic["failure"] == {
+        "stage": "database_population_or_retrieval",
+        "code": "SerializationFailure",
+        "message_sha256": sha256_hex(failure_message.encode("utf-8")),
+    }
+    assert diagnostic["delegate_call_counts"] == {
+        qualification.DOCUMENT_TASK: 4,
+        qualification.QUERY_TASK: 1,
+    }
+    assert diagnostic["cache_hit_counts"] == {
+        qualification.DOCUMENT_TASK: 1,
+        qualification.QUERY_TASK: 0,
+    }
+    assert diagnostic["diagnostic_sha256"] == sha256_hex(
+        {key: value for key, value in diagnostic.items() if key != "diagnostic_sha256"}
+    )
 
 
 def test_full_fake_run_fails_closed_on_alternate_tenant_retrieval_leak(

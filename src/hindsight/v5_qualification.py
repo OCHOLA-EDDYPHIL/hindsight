@@ -12,12 +12,15 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
+
+from psycopg.errors import SerializationFailure
 
 from hindsight.db import connect
 from hindsight.embedding_index import activate_profile, begin_profile_build
@@ -47,7 +50,7 @@ from hindsight.v5_corpus import (
 
 
 QUALIFICATION_SCHEMA_VERSION = 1
-QUALIFICATION_REVISION = "v5-development-live-qualification-v1"
+QUALIFICATION_REVISION = "v5-development-live-qualification-v2"
 QUERY_RENDERER_REVISION = "v5-recurrence-visible-observations-v1"
 CACHE_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 1
@@ -58,6 +61,8 @@ CHECKPOINT_ATTESTATION_ALGORITHM = "AWS_KMS_HMAC_SHA_256"
 CHECKPOINT_ATTESTATION_KIND = "v5-embedding-entry"
 EXPECTED_SCENARIO_COUNT = len(MECHANISM_FAMILIES) * EMBEDDING_CASES_PER_FAMILY
 EXPECTED_UNIQUE_DOCUMENTS = 18
+DATABASE_WRITE_ATTEMPTS = 3
+DATABASE_WRITE_RETRY_DELAYS_SECONDS = (0.25, 0.5)
 DEVELOPMENT_DATABASE_RE = re.compile(r"hindsight_v5_development_[a-z0-9_]+")
 OPAQUE_SCENARIO_RE = re.compile(r"v5s-[0-9a-f]{24}")
 OPAQUE_MEMORY_RE = re.compile(r"v5m-[0-9a-f]{24}")
@@ -161,6 +166,12 @@ def development_qualification_contract() -> dict[str, Any]:
             "runtime_permission_role": "hindsight_memory_worker",
             "learning_tenant_id": learning_tenant_id(),
             "alternate_tenant_id": ACCEPTANCE_TENANT_ID,
+            "candidate_write_retry": {
+                "outer_attempts": DATABASE_WRITE_ATTEMPTS,
+                "delays_seconds": list(DATABASE_WRITE_RETRY_DELAYS_SECONDS),
+                "retryable_error": "psycopg.errors.SerializationFailure",
+                "provider_reinvocation": False,
+            },
         },
         "retrieval": {
             "policy": "semantic_strict",
@@ -1055,6 +1066,7 @@ def _qualification_diagnostic(
     structural_receipt: Mapping[str, Any],
     checkpoint: CheckpointedEmbeddingProvider,
     results: Sequence[Mapping[str, Any]],
+    failure: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a non-claim diagnostic artifact before fail-closed summarization."""
 
@@ -1096,6 +1108,8 @@ def _qualification_diagnostic(
         "qualified_row_count": sum(row.get("status") == "qualified" for row in results),
         "results": [dict(row) for row in results],
     }
+    if failure is not None:
+        body["failure"] = dict(failure)
     return {**body, "diagnostic_sha256": sha256_hex(body)}
 
 
@@ -1175,12 +1189,33 @@ def run_development_qualification(
         )
     )
     _require_profile_mapping(_profile_mapping(profile))
-    results = _run_database_cases(
-        selected=selected,
-        db_url=runtime_database_url,
-        provider=checkpoint,
-        store_factory=store_factory,
-    )
+    try:
+        results = _run_database_cases(
+            selected=selected,
+            db_url=runtime_database_url,
+            provider=checkpoint,
+            store_factory=store_factory,
+        )
+    except Exception as exc:
+        if checkpoint.delegate_call_counts != calls_before_database:
+            raise RuntimeError(
+                "v5 database stage unexpectedly invoked the embedding provider"
+            ) from exc
+        failure_diagnostic = _qualification_diagnostic(
+            code_sha=code_sha,
+            database_evidence=database_evidence,
+            database_identities=database_identities,
+            structural_receipt=structural_receipt,
+            checkpoint=checkpoint,
+            results=[],
+            failure={
+                "stage": "database_population_or_retrieval",
+                "code": type(exc).__name__,
+                "message_sha256": hashlib.sha256(str(exc).encode("utf-8")).hexdigest(),
+            },
+        )
+        _atomic_write_json(diagnostic, failure_diagnostic)
+        raise
     diagnostic_value = _qualification_diagnostic(
         code_sha=code_sha,
         database_evidence=database_evidence,
@@ -1366,7 +1401,8 @@ def _load_database_case(
         content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         vector = provider.embed_document(content)
         vectors[candidate_id] = vector
-        row = store.remember(
+        row = _remember_candidate_with_retry(
+            store=store,
             memory_kind="semantic",
             namespace=namespace,
             content=content,
@@ -1395,6 +1431,24 @@ def _load_database_case(
         "vectors": vectors,
         "database_ids": database_ids,
     }
+
+
+def _remember_candidate_with_retry(
+    *,
+    store: QualificationStore,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    **remember_kwargs: Any,
+) -> Mapping[str, Any]:
+    """Retry one fully rolled-back CockroachDB candidate write with backoff."""
+
+    for attempt in range(1, DATABASE_WRITE_ATTEMPTS + 1):
+        try:
+            return store.remember(**remember_kwargs)
+        except SerializationFailure:
+            if attempt == DATABASE_WRITE_ATTEMPTS:
+                raise
+            sleep_fn(DATABASE_WRITE_RETRY_DELAYS_SECONDS[attempt - 1])
+    raise RuntimeError("v5 candidate write retry loop exited without a result")
 
 
 def _retrieve_database_case(
