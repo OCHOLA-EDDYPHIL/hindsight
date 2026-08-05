@@ -707,3 +707,190 @@ def test_v5_study_exact_sha_rejects_inexact_checkout(
 
     with pytest.raises(RuntimeError, match=message):
         study._exact_code_sha()
+
+
+def _patch_v5_embedding_cli_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    from hindsight import embeddings, gemini, opaque_tokens, runtime, v5_qualification
+
+    captured: dict[str, Any] = {}
+    resolved_provider_env = {
+        "GEMINI_API_KEYS": '{"version":1,"keys":[{"id":"test","api_key":"secret"}]}',
+        "AWS_REGION": "us-east-1",
+    }
+    pool = object()
+
+    def fake_runtime_settings(*, environ: dict[str, str], use_cache: bool):
+        captured["runtime_environ"] = dict(environ)
+        captured["runtime_use_cache"] = use_cache
+        return SimpleNamespace(
+            database_url=(
+                "postgresql://deploy@localhost:26257/"
+                "hindsight_v5_development_cli?sslmode=disable"
+            ),
+            provider_env=resolved_provider_env,
+        )
+
+    def fake_pool_from_env(provider_env: dict[str, str]):
+        captured["pool_provider_env"] = provider_env
+        return pool
+
+    class FakeGeminiProvider:
+        provider_name = "gemini"
+        capability = "semantic"
+        encoder_revision = "gemini-retrieval-task-v1"
+
+        def __init__(
+            self,
+            *,
+            credential_pool: object,
+            model_name: str,
+            dimensions: int,
+            representation: str,
+        ) -> None:
+            self.credential_pool = credential_pool
+            self.model_name = model_name
+            self.dimensions = dimensions
+            self.representation = representation
+            captured["embedding_provider"] = self
+
+    class FakeTokenizer:
+        def __init__(self, *, key_id: str, family_sha256: str) -> None:
+            self.key_id = key_id
+            self.family_sha256 = family_sha256
+            captured["checkpoint_attestor"] = self
+
+    contract_sha256 = "c" * 64
+
+    def fake_run_development_qualification(**kwargs: Any) -> dict[str, Any]:
+        captured["qualification_kwargs"] = kwargs
+        return {"status": "qualified", "receipt_sha256": "d" * 64}
+
+    monkeypatch.setattr(runtime, "runtime_settings", fake_runtime_settings)
+    monkeypatch.setattr(gemini, "gemini_pool_from_env", fake_pool_from_env)
+    monkeypatch.setattr(embeddings, "GeminiEmbeddingProvider", FakeGeminiProvider)
+    monkeypatch.setattr(opaque_tokens, "KmsHmacTokenizer", FakeTokenizer)
+    monkeypatch.setattr(
+        v5_qualification,
+        "development_qualification_contract",
+        lambda: {"qualification_contract_sha256": contract_sha256},
+    )
+    monkeypatch.setattr(
+        v5_qualification,
+        "run_development_qualification",
+        fake_run_development_qualification,
+    )
+    captured["resolved_provider_env"] = resolved_provider_env
+    captured["pool"] = pool
+    captured["contract_sha256"] = contract_sha256
+    return captured
+
+
+def test_v5_embedding_cli_wires_exact_gemini_database_kms_and_artifact_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    study = _load_v5_study_script()
+    captured = _patch_v5_embedding_cli_dependencies(monkeypatch)
+    runtime_database_url = (
+        "postgresql://runtime@localhost:26257/"
+        "hindsight_v5_development_cli?sslmode=disable"
+    )
+    key_id = "arn:aws:kms:us-east-1:111122223333:key/v5-qualification"
+    monkeypatch.setenv("LLM_PROVIDER", "deterministic")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "deterministic")
+    monkeypatch.setenv("GEMINI_EMBEDDING_MODEL", "stale-model")
+    monkeypatch.setenv("HINDSIGHT_V5_RUNTIME_DATABASE_URL", runtime_database_url)
+    monkeypatch.setenv("HINDSIGHT_QUALIFICATION_HMAC_KEY_ID", key_id)
+    checkpoint = tmp_path / "checkpoint"
+    output = tmp_path / "receipt.json"
+    diagnostic_output = tmp_path / "diagnostic.json"
+
+    receipt = study._qualify_embeddings(
+        code_sha=CODE_SHA,
+        checkpoint=checkpoint,
+        output=output,
+        diagnostic_output=diagnostic_output,
+    )
+
+    assert receipt == {"status": "qualified", "receipt_sha256": "d" * 64}
+    assert captured["runtime_use_cache"] is False
+    assert captured["runtime_environ"]["LLM_PROVIDER"] == "gemini"
+    assert captured["runtime_environ"]["EMBEDDING_PROVIDER"] == "gemini"
+    assert (
+        captured["runtime_environ"]["GEMINI_EMBEDDING_MODEL"]
+        == v5_corpus.EMBEDDING_MODEL
+    )
+    assert captured["pool_provider_env"] is captured["resolved_provider_env"]
+    provider = captured["embedding_provider"]
+    assert provider.provider_name == "gemini"
+    assert provider.credential_pool is captured["pool"]
+    assert provider.model_name == v5_corpus.EMBEDDING_MODEL
+    assert provider.dimensions == v5_corpus.EMBEDDING_DIMENSIONS
+    assert provider.capability == "semantic"
+    assert provider.encoder_revision == "gemini-retrieval-task-v1"
+    assert provider.representation == v5_corpus.GEMINI_PROVIDER_REPRESENTATION
+    attestor = captured["checkpoint_attestor"]
+    assert attestor.key_id == key_id
+    assert attestor.family_sha256 == captured["contract_sha256"]
+    assert captured["qualification_kwargs"] == {
+        "code_sha": CODE_SHA,
+        "database_url": (
+            "postgresql://deploy@localhost:26257/"
+            "hindsight_v5_development_cli?sslmode=disable"
+        ),
+        "runtime_database_url": runtime_database_url,
+        "embedding_provider": provider,
+        "checkpoint_attestor": attestor,
+        "checkpoint_path": checkpoint,
+        "receipt_path": output,
+        "diagnostic_path": diagnostic_output,
+    }
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "message"),
+    (
+        (
+            "HINDSIGHT_V5_RUNTIME_DATABASE_URL",
+            "HINDSIGHT_V5_RUNTIME_DATABASE_URL is required",
+        ),
+        (
+            "HINDSIGHT_QUALIFICATION_HMAC_KEY_ID",
+            "HINDSIGHT_QUALIFICATION_HMAC_KEY_ID is required",
+        ),
+    ),
+)
+def test_v5_embedding_cli_fails_closed_on_missing_runtime_or_hmac_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing_name: str,
+    message: str,
+):
+    study = _load_v5_study_script()
+    captured = _patch_v5_embedding_cli_dependencies(monkeypatch)
+    monkeypatch.setenv(
+        "HINDSIGHT_V5_RUNTIME_DATABASE_URL",
+        "postgresql://runtime@localhost:26257/"
+        "hindsight_v5_development_cli?sslmode=disable",
+    )
+    monkeypatch.setenv(
+        "HINDSIGHT_QUALIFICATION_HMAC_KEY_ID",
+        "arn:aws:kms:us-east-1:111122223333:key/v5-qualification",
+    )
+    monkeypatch.delenv(missing_name, raising=False)
+
+    with pytest.raises(RuntimeError, match=message):
+        study._qualify_embeddings(
+            code_sha=CODE_SHA,
+            checkpoint=tmp_path / "checkpoint",
+            output=tmp_path / "receipt.json",
+            diagnostic_output=tmp_path / "diagnostic.json",
+        )
+
+    assert "qualification_kwargs" not in captured
+
+
+def test_v5_manual_study_is_absent_from_normal_ci():
+    normal_ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "scripts/run_v5_study.py" not in normal_ci
