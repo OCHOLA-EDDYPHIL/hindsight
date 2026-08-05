@@ -64,6 +64,8 @@ def test_backend_and_fresh_migration_paths_select_product_and_packaging_only():
 def test_research_inputs_never_enter_normal_ci_qualification():
     for path in (
         "src/hindsight/benchmark.py",
+        "src/hindsight/v5_corpus.py",
+        "scripts/run_v5_study.py",
         "scripts/run_rank_diagnostics.py",
         "fixtures/v4/corpus.json",
         "tests/test_learning_orchestration.py",
