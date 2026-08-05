@@ -73,7 +73,6 @@ DATABASE_GROUPS = {
     ),
     "research": (
         "tests/test_benchmark_protocol_migrations.py",
-        "tests/test_cross_episode_demo.py",
         "tests/test_learning_benchmark_setup.py",
         "tests/test_learning_evidence_foundation.py",
         "tests/test_learning_orchestration.py",

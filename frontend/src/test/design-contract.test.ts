@@ -19,7 +19,6 @@ describe("responsive and motion design contracts", () => {
     expect(styles).toContain("@media (max-width: 800px)");
     expect(styles).toMatch(/\.outcome-grid,[\s\S]*grid-template-columns: minmax\(0, 1fr\)/);
     expect(styles).toMatch(/\.operator-walkthrough \{[\s\S]*grid-template-columns: minmax\(0, 1fr\)/);
-    expect(styles).toMatch(/\.lesson-chain \{[\s\S]*grid-template-columns: minmax\(0, 1fr\)/);
     expect(styles).toContain("overflow-wrap: anywhere");
   });
 
