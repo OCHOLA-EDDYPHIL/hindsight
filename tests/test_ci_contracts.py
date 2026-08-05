@@ -100,7 +100,7 @@ def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
     assert f"hindsight_product{suffix}" in workflow
     assert f"hindsight_fresh{suffix}" in workflow
     assert f"hindsight_populated{suffix}" in workflow
-    assert f"hindsight_extended{suffix}" in workflow
+    assert f"hindsight_extended{suffix}" not in workflow
 
     jobs = yaml.safe_load(workflow)["jobs"]
     compose_scopes = {
@@ -131,6 +131,11 @@ def test_historical_migrations_share_one_manual_container():
         for step in job["steps"]
     )
     assert any("--workers 4" in step.get("run", "") for step in job["steps"])
+    extended = next(
+        step for step in job["steps"] if step.get("name") == "Run extended database safeguards"
+    )
+    assert "scripts/ci_test_groups.py run main_extended" in extended["run"]
+    assert "scripts/migrate.py" in extended["run"]
     assert "matrix" not in job.get("strategy", {})
 
 
@@ -151,7 +156,7 @@ def test_fast_product_checks_use_exactly_one_server_and_database():
     assert "main_extended" not in group_step["run"]
 
 
-def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
+def test_main_schema_builds_share_one_server_and_isolate_required_databases():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     main_job = workflow["jobs"]["main_qualification"]
     schema_step = next(
@@ -162,10 +167,9 @@ def test_main_schema_builds_share_one_server_and_isolate_parallel_databases():
 
     assert "fresh_pid=$!" in schema_step["run"]
     assert "populated_pid=$!" in schema_step["run"]
-    assert "extended_pid=$!" in schema_step["run"]
     assert 'wait "$fresh_pid"' in schema_step["run"]
     assert 'wait "$populated_pid"' in schema_step["run"]
-    assert 'wait "$extended_pid"' in schema_step["run"]
+    assert "main_extended" not in schema_step["run"]
     assert "scripts/schema_manifest.py compare" in schema_step["run"]
     smoke_step = next(
         step
