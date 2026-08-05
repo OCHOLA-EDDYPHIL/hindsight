@@ -54,6 +54,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     api = builder.ARTIFACTS["api"]
 
     assert "agent.py" not in api["modules"]
+    assert "dashboard.py" not in api["modules"]
     assert "mcp_server.py" not in api["modules"]
     assert not any("langgraph" in dependency for dependency in api["dependencies"])
     assert not any(dependency.startswith("mcp") for dependency in api["dependencies"])
@@ -61,6 +62,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     assert "embedding_index.py" in api["modules"]
     assert "operations.py" in api["modules"]
     assert "run_dispatch.py" in api["modules"]
+    assert "snapshots.py" in api["modules"]
     assert "trace_contract.py" in api["modules"]
     assert {"realtime_ticket.py", "server_tenants.py", "tenant.py"} <= set(api["modules"])
 

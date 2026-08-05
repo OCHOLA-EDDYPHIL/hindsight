@@ -238,7 +238,6 @@ export function useCockpit() {
           items[0];
         if (selected) await selectIncident(selected.slug);
       } catch {
-        // The standalone SSE server intentionally exposes only memory endpoints.
         setIncidents([]);
       }
     },
@@ -437,7 +436,6 @@ export function useCockpit() {
     let disposed = false;
     let reconnectTimer: number | undefined;
     let interval: number | undefined;
-    let events: EventSource | undefined;
 
     if (config.websocketUrl) {
       const connect = async () => {
@@ -477,25 +475,6 @@ export function useCockpit() {
         }
       };
       void connect();
-    } else if (config.eventsBase) {
-      const url = `${config.eventsBase}?namespace=${encodeURIComponent(namespace)}`;
-      events = new EventSource(url);
-      events.addEventListener("open", () => {
-        if (snapshotView.current === "live") setConnection("live");
-      });
-      events.addEventListener("snapshot", (event) => {
-        if (snapshotView.current === "live") {
-          applySnapshot(JSON.parse((event as MessageEvent).data));
-        }
-      });
-      for (const type of ["memory", "operation"]) {
-        events.addEventListener(type, (event) =>
-          handleLiveEvent(JSON.parse((event as MessageEvent).data)),
-        );
-      }
-      events.addEventListener("error", () => {
-        if (snapshotView.current === "live") setConnection("reconnecting");
-      });
     } else {
       const pollMs = Math.max(1500, Number(config.pollIntervalMs || 4000));
       interval = window.setInterval(() => {
@@ -512,7 +491,6 @@ export function useCockpit() {
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(snapshotRefreshTimer.current);
       window.clearInterval(interval);
-      events?.close();
       if (socketRef.current) {
         const socket = socketRef.current;
         socketRef.current = null;
