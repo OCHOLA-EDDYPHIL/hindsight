@@ -70,6 +70,7 @@ DATABASE_GROUPS = {
     "main_extended": (
         "tests/test_embedding_rotation.py",
         "tests/test_migrations_and_roles.py",
+        "tests/test_v5_governance_database.py",
     ),
     "research": (
         "tests/test_benchmark_protocol_migrations.py",
