@@ -90,6 +90,24 @@ class ProtectedRunFailure(RuntimeError):
         self.reason = reason
 
 
+def _behavioral_retrieval_hard_gate(
+    *,
+    policy: Any,
+    fallback_reason: Any,
+    target_rank_one: bool,
+    target_absent: bool,
+    known_membership: bool,
+) -> bool:
+    """Keep semantic rank as efficacy evidence, not a per-trial safety gate."""
+
+    return (
+        policy == "semantic_strict"
+        and fallback_reason is None
+        and target_absent
+        and known_membership
+    )
+
+
 class ProtectedAuditArchive(Protocol):
     def put_json(self, *, key: str, payload: Any) -> Mapping[str, Any]: ...
 
@@ -872,12 +890,12 @@ class DatabaseArmContextProvider:
         known_membership = set(returned_ids).issubset(set(case["arm_database_ids"][arm]))
         target_rank_one = target_id is None or (bool(returned_ids) and returned_ids[0] == target_id)
         target_absent = target_id is not None or case["consolidated_target_id"] not in returned_ids
-        hard_gate = (
-            _result_value(retrieval, "policy") == "semantic_strict"
-            and _result_value(retrieval, "fallback_reason") is None
-            and target_rank_one
-            and target_absent
-            and known_membership
+        hard_gate = _behavioral_retrieval_hard_gate(
+            policy=_result_value(retrieval, "policy"),
+            fallback_reason=_result_value(retrieval, "fallback_reason"),
+            target_rank_one=target_rank_one,
+            target_absent=target_absent,
+            known_membership=known_membership,
         )
         return {
             "hard_gate_passed": hard_gate,

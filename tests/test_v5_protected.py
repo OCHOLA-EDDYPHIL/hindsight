@@ -18,6 +18,7 @@ from hindsight.v5_protected_runtime import (
     ProtectedAuditStore,
     ProtectedEvidenceArchive,
     ProtectedRunFailure,
+    _behavioral_retrieval_hard_gate,
 )
 
 
@@ -121,6 +122,15 @@ def _corpus(monkeypatch: pytest.MonkeyPatch) -> dict:
 
 def test_protocol_power_and_signed_freeze_are_deterministic() -> None:
     protocol = v5_protected.protected_study_protocol()
+    assert protocol["revision"] == "v5-protected-study-v2"
+    assert protocol["protocol_sha256"] == (
+        "7cebae7ffe73f81da25f28150c7c7c4aed9f5b4921ff23b422113de38d95950c"
+    )
+    assert protocol["retrieval"]["semantic_rank_one_acceptance"] == {
+        "scope": "aggregate-all-scenarios",
+        "minimum_numerator": 9,
+        "minimum_denominator": 10,
+    }
     assert protocol["arms"]["reference_lesson"] == "direct-oracle-derived-positive-control"
     assert protocol["execution"]["embedding_mode"] == "cache-only"
     assert protocol == v5_protected.protected_study_protocol()
@@ -500,6 +510,7 @@ def test_protected_retrieval_receipt_recomputes_every_gate() -> None:
         "results": [row],
         "scenario_count": 1,
         "rank_one_count": 1,
+        "semantic_accuracy_passed": True,
         "all_hard_gates_passed": True,
         "embedding_cache_miss_count": 0,
         "embedding_delegate_call_counts": {
@@ -523,6 +534,98 @@ def test_protected_retrieval_receipt_recomputes_every_gate() -> None:
             altered,
             expected_scenario_ids=[scenario_id],
         )
+
+
+def test_protected_retrieval_accepts_ninety_percent_but_not_less(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        v5_protected_execution,
+        "_v2_hard_gates_pass",
+        lambda row: row["hard_gate"],
+    )
+    monkeypatch.setattr(
+        v5_protected_execution,
+        "_semantic_rank_one",
+        lambda row: row["rank_one"],
+    )
+    scenario_ids = [f"scenario-{index}" for index in range(10)]
+    rows = [
+        {
+            "scenario_id": scenario_id,
+            "hard_gate": True,
+            "rank_one": index < 9,
+            "alternate_tenant_visible": False,
+            "alternate_decision_sealed": True,
+        }
+        for index, scenario_id in enumerate(scenario_ids)
+    ]
+    prepared = {scenario_id: {"namespaces": {}} for scenario_id in scenario_ids}
+    result = {
+        "status": "protected_retrieval_passed",
+        "results": rows,
+        "scenario_count": 10,
+        "rank_one_count": 9,
+        "semantic_accuracy_passed": True,
+        "all_hard_gates_passed": True,
+        "embedding_cache_miss_count": 0,
+        "embedding_delegate_call_counts": {"RETRIEVAL_DOCUMENT": 0},
+        "result_sha256": v5_protected.sha256_hex(rows),
+        "prepared_cases": prepared,
+        "prepared_cases_sha256": v5_protected.sha256_hex(prepared),
+        "prepared_arm_gate_count": 30,
+    }
+    assert v5_protected_execution.validate_protected_retrieval_result(
+        result,
+        expected_scenario_ids=scenario_ids,
+    ) == result
+
+    below_threshold = copy.deepcopy(result)
+    below_threshold["results"][8]["rank_one"] = False
+    below_threshold["rank_one_count"] = 8
+    below_threshold["result_sha256"] = v5_protected.sha256_hex(
+        below_threshold["results"]
+    )
+    with pytest.raises(ValueError, match="frozen gate"):
+        v5_protected_execution.validate_protected_retrieval_result(
+            below_threshold,
+            expected_scenario_ids=scenario_ids,
+        )
+
+    hard_gate_failure = copy.deepcopy(result)
+    hard_gate_failure["results"][0]["hard_gate"] = False
+    hard_gate_failure["result_sha256"] = v5_protected.sha256_hex(
+        hard_gate_failure["results"]
+    )
+    with pytest.raises(ValueError, match="frozen gate"):
+        v5_protected_execution.validate_protected_retrieval_result(
+            hard_gate_failure,
+            expected_scenario_ids=scenario_ids,
+        )
+
+
+def test_behavioral_retrieval_semantic_miss_is_not_a_hard_gate() -> None:
+    assert _behavioral_retrieval_hard_gate(
+        policy="semantic_strict",
+        fallback_reason=None,
+        target_rank_one=False,
+        target_absent=True,
+        known_membership=True,
+    )
+    assert not _behavioral_retrieval_hard_gate(
+        policy="semantic_strict",
+        fallback_reason="lexical_fallback",
+        target_rank_one=True,
+        target_absent=True,
+        known_membership=True,
+    )
+    assert not _behavioral_retrieval_hard_gate(
+        policy="semantic_strict",
+        fallback_reason=None,
+        target_rank_one=True,
+        target_absent=True,
+        known_membership=False,
+    )
 
 
 def test_protected_embedding_delegate_reuses_development_documents_only() -> None:
