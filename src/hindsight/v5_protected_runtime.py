@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -19,11 +20,17 @@ from botocore.exceptions import ClientError
 from hindsight.evidence_archive import canonical_json_bytes
 from hindsight.memory import MemoryGovernance, MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest
-from hindsight.v5_corpus import ACTION_BUDGET, V5IncidentSimulator, applicability_matches, sha256_hex
+from hindsight.v5_corpus import (
+    ACTION_BUDGET,
+    V5IncidentSimulator,
+    applicability_matches,
+    sha256_hex,
+)
 from hindsight.v5_protected import (
     ACTION_RESPONSE_SCHEMA,
     ACTION_SYSTEM_PROMPT,
     PROTECTED_ARMS,
+    PROTECTED_REASONING_TIMEOUT_SECONDS,
     PROTECTED_REPETITIONS,
     deterministic_arm_order,
     reference_lesson,
@@ -111,9 +118,7 @@ def _behavioral_retrieval_hard_gate(
 class ProtectedAuditArchive(Protocol):
     def put_json(self, *, key: str, payload: Any) -> Mapping[str, Any]: ...
 
-    def put_audit_event(
-        self, *, run_id: str, event: Mapping[str, Any]
-    ) -> Mapping[str, Any]: ...
+    def put_audit_event(self, *, run_id: str, event: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 class ProtectedAuditStore:
@@ -336,10 +341,10 @@ class ProtectedAuditStore:
         events = self.audit_events(run_id=run_id)
         result = {
             **claim,
-            "status": "terminal" if terminal is not None else ("running" if start_path.exists() else "claimed"),
-            "rollback_state": (
-                terminal["rollback_state"] if terminal is not None else "armed"
-            ),
+            "status": "terminal"
+            if terminal is not None
+            else ("running" if start_path.exists() else "claimed"),
+            "rollback_state": (terminal["rollback_state"] if terminal is not None else "armed"),
             "audit_event_count": len(events),
             "audit_head_sha256": events[-1]["event_sha256"] if events else None,
         }
@@ -392,8 +397,7 @@ class ProtectedAuditStore:
         missing = set(required_categories) - categories
         if missing:
             raise ValueError(
-                "v5 protected audit categories are incomplete: "
-                + ", ".join(sorted(missing))
+                "v5 protected audit categories are incomplete: " + ", ".join(sorted(missing))
             )
         return {
             "run": run,
@@ -435,9 +439,7 @@ class ProtectedAuditStore:
         )
         return event
 
-    def _write_archived_record(
-        self, *, run_id: str, name: str, value: Mapping[str, Any]
-    ) -> None:
+    def _write_archived_record(self, *, run_id: str, name: str, value: Mapping[str, Any]) -> None:
         path = self._run_directory(run_id) / f"{name}.json"
         write_private_json_exclusive(path, value)
         receipt = self._archive.put_json(
@@ -446,9 +448,7 @@ class ProtectedAuditStore:
         )
         self._write_archive_receipt(run_id=run_id, name=name, receipt=receipt)
 
-    def _write_archive_receipt(
-        self, *, run_id: str, name: str, receipt: Mapping[str, Any]
-    ) -> None:
+    def _write_archive_receipt(self, *, run_id: str, name: str, receipt: Mapping[str, Any]) -> None:
         write_private_json_exclusive(
             self._archive_directory(run_id) / f"{name}.json",
             dict(receipt),
@@ -503,9 +503,7 @@ class ProtectedEvidenceArchive:
             created = True
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code") or "")
-            status = int(
-                exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0
-            )
+            status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
             # S3's generated exception map does not expose PreconditionFailed.
             if code not in {"PreconditionFailed", "412"} and status != 412:
                 raise
@@ -554,6 +552,7 @@ class ProtectedEvidenceArchive:
             ),
             payload=dict(event),
         )
+
 
 class MonitorLease:
     """A small fail-closed liveness lease checked before irreversible steps."""
@@ -640,6 +639,7 @@ class BehavioralStudyRunner:
         audit_store: ProtectedAuditStore,
         monitor: MonitorLease,
         stop_on_unsafe: bool = True,
+        reasoning_timeout_seconds: float = PROTECTED_REASONING_TIMEOUT_SECONDS,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         self._run_id = run_id
@@ -649,6 +649,9 @@ class BehavioralStudyRunner:
         self._audit = audit_store
         self._monitor = monitor
         self._stop_on_unsafe = stop_on_unsafe
+        if reasoning_timeout_seconds <= 0:
+            raise ValueError("v5 protected reasoning timeout must be positive")
+        self._reasoning_timeout_seconds = reasoning_timeout_seconds
         self._progress = progress_callback
 
     def run(self, *, scenarios: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -693,9 +696,7 @@ class BehavioralStudyRunner:
         arm: str,
     ) -> dict[str, Any]:
         scenario_id = str(scenario["scenario_id"])
-        trial_id = sha256_hex(
-            [self._run_id, self._freeze_sha, scenario_id, repetition, arm]
-        )
+        trial_id = sha256_hex([self._run_id, self._freeze_sha, scenario_id, repetition, arm])
         simulator = V5IncidentSimulator(dict(scenario))
         for step in range(1, ACTION_BUDGET + 1):
             self._require_monitor()
@@ -740,8 +741,10 @@ class BehavioralStudyRunner:
             if arm == "reference_lesson":
                 prompt_context["reference_control"] = reference_lesson(scenario)
             try:
-                response = self._reasoning.generate(
-                    ReasoningRequest(
+                response = _generate_with_deadline(
+                    provider=self._reasoning,
+                    timeout_seconds=self._reasoning_timeout_seconds,
+                    request=ReasoningRequest(
                         system=ACTION_SYSTEM_PROMPT,
                         prompt=json.dumps(prompt_context, sort_keys=True),
                         temperature=0.0,
@@ -749,14 +752,19 @@ class BehavioralStudyRunner:
                         routing_key=f"{self._freeze_sha}:{trial_id}:{step}",
                         response_json_schema=ACTION_RESPONSE_SCHEMA,
                         thinking_budget=0,
-                    )
+                    ),
                 )
+            except ProtectedRunFailure:
+                raise
             except Exception as exc:
                 raise ProtectedRunFailure(
                     "artifact_integrity_failure",
                     "v5 protected reasoning provider failed",
                 ) from exc
-            if response.provider != self._reasoning.provider_name or response.model != self._reasoning.model_name:
+            if (
+                response.provider != self._reasoning.provider_name
+                or response.model != self._reasoning.model_name
+            ):
                 raise ProtectedRunFailure(
                     "artifact_integrity_failure",
                     "v5 protected reasoning provider identity drifted",
@@ -825,6 +833,48 @@ class BehavioralStudyRunner:
             self._monitor.require_live()
         except RuntimeError as exc:
             raise ProtectedRunFailure("monitoring_outage", str(exc)) from exc
+
+
+def _generate_with_deadline(
+    *,
+    provider: ReasoningProvider,
+    request: ReasoningRequest,
+    timeout_seconds: float,
+) -> Any:
+    """Interrupt a stalled provider call without leaving background work alive."""
+
+    if threading.current_thread() is not threading.main_thread():
+        raise ProtectedRunFailure(
+            "monitoring_outage",
+            "v5 protected reasoning deadline requires the main execution thread",
+        )
+    previous_delay, _previous_interval = signal.getitimer(signal.ITIMER_REAL)
+    if previous_delay > 0:
+        raise ProtectedRunFailure(
+            "monitoring_outage",
+            "v5 protected reasoning deadline found an existing process timer",
+        )
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expire(_signum: int, _frame: Any) -> None:
+        raise _ReasoningDeadlineExpired
+
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return provider.generate(request)
+    except _ReasoningDeadlineExpired as exc:
+        raise ProtectedRunFailure(
+            "monitoring_outage",
+            "v5 protected reasoning request exceeded its frozen deadline",
+        ) from exc
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+class _ReasoningDeadlineExpired(BaseException):
+    """Escape provider retry wrappers when the frozen wall-clock deadline expires."""
 
 
 class DatabaseArmContextProvider:
@@ -915,9 +965,7 @@ class DatabaseArmContextProvider:
             "reads": [
                 {
                     "retrieval_id": str(row.get("retrieval_id") or ""),
-                    "memory_id": str(
-                        row.get("semantic_memory_id") or row.get("memory_id") or ""
-                    ),
+                    "memory_id": str(row.get("semantic_memory_id") or row.get("memory_id") or ""),
                     "rank": int(row.get("rank") or 0),
                 }
                 for row in reads
@@ -957,8 +1005,7 @@ def prepare_arm_database(
                 raise ValueError("v5 protected arm preparation requires one target")
             target_memory_id = str(matching[0]["memory_id"])
             namespaces = {
-                arm: f"v5-{phase}-{scenario_id}-{arm.replace('_', '-')}"
-                for arm in PROTECTED_ARMS
+                arm: f"v5-{phase}-{scenario_id}-{arm.replace('_', '-')}" for arm in PROTECTED_ARMS
             }
             target_database_ids: dict[str, str | None] = {}
             arm_database_ids: dict[str, list[str]] = {}
@@ -1003,9 +1050,7 @@ def prepare_arm_database(
                         ),
                         precomputed_embedding=vector,
                         trust_status=(
-                            "review_required"
-                            if memory["status"] == "review_required"
-                            else "active"
+                            "review_required" if memory["status"] == "review_required" else "active"
                         ),
                         governance=governance,
                     )
@@ -1068,7 +1113,9 @@ def _parse_action(text: str) -> str:
 
 
 def _run_id(*, run_kind: str, authorization_sha256: str, contract_sha256: str) -> str:
-    value = f"https://hindsight.local/v5/protected/{run_kind}/{authorization_sha256}/{contract_sha256}"
+    value = (
+        f"https://hindsight.local/v5/protected/{run_kind}/{authorization_sha256}/{contract_sha256}"
+    )
     return str(uuid5(NAMESPACE_URL, value))
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import io
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -122,8 +124,11 @@ def _corpus(monkeypatch: pytest.MonkeyPatch) -> dict:
 
 def test_protocol_power_and_signed_freeze_are_deterministic() -> None:
     protocol = v5_protected.protected_study_protocol()
-    assert protocol["revision"] == "v5-protected-study-v2"
+    assert protocol["revision"] == "v5-protected-study-v3"
     assert protocol["protocol_sha256"] == (
+        "1df0f5f160a5cf5739ca90ca42ae0c266c074efdf9c035ddbed008058301b1b0"
+    )
+    assert v5_protected.PROTECTED_PROTOCOL_V2_SHA256 == (
         "7cebae7ffe73f81da25f28150c7c7c4aed9f5b4921ff23b422113de38d95950c"
     )
     assert protocol["retrieval"]["semantic_rank_one_acceptance"] == {
@@ -133,6 +138,8 @@ def test_protocol_power_and_signed_freeze_are_deterministic() -> None:
     }
     assert protocol["arms"]["reference_lesson"] == "direct-oracle-derived-positive-control"
     assert protocol["execution"]["embedding_mode"] == "cache-only"
+    assert protocol["providers"]["reasoning"]["request_timeout_seconds"] == 60
+    assert protocol["execution"]["reasoning_timeout_failure"] == "monitoring_outage"
     assert protocol == v5_protected.protected_study_protocol()
 
     power = _power_plan()
@@ -144,11 +151,14 @@ def test_protocol_power_and_signed_freeze_are_deterministic() -> None:
     frozen = _freeze()
     assert frozen["status"] == "study_frozen"
     assert frozen["tested_subject_sha"] == SUBJECT_SHA
-    assert v5_protected.verify_protected_artifact(
-        frozen,
-        signer=_Signer(),
-        kind=v5_protected.FINAL_FREEZE_KIND,
-    ) == frozen
+    assert (
+        v5_protected.verify_protected_artifact(
+            frozen,
+            signer=_Signer(),
+            kind=v5_protected.FINAL_FREEZE_KIND,
+        )
+        == frozen
+    )
 
     altered = copy.deepcopy(frozen)
     altered["protected_runner_sha"] = "2" * 40
@@ -181,12 +191,60 @@ def test_power_plan_fails_closed_above_the_maximum() -> None:
         )
 
 
+def test_pilot_attempt_authorization_binds_single_exact_runner() -> None:
+    authorization = v5_protected.build_pilot_attempt_authorization(
+        tested_subject_sha=SUBJECT_SHA,
+        policy_evaluator_sha=EVALUATOR_SHA,
+        source_protected_authorization_sha256=AUTH_SHA,
+        prior_pilot_artifact_sha256="d" * 64,
+        prior_pilot_run_id="prior-run",
+        prior_pilot_exact_code_sha="e" * 40,
+        authorized_runner_sha=RUNNER_SHA,
+        issued_at="2026-08-07T00:00:00+00:00",
+        signer=_Signer(),
+    )
+    verified = v5_protected.verify_protected_artifact(
+        authorization,
+        signer=_Signer(),
+        kind=v5_protected.PILOT_ATTEMPT_AUTHORIZATION_KIND,
+    )
+    assert (
+        v5_protected.validate_pilot_attempt_authorization(
+            verified,
+            tested_subject_sha=SUBJECT_SHA,
+            policy_evaluator_sha=EVALUATOR_SHA,
+            source_protected_authorization_sha256=AUTH_SHA,
+            exact_code_sha=RUNNER_SHA,
+        )
+        == authorization
+    )
+    with pytest.raises(ValueError, match="authorization differs"):
+        v5_protected.validate_pilot_attempt_authorization(
+            verified,
+            tested_subject_sha=SUBJECT_SHA,
+            policy_evaluator_sha=EVALUATOR_SHA,
+            source_protected_authorization_sha256=AUTH_SHA,
+            exact_code_sha="f" * 40,
+        )
+
+    altered = {**authorization, "single_attempt": False}
+    with pytest.raises(ValueError, match="content identity"):
+        v5_protected.verify_protected_artifact(
+            altered,
+            signer=_Signer(),
+            kind=v5_protected.PILOT_ATTEMPT_AUTHORIZATION_KIND,
+        )
+
+
 def test_beacon_requires_the_first_pulse_after_freeze_boundary() -> None:
     freeze_at = datetime(2026, 8, 7, tzinfo=UTC)
-    assert v5_protected.validate_beacon_receipt(
-        _beacon(),
-        freeze_recorded_at=freeze_at,
-    )["output_value"] == "d" * 64
+    assert (
+        v5_protected.validate_beacon_receipt(
+            _beacon(),
+            freeze_recorded_at=freeze_at,
+        )["output_value"]
+        == "d" * 64
+    )
 
     late_previous = {**_beacon(), "previous_published_at": "2026-08-07T00:10:30+00:00"}
     with pytest.raises(ValueError, match="first pulse"):
@@ -368,11 +426,14 @@ def test_exact_sign_flip_and_terminal_evaluation(monkeypatch: pytest.MonkeyPatch
         signer=_Signer(),
         kind=v5_protected.TERMINAL_RESULT_KIND,
     )
-    assert v5_protected.validate_terminal_artifact(
-        terminal=terminal,
-        final_freeze=_freeze(),
-        sealed_corpus=sealed,
-    ) == terminal
+    assert (
+        v5_protected.validate_terminal_artifact(
+            terminal=terminal,
+            final_freeze=_freeze(),
+            sealed_corpus=sealed,
+        )
+        == terminal
+    )
 
     rejected = v5_protected.evaluate_terminal_result(
         final_freeze=_freeze(),
@@ -422,6 +483,7 @@ def test_behavioral_pilot_seals_complete_trials_and_power(
         tested_subject_sha=SUBJECT_SHA,
         policy_evaluator_sha=EVALUATOR_SHA,
         protected_authorization_sha256=AUTH_SHA,
+        attempt_authorization_sha256="e" * 64,
         rehearsal_result_sha256="d" * 64,
         trials=trials,
         scenario_ids=scenario_ids,
@@ -431,11 +493,14 @@ def test_behavioral_pilot_seals_complete_trials_and_power(
     assert result["scenario_count"] == 60
     assert result["trial_count"] == 360
     assert result["power_plan"]["protected_scenario_count"] == 36
-    assert v5_protected.verify_protected_artifact(
-        result,
-        signer=_Signer(),
-        kind=v5_protected.PILOT_RESULT_KIND,
-    ) == result
+    assert (
+        v5_protected.verify_protected_artifact(
+            result,
+            signer=_Signer(),
+            kind=v5_protected.PILOT_RESULT_KIND,
+        )
+        == result
+    )
 
 
 def test_protected_embedding_checkpoint_is_separate_exact_and_cache_only(
@@ -522,10 +587,13 @@ def test_protected_retrieval_receipt_recomputes_every_gate() -> None:
         "prepared_cases_sha256": v5_protected.sha256_hex(prepared),
         "prepared_arm_gate_count": 3,
     }
-    assert v5_protected_execution.validate_protected_retrieval_result(
-        result,
-        expected_scenario_ids=[scenario_id],
-    ) == result
+    assert (
+        v5_protected_execution.validate_protected_retrieval_result(
+            result,
+            expected_scenario_ids=[scenario_id],
+        )
+        == result
+    )
     altered = copy.deepcopy(result)
     altered["results"][0]["max_distance_delta"] = 3e-6
     altered["result_sha256"] = v5_protected.sha256_hex(altered["results"])
@@ -575,17 +643,18 @@ def test_protected_retrieval_accepts_ninety_percent_but_not_less(
         "prepared_cases_sha256": v5_protected.sha256_hex(prepared),
         "prepared_arm_gate_count": 30,
     }
-    assert v5_protected_execution.validate_protected_retrieval_result(
-        result,
-        expected_scenario_ids=scenario_ids,
-    ) == result
+    assert (
+        v5_protected_execution.validate_protected_retrieval_result(
+            result,
+            expected_scenario_ids=scenario_ids,
+        )
+        == result
+    )
 
     below_threshold = copy.deepcopy(result)
     below_threshold["results"][8]["rank_one"] = False
     below_threshold["rank_one_count"] = 8
-    below_threshold["result_sha256"] = v5_protected.sha256_hex(
-        below_threshold["results"]
-    )
+    below_threshold["result_sha256"] = v5_protected.sha256_hex(below_threshold["results"])
     with pytest.raises(ValueError, match="frozen gate"):
         v5_protected_execution.validate_protected_retrieval_result(
             below_threshold,
@@ -594,9 +663,7 @@ def test_protected_retrieval_accepts_ninety_percent_but_not_less(
 
     hard_gate_failure = copy.deepcopy(result)
     hard_gate_failure["results"][0]["hard_gate"] = False
-    hard_gate_failure["result_sha256"] = v5_protected.sha256_hex(
-        hard_gate_failure["results"]
-    )
+    hard_gate_failure["result_sha256"] = v5_protected.sha256_hex(hard_gate_failure["results"])
     with pytest.raises(ValueError, match="frozen gate"):
         v5_protected_execution.validate_protected_retrieval_result(
             hard_gate_failure,
@@ -826,9 +893,7 @@ class _Context:
                 "target_rank_one": True,
                 "decision_sealed": True,
             },
-            "reads": [
-                {"retrieval_id": "retrieval-1", "memory_id": "memory-1", "rank": 1}
-            ],
+            "reads": [{"retrieval_id": "retrieval-1", "memory_id": "memory-1", "rank": 1}],
         }
 
 
@@ -852,6 +917,12 @@ class _Reasoning:
             model=self.model_name,
             usage={"calls": self.calls},
         )
+
+
+class _BlockingReasoning(_Reasoning):
+    def generate(self, _request) -> ReasoningResponse:
+        threading.Event().wait()
+        raise AssertionError("unreachable")
 
 
 def test_behavioral_runner_checkpoints_responses_before_outcomes() -> None:
@@ -913,3 +984,28 @@ def test_behavioral_runner_fails_immediately_on_safety_or_monitoring() -> None:
     with pytest.raises(ProtectedRunFailure) as outage:
         unavailable.run(scenarios=[scenario])
     assert outage.value.reason == "monitoring_outage"
+
+
+def test_behavioral_runner_bounds_stalled_reasoning_request() -> None:
+    scenario = compile_scenario(
+        family="retry_amplification",
+        seed="7" * 64,
+        code_sha=SUBJECT_SHA,
+    )
+    audit = _Audit()
+    runner = BehavioralStudyRunner(
+        run_id="run-1",
+        final_freeze_sha256="8" * 64,
+        reasoning_provider=_BlockingReasoning(),
+        context_provider=_Context(),
+        audit_store=audit,  # type: ignore[arg-type]
+        monitor=MonitorLease(timeout_seconds=60),
+        reasoning_timeout_seconds=0.01,
+    )
+    started = time.monotonic()
+    with pytest.raises(ProtectedRunFailure) as outage:
+        runner.run(scenarios=[scenario])
+    assert outage.value.reason == "monitoring_outage"
+    assert time.monotonic() - started < 1
+    categories = [category for category, _payload in audit.events]
+    assert categories == ["retrieval_decision", "memory_read"]
