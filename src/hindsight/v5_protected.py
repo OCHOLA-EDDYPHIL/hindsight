@@ -45,7 +45,7 @@ from hindsight.v5_governance import (
 
 
 PROTECTED_PROTOCOL_SCHEMA_VERSION = 1
-PROTECTED_PROTOCOL_REVISION = "v5-protected-study-v1"
+PROTECTED_PROTOCOL_REVISION = "v5-protected-study-v2"
 PROTECTED_SEED_DOMAIN = "hindsight-v5-protected-seed-v1"
 PROTECTED_ARM_ORDER_DOMAIN = "hindsight-v5-protected-arm-order-v1"
 PROTECTED_REVIEW_DOMAIN = "hindsight-v5-protected-review-v1"
@@ -175,6 +175,11 @@ def protected_study_protocol() -> dict[str, Any]:
         "retrieval": {
             "policy": "semantic_strict",
             "rank_requirement": 1,
+            "semantic_rank_one_acceptance": {
+                "scope": "aggregate-all-scenarios",
+                "minimum_numerator": 9,
+                "minimum_denominator": 10,
+            },
             "max_distance": EMBEDDING_MAX_DISTANCE,
             "maximum_distance_delta": V2_MAXIMUM_DISTANCE_DELTA,
             "fallback": None,

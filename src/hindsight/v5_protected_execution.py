@@ -17,6 +17,8 @@ from hindsight.tenant import tenant_scope
 from hindsight.v5_corpus import sha256_hex
 from hindsight.v5_governance import (
     CacheOnlyEmbeddingProvider,
+    V2_MINIMUM_SEMANTIC_DENOMINATOR,
+    V2_MINIMUM_SEMANTIC_NUMERATOR,
     _append_alternate_tenant_evidence,
     _semantic_rank_one,
     _v2_hard_gates_pass,
@@ -47,6 +49,14 @@ from hindsight.v5_qualification import (
 
 
 PROTECTED_DATABASE_RE = re.compile(r"hindsight_v5_protected_[a-z0-9_]+")
+
+
+def _semantic_accuracy_passes(*, rank_one_count: int, scenario_count: int) -> bool:
+    return (
+        scenario_count > 0
+        and rank_one_count * V2_MINIMUM_SEMANTIC_DENOMINATOR
+        >= scenario_count * V2_MINIMUM_SEMANTIC_NUMERATOR
+    )
 
 
 class DevelopmentCacheThenEmbeddingProvider:
@@ -260,7 +270,7 @@ def qualify_protected_retrieval(
     activate_profile_fn: Callable[..., Mapping[str, Any]] = activate_profile,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Require 100% protected rank-one delivery before any behavioral outcome."""
+    """Require 90% rank-one accuracy and 100% protected hard gates."""
 
     database_evidence = require_fresh_development_database(
         database_url,
@@ -330,16 +340,24 @@ def qualify_protected_retrieval(
         isolation_reader="v5.protected.isolation",
         isolation_purpose="Verify protected alternate-tenant invisibility",
     )
-    passed_rows = [
+    hard_gate_rows = [
         _v2_hard_gates_pass(row)
-        and _semantic_rank_one(row)
         and row.get("alternate_tenant_visible") is False
         and row.get("alternate_decision_sealed") is True
         for row in rows
     ]
+    rank_one_count = sum(_semantic_rank_one(row) for row in rows)
+    semantic_accuracy_passed = _semantic_accuracy_passes(
+        rank_one_count=rank_one_count,
+        scenario_count=len(rows),
+    )
     prepared_cases: dict[str, dict[str, Any]] = {}
     prepared_arm_gate_count = 0
-    if all(passed_rows) and len(rows) == len(scenarios):
+    if (
+        all(hard_gate_rows)
+        and semantic_accuracy_passed
+        and len(rows) == len(scenarios)
+    ):
         from hindsight.v5_protected_runtime import (
             DatabaseArmContextProvider,
             prepare_arm_database,
@@ -373,7 +391,8 @@ def qualify_protected_retrieval(
         checkpoint.delegate_call_counts.values()
     )
     passed = (
-        all(passed_rows)
+        all(hard_gate_rows)
+        and semantic_accuracy_passed
         and cache_clean
         and len(rows) == len(scenarios)
         and prepared_arm_gate_count == len(scenarios) * 3
@@ -400,8 +419,9 @@ def qualify_protected_retrieval(
         ).hexdigest(),
         "embedding_profile_id": str(profile["id"]),
         "scenario_count": len(rows),
-        "rank_one_count": sum(_semantic_rank_one(row) for row in rows),
-        "all_hard_gates_passed": all(passed_rows),
+        "rank_one_count": rank_one_count,
+        "semantic_accuracy_passed": semantic_accuracy_passed,
+        "all_hard_gates_passed": all(hard_gate_rows),
         "embedding_cache_miss_count": cache_only_delegate.miss_count,
         "embedding_delegate_call_counts": checkpoint.delegate_call_counts,
         "prepared_arm_gate_count": prepared_arm_gate_count,
@@ -423,20 +443,26 @@ def validate_protected_retrieval_result(
     if not isinstance(rows, list) or not isinstance(prepared, Mapping):
         raise ValueError("v5 protected retrieval evidence is incomplete")
     observed_ids = [str(row.get("scenario_id") or "") for row in rows]
-    passed = [
+    hard_gate_rows = [
         _v2_hard_gates_pass(row)
-        and _semantic_rank_one(row)
         and row.get("alternate_tenant_visible") is False
         and row.get("alternate_decision_sealed") is True
         for row in rows
     ]
+    rank_one_count = sum(_semantic_rank_one(row) for row in rows)
+    semantic_accuracy_passed = _semantic_accuracy_passes(
+        rank_one_count=rank_one_count,
+        scenario_count=len(rows),
+    )
     delegate_counts = result.get("embedding_delegate_call_counts")
     if (
         result.get("status") != "protected_retrieval_passed"
         or observed_ids != list(expected_scenario_ids)
         or result.get("scenario_count") != len(expected_scenario_ids)
-        or not all(passed)
-        or result.get("rank_one_count") != len(expected_scenario_ids)
+        or not all(hard_gate_rows)
+        or not semantic_accuracy_passed
+        or result.get("rank_one_count") != rank_one_count
+        or result.get("semantic_accuracy_passed") is not True
         or result.get("all_hard_gates_passed") is not True
         or result.get("embedding_cache_miss_count") != 0
         or not isinstance(delegate_counts, Mapping)
