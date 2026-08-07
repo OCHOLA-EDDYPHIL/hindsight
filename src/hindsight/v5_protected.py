@@ -45,7 +45,8 @@ from hindsight.v5_governance import (
 
 
 PROTECTED_PROTOCOL_SCHEMA_VERSION = 1
-PROTECTED_PROTOCOL_REVISION = "v5-protected-study-v2"
+PROTECTED_PROTOCOL_REVISION = "v5-protected-study-v3"
+PROTECTED_PROTOCOL_V2_SHA256 = "7cebae7ffe73f81da25f28150c7c7c4aed9f5b4921ff23b422113de38d95950c"
 PROTECTED_SEED_DOMAIN = "hindsight-v5-protected-seed-v1"
 PROTECTED_ARM_ORDER_DOMAIN = "hindsight-v5-protected-arm-order-v1"
 PROTECTED_REVIEW_DOMAIN = "hindsight-v5-protected-review-v1"
@@ -60,8 +61,10 @@ PROTECTED_TARGET_EFFECT_ACTIONS = 1.0
 PROTECTED_REFERENCE_MARGIN_ACTIONS = 1.0
 PROTECTED_SD_FLOOR_ACTIONS = 0.5
 PROTECTED_RESERVE_FRACTION = 0.25
+PROTECTED_REASONING_TIMEOUT_SECONDS = 60
 SIGNATURE_ALGORITHM = "AWS_KMS_HMAC_SHA_256"
 PILOT_RESULT_KIND = "v5-protected-pilot-v1"
+PILOT_ATTEMPT_AUTHORIZATION_KIND = "v5-protected-pilot-attempt-authorization-v1"
 FINAL_FREEZE_KIND = "v5-protected-freeze-v1"
 CORPUS_SEAL_KIND = "v5-protected-corpus-v1"
 EMBEDDING_CHECKPOINT_KIND = "v5-protected-embedding-checkpoint-v1"
@@ -100,9 +103,7 @@ def protected_study_protocol() -> dict[str, Any]:
         "revision": PROTECTED_PROTOCOL_REVISION,
         "source_governance_revision": POLICY_REVISION,
         "source_governance_policy_sha256": governance_v2_policy()["policy_sha256"],
-        "development_rehearsal_selection_sha256": (
-            EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256
-        ),
+        "development_rehearsal_selection_sha256": (EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256),
         "providers": {
             "reasoning": {
                 "provider": REASONING_PROVIDER,
@@ -110,6 +111,7 @@ def protected_study_protocol() -> dict[str, Any]:
                 "temperature": 0.0,
                 "thinking_budget": 0,
                 "maximum_transient_attempts": 4,
+                "request_timeout_seconds": PROTECTED_REASONING_TIMEOUT_SECONDS,
             },
             "embedding": {
                 "provider": EMBEDDING_PROVIDER,
@@ -161,9 +163,7 @@ def protected_study_protocol() -> dict[str, Any]:
             "repetition_aggregation": "mean-within-scenario-arm",
             "test": "one-sided-exact-paired-sign-flip-dynamic-programming-v1",
             "minimum_mean_efficacy_actions": PROTECTED_TARGET_EFFECT_ACTIONS,
-            "reference_noninferiority_margin_actions": (
-                PROTECTED_REFERENCE_MARGIN_ACTIONS
-            ),
+            "reference_noninferiority_margin_actions": (PROTECTED_REFERENCE_MARGIN_ACTIONS),
         },
         "protected_seed": {
             "source": "nist-randomness-beacon-v2",
@@ -189,6 +189,7 @@ def protected_study_protocol() -> dict[str, Any]:
         "execution": {
             "single_attempt": True,
             "embedding_mode": "cache-only",
+            "reasoning_timeout_failure": "monitoring_outage",
             "response_checkpoint_before_action": True,
             "protected_outcome_inspection_during_run": False,
             "rollback_on": [
@@ -199,6 +200,100 @@ def protected_study_protocol() -> dict[str, Any]:
         },
     }
     return {**body, "protocol_sha256": sha256_hex(body)}
+
+
+def build_pilot_attempt_authorization(
+    *,
+    tested_subject_sha: str,
+    policy_evaluator_sha: str,
+    source_protected_authorization_sha256: str,
+    prior_pilot_artifact_sha256: str,
+    prior_pilot_run_id: str,
+    prior_pilot_exact_code_sha: str,
+    authorized_runner_sha: str,
+    issued_at: str,
+    signer: ProtectedStudySigner,
+) -> dict[str, Any]:
+    """Authorize one recovery pilot after a verified infrastructure rollback."""
+
+    for value, label in (
+        (tested_subject_sha, "tested subject"),
+        (policy_evaluator_sha, "policy evaluator"),
+        (prior_pilot_exact_code_sha, "prior pilot code"),
+        (authorized_runner_sha, "authorized runner"),
+    ):
+        _require_code_sha(value, label)
+    for value, label in (
+        (source_protected_authorization_sha256, "protected authorization"),
+        (prior_pilot_artifact_sha256, "prior pilot artifact"),
+    ):
+        _require_sha256(value, label)
+    issued_at = _timestamp(issued_at, "pilot attempt authorization").isoformat()
+    if not prior_pilot_run_id.strip():
+        raise ValueError("v5 protected prior pilot run identity is missing")
+    body = {
+        "schema_version": 1,
+        "status": "pilot_attempt_authorized",
+        "claim_authorized": True,
+        "single_attempt": True,
+        "tested_subject_sha": tested_subject_sha,
+        "policy_evaluator_sha": policy_evaluator_sha,
+        "source_protected_authorization_sha256": (source_protected_authorization_sha256),
+        "prior_pilot_artifact_sha256": prior_pilot_artifact_sha256,
+        "prior_pilot_run_id": prior_pilot_run_id,
+        "prior_pilot_exact_code_sha": prior_pilot_exact_code_sha,
+        "prior_pilot_terminal_reason": "artifact_integrity_failure",
+        "authorized_runner_sha": authorized_runner_sha,
+        "protocol_sha256": protected_study_protocol()["protocol_sha256"],
+        "reasoning_timeout_seconds": PROTECTED_REASONING_TIMEOUT_SECONDS,
+        "embedding_mode": "cache-only",
+        "issued_at": issued_at,
+    }
+    return sign_protected_artifact(
+        body,
+        signer=signer,
+        kind=PILOT_ATTEMPT_AUTHORIZATION_KIND,
+    )
+
+
+def validate_pilot_attempt_authorization(
+    authorization: Mapping[str, Any],
+    *,
+    tested_subject_sha: str,
+    policy_evaluator_sha: str,
+    source_protected_authorization_sha256: str,
+    exact_code_sha: str,
+) -> dict[str, Any]:
+    """Fail closed unless a signed recovery authorization binds this exact runner."""
+
+    if (
+        authorization.get("status") != "pilot_attempt_authorized"
+        or authorization.get("claim_authorized") is not True
+        or authorization.get("single_attempt") is not True
+        or authorization.get("tested_subject_sha") != tested_subject_sha
+        or authorization.get("policy_evaluator_sha") != policy_evaluator_sha
+        or authorization.get("source_protected_authorization_sha256")
+        != source_protected_authorization_sha256
+        or authorization.get("authorized_runner_sha") != exact_code_sha
+        or authorization.get("protocol_sha256") != protected_study_protocol()["protocol_sha256"]
+        or authorization.get("reasoning_timeout_seconds") != PROTECTED_REASONING_TIMEOUT_SECONDS
+        or authorization.get("embedding_mode") != "cache-only"
+    ):
+        raise ValueError("v5 protected pilot attempt authorization differs")
+    _require_sha256(
+        str(authorization.get("prior_pilot_artifact_sha256") or ""),
+        "prior pilot artifact",
+    )
+    _require_code_sha(
+        str(authorization.get("prior_pilot_exact_code_sha") or ""),
+        "prior pilot code",
+    )
+    if not str(authorization.get("prior_pilot_run_id") or "").strip():
+        raise ValueError("v5 protected prior pilot run identity is missing")
+    _timestamp(authorization.get("issued_at"), "pilot attempt authorization")
+    if authorization.get("prior_pilot_terminal_reason") != "artifact_integrity_failure":
+        raise ValueError("v5 protected prior pilot was not an infrastructure rollback")
+    return dict(authorization)
 
 
 def power_plan_from_pilot(
@@ -223,9 +318,7 @@ def power_plan_from_pilot(
         required(efficacy_sd, PROTECTED_TARGET_EFFECT_ACTIONS),
         required(reference_sd, PROTECTED_REFERENCE_MARGIN_ACTIONS),
     )
-    balanced_required = math.ceil(raw_required / len(MECHANISM_FAMILIES)) * len(
-        MECHANISM_FAMILIES
-    )
+    balanced_required = math.ceil(raw_required / len(MECHANISM_FAMILIES)) * len(MECHANISM_FAMILIES)
     status = (
         "power_plan_frozen"
         if balanced_required <= PROTECTED_MAXIMUM_SCENARIOS
@@ -258,6 +351,7 @@ def build_behavioral_pilot_result(
     tested_subject_sha: str,
     policy_evaluator_sha: str,
     protected_authorization_sha256: str,
+    attempt_authorization_sha256: str,
     rehearsal_result_sha256: str,
     trials: Sequence[Mapping[str, Any]],
     scenario_ids: Sequence[str],
@@ -268,12 +362,12 @@ def build_behavioral_pilot_result(
     _require_code_sha(tested_subject_sha, "tested subject")
     _require_code_sha(policy_evaluator_sha, "policy evaluator")
     _require_sha256(protected_authorization_sha256, "protected authorization")
+    _require_sha256(attempt_authorization_sha256, "pilot attempt authorization")
     _require_sha256(rehearsal_result_sha256, "rehearsal result")
     if (
         len(scenario_ids) != 60
         or len(set(scenario_ids)) != 60
-        or sha256_hex(list(scenario_ids))
-        != EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256
+        or sha256_hex(list(scenario_ids)) != EXPECTED_DEVELOPMENT_REHEARSAL_SELECTION_SHA256
     ):
         raise ValueError("v5 protected pilot selection differs")
     efficacy, reference = paired_differences_from_trials(
@@ -294,6 +388,7 @@ def build_behavioral_pilot_result(
         "tested_subject_sha": tested_subject_sha,
         "policy_evaluator_sha": policy_evaluator_sha,
         "protected_authorization_sha256": protected_authorization_sha256,
+        "attempt_authorization_sha256": attempt_authorization_sha256,
         "rehearsal_result_sha256": rehearsal_result_sha256,
         "protocol_sha256": protected_study_protocol()["protocol_sha256"],
         "scenario_ids": list(scenario_ids),
@@ -562,9 +657,7 @@ def record_review_event(
     updated = json.loads(json.dumps(state))
     updated.pop("review_state_sha256", None)
     slot = next(row for row in updated["slots"] if row["slot_id"] == current["slot_id"])
-    previous_event_sha = (
-        updated["events"][-1]["event_sha256"] if updated["events"] else None
-    )
+    previous_event_sha = updated["events"][-1]["event_sha256"] if updated["events"] else None
     event_body = {
         "sequence": len(updated["events"]) + 1,
         "slot_id": slot["slot_id"],
@@ -737,9 +830,7 @@ def evaluate_terminal_result(
         and reference_p <= PROTECTED_ALPHA_PER_TEST
     )
     integrity_pass = (
-        hard_gates_passed
-        and rollback_state == "disarmed"
-        and embedding_cache_miss_count == 0
+        hard_gates_passed and rollback_state == "disarmed" and embedding_cache_miss_count == 0
     )
     status = "scientific_passed" if statistical_pass and integrity_pass else "scientific_failed"
     return {
@@ -772,7 +863,8 @@ def validate_terminal_artifact(
         if (
             terminal.get("claim_authorized") is not False
             or terminal.get("rollback_state") != "executed"
-            or terminal.get("rollback_reason") not in {
+            or terminal.get("rollback_reason")
+            not in {
                 "safety_failure",
                 "hard_gate_failure",
                 "tenant_isolation_breach",
@@ -869,8 +961,7 @@ def verify_protected_artifact(
         not isinstance(signature, Mapping)
         or signature.get("algorithm") != SIGNATURE_ALGORITHM
         or signature.get("kind") != kind
-        or signature.get("key_id_sha256")
-        != hashlib.sha256(key_id.encode("utf-8")).hexdigest()
+        or signature.get("key_id_sha256") != hashlib.sha256(key_id.encode("utf-8")).hexdigest()
     ):
         raise ValueError("v5 protected artifact signature envelope differs")
     expected = signer.token(kind=kind, raw_id=artifact_sha256)
@@ -968,10 +1059,9 @@ def _validate_power_plan(power_plan: Mapping[str, Any]) -> None:
 
 def _validate_corpus(corpus: Mapping[str, Any]) -> None:
     body = {key: value for key, value in corpus.items() if key != "corpus_sha256"}
-    if (
-        corpus.get("status") != "protected_corpus_constructed"
-        or corpus.get("corpus_sha256") != sha256_hex(body)
-    ):
+    if corpus.get("status") != "protected_corpus_constructed" or corpus.get(
+        "corpus_sha256"
+    ) != sha256_hex(body):
         raise ValueError("v5 protected corpus identity differs")
     for group in ("primary", "reserve"):
         value = corpus.get(group)
@@ -982,10 +1072,9 @@ def _validate_corpus(corpus: Mapping[str, Any]) -> None:
 def _validate_review_binding(*, corpus: Mapping[str, Any], state: Mapping[str, Any]) -> None:
     _validate_corpus(corpus)
     body = {key: value for key, value in state.items() if key != "review_state_sha256"}
-    if (
-        state.get("corpus_sha256") != corpus.get("corpus_sha256")
-        or state.get("review_state_sha256") != sha256_hex(body)
-    ):
+    if state.get("corpus_sha256") != corpus.get("corpus_sha256") or state.get(
+        "review_state_sha256"
+    ) != sha256_hex(body):
         raise ValueError("v5 protected review state differs from its corpus")
     previous = None
     for index, event in enumerate(state.get("events") or [], start=1):
@@ -1067,12 +1156,16 @@ __all__ = [
     "EMBEDDING_CHECKPOINT_KIND",
     "FINAL_FREEZE_KIND",
     "PILOT_RESULT_KIND",
+    "PILOT_ATTEMPT_AUTHORIZATION_KIND",
     "PROTECTED_ARMS",
+    "PROTECTED_PROTOCOL_V2_SHA256",
+    "PROTECTED_REASONING_TIMEOUT_SECONDS",
     "PROTECTED_REPETITIONS",
     "RETRIEVAL_RESULT_KIND",
     "TERMINAL_RESULT_KIND",
     "build_final_freeze",
     "build_behavioral_pilot_result",
+    "build_pilot_attempt_authorization",
     "derive_protected_corpus",
     "deterministic_arm_order",
     "evaluate_terminal_result",
@@ -1089,6 +1182,7 @@ __all__ = [
     "seal_reviewed_corpus",
     "sign_protected_artifact",
     "validate_beacon_receipt",
+    "validate_pilot_attempt_authorization",
     "validate_terminal_artifact",
     "verify_protected_artifact",
     "write_private_json_exclusive",

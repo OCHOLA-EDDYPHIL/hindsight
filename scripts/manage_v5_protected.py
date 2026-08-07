@@ -34,11 +34,14 @@ from hindsight.v5_protected import (  # noqa: E402
     CORPUS_SEAL_KIND,
     EMBEDDING_CHECKPOINT_KIND,
     FINAL_FREEZE_KIND,
+    PILOT_ATTEMPT_AUTHORIZATION_KIND,
     PILOT_RESULT_KIND,
+    PROTECTED_PROTOCOL_V2_SHA256,
     RETRIEVAL_RESULT_KIND,
     TERMINAL_RESULT_KIND,
     build_behavioral_pilot_result,
     build_final_freeze,
+    build_pilot_attempt_authorization,
     derive_protected_corpus,
     evaluate_terminal_result,
     new_review_state,
@@ -50,6 +53,7 @@ from hindsight.v5_protected import (  # noqa: E402
     seal_reviewed_corpus,
     sign_protected_artifact,
     validate_beacon_receipt,
+    validate_pilot_attempt_authorization,
     validate_terminal_artifact,
     verify_protected_artifact,
     write_private_json_exclusive,
@@ -90,8 +94,14 @@ def main() -> int:
     source = commands.add_parser("verify-source")
     _add_source_arguments(source)
 
+    authorize_pilot = commands.add_parser("authorize-pilot")
+    _add_source_arguments(authorize_pilot)
+    authorize_pilot.add_argument("--prior-pilot", type=pathlib.Path, required=True)
+    authorize_pilot.add_argument("--output", type=pathlib.Path, required=True)
+
     pilot = commands.add_parser("run-pilot")
     _add_source_arguments(pilot)
+    pilot.add_argument("--attempt-authorization", type=pathlib.Path, required=True)
     pilot.add_argument("--checkpoint", type=pathlib.Path, required=True)
     pilot.add_argument("--execution-manifest", type=pathlib.Path, required=True)
     pilot.add_argument("--output", type=pathlib.Path, required=True)
@@ -130,9 +140,7 @@ def main() -> int:
     _add_protected_chain_arguments(embeddings, include_retrieval=False)
     embeddings.add_argument("--checkpoint", type=pathlib.Path, required=True)
     embeddings.add_argument("--development-checkpoint", type=pathlib.Path, required=True)
-    embeddings.add_argument(
-        "--development-execution-manifest", type=pathlib.Path, required=True
-    )
+    embeddings.add_argument("--development-execution-manifest", type=pathlib.Path, required=True)
     embeddings.add_argument("--output", type=pathlib.Path, required=True)
 
     qualify = commands.add_parser("qualify-retrieval")
@@ -154,6 +162,8 @@ def main() -> int:
     verify.add_argument(
         "--kind",
         choices=(
+            PILOT_ATTEMPT_AUTHORIZATION_KIND,
+            PILOT_RESULT_KIND,
             FINAL_FREEZE_KIND,
             CORPUS_SEAL_KIND,
             EMBEDDING_CHECKPOINT_KIND,
@@ -200,11 +210,62 @@ def main() -> int:
         value = _verify_source_chain(args, signer=governance_signer)
         _print_json(value)
         return 0
+    if args.command == "authorize-pilot":
+        source_chain = _verify_source_chain(args, signer=governance_signer)
+        exact_main = _exact_main_sha()
+        prior_signer = KmsHmacTokenizer(
+            key_id=protected_signer.key_id,
+            family_sha256=PROTECTED_PROTOCOL_V2_SHA256,
+        )
+        prior = verify_protected_artifact(
+            _load_json(args.prior_pilot),
+            signer=prior_signer,
+            kind=PILOT_RESULT_KIND,
+        )
+        prior_source = dict(prior.get("source") or {})
+        if (
+            prior.get("status") != "rolled_back"
+            or prior.get("rollback_reason") != "artifact_integrity_failure"
+            or prior_source.get("tested_subject_sha") != source_chain["tested_subject_sha"]
+            or prior_source.get("policy_evaluator_sha") != source_chain["policy_evaluator_sha"]
+            or prior_source.get("protected_authorization_sha256")
+            != source_chain["protected_authorization_sha256"]
+        ):
+            raise ValueError("v5 protected prior pilot is not the verified infrastructure rollback")
+        value = build_pilot_attempt_authorization(
+            tested_subject_sha=source_chain["tested_subject_sha"],
+            policy_evaluator_sha=source_chain["policy_evaluator_sha"],
+            source_protected_authorization_sha256=source_chain["protected_authorization_sha256"],
+            prior_pilot_artifact_sha256=prior["artifact_sha256"],
+            prior_pilot_run_id=prior["run_id"],
+            prior_pilot_exact_code_sha=prior["exact_code_sha"],
+            authorized_runner_sha=exact_main,
+            issued_at=datetime.now(UTC).isoformat(),
+            signer=protected_signer,
+        )
+        _write_signed(args.output, value, stage="pilot-attempt-authorization")
+        _print_json(_summary(value))
+        return 0
     if args.command == "run-pilot":
         source_chain = _verify_source_chain(args, signer=governance_signer)
+        attempt = verify_protected_artifact(
+            _load_json(args.attempt_authorization),
+            signer=protected_signer,
+            kind=PILOT_ATTEMPT_AUTHORIZATION_KIND,
+        )
+        validate_pilot_attempt_authorization(
+            attempt,
+            tested_subject_sha=source_chain["tested_subject_sha"],
+            policy_evaluator_sha=source_chain["policy_evaluator_sha"],
+            source_protected_authorization_sha256=source_chain["protected_authorization_sha256"],
+            exact_code_sha=_exact_main_sha(),
+        )
         value = _run_pilot(
             args=args,
-            source=source_chain,
+            source={
+                **source_chain,
+                "attempt_authorization_sha256": attempt["artifact_sha256"],
+            },
             protected_signer=protected_signer,
         )
         _print_json(_summary(value))
@@ -226,9 +287,7 @@ def main() -> int:
             tested_subject_sha=source_chain["tested_subject_sha"],
             policy_evaluator_sha=source_chain["policy_evaluator_sha"],
             protected_runner_sha=_exact_main_sha(),
-            source_protected_authorization_sha256=source_chain[
-                "protected_authorization_sha256"
-            ],
+            source_protected_authorization_sha256=source_chain["protected_authorization_sha256"],
             source_pilot_sha256=pilot["artifact_sha256"],
             power_plan=pilot["power_plan"],
             recorded_at=datetime.now(UTC).isoformat(),
@@ -255,9 +314,7 @@ def main() -> int:
     elif args.command == "review-next":
         value = {
             "guide": owner_review_guide(),
-            "item": next_review_item(
-                corpus=_load_json(args.corpus), state=_load_json(args.state)
-            ),
+            "item": next_review_item(corpus=_load_json(args.corpus), state=_load_json(args.state)),
         }
         _print_json(value)
         return 0
@@ -291,9 +348,7 @@ def main() -> int:
                 family_sha256=V1_QUALIFICATION_CONTRACT_SHA256,
             ),
             execution_manifest_sha256=str(
-                _load_json(args.development_execution_manifest)[
-                    "execution_manifest_sha256"
-                ]
+                _load_json(args.development_execution_manifest)["execution_manifest_sha256"]
             ),
             qualification_contract_sha256=V1_QUALIFICATION_CONTRACT_SHA256,
         )
@@ -334,10 +389,8 @@ def main() -> int:
         if (
             embedding_receipt.get("status") != "protected_embeddings_ready"
             or embedding_receipt.get("tested_subject_sha") != frozen["tested_subject_sha"]
-            or embedding_receipt.get("policy_evaluator_sha")
-            != frozen["policy_evaluator_sha"]
-            or embedding_receipt.get("protected_runner_sha")
-            != frozen["protected_runner_sha"]
+            or embedding_receipt.get("policy_evaluator_sha") != frozen["policy_evaluator_sha"]
+            or embedding_receipt.get("protected_runner_sha") != frozen["protected_runner_sha"]
             or embedding_receipt.get("final_freeze_sha256") != frozen["artifact_sha256"]
             or embedding_receipt.get("sealed_corpus_sha256") != sealed["artifact_sha256"]
         ):
@@ -458,7 +511,7 @@ def _run_pilot(
         claimed = audit.claim(
             run_kind="development_pilot",
             execution_contract_sha256=protected_study_protocol()["protocol_sha256"],
-            protected_authorization_sha256=source["protected_authorization_sha256"],
+            protected_authorization_sha256=source["attempt_authorization_sha256"],
             exact_code_sha=exact_main,
             claim_payload={
                 "source": source,
@@ -496,9 +549,8 @@ def _run_pilot(
             value = build_behavioral_pilot_result(
                 tested_subject_sha=source["tested_subject_sha"],
                 policy_evaluator_sha=source["policy_evaluator_sha"],
-                protected_authorization_sha256=source[
-                    "protected_authorization_sha256"
-                ],
+                protected_authorization_sha256=source["protected_authorization_sha256"],
+                attempt_authorization_sha256=source["attempt_authorization_sha256"],
                 rehearsal_result_sha256=source["rehearsal_sha256"],
                 trials=trials,
                 scenario_ids=rehearsal_ids,
@@ -586,14 +638,12 @@ def _run_protected(
         or retrieval.get("status") != "protected_retrieval_passed"
         or retrieval.get("all_hard_gates_passed") is not True
         or retrieval.get("embedding_cache_miss_count") != 0
-        or retrieval.get("embedding_checkpoint_sha256")
-        != embedding_receipt["artifact_sha256"]
+        or retrieval.get("embedding_checkpoint_sha256") != embedding_receipt["artifact_sha256"]
         or retrieval.get("tested_subject_sha") != frozen["tested_subject_sha"]
         or retrieval.get("policy_evaluator_sha") != frozen["policy_evaluator_sha"]
         or retrieval.get("protected_runner_sha") != frozen["protected_runner_sha"]
         or retrieval.get("prepared_arm_gate_count") != len(scenarios) * 3
-        or retrieval.get("prepared_cases_sha256")
-        != _sha256(retrieval.get("prepared_cases"))
+        or retrieval.get("prepared_cases_sha256") != _sha256(retrieval.get("prepared_cases"))
     ):
         raise ValueError("v5 protected execution evidence is not eligible")
     checkpoint, delegate = open_cache_only_protected_checkpoint(
@@ -681,12 +731,8 @@ def _run_protected(
                     **unsigned,
                     "run_id": run_id,
                     "exact_code_sha": exact_main,
-                    "protected_authorization_sha256": source[
-                        "protected_authorization_sha256"
-                    ],
-                    "embedding_checkpoint_sha256": embedding_receipt[
-                        "artifact_sha256"
-                    ],
+                    "protected_authorization_sha256": source["protected_authorization_sha256"],
+                    "embedding_checkpoint_sha256": embedding_receipt["artifact_sha256"],
                     "retrieval_result_sha256": retrieval["artifact_sha256"],
                     "trials": trials,
                     "trials_sha256": _sha256(trials),
@@ -772,14 +818,11 @@ def _verify_source_chain(args: argparse.Namespace, *, signer: KmsHmacTokenizer) 
     verify_rehearsal_result(rehearsal_result=rehearsal, signer=signer)
     verify_protected_learning_authorization(protected_authorization=protected, signer=signer)
     if (
-        rehearsal.get("source_authorization_sha256")
-        != verified_authorization["artifact_sha256"]
-        or protected.get("source_authorization_sha256")
-        != verified_authorization["artifact_sha256"]
+        rehearsal.get("source_authorization_sha256") != verified_authorization["artifact_sha256"]
+        or protected.get("source_authorization_sha256") != verified_authorization["artifact_sha256"]
         or protected.get("source_rehearsal_sha256") != rehearsal.get("artifact_sha256")
         or protected.get("tested_subject_sha") != verified_authorization["tested_subject_sha"]
-        or protected.get("policy_evaluator_sha")
-        != verified_authorization["policy_evaluator_sha"]
+        or protected.get("policy_evaluator_sha") != verified_authorization["policy_evaluator_sha"]
     ):
         raise ValueError("v5 protected source artifact chain differs")
     return {
@@ -898,10 +941,7 @@ def _verify_protected_database_binding(
 
 def _archive_terminal(*, run_id: str, value: dict[str, Any]) -> dict[str, Any]:
     return _archive_value(
-        key=(
-            f"learning/v5/protected-studies/{run_id}/terminal/"
-            f"{value['artifact_sha256']}.json"
-        ),
+        key=(f"learning/v5/protected-studies/{run_id}/terminal/{value['artifact_sha256']}.json"),
         value=value,
     )
 
@@ -1082,10 +1122,7 @@ def _write(path: pathlib.Path, value: dict[str, Any]) -> None:
 def _write_signed(path: pathlib.Path, value: dict[str, Any], *, stage: str) -> None:
     _write(path, value)
     _archive_value(
-        key=(
-            f"learning/v5/protected-studies/preparation/{stage}/"
-            f"{value['artifact_sha256']}.json"
-        ),
+        key=(f"learning/v5/protected-studies/preparation/{stage}/{value['artifact_sha256']}.json"),
         value=value,
     )
 
