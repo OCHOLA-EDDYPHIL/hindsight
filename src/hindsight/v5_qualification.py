@@ -853,11 +853,12 @@ def require_fresh_development_database(
     database_url: str,
     *,
     connect_fn: Callable[..., Any] = connect,
+    database_name_pattern: re.Pattern[str] = DEVELOPMENT_DATABASE_RE,
 ) -> dict[str, str]:
     """Require a fully migrated, empty, name-fenced disposable database."""
 
     database_name = _database_name(database_url)
-    if not DEVELOPMENT_DATABASE_RE.fullmatch(database_name):
+    if not database_name_pattern.fullmatch(database_name):
         raise ValueError("v5 qualification requires a hindsight_v5_development_* database")
     expected_migrations = sorted(path.name for path in MIGRATIONS_DIR.glob("[0-9]*.sql"))
     if not expected_migrations:
@@ -1010,12 +1011,13 @@ def require_restricted_runtime_database(
     runtime_database_url: str,
     *,
     connect_fn: Callable[..., Any] = connect,
+    database_name_pattern: re.Pattern[str] = DEVELOPMENT_DATABASE_RE,
 ) -> dict[str, str]:
     """Require a non-bypass runtime identity on the same disposable database."""
 
     deploy_name = _database_name(deploy_database_url)
     runtime_name = _database_name(runtime_database_url)
-    if deploy_name != runtime_name or not DEVELOPMENT_DATABASE_RE.fullmatch(runtime_name):
+    if deploy_name != runtime_name or not database_name_pattern.fullmatch(runtime_name):
         raise ValueError(
             "v5 qualification deploy and runtime URLs must target the same "
             "hindsight_v5_development_* database"
@@ -1648,9 +1650,14 @@ def _load_database_case(
     store: QualificationStore,
     provider: CheckpointedEmbeddingProvider,
     contract_sha256: str,
+    namespace_prefix: str = "v5-development",
+    writer: str = "v5.development.qualification",
+    source_prefix: str = "v5-development",
+    justification: str = "Store one governed development retrieval candidate",
+    content_schema: str = "v5_development_candidate.v2",
 ) -> dict[str, Any]:
     scenario_id = str(scenario["scenario_id"])
-    namespace = _scenario_namespace(scenario_id)
+    namespace = _scenario_namespace(scenario_id, prefix=namespace_prefix)
     memories = _candidate_memories(scenario)
     vectors: dict[str, list[float]] = {}
     database_ids: dict[str, str] = {}
@@ -1677,12 +1684,12 @@ def _load_database_case(
             namespace=namespace,
             content=content,
             provenance=Provenance(
-                writer="v5.development.qualification",
-                source_ref=f"v5-development:{scenario_id}:{candidate_id}",
-                justification="Store one governed development retrieval candidate",
+                writer=writer,
+                source_ref=f"{source_prefix}:{scenario_id}:{candidate_id}",
+                justification=justification,
             ),
             metadata=candidate_database_metadata(memory),
-            content_schema="v5_development_candidate.v2",
+            content_schema=content_schema,
             structured_payload=candidate_database_payload(
                 scenario_id=scenario_id,
                 candidate_id=candidate_id,
@@ -1702,8 +1709,8 @@ def _load_database_case(
             invalidated = store.invalidate(
                 memory_id=database_id,
                 memory_kind="semantic",
-                actor="v5.development.qualification",
-                reason="Frozen development candidate invalidation state",
+                actor=writer,
+                reason=f"Frozen {namespace_prefix} candidate invalidation state",
             )
             if invalidated is None:
                 raise RuntimeError("v5 invalidated candidate did not remain audit-visible")
@@ -1741,6 +1748,9 @@ def _retrieve_database_case(
     loaded_case: Mapping[str, Any],
     store: QualificationStore,
     provider: CheckpointedEmbeddingProvider,
+    decision_prefix: str = "v5-development-retrieval",
+    reader: str = "v5.development.qualification",
+    purpose: str = "Qualify strict rank-one development retrieval",
 ) -> dict[str, Any]:
     scenario = loaded_case["scenario"]
     scenario_id = str(loaded_case["scenario_id"])
@@ -1777,15 +1787,15 @@ def _retrieve_database_case(
         str(memory["memory_id"]) for memory in memories if not _candidate_is_positive(memory)
     }
     query = render_retrieval_query(scenario)
-    decision_id = f"v5-development-retrieval:{scenario_id}"
+    decision_id = f"{decision_prefix}:{scenario_id}"
     with provider.query_scope(scenario_id=scenario_id, query=query):
         query_vector = provider.embed_query(query)
         retrieval = store.retrieve_semantic(
             namespace=namespace,
             query=query,
             decision_id=decision_id,
-            reader="v5.development.qualification",
-            purpose="Qualify strict rank-one development retrieval",
+            reader=reader,
+            purpose=purpose,
             policy="semantic_strict",
             limit=4,
             positive_guidance_only=True,
@@ -2124,10 +2134,12 @@ def _cosine_distance(left: Sequence[float], right: Sequence[float]) -> float:
     return distance
 
 
-def _scenario_namespace(scenario_id: str) -> str:
+def _scenario_namespace(scenario_id: str, *, prefix: str = "v5-development") -> str:
     if not OPAQUE_SCENARIO_RE.fullmatch(scenario_id):
         raise ValueError("v5 qualification namespace requires an opaque scenario identity")
-    return f"v5-development:{scenario_id}"
+    if not re.fullmatch(r"[a-z0-9-]+", prefix):
+        raise ValueError("v5 qualification namespace prefix is invalid")
+    return f"{prefix}:{scenario_id}"
 
 
 def _verify_retrieval_trace(
