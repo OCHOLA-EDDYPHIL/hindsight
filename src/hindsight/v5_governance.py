@@ -873,6 +873,10 @@ def _append_alternate_tenant_evidence(
     db_url: str,
     provider: CheckpointedEmbeddingProvider,
     store_factory: Callable[..., QualificationStore],
+    retrieval_decision_prefix: str = "v5-development-retrieval",
+    isolation_decision_prefix: str = "v5-development-isolation",
+    isolation_reader: str = "v5.development.isolation",
+    isolation_purpose: str = "Verify alternate-tenant invisibility",
 ) -> None:
     with tenant_scope(ACCEPTANCE_TENANT_ID):
         with store_factory(url=db_url, embedding_provider=provider) as store:
@@ -881,14 +885,14 @@ def _append_alternate_tenant_evidence(
                 scenario = case["scenario"]
                 query = render_retrieval_query(scenario)
                 namespace = str(case["namespace"])
-                decision_id = f"v5-development-isolation:{scenario_id}"
+                decision_id = f"{isolation_decision_prefix}:{scenario_id}"
                 with provider.query_scope(scenario_id=scenario_id, query=query):
                     alternate = store.retrieve_semantic(
                         namespace=namespace,
                         query=query,
                         decision_id=decision_id,
-                        reader="v5.development.isolation",
-                        purpose="Verify alternate-tenant invisibility",
+                        reader=isolation_reader,
+                        purpose=isolation_purpose,
                         policy="semantic_strict",
                         limit=4,
                         positive_guidance_only=True,
@@ -908,7 +912,9 @@ def _append_alternate_tenant_evidence(
                     for database_id in case["database_ids"]
                 )
                 learning_reads_visible = bool(
-                    store.reads_for_decision(decision_id=f"v5-development-retrieval:{scenario_id}")
+                    store.reads_for_decision(
+                        decision_id=f"{retrieval_decision_prefix}:{scenario_id}"
+                    )
                 )
                 result.update(
                     {
