@@ -1,9 +1,6 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
 LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
-BENCHMARK_MAX_DISTANCE ?= 0.35
-DIAGNOSTIC_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight_diagnostic_local?sslmode=disable
-
-.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local benchmark-smoke benchmark-pilot rank-diagnostic-synthetic product-api-local changefeed-apply changefeed-pause changefeed-status
+.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local product-api-local changefeed-apply changefeed-pause changefeed-status
 
 dev-up:
 	docker compose up -d --wait
@@ -44,17 +41,6 @@ poison-rewind-demo-local:
 
 poison-rewind-trace-local:
 	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_OTEL_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT="$(LOCAL_OTEL_ENDPOINT)" OTEL_EXPORTER_OTLP_INSECURE=true uv run python scripts/run_poison_rewind_demo.py all
-
-benchmark-smoke:
-	uv run python scripts/run_learning_benchmark.py ci-smoke
-
-benchmark-pilot:
-	HINDSIGHT_BENCHMARK_CODE_SHA="$$(git rev-parse HEAD)" uv run python scripts/run_learning_benchmark.py pilot --max-distance "$(BENCHMARK_MAX_DISTANCE)"
-
-rank-diagnostic-synthetic:
-	docker compose exec -T crdb cockroach sql --insecure -e "CREATE DATABASE IF NOT EXISTS hindsight_diagnostic_local"
-	DATABASE_URL="$(DIAGNOSTIC_DATABASE_URL)" uv run python scripts/migrate.py
-	DATABASE_URL="$(DIAGNOSTIC_DATABASE_URL)" EMBEDDING_PROVIDER=deterministic uv run python scripts/run_rank_diagnostics.py synthetic --code-sha "$$(git rev-parse HEAD)" --max-distance "$(BENCHMARK_MAX_DISTANCE)" --require-target-rank-one
 
 product-api-local:
 	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_DATABASE_URL_PARAM="" HINDSIGHT_GEMINI_API_KEY_PARAM="" HINDSIGHT_GEMINI_API_KEYS_PARAM="" HINDSIGHT_INLINE_WORKER=1 HINDSIGHT_SECURE_COOKIES=0 uv run uvicorn hindsight.api:app --reload --host 127.0.0.1 --port 8766

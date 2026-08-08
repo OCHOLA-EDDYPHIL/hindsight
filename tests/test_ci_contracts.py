@@ -12,9 +12,6 @@ RUNNER_ROUTED_WORKFLOWS = (
     "ci.yml",
     "deploy-demo.yml",
     "live-acceptance.yml",
-    "learning-qualification.yml",
-    "learning-evidence.yml",
-    "v4-corpus-construction.yml",
 )
 
 
@@ -54,11 +51,6 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
     assert set(migration_runner.PARALLEL_CASES).union(
         migration_runner.ROLE_SENSITIVE_CASES
     ) == {
-        "benchmark_upgrade",
-        "benchmark_fresh",
-        "benchmark_preparation",
-        "benchmark_finalizer",
-        "benchmark_retry",
         "agent_runtime_roles",
         "populated_roles",
         "dispatch_upgrade",
@@ -171,25 +163,25 @@ def test_main_schema_builds_share_one_server_and_isolate_required_databases():
     assert 'wait "$populated_pid"' in schema_step["run"]
     assert "main_extended" not in schema_step["run"]
     assert "scripts/schema_manifest.py compare" in schema_step["run"]
-    smoke_step = next(
-        step
-        for step in main_job["steps"]
-        if step.get("name") == "Run deterministic benchmark smoke"
-    )
-    assert "scripts/migrate.py" not in smoke_step["run"]
-    assert 'DATABASE_URL="$FRESH_DATABASE_URL"' in smoke_step["run"]
+    assert all("benchmark" not in step.get("name", "").lower() for step in main_job["steps"])
+    assert all("run_learning_benchmark.py" not in step.get("run", "") for step in main_job["steps"])
 
 
-def test_expensive_qualification_is_manual_only():
+def test_frozen_research_workflows_and_normal_ci_commands_are_absent():
     ci = (ROOT / ".github/workflows/ci.yml").read_text()
     migrations = (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
-    learning = (ROOT / ".github/workflows/learning-qualification.yml").read_text()
 
     assert "run_migration_compatibility.py" not in ci
     assert "run_rank_diagnostics.py" not in ci
+    assert "run_learning_benchmark.py" not in ci
     assert "workflow_call:" not in migrations
     assert "workflow_dispatch:" in migrations
-    assert "workflow_dispatch:" in learning
+    for name in (
+        "learning-qualification.yml",
+        "learning-evidence.yml",
+        "v4-corpus-construction.yml",
+    ):
+        assert not (ROOT / ".github/workflows" / name).exists()
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):

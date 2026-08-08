@@ -34,7 +34,7 @@ def test_runner_executes_every_case_and_reports_any_failure(monkeypatch):
 
     def fake_run(case: str, **_kwargs):
         executed.append(case)
-        return case, int(case == "benchmark_retry"), f"{case}\n"
+        return case, int(case == "qualification_authority"), f"{case}\n"
 
     monkeypatch.setattr(runner, "run_case", fake_run)
 

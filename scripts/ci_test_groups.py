@@ -14,25 +14,6 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 
 MIGRATION_CASES = {
-    "benchmark_upgrade": (
-        "tests/test_benchmark_protocol_migrations.py::"
-        "test_upgrade_from_0012_backfills_the_first_confirmation_after_schema_commit"
-    ),
-    "benchmark_fresh": (
-        "tests/test_benchmark_protocol_migrations.py::"
-        "test_fresh_protocol_enforces_binding_study_and_preparation_invariants"
-    ),
-    "benchmark_preparation": (
-        "tests/test_benchmark_protocol_migrations.py::"
-        "test_preparation_attempts_commit_and_exhaust_without_attempt_four"
-    ),
-    "benchmark_finalizer": (
-        "tests/test_benchmark_protocol_migrations.py::"
-        "test_interrupted_benchmark_finalizer_closes_children_before_parents"
-    ),
-    "benchmark_retry": (
-        "tests/test_learning_benchmark_setup.py::test_preparation_retry_reuses_seeded_context"
-    ),
     "agent_runtime_roles": (
         "tests/test_agent.py::"
         "test_preinitialized_agent_storage_supports_start_and_resume_without_create_privilege"
@@ -69,14 +50,8 @@ DATABASE_GROUPS = {
     ),
     "main_extended": (
         "tests/test_embedding_rotation.py",
-        "tests/test_migrations_and_roles.py",
-        "tests/test_v5_governance_database.py",
-    ),
-    "research": (
-        "tests/test_benchmark_protocol_migrations.py",
-        "tests/test_learning_benchmark_setup.py",
         "tests/test_learning_evidence_foundation.py",
-        "tests/test_learning_orchestration.py",
+        "tests/test_migrations_and_roles.py",
     ),
 }
 

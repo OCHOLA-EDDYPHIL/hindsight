@@ -25,12 +25,8 @@ from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, PUBLIC_DEMO_TENANT_ID
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL_DATABASE_HOSTS = {"localhost", "127.0.0.1", "::1"}
-BENCHMARK_MAX_DISTANCE = 0.35
+SEMANTIC_MAX_DISTANCE = 0.35
 ACCEPTANCE_ARTIFACT_DIR_ENV = "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR"
-PILOT_EMBEDDING_SELECTOR = (
-    "tests/test_embeddings.py::"
-    "test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons"
-)
 PROVIDER_SANITY_SELECTORS = (
     "tests/test_embeddings.py::test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase",
     "tests/test_reasoning.py::test_live_gemini_reasoning_provider",
@@ -139,18 +135,6 @@ def main() -> None:
     hosted_plan.add_argument("--candidate-ui-url", required=True)
     hosted_plan.add_argument("--github-output", type=pathlib.Path, required=True)
 
-    local_pilot = subparsers.add_parser("learning-pilot")
-    _add_local_benchmark_arguments(local_pilot)
-
-    learning_full = subparsers.add_parser("learning-full")
-    _add_local_benchmark_arguments(learning_full)
-    learning_full.add_argument(
-        "--database-scope",
-        choices=("local", "hosted"),
-        required=True,
-    )
-    learning_full.add_argument("--summary-path", type=pathlib.Path)
-
     args = parser.parse_args()
     if args.command == "local-product-full":
         _run_local_product_full(args)
@@ -158,32 +142,6 @@ def main() -> None:
         _run_hosted_product(args)
     elif args.command == "hosted-plan":
         _plan_hosted_acceptance(args)
-    elif args.command == "learning-pilot":
-        _preflight_local_learning(args)
-        _verify_learning_providers()
-        _run_local_benchmark(args, include_confirmation=False)
-    else:
-        if args.database_scope == "local":
-            _preflight_local_learning(args)
-            _verify_learning_providers()
-            _run_local_benchmark(args, include_confirmation=True)
-        else:
-            _verify_learning_providers()
-            _run_hosted_benchmark(args)
-
-
-def _add_local_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
-    parser.add_argument("--max-distance", type=float, default=BENCHMARK_MAX_DISTANCE)
-    parser.add_argument("--report-dir", type=pathlib.Path, required=True)
-    parser.add_argument("--code-sha")
-
-
-def _preflight_local_learning(args: argparse.Namespace) -> None:
-    _require_fixed_max_distance(args.max_distance)
-    _validate_local_url(_required_database_url(args.database_url))
-    _require_local_report_path(args.report_dir)
-    _require_local_code_sha(args.code_sha)
 
 
 def _verify_product_providers() -> None:
@@ -203,20 +161,6 @@ def _verify_product_providers() -> None:
         phase="providers",
         artifact_dir=artifact_dir,
     )
-
-
-def _verify_learning_providers() -> None:
-    _require_gemini_credentials()
-    env = dict(os.environ)
-    env.update(
-        {
-            "RUN_LIVE_GEMINI_EMBEDDINGS": "1",
-            "RUN_LIVE_GEMINI_REASONING": "1",
-        }
-    )
-    _add_single_gemini_key(env)
-    for _ in range(2):
-        _run([sys.executable, "-m", "pytest", "-q", PILOT_EMBEDDING_SELECTOR], env=env)
 
 
 def _verify_semantic(args: argparse.Namespace) -> None:
@@ -307,7 +251,7 @@ def _initialize_product_database(
                 sys.executable,
                 "scripts/reembed_memories.py",
                 "--max-distance",
-                str(BENCHMARK_MAX_DISTANCE),
+                str(SEMANTIC_MAX_DISTANCE),
             ],
             env=env,
         )
@@ -622,146 +566,6 @@ def _read_text_url(url: str) -> str:
         return response.read().decode("utf-8")
 
 
-def _run_local_benchmark(args: argparse.Namespace, *, include_confirmation: bool) -> None:
-    database_url = _required_database_url(args.database_url)
-    _require_fixed_max_distance(args.max_distance)
-    _validate_local_url(database_url)
-    _require_gemini_credentials()
-    code_sha = _require_local_code_sha(args.code_sha)
-    _require_local_report_path(args.report_dir)
-    _create_local_database(database_url)
-    report_dir = _new_report_dir(args.report_dir)
-    env = _live_environment(database_url=database_url, code_sha=code_sha)
-
-    _run([sys.executable, "scripts/migrate.py"], env=env)
-    _run([sys.executable, "scripts/initialize_agent_storage.py"], env=env)
-    _run(
-        [
-            sys.executable,
-            "scripts/reembed_memories.py",
-            "--max-distance",
-            str(BENCHMARK_MAX_DISTANCE),
-        ],
-        env=env,
-    )
-    if include_confirmation:
-        _run_benchmark_sequence(
-            database_url=database_url,
-            env=env,
-            report_dir=report_dir,
-        )
-    else:
-        _run_pilot_and_preregister(
-            database_url=database_url,
-            env=env,
-            report_dir=report_dir,
-        )
-
-
-def _run_hosted_benchmark(args: argparse.Namespace) -> None:
-    database_url = _required_database_url(args.database_url)
-    _require_hosted_database(database_url)
-    _require_fixed_max_distance(args.max_distance)
-    _require_gemini_credentials()
-    report_dir = _new_report_dir(args.report_dir)
-    env = _live_environment(
-        database_url=database_url,
-        code_sha=_required_code_sha(),
-    )
-    confirmation = _run_benchmark_sequence(
-        database_url=database_url,
-        env=env,
-        report_dir=report_dir,
-    )
-    if args.summary_path is not None:
-        _append_confirmation_summary(args.summary_path, confirmation)
-
-
-def _run_benchmark_sequence(
-    *, database_url: str, env: dict[str, str], report_dir: pathlib.Path
-) -> dict[str, Any]:
-    pilot, _preregistration = _run_pilot_and_preregister(
-        database_url=database_url,
-        env=env,
-        report_dir=report_dir,
-    )
-    pilot_id = _experiment_id(pilot)
-    confirmation_path = report_dir / "confirmation.json"
-    _run(
-        [
-            sys.executable,
-            "scripts/run_learning_benchmark.py",
-            "confirmation",
-            "--pilot-experiment-id",
-            pilot_id,
-        ],
-        env=env,
-        stdout_path=confirmation_path,
-    )
-    confirmation = _load_report(confirmation_path)
-    confirmation_id = _experiment_id(confirmation)
-    _validate_experiment(
-        database_url=database_url,
-        experiment_id=confirmation_id,
-        experiment_kind="confirmation",
-        expected_preparations=12,
-        expected_trials=72,
-    )
-    _require_confirmation_gates(confirmation)
-    return confirmation
-
-
-def _run_pilot_and_preregister(
-    *, database_url: str, env: dict[str, str], report_dir: pathlib.Path
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    pilot = _run_pilot(database_url=database_url, env=env, report_dir=report_dir)
-    pilot_id = _experiment_id(pilot)
-    _validate_experiment(
-        database_url=database_url,
-        experiment_id=pilot_id,
-        experiment_kind="pilot",
-        expected_preparations=6,
-        expected_trials=36,
-    )
-    preregistration_path = report_dir / "preregistration.json"
-    _run(
-        [
-            sys.executable,
-            "scripts/run_learning_benchmark.py",
-            "preregister",
-            "--pilot-experiment-id",
-            pilot_id,
-        ],
-        env=env,
-        stdout_path=preregistration_path,
-    )
-    preregistration = _load_report(preregistration_path)
-    _require_preregistration(preregistration, pilot_id=pilot_id)
-    return pilot, preregistration
-
-
-def _run_pilot(
-    *, database_url: str, env: dict[str, str], report_dir: pathlib.Path
-) -> dict[str, Any]:
-    pilot_path = report_dir / "pilot.json"
-    _run(
-        [
-            sys.executable,
-            "scripts/run_learning_benchmark.py",
-            "pilot",
-            "--repetitions",
-            "2",
-            "--max-distance",
-            str(BENCHMARK_MAX_DISTANCE),
-        ],
-        env=env,
-        stdout_path=pilot_path,
-    )
-    pilot = _load_report(pilot_path)
-    _require_report_identity(pilot, experiment_kind="pilot")
-    return pilot
-
-
 def _run(
     command: list[str],
     *,
@@ -818,25 +622,6 @@ def _require_hosted_database(database_url: str) -> None:
     parts = urlsplit(database_url)
     if parts.hostname in LOCAL_DATABASE_HOSTS:
         raise ValueError("hosted acceptance refuses loopback databases")
-
-
-def _require_fixed_max_distance(value: float) -> None:
-    if value != BENCHMARK_MAX_DISTANCE:
-        raise ValueError("live acceptance fixes max distance at 0.35")
-
-
-def _new_report_dir(path: pathlib.Path) -> pathlib.Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.mkdir()
-    return path
-
-
-def _require_local_report_path(path: pathlib.Path) -> None:
-    resolved = path.resolve()
-    if resolved == ROOT or ROOT in resolved.parents:
-        raise ValueError("local acceptance reports must be outside the repository")
-    if resolved.exists():
-        raise ValueError("local acceptance requires a new report directory")
 
 
 def _require_gemini_credentials() -> None:
@@ -907,163 +692,6 @@ def _add_single_gemini_key(env: dict[str, str]) -> None:
     if not credentials:
         raise ValueError("Gemini credential document contains no usable key")
     env["GEMINI_API_KEY"] = credentials[0].api_key
-
-
-def _live_environment(*, database_url: str, code_sha: str) -> dict[str, str]:
-    env = dict(os.environ)
-    env.update(
-        {
-            "DATABASE_URL": database_url,
-            "EMBEDDING_PROVIDER": "gemini",
-            "LLM_PROVIDER": "gemini",
-            "HINDSIGHT_BENCHMARK_CODE_SHA": code_sha,
-        }
-    )
-    return env
-
-
-def _code_sha() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
-
-
-def _require_local_code_sha(value: str | None) -> str:
-    head = _code_sha()
-    resolved = (value or head).strip()
-    if resolved != head:
-        raise ValueError("local benchmark code SHA must equal HEAD")
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    if status.stdout.strip():
-        raise ValueError("local benchmark requires a clean exact-HEAD worktree")
-    return resolved
-
-
-def _required_code_sha() -> str:
-    value = (os.environ.get("HINDSIGHT_BENCHMARK_CODE_SHA") or "").strip()
-    if not value:
-        raise ValueError("HINDSIGHT_BENCHMARK_CODE_SHA is required")
-    return value
-
-
-def _load_report(path: pathlib.Path) -> dict[str, Any]:
-    if not path.is_file() or path.stat().st_size == 0:
-        raise RuntimeError(f"acceptance report is empty: {path.name}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or not payload:
-        raise RuntimeError(f"acceptance report is invalid: {path.name}")
-    return payload
-
-
-def _experiment_id(report: dict[str, Any]) -> str:
-    value = str(report.get("experiment_id") or "").strip()
-    if not value:
-        raise RuntimeError("benchmark report has no experiment_id")
-    return value
-
-
-def _require_report_identity(report: dict[str, Any], *, experiment_kind: str) -> None:
-    if report.get("experiment_kind") != experiment_kind or report.get("status") != "completed":
-        raise RuntimeError(f"{experiment_kind} report is not completed")
-    for field in ("raw_trace_digest", "claim_evidence_digest"):
-        if not str(report.get(field) or "").strip():
-            raise RuntimeError(f"{experiment_kind} report has no {field}")
-
-
-def _validate_experiment(
-    *,
-    database_url: str,
-    experiment_id: str,
-    experiment_kind: str,
-    expected_preparations: int,
-    expected_trials: int,
-) -> None:
-    with psycopg.connect(database_url) as conn:
-        experiment = conn.execute(
-            "SELECT experiment_kind, status FROM benchmark_experiments WHERE id = %s",
-            (experiment_id,),
-        ).fetchone()
-        preparations = conn.execute(
-            """
-                SELECT count(*), count(*) FILTER (WHERE status = 'completed')
-                FROM benchmark_variant_preparations WHERE experiment_id = %s
-            """,
-            (experiment_id,),
-        ).fetchone()
-        trials = conn.execute(
-            """
-                SELECT count(*),
-                    count(*) FILTER (WHERE status = 'completed'),
-                    count(*) FILTER (WHERE recovered IS TRUE),
-                    count(*) FILTER (WHERE failure_code IS NOT NULL),
-                    count(*) FILTER (
-                        WHERE status IN ('invalid', 'infrastructure_failed')
-                    )
-                FROM benchmark_trials WHERE experiment_id = %s
-            """,
-            (experiment_id,),
-        ).fetchone()
-    expected = (expected_trials, expected_trials, expected_trials, 0, 0)
-    if (
-        experiment != (experiment_kind, "completed")
-        or preparations != (expected_preparations, expected_preparations)
-        or trials != expected
-    ):
-        raise RuntimeError(f"{experiment_kind} did not complete every required trial")
-
-
-def _require_preregistration(report: dict[str, Any], *, pilot_id: str) -> None:
-    if (
-        str(report.get("pilot_experiment_id") or "") != pilot_id
-        or not str(report.get("preregistration_sha256") or "").strip()
-        or len(report.get("eligible_held_out_variant_ids") or []) != 12
-        or len(report.get("selected_held_out_variant_ids") or []) != 12
-        or report.get("repetitions_per_variant") != 2
-    ):
-        raise RuntimeError("confirmation preregistration is incomplete")
-
-
-def _require_confirmation_gates(report: dict[str, Any]) -> None:
-    _require_report_identity(report, experiment_kind="confirmation")
-    gates = report.get("gates")
-    if (
-        report.get("claim_authorized") is not True
-        or not isinstance(gates, dict)
-        or not gates
-        or not all(value is True for value in gates.values())
-    ):
-        raise RuntimeError("confirmation did not authorize the semantic-learning claim")
-
-
-def _append_confirmation_summary(path: pathlib.Path, report: dict[str, Any]) -> None:
-    gates = dict(report["gates"])
-    lines = [
-        "### Preregistered live benchmark",
-        "",
-        f"- Experiment: `{report.get('experiment_id')}`",
-        f"- Trace digest: `{report.get('raw_trace_digest')}`",
-        f"- Claim authorized: `{report.get('claim_authorized') is True}`",
-        "",
-        "| Gate | Result |",
-        "| --- | --- |",
-        *(
-            f"| {name} | {'pass' if value is True else 'fail'} |"
-            for name, value in sorted(gates.items())
-        ),
-    ]
-    with path.open("a", encoding="utf-8") as summary:
-        summary.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
