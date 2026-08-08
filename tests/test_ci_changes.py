@@ -18,7 +18,7 @@ ci_test_groups = importlib.util.module_from_spec(GROUP_SPEC)
 GROUP_SPEC.loader.exec_module(ci_test_groups)
 
 
-def test_main_adds_product_schema_lambda_and_benchmark_qualification():
+def test_main_adds_product_schema_lambda_and_main_qualification():
     assert classify_paths(["docs/architecture.md"], event_name="push") == {
         "database": True,
         "main_qualification": True,
@@ -61,18 +61,12 @@ def test_backend_and_fresh_migration_paths_select_product_and_packaging_only():
         }
 
 
-def test_research_inputs_never_enter_normal_ci_qualification():
-    for path in (
-        "src/hindsight/benchmark.py",
-        "src/hindsight/v5_corpus.py",
-        "src/hindsight/v5_qualification.py",
-        "scripts/run_v5_study.py",
-        "scripts/run_rank_diagnostics.py",
-        "fixtures/v4/corpus.json",
-        "tests/test_learning_orchestration.py",
-    ):
-        selected = classify_paths([path], event_name="pull_request")
-        assert not any(selected.values()), path
+def test_all_owned_database_tests_select_the_database_job():
+    selected = classify_paths(
+        ["tests/test_learning_evidence_foundation.py"], event_name="pull_request"
+    )
+
+    assert selected["database"] is True
 
 
 def test_ci_control_changes_do_not_force_expensive_jobs():

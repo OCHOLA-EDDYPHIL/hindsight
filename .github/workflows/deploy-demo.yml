@@ -104,7 +104,6 @@ env:
   TF_VAR_gemini_model: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
   TF_VAR_embedding_provider: ${{ inputs.validation_mode && 'gemini' || vars.HINDSIGHT_EMBEDDING_PROVIDER || 'gemini' }}
   TF_VAR_gemini_embedding_model: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
-  TF_VAR_gemini_embedding_representation: ${{ vars.HINDSIGHT_GEMINI_REPRESENTATION || 'raw_control' }}
   TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
   TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
   TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
@@ -420,7 +419,6 @@ jobs:
           export LLM_PROVIDER="$TF_VAR_llm_provider"
           export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"
           export GEMINI_EMBEDDING_MODEL="$TF_VAR_gemini_embedding_model"
-          export HINDSIGHT_GEMINI_REPRESENTATION="$TF_VAR_gemini_embedding_representation"
           uv run python scripts/reembed_memories.py --max-distance "$EMBEDDING_MAX_DISTANCE"
           uv run python scripts/configure_changefeed.py apply
       - name: Pause changefeed for inactive runtime

@@ -23,12 +23,6 @@ EMBEDDING_DIMENSIONS = 1024
 BEDROCK_TITAN_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 LIVE_BEDROCK_EMBEDDINGS_FLAG = "RUN_LIVE_BEDROCK_EMBEDDINGS"
 DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-2"
-GEMINI_REPRESENTATIONS = (
-    "raw_control",
-    "generic_title",
-    "applicability_instruction",
-)
-
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -152,15 +146,9 @@ class GeminiEmbeddingProvider:
         credential_pool: GeminiCredentialPool,
         model_name: str = DEFAULT_GEMINI_EMBEDDING_MODEL,
         dimensions: int = EMBEDDING_DIMENSIONS,
-        representation: str = "raw_control",
     ):
-        if representation not in GEMINI_REPRESENTATIONS:
-            raise ValueError("unsupported Gemini retrieval representation")
         self.model_name = model_name
         self.dimensions = dimensions
-        self.representation = representation
-        if representation != "raw_control":
-            self.encoder_revision = f"gemini-retrieval-task-v2-{representation}"
         self._credential_pool = credential_pool
 
     def _embed(self, text: str, *, task_type: str, title: str | None = None) -> list[float]:
@@ -197,17 +185,14 @@ class GeminiEmbeddingProvider:
         return self.embed_document(text)
 
     def embed_document(self, text: str) -> list[float]:
-        content, title = _gemini_representation(
-            text, representation=self.representation, query=False
-        )
+        content = _normalize_gemini_text(text)
         return self._embed(
             content,
             task_type="RETRIEVAL_DOCUMENT",
-            title=title,
         )
 
     def embed_query(self, text: str) -> list[float]:
-        content, _ = _gemini_representation(text, representation=self.representation, query=True)
+        content = _normalize_gemini_text(text)
         return self._embed(
             content,
             task_type="RETRIEVAL_QUERY",
@@ -285,7 +270,6 @@ def embedding_provider_from_env(
             model_name=(
                 env.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
             ).strip(),
-            representation=(env.get("HINDSIGHT_GEMINI_REPRESENTATION") or "raw_control").strip(),
         )
     if provider == "bedrock":
         return BedrockTitanEmbeddingProvider(
@@ -295,28 +279,9 @@ def embedding_provider_from_env(
     raise ValueError(f"Unsupported EMBEDDING_PROVIDER: {provider}")
 
 
-def _gemini_representation(
-    text: str, *, representation: str, query: bool
-) -> tuple[str, str | None]:
-    """Format raw text without accepting candidate metadata or identity."""
+def _normalize_gemini_text(text: str) -> str:
+    """Normalize raw retrieval text without adding candidate metadata or identity."""
 
-    normalized = unicodedata.normalize(
+    return unicodedata.normalize(
         "NFC", text.replace("\r\n", "\n").replace("\r", "\n")
     ).strip()
-    if representation == "raw_control":
-        return normalized, None
-    if representation == "generic_title":
-        return normalized, None if query else "Hindsight operational memory"
-    if representation == "applicability_instruction":
-        if query:
-            return (
-                "Retrieve the operational memory most applicable to this incident.\n"
-                f"Incident:\n{normalized}",
-                None,
-            )
-        return (
-            "Operational memory that may contain a relevant situation, check, or action.\n"
-            f"Memory:\n{normalized}",
-            "Hindsight operational memory",
-        )
-    raise ValueError("unsupported Gemini retrieval representation")

@@ -456,14 +456,6 @@ def test_memory_store_has_no_direct_rewind_mutation_surface():
     assert not hasattr(MemoryStore, "preview_rewind")
 
 
-def test_power_analysis_and_ci_smoke_cannot_authorize_public_claims():
-    from hindsight.benchmark import power_analysis
-
-    plan = power_analysis(paired_differences=[0.5, 1.0, 1.5, 2.0], power=0.90)
-    assert plan.repetitions_per_variant >= 2
-    assert plan.alpha_per_comparison == pytest.approx(0.025)
-
-
 @requires_db
 def test_memory_payload_and_provenance_fields_are_database_immutable():
     from psycopg import errors

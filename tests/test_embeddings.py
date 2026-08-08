@@ -1,9 +1,7 @@
 """Embedding provider tests."""
 
-import json
 import math
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -140,66 +138,6 @@ def test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase():
 
     assert relevant_distance < distractor_distance
     assert relevant_distance < 0.35
-
-
-@pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_GEMINI_EMBEDDINGS") != "1",
-    reason="live Gemini embedding invocation is opt-in",
-)
-def test_live_gemini_embedding_provider_ranks_frozen_pilot_reference_lessons():
-    from hindsight.embeddings import (
-        DEFAULT_GEMINI_EMBEDDING_MODEL,
-        GeminiEmbeddingProvider,
-    )
-    from hindsight.gemini import gemini_pool_from_env
-
-    configured_model = (
-        os.environ.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
-    )
-    provider = GeminiEmbeddingProvider(
-        credential_pool=gemini_pool_from_env(),
-        model_name=configured_model,
-    )
-    corpus_path = (
-        Path(__file__).resolve().parents[1] / "fixtures" / "benchmark_variants.json"
-    )
-    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
-    pilot = [row for row in corpus["variants"] if row["split"] == "pilot"]
-
-    assert len(pilot) == 6
-    for row in pilot:
-        query = provider.embed_query(row["recurrence_query"])
-        candidates = [
-            ("reference_lesson", "target", row["reference_lesson"]),
-            *[
-                (context["context_id"], context["role"], context["content"])
-                for context in row["context_memories"]
-            ],
-        ]
-        ranked = sorted(
-            (
-                _cosine_distance(query, provider.embed_document(content)),
-                candidate_id,
-                role,
-            )
-            for candidate_id, role, content in candidates
-        )
-        reference_distance = next(
-            distance
-            for distance, candidate_id, _role in ranked
-            if candidate_id == "reference_lesson"
-        )
-        distractor_distances = [
-            distance for distance, _candidate_id, role in ranked if role == "hard_distractor"
-        ]
-
-        assert ranked[0][1] == "reference_lesson", (row["variant_id"], ranked)
-        assert reference_distance < 0.35, (row["variant_id"], ranked)
-        assert len(distractor_distances) >= 2
-        assert all(distance < 0.35 for distance in distractor_distances), (
-            row["variant_id"],
-            ranked,
-        )
 
 
 def _cosine_distance(left: list[float], right: list[float]) -> float:

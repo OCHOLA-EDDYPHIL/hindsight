@@ -43,11 +43,9 @@ def test_local_acceptance_refuses_non_loopback_and_existing_databases(monkeypatc
         acceptance._create_local_database(
             "postgresql://root@localhost:26257/pilot?sslmode=disable"
         )
-    with pytest.raises(ValueError, match="outside the repository"):
-        acceptance._require_local_report_path(ROOT / "acceptance-reports")
 
 
-def test_product_provider_verification_excludes_frozen_pilot(monkeypatch):
+def test_product_provider_verification_uses_only_product_sanity_checks(monkeypatch):
     monkeypatch.setenv(
         "GEMINI_API_KEYS",
         '{"version":1,"keys":[{"id":"one","api_key":"opaque-material"}]}',
@@ -67,33 +65,9 @@ def test_product_provider_verification_excludes_frozen_pilot(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][0] == acceptance.PROVIDER_SANITY_SELECTORS
-    assert acceptance.PILOT_EMBEDDING_SELECTOR not in calls[0][0]
     assert calls[0][1]["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1"
     assert calls[0][1]["GEMINI_API_KEY"] == "opaque-material"
     assert calls[0][2:] == ("providers", artifact_dir)
-
-
-def test_learning_provider_verification_runs_frozen_pilot_twice(monkeypatch):
-    monkeypatch.setenv(
-        "GEMINI_API_KEYS",
-        '{"version":1,"keys":[{"id":"one","api_key":"opaque-material"}]}',
-    )
-    calls = []
-    monkeypatch.setattr(
-        acceptance,
-        "_run",
-        lambda command, *, env, stdout_path=None: calls.append((command, env)),
-    )
-
-    acceptance._verify_learning_providers()
-
-    assert [call[0][-1] for call in calls] == [
-        acceptance.PILOT_EMBEDDING_SELECTOR,
-        acceptance.PILOT_EMBEDDING_SELECTOR,
-    ]
-    assert all(call[1]["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1" for call in calls)
-    assert all(call[1]["GEMINI_API_KEY"] == "opaque-material" for call in calls)
-
 
 def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(monkeypatch):
     database_url = "postgresql://root@localhost:26257/db?sslmode=disable"
@@ -459,102 +433,6 @@ def test_local_browser_rejects_skipped_shared_contract(monkeypatch, tmp_path):
         )
 
 
-def _completed_report(kind: str, experiment_id: str) -> dict[str, object]:
-    return {
-        "experiment_id": experiment_id,
-        "experiment_kind": kind,
-        "status": "completed",
-        "raw_trace_digest": "trace",
-        "claim_evidence_digest": "claim",
-    }
-
-
-def test_local_pilot_runs_setup_and_preregisters_without_confirmation(monkeypatch, tmp_path):
-    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
-    commands = []
-    validations = []
-
-    def fake_run(command, *, env, stdout_path=None):
-        commands.append((command, env, stdout_path))
-        if stdout_path is None:
-            return
-        if "pilot" in command:
-            payload = _completed_report("pilot", "pilot-id")
-        else:
-            payload = {
-                "pilot_experiment_id": "pilot-id",
-                "preregistration_sha256": "digest",
-                "eligible_held_out_variant_ids": [f"eligible-{i}" for i in range(12)],
-                "selected_held_out_variant_ids": [f"selected-{i}" for i in range(12)],
-                "repetitions_per_variant": 2,
-            }
-        stdout_path.write_text(acceptance.json.dumps(payload))
-
-    monkeypatch.setattr(acceptance, "_run", fake_run)
-    monkeypatch.setattr(acceptance, "_create_local_database", lambda _url: None)
-    monkeypatch.setattr(acceptance, "_require_local_code_sha", lambda _sha: "a" * 40)
-    monkeypatch.setattr(
-        acceptance,
-        "_validate_experiment",
-        lambda **kwargs: validations.append(kwargs),
-    )
-    report_dir = tmp_path / "reports"
-
-    acceptance._run_local_benchmark(
-        SimpleNamespace(
-            database_url="postgresql://root@localhost:26257/pilot?sslmode=disable",
-            max_distance=0.35,
-            report_dir=report_dir,
-            code_sha=None,
-        ),
-        include_confirmation=False,
-    )
-
-    flattened = [part for command, _env, _path in commands for part in command]
-    assert "scripts/migrate.py" in flattened
-    assert "scripts/initialize_agent_storage.py" in flattened
-    assert "scripts/reembed_memories.py" in flattened
-    assert "pilot" in flattened
-    assert "confirmation" not in flattened
-    assert "preregister" in flattened
-    assert validations[0]["expected_trials"] == 36
-    assert (report_dir / "pilot.json").is_file()
-    assert (report_dir / "preregistration.json").is_file()
-
-
-def test_local_benchmark_checks_clean_sha_before_creating_database(monkeypatch, tmp_path):
-    monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
-    order = []
-    monkeypatch.setattr(
-        acceptance,
-        "_require_local_code_sha",
-        lambda _sha: order.append("sha") or "a" * 40,
-    )
-    monkeypatch.setattr(
-        acceptance,
-        "_create_local_database",
-        lambda _url: order.append("database"),
-    )
-    monkeypatch.setattr(
-        acceptance,
-        "_run_pilot_and_preregister",
-        lambda **_kwargs: ({}, {}),
-    )
-    monkeypatch.setattr(acceptance, "_run", lambda *_args, **_kwargs: None)
-
-    acceptance._run_local_benchmark(
-        SimpleNamespace(
-            database_url="postgresql://root@localhost:26257/pilot?sslmode=disable",
-            max_distance=0.35,
-            report_dir=tmp_path / "reports",
-            code_sha=None,
-        ),
-        include_confirmation=False,
-    )
-
-    assert order == ["sha", "database"]
-
-
 def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, tmp_path):
     monkeypatch.setenv("RUN_HOSTED_ACCEPTANCE", "1")
     monkeypatch.setenv("HOSTED_API_URL", "https://hosted.invalid")
@@ -627,11 +505,6 @@ def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypa
     )
     monkeypatch.setattr(
         acceptance,
-        "_require_local_code_sha",
-        lambda _value: pytest.fail("product acceptance must not require an exact SHA"),
-    )
-    monkeypatch.setattr(
-        acceptance,
         "uuid4",
         lambda: SimpleNamespace(hex="1234567890abcdef1234567890abcdef"),
     )
@@ -652,141 +525,6 @@ def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypa
     assert calls == ["providers", "semantic", "resilience", "browser"]
 
 
-def test_full_benchmark_owns_reports_and_strict_validations(monkeypatch, tmp_path):
-    commands = []
-    validations = []
-
-    def fake_run(command, *, env, stdout_path=None):
-        commands.append(command)
-        if stdout_path is None:
-            return
-        if "pilot" in command:
-            payload = _completed_report("pilot", "pilot-id")
-        elif "confirmation" in command:
-            payload = {
-                **_completed_report("confirmation", "confirmation-id"),
-                "claim_authorized": True,
-                "gates": {"complete_pairs": True, "retrieval": True},
-            }
-        else:
-            payload = {
-                "pilot_experiment_id": "pilot-id",
-                "preregistration_sha256": "digest",
-                "eligible_held_out_variant_ids": [f"eligible-{i}" for i in range(12)],
-                "selected_held_out_variant_ids": [f"selected-{i}" for i in range(12)],
-                "repetitions_per_variant": 2,
-            }
-        stdout_path.write_text(acceptance.json.dumps(payload))
-
-    monkeypatch.setattr(acceptance, "_run", fake_run)
-    monkeypatch.setattr(
-        acceptance,
-        "_validate_experiment",
-        lambda **kwargs: validations.append(kwargs),
-    )
-    report_dir = tmp_path / "reports"
-    report_dir.mkdir()
-
-    confirmation = acceptance._run_benchmark_sequence(
-        database_url="postgresql://root@localhost/db",
-        env={},
-        report_dir=report_dir,
-    )
-
-    flattened = [part for command in commands for part in command]
-    assert flattened.count("pilot") == 1
-    assert flattened.count("preregister") == 1
-    assert flattened.count("confirmation") == 1
-    assert [item["expected_trials"] for item in validations] == [36, 72]
-    assert confirmation["claim_authorized"] is True
-    assert all((report_dir / name).stat().st_size > 0 for name in (
-        "pilot.json",
-        "preregistration.json",
-        "confirmation.json",
-    ))
-
-
-def test_learning_failure_is_strict_and_preserves_reports(monkeypatch, tmp_path):
-    def fake_run(command, *, env, stdout_path=None):
-        if stdout_path is None:
-            return
-        if "pilot" in command:
-            payload = _completed_report("pilot", "pilot-id")
-        elif "confirmation" in command:
-            payload = {
-                **_completed_report("confirmation", "confirmation-id"),
-                "claim_authorized": False,
-                "gates": {"complete_pairs": True, "retrieval": False},
-            }
-        else:
-            payload = {
-                "pilot_experiment_id": "pilot-id",
-                "preregistration_sha256": "digest",
-                "eligible_held_out_variant_ids": [f"eligible-{i}" for i in range(12)],
-                "selected_held_out_variant_ids": [f"selected-{i}" for i in range(12)],
-                "repetitions_per_variant": 2,
-            }
-        stdout_path.write_text(acceptance.json.dumps(payload))
-
-    monkeypatch.setattr(acceptance, "_run", fake_run)
-    monkeypatch.setattr(acceptance, "_validate_experiment", lambda **_kwargs: None)
-    report_dir = tmp_path / "reports"
-    report_dir.mkdir()
-
-    with pytest.raises(RuntimeError, match="did not authorize"):
-        acceptance._run_benchmark_sequence(
-            database_url="postgresql://root@localhost/db",
-            env={},
-            report_dir=report_dir,
-        )
-
-    assert all(
-        (report_dir / name).stat().st_size > 0
-        for name in ("pilot.json", "preregistration.json", "confirmation.json")
-    )
-
-
-def test_experiment_validation_requires_every_trial(monkeypatch):
-    rows = iter(
-        [
-            ("pilot", "completed"),
-            (6, 6),
-            (36, 36, 36, 0, 0),
-        ]
-    )
-
-    class Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def execute(self, _query, _params):
-            return SimpleNamespace(fetchone=lambda: next(rows))
-
-    monkeypatch.setattr(acceptance.psycopg, "connect", lambda _url: Connection())
-    acceptance._validate_experiment(
-        database_url="postgresql://db",
-        experiment_id="pilot-id",
-        experiment_kind="pilot",
-        expected_preparations=6,
-        expected_trials=36,
-    )
-
-
-def test_confirmation_gate_validation_fails_closed():
-    base = _completed_report("confirmation", "confirmation-id")
-    with pytest.raises(RuntimeError, match="did not authorize"):
-        acceptance._require_confirmation_gates(
-            {**base, "claim_authorized": False, "gates": {"retrieval": True}}
-        )
-    with pytest.raises(RuntimeError, match="did not authorize"):
-        acceptance._require_confirmation_gates(
-            {**base, "claim_authorized": True, "gates": {"retrieval": False}}
-        )
-
-
 def test_live_workflow_calls_shared_acceptance_commands():
     workflow = (ROOT / ".github" / "workflows" / "live-acceptance.yml").read_text()
 
@@ -802,19 +540,3 @@ def test_live_workflow_calls_shared_acceptance_commands():
         "live-benchmark-",
     ):
         assert forbidden not in workflow
-
-
-def test_learning_workflow_is_manual_guarded_and_never_deploys():
-    workflow = (ROOT / ".github" / "workflows" / "learning-evidence.yml").read_text()
-
-    assert "workflow_dispatch:" in workflow
-    assert 'HINDSIGHT_BENCHMARK_TENANT_ID: 00000000-0000-0000-0000-000000000004' in workflow
-    assert "manage_learning_authority.py" in workflow
-    assert "run_learning_benchmark.py pilot" in workflow
-    assert "run_learning_benchmark.py preregister" in workflow
-    assert "run_learning_benchmark.py confirmation" in workflow
-    assert "finalize_learning_study.py" in workflow
-    assert "configure_changefeed.py pause" not in workflow
-    assert "protocol_reset_id" not in workflow
-    assert "deploy-demo.yml" not in workflow
-    assert "pull_request:" not in workflow

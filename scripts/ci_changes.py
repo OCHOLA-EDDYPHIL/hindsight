@@ -22,19 +22,6 @@ COMPONENTS = (
 PRODUCT_TEST_FILES = frozenset(
     Path(path).name for path in database_test_files("product")
 )
-RESEARCH_MODULES = frozenset(
-    {
-        "benchmark.py",
-        "evidence_archive.py",
-        "learning_authority.py",
-        "qualification_authority.py",
-        "rank_diagnostics.py",
-        "representation_selection.py",
-        "v4_corpus.py",
-        "v5_corpus.py",
-        "v5_qualification.py",
-    }
-)
 DATABASE_SCRIPTS = frozenset(
     {
         "apply_database_roles.py",
@@ -62,7 +49,7 @@ def _none_selected() -> dict[str, bool]:
 
 
 def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
-    """Return normal CI jobs; release and research jobs are deliberately absent."""
+    """Return the normal CI jobs affected by the supplied repository paths."""
 
     selected = _none_selected()
     saw_path = False
@@ -89,8 +76,6 @@ def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
             selected["lambda_artifacts"] = True
             continue
         if path.startswith("src/hindsight/"):
-            if Path(path).name in RESEARCH_MODULES:
-                continue
             selected["database"] = True
             selected["lambda_artifacts"] = True
             continue
@@ -98,13 +83,10 @@ def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
             selected["database"] = True
             selected["lambda_artifacts"] = True
             continue
-        if path.startswith("fixtures/"):
-            # Corpus and study construction are qualified only by manual workflows.
-            continue
         if path.startswith("docs/") or path.endswith((".md", ".rst", ".txt")):
             continue
         if path.startswith("tests/"):
-            if Path(path).name in PRODUCT_TEST_FILES:
+            if path in database_test_files():
                 selected["database"] = True
             continue
         if path.startswith("scripts/"):

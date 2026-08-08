@@ -361,24 +361,20 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
 
 def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    learning = pathlib.Path(".github/workflows/learning-evidence.yml").read_text()
     deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
     destroy = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
 
     live_concurrency = live.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
-    learning_concurrency = learning.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
 
     assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2" in live_concurrency
-    assert "group: hindsight-demo-environment" in learning_concurrency
     assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2" in destroy_concurrency
     assert "inputs.validation_mode" in deploy_concurrency
     assert "format('hindsight-live-deploy-{0}-{1}'" in deploy_concurrency
     assert "format('hindsight-{0}-environment-v2'" in deploy_concurrency
     for concurrency in (
         live_concurrency,
-        learning_concurrency,
         deploy_concurrency,
         destroy_concurrency,
     ):
@@ -718,7 +714,7 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
         "DATABASE_ROLES_RESULT",
     ),
 )
-def test_product_completion_ignores_learning_result_but_requires_every_product_job(
+def test_product_completion_requires_every_product_job(
     tmp_path, failed_result
 ):
     workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
@@ -735,7 +731,6 @@ def test_product_completion_ignores_learning_result_but_requires_every_product_j
         "WORKER_RESULT": "success",
         "BROWSER_RESULT": "success",
         "DATABASE_ROLES_RESULT": "success",
-        "LEARNING_RESULT": "failure",
         "HEAD_SHA": "a" * 40,
         "UI_URL": "https://ui.example.invalid",
         "API_URL": "https://api.example.invalid",
@@ -759,47 +754,6 @@ def test_product_completion_ignores_learning_result_but_requires_every_product_j
 
     assert accepted.returncode == 0, accepted.stderr
     assert rejected.returncode != 0
-
-
-def test_learning_authorization_guards_precede_all_hosted_side_effects(tmp_path):
-    workflow_path = ".github/workflows/learning-evidence.yml"
-    workflow = pathlib.Path(workflow_path).read_text()
-    authorize_job = workflow.split("  authorize:\n", 1)[1].split("  exact_main_ci:\n", 1)[0]
-
-    assert authorize_job.index('"$ACTOR" == "$REPOSITORY_OWNER"') < authorize_job.index(
-        'gh api "/repos/$REPOSITORY/actions/runs/$PRODUCT_RUN_ID"'
-    )
-    for forbidden in (
-        "configure-aws-credentials",
-        "aws ssm get-parameter",
-        "configure_changefeed.py",
-        "manage_learning_authority.py",
-    ):
-        assert forbidden not in authorize_job
-
-    rejected = _run_authorization_script(
-        workflow_path,
-        values={
-            "REF_NAME": "refs/heads/main",
-            "EVENT_SHA": "a" * 40,
-            "REPOSITORY": "owner/project",
-            "WORKFLOW_REF": (
-                "owner/project/.github/workflows/learning-evidence.yml@refs/heads/main"
-            ),
-            "ACTOR": "different-user",
-            "TRIGGERING_ACTOR": "owner",
-            "REPOSITORY_OWNER": "owner",
-            "OPERATION": "seal-only",
-            "SEQUENCE": "1",
-            "PRODUCT_RUN_ID": "",
-            "QUALIFICATION_RUN_ID": "",
-            "GH_TOKEN": "unused",
-        },
-        output_path=tmp_path / "learning-rejected",
-    )
-
-    assert rejected.returncode != 0
-    assert "repository owner on exact main" in rejected.stderr
 
 
 def test_deploy_authorization_distinguishes_reusable_and_direct_dispatch(tmp_path):

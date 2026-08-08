@@ -161,8 +161,6 @@ jobs:
             --apply-roles --output build/schema/populated.json
           uv run python scripts/schema_manifest.py compare \
             build/schema/fresh.json build/schema/populated.json
-      - name: Run deterministic benchmark smoke
-        run: DATABASE_URL="$FRESH_DATABASE_URL" uv run python scripts/run_learning_benchmark.py ci-smoke
       - name: Remove main qualification container
         if: always()
         run: docker compose down --volumes --remove-orphans
