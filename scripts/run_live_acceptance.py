@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import secrets
 import subprocess
 import sys
@@ -109,6 +110,8 @@ HOSTED_PHASE_SELECTORS = {
     "browser": HOSTED_BROWSER_PRODUCT_SELECTORS,
     "roles": ROLE_PRODUCT_SELECTORS,
 }
+HOSTED_ACCEPTANCE_MODES = ("full", "browser-only")
+EXACT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 def main() -> None:
@@ -130,6 +133,12 @@ def main() -> None:
         default=os.environ.get("DATABASE_URL"),
     )
 
+    hosted_plan = subparsers.add_parser("hosted-plan")
+    hosted_plan.add_argument("--mode", choices=HOSTED_ACCEPTANCE_MODES, required=True)
+    hosted_plan.add_argument("--requested-sha", required=True)
+    hosted_plan.add_argument("--candidate-ui-url", required=True)
+    hosted_plan.add_argument("--github-output", type=pathlib.Path, required=True)
+
     local_pilot = subparsers.add_parser("learning-pilot")
     _add_local_benchmark_arguments(local_pilot)
 
@@ -147,6 +156,8 @@ def main() -> None:
         _run_local_product_full(args)
     elif args.command == "hosted-product":
         _run_hosted_product(args)
+    elif args.command == "hosted-plan":
+        _plan_hosted_acceptance(args)
     elif args.command == "learning-pilot":
         _preflight_local_learning(args)
         _verify_learning_providers()
@@ -428,6 +439,90 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
     _run_hosted_pytest(selectors, env=env, phase=args.phase)
 
 
+def _plan_hosted_acceptance(args: argparse.Namespace) -> None:
+    requested_sha = _require_exact_sha(args.requested_sha)
+    candidate_ui_url = _require_https_url(args.candidate_ui_url, "candidate UI URL")
+    outputs = {
+        "acceptance_mode": args.mode,
+        "run_product_preflight": "true" if args.mode == "full" else "false",
+        "run_deploy": "true",
+        "reuse_candidate": "false",
+        "candidate_ui_url": "",
+        "candidate_api_url": "",
+        "candidate_websocket_url": "",
+        "observed_revision": "not-checked",
+    }
+    if args.mode == "browser-only":
+        candidate = _probe_deployed_candidate(
+            expected_sha=requested_sha,
+            ui_url=candidate_ui_url,
+        )
+        outputs["observed_revision"] = candidate["observed_revision"]
+        if candidate["reusable"]:
+            outputs.update(
+                {
+                    "run_deploy": "false",
+                    "reuse_candidate": "true",
+                    "candidate_ui_url": candidate["ui_url"],
+                    "candidate_api_url": candidate["api_url"],
+                    "candidate_websocket_url": candidate["websocket_url"],
+                }
+            )
+    _write_github_outputs(args.github_output, outputs)
+
+
+def _probe_deployed_candidate(*, expected_sha: str, ui_url: str) -> dict[str, Any]:
+    try:
+        health = _read_json_url(f"{ui_url}/v1/health/live")
+        observed_revision = health.get("revision")
+        if observed_revision != expected_sha:
+            return {
+                "reusable": False,
+                "observed_revision": _reported_revision(observed_revision),
+            }
+        config = _read_runtime_config(f"{ui_url}/config.js")
+        websocket_url = config.get("websocketUrl")
+        if config.get("apiBase") != "/v1":
+            raise ValueError("candidate API base is not the public /v1 route")
+        if not isinstance(websocket_url, str) or not websocket_url.startswith("wss://"):
+            raise ValueError("candidate WebSocket endpoint must use WSS")
+    except (OSError, ValueError):
+        return {"reusable": False, "observed_revision": "unavailable"}
+    return {
+        "reusable": True,
+        "observed_revision": expected_sha,
+        "ui_url": ui_url,
+        "api_url": ui_url,
+        "websocket_url": websocket_url,
+    }
+
+
+def _read_runtime_config(url: str) -> dict[str, Any]:
+    text = _read_text_url(url).strip()
+    prefix = "window.HINDSIGHT_CONFIG = "
+    if not text.startswith(prefix) or not text.endswith(";"):
+        raise ValueError("candidate runtime configuration has an unexpected format")
+    payload = json.loads(text[len(prefix) : -1])
+    if not isinstance(payload, dict):
+        raise ValueError("candidate runtime configuration must be an object")
+    return payload
+
+
+def _reported_revision(value: Any) -> str:
+    if isinstance(value, str) and EXACT_SHA_PATTERN.fullmatch(value):
+        return value
+    return "invalid"
+
+
+def _write_github_outputs(path: pathlib.Path, outputs: dict[str, str]) -> None:
+    lines = []
+    for name, value in outputs.items():
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"GitHub output {name} contains a newline")
+        lines.append(f"{name}={value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _hosted_phase_tenant_id(phase: str) -> str:
     if phase in {"worker", "browser"}:
         return PUBLIC_DEMO_TENANT_ID
@@ -497,13 +592,34 @@ def _run_strict_pytest(
 def _verify_hosted_endpoints() -> None:
     ui_url = _required_https_env("HINDSIGHT_BROWSER_BASE_URL").rstrip("/")
     api_url = _required_https_env("HOSTED_API_URL").rstrip("/")
+    expected_revision = _require_exact_sha(
+        _required_env("HINDSIGHT_EXPECTED_DEPLOYED_REVISION")
+    )
     websocket_url = _required_env("HINDSIGHT_WEBSOCKET_URL")
     if not websocket_url.startswith("wss://"):
         raise ValueError("hosted product WebSocket endpoint must use WSS")
+    for base_url in (ui_url, api_url):
+        health = _read_json_url(f"{base_url}/v1/health/live")
+        if health.get("revision") != expected_revision:
+            raise RuntimeError("hosted product revision does not match the requested SHA")
     for url in (f"{ui_url}/v1/health/ready", f"{api_url}/v1/health/ready"):
         with request.urlopen(url, timeout=30) as response:  # noqa: S310 - guarded HTTPS URL
             if response.status != 200:
                 raise RuntimeError(f"hosted product endpoint is not ready: {url}")
+
+
+def _read_json_url(url: str) -> dict[str, Any]:
+    payload = json.loads(_read_text_url(url))
+    if not isinstance(payload, dict):
+        raise ValueError("hosted endpoint response must be an object")
+    return payload
+
+
+def _read_text_url(url: str) -> str:
+    with request.urlopen(url, timeout=30) as response:  # noqa: S310 - guarded HTTPS URL
+        if response.status != 200:
+            raise OSError(f"hosted endpoint returned HTTP {response.status}")
+        return response.read().decode("utf-8")
 
 
 def _run_local_benchmark(args: argparse.Namespace, *, include_confirmation: bool) -> None:
@@ -739,9 +855,20 @@ def _required_env(name: str) -> str:
 
 
 def _required_https_env(name: str) -> str:
-    value = _required_env(name)
+    return _require_https_url(_required_env(name), name)
+
+
+def _require_https_url(value: str, label: str) -> str:
+    value = value.strip().rstrip("/")
     if not value.startswith("https://"):
-        raise ValueError(f"{name} must use HTTPS")
+        raise ValueError(f"{label} must use HTTPS")
+    return value
+
+
+def _require_exact_sha(value: str) -> str:
+    value = value.strip()
+    if not EXACT_SHA_PATTERN.fullmatch(value):
+        raise ValueError("requested revision must be a full lowercase hexadecimal SHA")
     return value
 
 

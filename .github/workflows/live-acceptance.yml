@@ -3,6 +3,14 @@ name: live acceptance
 on:
   workflow_dispatch:
     inputs:
+      acceptance_mode:
+        description: Authoritative full gate or browser-only diagnostic
+        required: true
+        type: choice
+        default: full
+        options:
+          - full
+          - browser-only
       deployment_environment:
         description: Protected GitHub environment containing one AWS account configuration
         required: true
@@ -36,6 +44,7 @@ jobs:
       authorized: ${{ steps.authorization.outputs.authorized }}
       product_sha: ${{ steps.authorization.outputs.product_sha }}
       deployment_environment: ${{ steps.authorization.outputs.deployment_environment }}
+      acceptance_mode: ${{ steps.authorization.outputs.acceptance_mode }}
     steps:
       - id: authorization
         name: Resolve owner-authorized product revision
@@ -48,11 +57,17 @@ jobs:
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment || 'demo' }}
+          REQUESTED_MODE: ${{ inputs.acceptance_mode || 'full' }}
         shell: bash
         run: |
           REQUESTED_ENVIRONMENT="${REQUESTED_ENVIRONMENT:-demo}"
+          REQUESTED_MODE="${REQUESTED_MODE:-full}"
           [[ "$REQUESTED_ENVIRONMENT" == "demo" || "$REQUESTED_ENVIRONMENT" == "demo-candidate" ]] || {
             echo "Unsupported deployment environment." >&2
+            exit 1
+          }
+          [[ "$REQUESTED_MODE" == "full" || "$REQUESTED_MODE" == "browser-only" ]] || {
+            echo "Unsupported acceptance mode." >&2
             exit 1
           }
           [[ "$REF_NAME" == "refs/heads/main" \
@@ -67,6 +82,7 @@ jobs:
             echo "authorized=true"
             echo "product_sha=$EVENT_SHA"
             echo "deployment_environment=$REQUESTED_ENVIRONMENT"
+            echo "acceptance_mode=$REQUESTED_MODE"
           } >> "$GITHUB_OUTPUT"
 
   exact_main_ci:
@@ -104,10 +120,52 @@ jobs:
             --sha "$PRODUCT_SHA" \
             --github-output "$GITHUB_OUTPUT"
 
+  acceptance_plan:
+    needs:
+      - authorize
+      - exact_main_ci
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    permissions:
+      contents: read
+    outputs:
+      run_product_preflight: ${{ steps.plan.outputs.run_product_preflight }}
+      run_deploy: ${{ steps.plan.outputs.run_deploy }}
+      reuse_candidate: ${{ steps.plan.outputs.reuse_candidate }}
+      candidate_ui_url: ${{ steps.plan.outputs.candidate_ui_url }}
+      candidate_api_url: ${{ steps.plan.outputs.candidate_api_url }}
+      candidate_websocket_url: ${{ steps.plan.outputs.candidate_websocket_url }}
+      observed_revision: ${{ steps.plan.outputs.observed_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Verify exact product revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - id: plan
+        name: Resolve exact-SHA execution mode
+        env:
+          ACCEPTANCE_MODE: ${{ needs.authorize.outputs.acceptance_mode }}
+          PRODUCT_SHA: ${{ needs.authorize.outputs.product_sha }}
+          CANDIDATE_UI_URL: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
+        run: >-
+          uv run python scripts/run_live_acceptance.py hosted-plan
+          --mode "$ACCEPTANCE_MODE"
+          --requested-sha "$PRODUCT_SHA"
+          --candidate-ui-url "$CANDIDATE_UI_URL"
+          --github-output "$GITHUB_OUTPUT"
+
   product_preflight:
     needs:
       - authorize
       - exact_main_ci
+      - acceptance_plan
+    if: needs.acceptance_plan.outputs.run_product_preflight == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
@@ -186,7 +244,16 @@ jobs:
     needs:
       - authorize
       - exact_main_ci
+      - acceptance_plan
       - product_preflight
+    if: >-
+      always() &&
+      needs.authorize.result == 'success' &&
+      needs.exact_main_ci.result == 'success' &&
+      needs.acceptance_plan.result == 'success' &&
+      needs.acceptance_plan.outputs.run_deploy == 'true' &&
+      (needs.authorize.outputs.acceptance_mode == 'browser-only' ||
+       needs.product_preflight.result == 'success')
     permissions:
       contents: read
       id-token: write
@@ -201,6 +268,7 @@ jobs:
 
   semantic_product:
     needs: [authorize, deploy]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
@@ -250,6 +318,7 @@ jobs:
 
   consolidation_product:
     needs: [authorize, deploy]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
@@ -303,6 +372,7 @@ jobs:
 
   worker_product:
     needs: [authorize, deploy]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 25
@@ -337,7 +407,15 @@ jobs:
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase worker
 
   browser_product:
-    needs: [authorize, deploy]
+    needs: [authorize, acceptance_plan, deploy]
+    if: >-
+      always() &&
+      needs.authorize.result == 'success' &&
+      needs.acceptance_plan.result == 'success' &&
+      ((needs.acceptance_plan.outputs.reuse_candidate == 'true' &&
+        needs.deploy.result == 'skipped') ||
+       (needs.acceptance_plan.outputs.reuse_candidate == 'false' &&
+        needs.deploy.result == 'success'))
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
@@ -352,9 +430,10 @@ jobs:
       CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
       GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
       GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
-      HINDSIGHT_BROWSER_BASE_URL: ${{ needs.deploy.outputs.ui_url }}
-      HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
-      HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}
+      HINDSIGHT_BROWSER_BASE_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_ui_url || needs.deploy.outputs.ui_url }}
+      HOSTED_API_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_api_url || needs.deploy.outputs.api_url }}
+      HINDSIGHT_WEBSOCKET_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_websocket_url || needs.deploy.outputs.websocket_url }}
+      HINDSIGHT_EXPECTED_DEPLOYED_REVISION: ${{ needs.authorize.outputs.product_sha }}
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
@@ -405,6 +484,7 @@ jobs:
 
   database_roles:
     needs: [authorize, deploy]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 10
@@ -430,7 +510,7 @@ jobs:
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase roles
 
   product_acceptance_complete:
-    if: always()
+    if: always() && needs.authorize.outputs.acceptance_mode == 'full'
     needs:
       - authorize
       - exact_main_ci
