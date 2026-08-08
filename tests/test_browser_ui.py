@@ -9,6 +9,8 @@ from uuid import uuid4
 
 import pytest
 
+from hindsight.demo_state import DEMO_NAMESPACE
+
 BASE_URL = os.environ.get("HINDSIGHT_BROWSER_BASE_URL")
 OPERATOR_TOKEN = os.environ.get("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
 
@@ -224,7 +226,7 @@ def test_operator_can_run_and_explain_signature_workflow():
     signature = None
     try:
         driver.set_window_size(1440, 1000)
-        driver.get(_browser_url(namespace=f"live-browser:{uuid4()}"))
+        driver.get(_browser_url(namespace=DEMO_NAMESPACE))
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         _capture_console_errors(driver)
         wait.until(lambda browser: "Live" in browser.find_element(By.ID, "connection").text)
@@ -357,8 +359,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(
             lambda browser: browser.find_element(By.ID, "operatorLabel").text == "Operator access"
         )
-        public_namespace = None if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1" else namespace
-        driver.get(_public_browser_url(namespace=public_namespace))
+        driver.get(_public_browser_url())
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         _capture_console_errors(driver)
         wait.until(
@@ -879,12 +880,9 @@ def _browser_url(*, namespace: str, as_of: str | None = None) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-def _public_browser_url(*, namespace: str | None = None) -> str:
+def _public_browser_url() -> str:
     parts = urlsplit(BASE_URL)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if namespace is None:
-        query.pop("namespace", None)
-    else:
-        query["namespace"] = namespace
+    query.pop("namespace", None)
     query.pop("as_of", None)
     return urlunsplit(parts._replace(query=urlencode(query)))
