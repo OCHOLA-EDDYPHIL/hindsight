@@ -131,6 +131,7 @@ def test_firefox_startup_is_isolated_retried_and_evidenced(monkeypatch, tmp_path
         return sentinel
 
     monkeypatch.setenv("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setattr(webdriver, "Firefox", start)
     monkeypatch.setattr(service_module, "Service", FakeService)
     monkeypatch.setattr(time, "sleep", sleeps.append)
@@ -156,6 +157,29 @@ def test_firefox_startup_is_isolated_retried_and_evidenced(monkeypatch, tmp_path
             }
         ]
     }
+
+
+def test_firefox_uses_virtual_display_without_native_headless(monkeypatch):
+    from selenium import webdriver
+    from selenium.webdriver.firefox import service as service_module
+
+    attempts = []
+    sentinel = object()
+
+    class FakeService:
+        def __init__(self, *, log_output):
+            self.log_output = log_output
+
+    def start(*, options, service):
+        attempts.append(tuple(options.arguments))
+        return sentinel
+
+    monkeypatch.setenv("DISPLAY", ":99")
+    monkeypatch.setattr(webdriver, "Firefox", start)
+    monkeypatch.setattr(service_module, "Service", FakeService)
+
+    assert _start_firefox_driver() is sentinel
+    assert attempts == [("-no-remote", "-new-instance")]
 
 
 @requires_browser
@@ -618,7 +642,10 @@ def _start_firefox_driver():
     failures = []
     for attempt in range(1, 3):
         options = Options()
-        for argument in ("-headless", "-no-remote", "-new-instance"):
+        arguments = ["-no-remote", "-new-instance"]
+        if not os.environ.get("DISPLAY"):
+            arguments.insert(0, "-headless")
+        for argument in arguments:
             options.add_argument(argument)
         service = Service(log_output=_geckodriver_log_path(attempt))
         try:
