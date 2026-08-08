@@ -12,9 +12,7 @@ from hindsight.demo_state import DEMO_NAMESPACE
 from hindsight.memory import MemoryStore
 
 
-def decision_influence(
-    *, decision_id: str, db_url: str | None = None
-) -> dict[str, Any]:
+def decision_influence(*, decision_id: str, db_url: str | None = None) -> dict[str, Any]:
     """Return cited memories, provenance, retrievals, and lineage for one decision."""
 
     with connect(db_url, application_name="hindsight-decision-influence") as conn:
@@ -349,6 +347,9 @@ def _governed_decision_trace(conn: Any, *, decision_id: str) -> dict[str, Any] |
                                 episodic.lineage_status) AS memory_lineage_status,
                        COALESCE(semantic.trust_status,
                                 episodic.trust_status) AS memory_trust_status,
+                       COALESCE(semantic.writer, episodic.writer) AS writer,
+                       COALESCE(semantic.source_ref, episodic.source_ref) AS source_ref,
+                       COALESCE(semantic.justification, episodic.justification) AS justification,
                        COALESCE(semantic.t_valid, episodic.t_valid) AS t_valid,
                        COALESCE(semantic.t_invalid, episodic.t_invalid) AS t_invalid,
                        CASE
@@ -411,28 +412,20 @@ def _governed_decision_trace(conn: Any, *, decision_id: str) -> dict[str, Any] |
         )
         lineage = [dict(row) for row in cur.fetchall()]
 
-    retrieval_profiles = {
-        str(row["id"]): row.get("embedding_profile_id") for row in retrievals
-    }
+    retrieval_profiles = {str(row["id"]): row.get("embedding_profile_id") for row in retrievals}
     for read in reads:
         memory_id = str(read["memory_id"])
         read_id = str(read["id"])
-        read["embedding_profile_id"] = retrieval_profiles.get(
-            str(read["retrieval_id"])
-        )
+        read["embedding_profile_id"] = retrieval_profiles.get(str(read["retrieval_id"]))
         read["evidence_ids"] = [
             row["id"]
             for row in evidence
-            if str(row.get("semantic_memory_id") or row.get("episodic_memory_id"))
-            == memory_id
+            if str(row.get("semantic_memory_id") or row.get("episodic_memory_id")) == memory_id
         ]
         read["incoming_lineage_edge_ids"] = [
             row["id"]
             for row in lineage
-            if str(
-                row.get("child_semantic_memory_id")
-                or row.get("child_episodic_memory_id")
-            )
+            if str(row.get("child_semantic_memory_id") or row.get("child_episodic_memory_id"))
             == memory_id
         ]
         read["outgoing_lineage_edge_ids"] = [

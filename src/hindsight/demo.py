@@ -19,7 +19,12 @@ from hindsight.demo_state import (
     POISONED_MEMORY_CONTENT,
 )
 from hindsight.embeddings import embedding_provider_from_env
-from hindsight.memory import MemoryStore, Provenance, RewindResult
+from hindsight.memory import (
+    APPROVED_POSITIVE_GUIDANCE,
+    MemoryStore,
+    Provenance,
+    RewindResult,
+)
 from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, ReasoningResponse
 from hindsight.simulator import BoundedActionRequest, DeterministicIncidentSimulator
@@ -350,19 +355,19 @@ def poison_demo_memory(
                 provenance=Provenance(
                     writer="demo.poison",
                     source_ref="demo:simulated-memory-poisoning",
-                    justification="Scripted memory poisoning for rewind demonstration",
+                    justification=(
+                        "Simulate previously approved retry guidance whose applicability "
+                        "is stale for the current incident"
+                    ),
                 ),
                 metadata={
-                "demo": "poison-rewind",
-                "role": "poison",
-                "attack_class": "memory_poisoning",
-                "kind": "procedural_lesson",
-                "operator_disposition": "rejected",
-                "safety_status": "unsafe",
-                "contradiction_status": "contradicted",
-                "evidence_quality": "unverified_claim",
-                "usage_instruction": "audit_only",
-            },
+                    "demo": "poison-rewind",
+                    "role": "poison",
+                    "attack_class": "memory_poisoning",
+                    "kind": "procedural_lesson",
+                    "evidence_quality": "legacy_runbook",
+                },
+                governance=APPROVED_POSITIVE_GUIDANCE,
             )
         set_span_attributes(span, {"hindsight.memory.id": str(memory["id"])})
         return memory
@@ -394,16 +399,18 @@ def run_demo_agent_turn(
             url=db_url or database_url(),
             embedding_provider=embedding_provider_from_env(),
         ) as store:
-            recalled = list(store.retrieve_semantic(
-                namespace=namespace,
-                query=DEMO_INPUT,
-                limit=5,
-                decision_id=decision_id,
-                reader="agent.recall",
-                purpose="retrieve semantic incident context",
-                policy="semantic_strict",
-                positive_guidance_only=True,
-            ).hits)
+            recalled = list(
+                store.retrieve_semantic(
+                    namespace=namespace,
+                    query=DEMO_INPUT,
+                    limit=5,
+                    decision_id=decision_id,
+                    reader="agent.recall",
+                    purpose="retrieve semantic incident context",
+                    policy="semantic_strict",
+                    positive_guidance_only=True,
+                ).hits
+            )
             plan = provider.generate(
                 ReasoningRequest(
                     system=(
@@ -416,15 +423,10 @@ def run_demo_agent_turn(
                 )
             ).text
             poisoned = any(
-                isinstance(row.get("metadata"), dict)
-                and row["metadata"].get("role") == "poison"
+                isinstance(row.get("metadata"), dict) and row["metadata"].get("role") == "poison"
                 for row in recalled
             )
-            actions = (
-                ("scale_workers",)
-                if poisoned
-                else ("inspect_dependency", "throttle_retries")
-            )
+            actions = ("scale_workers",) if poisoned else ("inspect_dependency", "throttle_retries")
             action_request_id = f"action:{thread_id}:request"
             scored = DeterministicIncidentSimulator().execute(
                 BoundedActionRequest(
@@ -481,12 +483,12 @@ def run_demo_agent_turn(
                     ],
                     "action_approved": True,
                     "operator_disposition": (
-                        "approved" if scored.recovered and not scored.unsafe_action_count else "rejected"
+                        "approved"
+                        if scored.recovered and not scored.unsafe_action_count
+                        else "rejected"
                     ),
                     "safety_status": "unsafe" if scored.unsafe_action_count else "safe",
-                    "contradiction_status": (
-                        "supported" if scored.recovered else "contradicted"
-                    ),
+                    "contradiction_status": ("supported" if scored.recovered else "contradicted"),
                     "usage_instruction": (
                         "positive_guidance"
                         if scored.recovered and not scored.unsafe_action_count

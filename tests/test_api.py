@@ -66,8 +66,18 @@ def test_public_health_and_guarded_mutation(monkeypatch):
             "summary": "p99 is above SLO",
         },
     )
+    denied_reset = client.post(
+        "/v1/demo/poison-rewind/reset",
+        json={"namespace": "demo:payments-poison-rewind"},
+    )
+    denied_poison = client.post(
+        "/v1/demo/poison-rewind/poison",
+        json={"namespace": "demo:payments-poison-rewind:session:untrusted"},
+    )
 
     assert denied.status_code == 403
+    assert denied_reset.status_code == 403
+    assert denied_poison.status_code == 403
 
 
 def test_server_binds_v1_and_v2_without_tenant_request_selectors(monkeypatch):

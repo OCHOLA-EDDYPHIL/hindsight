@@ -5,15 +5,14 @@ from uuid import uuid4
 
 import pytest
 
-requires_db = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
-)
+requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
 @requires_db
-def test_poison_rewind_demo_filters_poison_then_rewinds_audit_history():
+def test_poison_rewind_demo_traces_stale_guidance_then_rewinds_audit_history():
     from hindsight.db import database_url
     from hindsight.demo import (
+        BAD_RECOMMENDATION,
         GOOD_RECOMMENDATION,
         REWIND_REASON,
         run_poison_rewind_demo,
@@ -26,15 +25,18 @@ def test_poison_rewind_demo_filters_poison_then_rewinds_audit_history():
 
     assert result.namespace.startswith(f"{namespace}:session:")
     assert result.clean_run.plan == GOOD_RECOMMENDATION
-    assert result.bad_run.plan == GOOD_RECOMMENDATION
+    assert result.bad_run.plan == BAD_RECOMMENDATION
     assert result.bad_run.action_trace["score"] == {
-        "recovered": True,
-        "unsafe_action_count": 0,
+        "recovered": False,
+        "unsafe_action_count": 1,
     }
-    assert str(result.poison_memory["id"]) not in result.bad_run.recalled_memory_ids
+    assert result.poison_memory["metadata"]["operator_disposition"] == "approved"
+    assert result.poison_memory["metadata"]["usage_instruction"] == "positive_guidance"
+    assert str(result.poison_memory["id"]) in result.bad_run.recalled_memory_ids
     assert result.diagnosis["decision_id"] == result.bad_run.decision_id
-    assert all(
-        str(item["memory"]["id"]) != str(result.poison_memory["id"])
+    assert any(
+        str(item["memory"]["id"]) == str(result.poison_memory["id"])
+        and item["provenance"]["writer"] == "demo.poison"
         for item in result.diagnosis["memories"]
     )
     assert result.rewind.operation["operation_type"] == "rewind"

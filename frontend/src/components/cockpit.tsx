@@ -189,6 +189,7 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
   const execution = run?.action_trace?.execution;
   const observations = run?.action_trace?.observations || [];
   const latestObservation = observations.at(-1);
+  const reads = run?.trace?.reads || [];
   return (
     <article className={cn("outcome", historical ? "outcome-historical" : "outcome-current")}>
       <header>
@@ -234,6 +235,27 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
           <span>
             {latestObservation.action || "initial state"} · {latestObservation.recovered ? "recovered" : "not recovered"}
           </span>
+        </div>
+      ) : null}
+      {reads.length ? (
+        <div className="decision-citations" aria-label={`${mode} decision evidence`}>
+          <span>Decision evidence</span>
+          {reads.map((read) => {
+            const dependencyCount = read.outgoing_lineage_edge_ids?.length || 0;
+            return (
+              <div className="decision-citation" key={read.id}>
+                <div>
+                  <strong>{read.writer || "writer unavailable"}</strong>
+                  <span>{read.source_ref || "source unavailable"}</span>
+                </div>
+                <IdentifierValue value={read.memory_id} label={`${mode} cited memory`} quiet />
+                <p>{read.justification || "No provenance justification recorded."}</p>
+                <span>
+                  {dependencyCount} downstream lineage {dependencyCount === 1 ? "edge" : "edges"}
+                </span>
+              </div>
+            );
+          })}
         </div>
       ) : null}
       <footer>

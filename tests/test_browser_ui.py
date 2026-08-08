@@ -18,9 +18,7 @@ requires_browser = pytest.mark.skipif(
 
 
 def test_reset_resubscribes_before_loading_the_fresh_namespace():
-    source = (
-        Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts"
-    ).read_text()
+    source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     reset = source.split("const resetDemo = useCallback", 1)[1].split(
         "const poisonDemo = useCallback", 1
     )[0]
@@ -30,15 +28,11 @@ def test_reset_resubscribes_before_loading_the_fresh_namespace():
     assert reset.index("updateNamespace(payload.namespace);") < reset.index(
         "subscribeSocket(payload.namespace);"
     )
-    assert reset.index("subscribeSocket(payload.namespace);") < reset.index(
-        "await loadIncidents("
-    )
+    assert reset.index("subscribeSocket(payload.namespace);") < reset.index("await loadIncidents(")
 
 
 def test_live_events_from_a_previous_namespace_are_ignored():
-    source = (
-        Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts"
-    ).read_text()
+    source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     handler = source.split("const handleLiveEvent = useCallback", 1)[1].split(
         "const subscribeSocket", 1
     )[0]
@@ -47,9 +41,7 @@ def test_live_events_from_a_previous_namespace_are_ignored():
 
 
 def test_explicit_namespace_renders_before_incident_defaults_are_loaded():
-    source = (
-        Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts"
-    ).read_text()
+    source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     startup = source.split("const retryInitialLoad = useCallback", 1)[1].split(
         "useEffect(() =>", 1
     )[0]
@@ -64,18 +56,16 @@ def test_explicit_namespace_renders_before_incident_defaults_are_loaded():
 
 def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status():
     hook = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
-    surface = (
-        Path(__file__).parents[1] / "frontend/src/components/cockpit.tsx"
-    ).read_text()
+    surface = (Path(__file__).parents[1] / "frontend/src/components/cockpit.tsx").read_text()
     polling = hook.split("const waitForOperation = useCallback", 1)[1].split(
         "const executeRewind", 1
     )[0]
 
     assert "config.operationPollSeconds" in polling
     assert "last status" in polling
-    assert polling.index('includes(operation.status)) {\n          return operation;') < polling.index(
-        "const previous = snapshotRef.current;"
-    )
+    assert polling.index(
+        "includes(operation.status)) {\n          return operation;"
+    ) < polling.index("const previous = snapshotRef.current;")
     assert "data-operation-id" in surface
     assert "data-operation-type" in surface
     assert "data-operation-status" in surface
@@ -141,34 +131,38 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.ID, "operatorButton").click()
         driver.find_element(By.ID, "operatorToken").send_keys(OPERATOR_TOKEN)
         driver.find_element(By.CSS_SELECTOR, "#operatorForm button[type=submit]").click()
-        wait.until_not(lambda browser: browser.find_element(By.ID, "startRun").get_attribute("disabled"))
+        wait.until_not(
+            lambda browser: browser.find_element(By.ID, "startRun").get_attribute("disabled")
+        )
 
         walkthrough = driver.find_element(By.ID, "operatorWalkthrough")
         assert not walkthrough.is_displayed()
         driver.find_element(By.ID, "walkthroughToggle").click()
-        wait.until(lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed())
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed()
+        )
         assert "Reset the replay" in walkthrough.text
         assert "Inspect history" in walkthrough.text
         driver.find_element(By.ID, "walkthroughToggle").click()
-        wait.until_not(lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed())
+        wait.until_not(
+            lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed()
+        )
 
         previous_namespace = driver.find_element(By.ID, "namespace").text
         driver.find_element(By.ID, "resetDemo").click()
-        namespace = wait.until(
-            lambda browser: _ready_reset_namespace(browser, previous_namespace)
-        )
+        namespace = wait.until(lambda browser: _ready_reset_namespace(browser, previous_namespace))
 
         driver.find_element(By.ID, "poisonDemo").click()
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text
-            == "2 live · 0 invalid"
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "2 live · 0 invalid"
         )
 
         driver.find_element(By.ID, "startRun").click()
-        wait.until(lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text)
         wait.until(
-            lambda browser: "Poisoned memory"
-            in browser.find_element(By.ID, "influenceList").text
+            lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text
+        )
+        wait.until(
+            lambda browser: "Poisoned memory" in browser.find_element(By.ID, "influenceList").text
         )
         bad_action = driver.find_element(By.CSS_SELECTOR, ".action-execution").text
         assert "scale_workers" in bad_action
@@ -179,16 +173,20 @@ def test_operator_can_run_and_explain_signature_workflow():
             expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.not-recovered"))
         )
         assert "1 unsafe" in bad_score.text
-        assert "amplified unresolved upstream pressure" in driver.find_element(
-            By.CSS_SELECTOR, ".action-observation"
-        ).text
+        assert (
+            "amplified unresolved upstream pressure"
+            in driver.find_element(By.CSS_SELECTOR, ".action-observation").text
+        )
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text
-            == "3 live · 0 invalid"
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "3 live · 0 invalid"
         )
 
         driver.find_element(By.ID, "previewRewind").click()
-        wait.until(lambda browser: "versions will close" in browser.find_element(By.ID, "rewindPreview").text)
+        wait.until(
+            lambda browser: (
+                "versions will close" in browser.find_element(By.ID, "rewindPreview").text
+            )
+        )
         driver.find_element(By.ID, "executeRewind").click()
         operation = wait.until(
             expected.presence_of_element_located(
@@ -202,12 +200,10 @@ def test_operator_can_run_and_explain_signature_workflow():
         )
         _wait_for_completed_operation(driver, timeout=float(operation_poll_seconds) + 30)
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text
-            == "1 live · 2 invalid"
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "1 live · 2 invalid"
         )
         wait.until(
-            lambda browser: browser.find_element(By.ID, "executeRewind").text
-            == "Execute rewind"
+            lambda browser: browser.find_element(By.ID, "executeRewind").text == "Execute rewind"
         )
 
         timeline = driver.find_element(By.ID, "timeline")
@@ -216,19 +212,24 @@ def test_operator_can_run_and_explain_signature_workflow():
             "arguments[0].value = 0; arguments[0].dispatchEvent(new Event('input'));",
             timeline,
         )
-        wait.until(lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Beliefs As Of")
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Beliefs As Of"
+        )
         wait.until(lambda browser: "0 invalid" in browser.find_element(By.ID, "memoryCount").text)
         assert not driver.find_elements(By.CSS_SELECTOR, ".memory.invalidated")
 
         driver.find_element(By.ID, "liveButton").click()
-        wait.until(lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Current Beliefs")
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text
-            == "1 live · 2 invalid"
+            lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Current Beliefs"
+        )
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "1 live · 2 invalid"
         )
 
         driver.find_element(By.ID, "startRun").click()
-        wait.until(lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text)
+        wait.until(
+            lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text
+        )
         wait.until(lambda browser: "1 read" in browser.find_element(By.ID, "influenceCount").text)
         assert "Poisoned memory" not in driver.find_element(By.ID, "influenceList").text
         corrected_action = driver.find_element(By.CSS_SELECTOR, ".action-execution").text
@@ -243,11 +244,39 @@ def test_operator_can_run_and_explain_signature_workflow():
         )
         assert "0 unsafe" in corrected_score.text
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text
-            == "2 live · 2 invalid"
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "2 live · 2 invalid"
         )
         _assert_typed_reflection(namespace)
         signature = _assert_signature_trace(namespace=namespace, operation_id=operation_id)
+        assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
+        assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
+
+        driver.find_element(By.ID, "lockButton").click()
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "operatorLabel").text == "Operator access"
+        )
+        driver.get(_public_browser_url())
+        wait.until(expected.presence_of_element_located((By.ID, "memories")))
+        _capture_console_errors(driver)
+        wait.until(
+            lambda browser: (
+                "resolved"
+                in browser.find_element(By.CSS_SELECTOR, '[data-stage="influenced_decision_id"]')
+                .get_attribute("class")
+                .split()
+            )
+        )
+        historical_evidence = driver.find_element(
+            By.CSS_SELECTOR, ".outcome-historical .decision-citations"
+        ).text
+        current_evidence = driver.find_element(
+            By.CSS_SELECTOR, ".outcome-current .decision-citations"
+        ).text
+        assert "demo.poison" in historical_evidence
+        assert "demo:simulated-memory-poisoning" in historical_evidence
+        assert "stale for the current incident" in historical_evidence
+        assert "demo.seed" in current_evidence
+        assert not driver.find_element(By.CSS_SELECTOR, ".operator-console").is_displayed()
         assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
         assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
     finally:
@@ -282,7 +311,9 @@ def _wait_for_completed_operation(driver, *, timeout: float) -> None:
     try:
         WebDriverWait(driver, timeout).until(completed)
     except TimeoutException as exc:
-        raise AssertionError(f"rewind did not complete before its retry budget: {observed}") from exc
+        raise AssertionError(
+            f"rewind did not complete before its retry budget: {observed}"
+        ) from exc
 
 
 def _capture_console_errors(driver) -> None:
@@ -329,9 +360,7 @@ def _write_browser_evidence(
     except Exception as exc:  # noqa: BLE001 - evidence capture must not mask the test failure
         capture_errors.append(f"screenshot: {type(exc).__name__}: {exc}")
     try:
-        console_errors = driver.execute_script(
-            "return window.__HINDSIGHT_CONSOLE_ERRORS || [];"
-        )
+        console_errors = driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];")
     except Exception as exc:  # noqa: BLE001 - evidence capture must not mask the test failure
         capture_errors.append(f"console: {type(exc).__name__}: {exc}")
         console_errors = []
@@ -385,7 +414,12 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
             """
                 SELECT run.id, run.decision_id, run.status, run.plan, run.proposed_action,
                        run.reflected_memory_id, read.id, read.memory_id,
-                       memory.writer, read.rank, read.distance
+                       memory.writer, read.rank, read.distance,
+                       memory.source_ref, memory.justification,
+                       (
+                           SELECT count(*) FROM memory_lineage_edges AS edge
+                           WHERE edge.parent_read_id = read.id
+                       ) AS downstream_lineage_edges
                 FROM agent_runs AS run
                 LEFT JOIN memory_reads AS read ON read.decision_id = run.decision_id
                 LEFT JOIN semantic_memories AS memory ON memory.id = read.semantic_memory_id
@@ -436,6 +470,9 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
                     "writer": row[8],
                     "rank": row[9],
                     "distance": row[10],
+                    "source_ref": row[11],
+                    "justification": row[12],
+                    "downstream_lineage_edges": row[13],
                 }
             )
     for run_id, metadata in event_rows:
@@ -452,7 +489,10 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
         "recovered": False,
         "unsafe_action_count": 1,
     }
-    assert any(read["writer"] == "demo.poison" for read in bad["reads"])
+    poison_read = next(read for read in bad["reads"] if read["writer"] == "demo.poison")
+    assert poison_read["source_ref"] == "demo:simulated-memory-poisoning"
+    assert "applicability is stale" in poison_read["justification"]
+    assert poison_read["downstream_lineage_edges"] >= 1
     assert corrected["status"] == "completed"
     assert "retry" in corrected["plan"].lower()
     assert corrected["action_trace"]["score"] == {
@@ -467,9 +507,7 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
         memories = store.list_current_semantic(namespace=namespace, limit=100)
         current_writers = {memory["writer"] for memory in memories}
         poison_id = next(
-            read["memory_id"]
-            for read in bad["reads"]
-            if read["writer"] == "demo.poison"
+            read["memory_id"] for read in bad["reads"] if read["writer"] == "demo.poison"
         )
         poison = store.audit_memory(memory_kind="semantic", memory_id=poison_id)
 
@@ -506,16 +544,20 @@ def test_review_required_memory_renders_as_active_in_its_historical_snapshot():
         driver.get(_browser_url(namespace=namespace))
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         wait.until(
-            lambda browser: browser.find_element(By.CSS_SELECTOR, ".memory-status").text
-            == "review required"
+            lambda browser: (
+                browser.find_element(By.CSS_SELECTOR, ".memory-status").text == "review required"
+            )
         )
         assert "1 live · 0 invalid" in driver.find_element(By.ID, "memoryCount").text
 
         driver.get(_browser_url(namespace=namespace, as_of=cutoff))
-        wait.until(lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Beliefs As Of")
         wait.until(
-            lambda browser: browser.find_element(By.CSS_SELECTOR, ".memory-status").text
-            == "current"
+            lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Beliefs As Of"
+        )
+        wait.until(
+            lambda browser: (
+                browser.find_element(By.CSS_SELECTOR, ".memory-status").text == "current"
+            )
         )
         assert "review required" not in driver.find_element(By.ID, "memories").text
         assert not driver.find_elements(By.CSS_SELECTOR, ".memory.invalidated")
@@ -657,4 +699,12 @@ def _browser_url(*, namespace: str, as_of: str | None = None) -> str:
         query.pop("as_of", None)
     else:
         query["as_of"] = as_of
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _public_browser_url() -> str:
+    parts = urlsplit(BASE_URL)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("namespace", None)
+    query.pop("as_of", None)
     return urlunsplit(parts._replace(query=urlencode(query)))
