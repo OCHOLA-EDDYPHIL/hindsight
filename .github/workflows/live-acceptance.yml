@@ -434,7 +434,7 @@ jobs:
       HOSTED_API_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_api_url || needs.deploy.outputs.api_url }}
       HINDSIGHT_WEBSOCKET_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_websocket_url || needs.deploy.outputs.websocket_url }}
       HINDSIGHT_EXPECTED_DEPLOYED_REVISION: ${{ needs.authorize.outputs.product_sha }}
-      SE_SKIP_DRIVER_IN_PATH: "true"
+      HINDSIGHT_SELENIUM_REMOTE_URL: http://127.0.0.1:4444
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
@@ -473,26 +473,39 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_ENV"
       - name: Configure browser evidence directory
-        run: echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence" >> "$GITHUB_ENV"
-      - name: Ensure isolated virtual display
+        run: |
+          mkdir -p "$RUNNER_TEMP/hindsight-browser-evidence"
+          echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence" >> "$GITHUB_ENV"
+      - name: Start isolated Firefox service
         shell: bash
         run: |
-          if ! command -v xvfb-run >/dev/null; then
-            display_root="$RUNNER_TEMP/hindsight-xvfb"
-            mkdir -p "$display_root/packages" "$display_root/root"
-            pushd "$display_root/packages" >/dev/null
-            apt-get download xvfb xauth xserver-common libfontenc1 libxfont2 x11-xkb-utils
-            for archive in ./*.deb; do
-              dpkg-deb --extract "$archive" "$display_root/root"
-            done
-            popd >/dev/null
-            echo "$display_root/root/usr/bin" >> "$GITHUB_PATH"
-            echo "LD_LIBRARY_PATH=$display_root/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-            test -x "$display_root/root/usr/bin/Xvfb"
-            test -x "$display_root/root/usr/bin/xauth"
-          fi
+          container_name="hindsight-firefox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$container_name" =~ ^hindsight-firefox-[0-9]+-[0-9]+$ ]]
+          [[ -z "$(docker ps -aq --filter "name=^/${container_name}$")" ]]
+          docker run -d --name "$container_name" --shm-size=2g \
+            -p 127.0.0.1:4444:4444 \
+            selenium/standalone-firefox@sha256:68754beb3956735905fe9a49004d71c3e1de7b410885151fd8f139618e9537dc
+          echo "HINDSIGHT_SELENIUM_CONTAINER_NAME=$container_name" >> "$GITHUB_ENV"
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:4444/status \
+              | uv run python -c 'import json,sys; raise SystemExit(not json.load(sys.stdin)["value"]["ready"])'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
       - name: Run browser acceptance
-        run: xvfb-run -a -s '-screen 0 1440x1000x24' uv run python scripts/run_live_acceptance.py hosted-product --phase browser
+        run: uv run python scripts/run_live_acceptance.py hosted-product --phase browser
+      - name: Capture and stop Firefox service
+        if: always()
+        shell: bash
+        run: |
+          container_name="${HINDSIGHT_SELENIUM_CONTAINER_NAME:-}"
+          [[ "$container_name" =~ ^hindsight-firefox-[0-9]+-[0-9]+$ ]] || exit 0
+          container_id="$(docker ps -aq --filter "name=^/${container_name}$")"
+          [[ -n "$container_id" ]] || exit 0
+          docker logs "$container_name" > "$HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR/selenium-service.log" 2>&1
+          docker rm -f "$container_name"
       - if: always()
         uses: actions/upload-artifact@v4
         with:

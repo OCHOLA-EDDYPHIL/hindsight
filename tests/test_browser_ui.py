@@ -182,6 +182,35 @@ def test_firefox_uses_virtual_display_without_native_headless(monkeypatch):
     assert attempts == [("-no-remote", "-new-instance")]
 
 
+def test_firefox_uses_remote_isolated_service_when_configured(monkeypatch, tmp_path):
+    from selenium import webdriver
+
+    attempts = []
+    sleeps = []
+    sentinel = object()
+
+    def start(*, command_executor, options):
+        attempts.append((command_executor, tuple(options.arguments)))
+        if len(attempts) == 1:
+            raise TimeoutError("remote session bootstrap timed out")
+        return sentinel
+
+    monkeypatch.setenv("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.setenv("HINDSIGHT_SELENIUM_REMOTE_URL", "http://127.0.0.1:4444")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(webdriver, "Remote", start)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    assert _start_firefox_driver() is sentinel
+    assert attempts == [
+        ("http://127.0.0.1:4444", ("-no-remote", "-new-instance")),
+        ("http://127.0.0.1:4444", ("-no-remote", "-new-instance")),
+    ]
+    assert sleeps == [2]
+    evidence = json.loads((tmp_path / "firefox-startup.json").read_text())
+    assert evidence["failures"][0]["error"].startswith("TimeoutError:")
+
+
 @requires_browser
 def test_operator_can_run_and_explain_signature_workflow():
     from selenium.webdriver.common.by import By
@@ -328,7 +357,8 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(
             lambda browser: browser.find_element(By.ID, "operatorLabel").text == "Operator access"
         )
-        driver.get(_public_browser_url())
+        public_namespace = None if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1" else namespace
+        driver.get(_public_browser_url(namespace=public_namespace))
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         _capture_console_errors(driver)
         wait.until(
@@ -492,7 +522,8 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
                        (
                            SELECT count(*) FROM memory_lineage_edges AS edge
                            WHERE edge.parent_read_id = read.id
-                       ) AS downstream_lineage_edges
+                       ) AS downstream_lineage_edges,
+                       run.provider, run.model
                 FROM agent_runs AS run
                 LEFT JOIN memory_reads AS read ON read.decision_id = run.decision_id
                 LEFT JOIN semantic_memories AS memory ON memory.id = read.semantic_memory_id
@@ -532,6 +563,8 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
                 "plan": row[3],
                 "proposed_action": row[4],
                 "reflected_memory_id": str(row[5]) if row[5] else None,
+                "provider": row[14],
+                "model": row[15],
                 "reads": [],
             },
         )
@@ -567,7 +600,11 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert "applicability is stale" in poison_read["justification"]
     assert poison_read["downstream_lineage_edges"] >= 1
     assert corrected["status"] == "completed"
-    assert "retry" in corrected["plan"].lower()
+    if corrected["provider"] == "deterministic":
+        assert corrected["model"] == "deterministic-v1"
+        assert corrected["plan"] == "deterministic response"
+    else:
+        assert "retry" in corrected["plan"].lower()
     assert corrected["action_trace"]["score"] == {
         "recovered": True,
         "unsafe_action_count": 0,
@@ -639,17 +676,22 @@ def _start_firefox_driver():
     from selenium.webdriver.firefox.options import Options
     from selenium.webdriver.firefox.service import Service
 
+    remote_url = (os.environ.get("HINDSIGHT_SELENIUM_REMOTE_URL") or "").strip()
     failures = []
     for attempt in range(1, 3):
         options = Options()
         arguments = ["-no-remote", "-new-instance"]
-        if not os.environ.get("DISPLAY"):
+        if not os.environ.get("DISPLAY") and not remote_url:
             arguments.insert(0, "-headless")
         for argument in arguments:
             options.add_argument(argument)
-        service = Service(log_output=_geckodriver_log_path(attempt))
+        service = None
         try:
-            driver = webdriver.Firefox(options=options, service=service)
+            if remote_url:
+                driver = webdriver.Remote(command_executor=remote_url, options=options)
+            else:
+                service = Service(log_output=_geckodriver_log_path(attempt))
+                driver = webdriver.Firefox(options=options, service=service)
         except Exception as exc:  # noqa: BLE001 - retry only wraps session bootstrap
             failures.append(
                 {
@@ -657,10 +699,13 @@ def _start_firefox_driver():
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
-            try:
-                service.stop()
-            except Exception as stop_exc:  # noqa: BLE001 - preserve the startup failure
-                failures[-1]["cleanup_error"] = f"{type(stop_exc).__name__}: {stop_exc}"
+            if service is not None:
+                try:
+                    service.stop()
+                except Exception as stop_exc:  # noqa: BLE001 - preserve startup failure
+                    failures[-1]["cleanup_error"] = (
+                        f"{type(stop_exc).__name__}: {stop_exc}"
+                    )
             _write_firefox_startup_evidence(failures)
             if attempt == 2:
                 raise
@@ -834,9 +879,12 @@ def _browser_url(*, namespace: str, as_of: str | None = None) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-def _public_browser_url() -> str:
+def _public_browser_url(*, namespace: str | None = None) -> str:
     parts = urlsplit(BASE_URL)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.pop("namespace", None)
+    if namespace is None:
+        query.pop("namespace", None)
+    else:
+        query["namespace"] = namespace
     query.pop("as_of", None)
     return urlunsplit(parts._replace(query=urlencode(query)))
