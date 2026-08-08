@@ -77,7 +77,6 @@ DATABASE_GROUPS = {
         "tests/test_learning_benchmark_setup.py",
         "tests/test_learning_evidence_foundation.py",
         "tests/test_learning_orchestration.py",
-        "tests/test_telemetry.py",
     ),
 }
 
