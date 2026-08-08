@@ -3,7 +3,7 @@ LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
 BENCHMARK_MAX_DISTANCE ?= 0.35
 DIAGNOSTIC_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight_diagnostic_local?sslmode=disable
 
-.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts telemetry-demo poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local benchmark-smoke benchmark-pilot rank-diagnostic-synthetic product-api-local changefeed-apply changefeed-pause changefeed-status
+.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local benchmark-smoke benchmark-pilot rank-diagnostic-synthetic product-api-local changefeed-apply changefeed-pause changefeed-status
 
 dev-up:
 	docker compose up -d --wait
@@ -35,9 +35,6 @@ lint:
 
 lambda-artifacts:
 	uv run python scripts/build_lambda_artifacts.py
-
-telemetry-demo:
-	DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python scripts/run_telemetry_demo.py
 
 poison-rewind-demo:
 	uv run python scripts/run_poison_rewind_demo.py all
