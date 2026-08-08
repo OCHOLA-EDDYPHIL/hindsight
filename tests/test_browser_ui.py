@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -105,17 +106,65 @@ def test_reset_session_readiness_requires_new_namespace_and_known_good_snapshot(
     )
 
 
+def test_firefox_startup_is_isolated_retried_and_evidenced(monkeypatch, tmp_path):
+    from selenium import webdriver
+    from selenium.webdriver.firefox import service as service_module
+
+    attempts = []
+    services = []
+    sleeps = []
+    sentinel = object()
+
+    class FakeService:
+        def __init__(self, *, log_output):
+            self.log_output = log_output
+            self.stopped = False
+            services.append(self)
+
+        def stop(self):
+            self.stopped = True
+
+    def start(*, options, service):
+        attempts.append((tuple(options.arguments), service.log_output))
+        if len(attempts) == 1:
+            raise TimeoutError("session bootstrap timed out")
+        return sentinel
+
+    monkeypatch.setenv("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.setattr(webdriver, "Firefox", start)
+    monkeypatch.setattr(service_module, "Service", FakeService)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    assert _start_firefox_driver() is sentinel
+    assert [arguments for arguments, _ in attempts] == [
+        ("-headless", "-no-remote", "-new-instance"),
+        ("-headless", "-no-remote", "-new-instance"),
+    ]
+    assert [Path(log).name for _, log in attempts] == [
+        "geckodriver-attempt-1.log",
+        "geckodriver-attempt-2.log",
+    ]
+    assert services[0].stopped is True
+    assert services[1].stopped is False
+    assert sleeps == [2]
+    evidence = json.loads((tmp_path / "firefox-startup.json").read_text())
+    assert evidence == {
+        "failures": [
+            {
+                "attempt": 1,
+                "error": "TimeoutError: session bootstrap timed out",
+            }
+        ]
+    }
+
+
 @requires_browser
 def test_operator_can_run_and_explain_signature_workflow():
-    from selenium import webdriver
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.firefox.options import Options
     from selenium.webdriver.support import expected_conditions as expected
     from selenium.webdriver.support.ui import WebDriverWait
 
-    options = Options()
-    options.add_argument("-headless")
-    driver = webdriver.Firefox(options=options)
+    driver = _start_firefox_driver()
     driver.set_script_timeout(120)
     wait = WebDriverWait(driver, 90)
     operation_id = None
@@ -528,16 +577,12 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
 
 @requires_browser
 def test_review_required_memory_renders_as_active_in_its_historical_snapshot():
-    from selenium import webdriver
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.firefox.options import Options
     from selenium.webdriver.support import expected_conditions as expected
     from selenium.webdriver.support.ui import WebDriverWait
 
     namespace, cutoff = _prepare_review_required_fixture()
-    options = Options()
-    options.add_argument("-headless")
-    driver = webdriver.Firefox(options=options)
+    driver = _start_firefox_driver()
     wait = WebDriverWait(driver, 90)
     try:
         driver.set_window_size(1440, 1000)
@@ -563,6 +608,66 @@ def test_review_required_memory_renders_as_active_in_its_historical_snapshot():
         assert not driver.find_elements(By.CSS_SELECTOR, ".memory.invalidated")
     finally:
         driver.quit()
+
+
+def _start_firefox_driver():
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.firefox.service import Service
+
+    failures = []
+    for attempt in range(1, 3):
+        options = Options()
+        for argument in ("-headless", "-no-remote", "-new-instance"):
+            options.add_argument(argument)
+        service = Service(log_output=_geckodriver_log_path(attempt))
+        try:
+            driver = webdriver.Firefox(options=options, service=service)
+        except Exception as exc:  # noqa: BLE001 - retry only wraps session bootstrap
+            failures.append(
+                {
+                    "attempt": attempt,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            try:
+                service.stop()
+            except Exception as stop_exc:  # noqa: BLE001 - preserve the startup failure
+                failures[-1]["cleanup_error"] = f"{type(stop_exc).__name__}: {stop_exc}"
+            _write_firefox_startup_evidence(failures)
+            if attempt == 2:
+                raise
+            time.sleep(2)
+        else:
+            _write_firefox_startup_evidence(failures)
+            return driver
+    raise AssertionError("Firefox driver startup exhausted its bounded retry")
+
+
+def _geckodriver_log_path(attempt: int) -> str | None:
+    directory = _browser_evidence_directory()
+    if directory is None:
+        return None
+    return str(directory / f"geckodriver-attempt-{attempt}.log")
+
+
+def _write_firefox_startup_evidence(failures: list[dict]) -> None:
+    directory = _browser_evidence_directory()
+    if directory is None:
+        return
+    (directory / "firefox-startup.json").write_text(
+        json.dumps({"failures": failures}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _browser_evidence_directory() -> Path | None:
+    directory_value = (os.environ.get("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR") or "").strip()
+    if not directory_value:
+        return None
+    directory = Path(directory_value)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
 def _assert_typed_reflection(namespace: str) -> None:
