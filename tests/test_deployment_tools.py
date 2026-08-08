@@ -335,9 +335,10 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
         "  product_acceptance_complete:\n", 1
     )[0]
 
-    assert (
-        "HINDSIGHT_WEBSOCKET_URL: ${{ needs.deploy.outputs.websocket_url }}" in browser_job
-    )
+    assert "HINDSIGHT_WEBSOCKET_URL:" in browser_job
+    assert "needs.acceptance_plan.outputs.candidate_websocket_url" in browser_job
+    assert "needs.deploy.outputs.websocket_url" in browser_job
+    assert "HINDSIGHT_EXPECTED_DEPLOYED_REVISION" in browser_job
     assert 'CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER"' in browser_job
     assert 'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"' in browser_job
     assert 'echo "::add-mask::$value"' in browser_job
@@ -397,6 +398,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
     assert set(parsed["jobs"]) == {
         "authorize",
         "exact_main_ci",
+        "acceptance_plan",
         "product_preflight",
         "deploy",
         "semantic_product",
@@ -411,23 +413,33 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "actions": "read",
         "contents": "read",
     }
+    assert parsed["jobs"]["acceptance_plan"]["needs"] == [
+        "authorize",
+        "exact_main_ci",
+    ]
     assert parsed["jobs"]["product_preflight"]["needs"] == [
         "authorize",
         "exact_main_ci",
+        "acceptance_plan",
     ]
     assert parsed["jobs"]["deploy"]["needs"] == [
         "authorize",
         "exact_main_ci",
+        "acceptance_plan",
         "product_preflight",
     ]
     for job_name in (
         "semantic_product",
         "consolidation_product",
         "worker_product",
-        "browser_product",
         "database_roles",
     ):
         assert parsed["jobs"][job_name]["needs"] == ["authorize", "deploy"]
+    assert parsed["jobs"]["browser_product"]["needs"] == [
+        "authorize",
+        "acceptance_plan",
+        "deploy",
+    ]
     assert parsed["jobs"]["product_acceptance_complete"]["needs"] == [
         "authorize",
         "exact_main_ci",
@@ -439,6 +451,40 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "browser_product",
         "database_roles",
     ]
+
+
+def test_live_acceptance_modes_preserve_full_gate_and_isolate_browser_diagnostics():
+    workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    parsed = yaml.safe_load(workflow)
+    inputs = parsed[True]["workflow_dispatch"]["inputs"]
+    jobs = parsed["jobs"]
+
+    assert inputs["acceptance_mode"] == {
+        "description": "Authoritative full gate or browser-only diagnostic",
+        "required": True,
+        "type": "choice",
+        "default": "full",
+        "options": ["full", "browser-only"],
+    }
+    assert "hosted-plan" in next(
+        step["run"] for step in jobs["acceptance_plan"]["steps"] if step.get("id") == "plan"
+    )
+    assert jobs["product_preflight"]["if"] == (
+        "needs.acceptance_plan.outputs.run_product_preflight == 'true'"
+    )
+    for job_name in (
+        "semantic_product",
+        "consolidation_product",
+        "worker_product",
+        "database_roles",
+    ):
+        assert jobs[job_name]["if"] == ("needs.authorize.outputs.acceptance_mode == 'full'")
+    assert jobs["worker_product"]["needs"] == ["authorize", "deploy"]
+    assert "reuse_candidate" in jobs["browser_product"]["if"]
+    assert jobs["product_acceptance_complete"]["if"] == (
+        "always() && needs.authorize.outputs.acceptance_mode == 'full'"
+    )
+    assert "acceptance_mode" not in parsed["concurrency"]["group"]
 
 
 def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_path):
@@ -623,6 +669,7 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
             {"TRIGGERING_ACTOR": "different-user"},
             {"WORKFLOW_REF": f"{repository}/.github/workflows/other.yml@refs/heads/main"},
             {"EVENT_SHA": "not-a-sha"},
+            {"REQUESTED_MODE": "unsupported"},
         )
     ):
         rejected = _run_authorization_script(

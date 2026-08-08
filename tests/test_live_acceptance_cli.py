@@ -18,6 +18,10 @@ acceptance = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(acceptance)
 
 
+def _github_outputs(path: pathlib.Path) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
+
 def test_local_acceptance_refuses_non_loopback_and_existing_databases(monkeypatch):
     with pytest.raises(ValueError, match="loopback"):
         acceptance._validate_local_url(
@@ -154,6 +158,198 @@ def test_hosted_product_phases_are_selector_isolated():
     }
     flattened = [selector for selectors in phases.values() for selector in selectors]
     assert len(flattened) == len(set(flattened))
+
+
+def test_full_hosted_plan_preserves_authoritative_path(monkeypatch, tmp_path):
+    output = tmp_path / "github-output"
+    monkeypatch.setattr(
+        acceptance,
+        "_probe_deployed_candidate",
+        lambda **_kwargs: pytest.fail("full mode must not probe for deployment reuse"),
+    )
+
+    acceptance._plan_hosted_acceptance(
+        SimpleNamespace(
+            mode="full",
+            requested_sha="a" * 40,
+            candidate_ui_url="https://ui.example.test",
+            github_output=output,
+        )
+    )
+
+    assert _github_outputs(output) == {
+        "acceptance_mode": "full",
+        "run_product_preflight": "true",
+        "run_deploy": "true",
+        "reuse_candidate": "false",
+        "candidate_ui_url": "",
+        "candidate_api_url": "",
+        "candidate_websocket_url": "",
+        "observed_revision": "not-checked",
+    }
+
+
+def test_browser_only_plan_reuses_only_an_exact_candidate(monkeypatch, tmp_path):
+    output = tmp_path / "github-output"
+    requested_sha = "b" * 40
+    monkeypatch.setattr(
+        acceptance,
+        "_probe_deployed_candidate",
+        lambda **_kwargs: {
+            "reusable": True,
+            "observed_revision": requested_sha,
+            "ui_url": "https://ui.example.test",
+            "api_url": "https://ui.example.test",
+            "websocket_url": "wss://socket.example.test/demo",
+        },
+    )
+
+    acceptance._plan_hosted_acceptance(
+        SimpleNamespace(
+            mode="browser-only",
+            requested_sha=requested_sha,
+            candidate_ui_url="https://ui.example.test",
+            github_output=output,
+        )
+    )
+
+    assert _github_outputs(output) == {
+        "acceptance_mode": "browser-only",
+        "run_product_preflight": "false",
+        "run_deploy": "false",
+        "reuse_candidate": "true",
+        "candidate_ui_url": "https://ui.example.test",
+        "candidate_api_url": "https://ui.example.test",
+        "candidate_websocket_url": "wss://socket.example.test/demo",
+        "observed_revision": requested_sha,
+    }
+
+
+@pytest.mark.parametrize("observed_revision", ("a" * 40, "unavailable"))
+def test_browser_only_plan_deploys_once_for_nonreusable_candidate(
+    monkeypatch, tmp_path, observed_revision
+):
+    output = tmp_path / "github-output"
+    monkeypatch.setattr(
+        acceptance,
+        "_probe_deployed_candidate",
+        lambda **_kwargs: {
+            "reusable": False,
+            "observed_revision": observed_revision,
+        },
+    )
+
+    acceptance._plan_hosted_acceptance(
+        SimpleNamespace(
+            mode="browser-only",
+            requested_sha="b" * 40,
+            candidate_ui_url="https://ui.example.test",
+            github_output=output,
+        )
+    )
+
+    outputs = _github_outputs(output)
+    assert outputs["run_product_preflight"] == "false"
+    assert outputs["run_deploy"] == "true"
+    assert outputs["reuse_candidate"] == "false"
+    assert outputs["observed_revision"] == observed_revision
+
+
+def test_candidate_probe_requires_exact_revision_and_runtime_endpoints(monkeypatch):
+    requested_sha = "c" * 40
+    monkeypatch.setattr(
+        acceptance,
+        "_read_runtime_config",
+        lambda _url: {
+            "apiBase": "/v1",
+            "websocketUrl": "wss://socket.example.test/demo",
+        },
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_read_json_url",
+        lambda _url: {"status": "live", "revision": requested_sha},
+    )
+
+    exact = acceptance._probe_deployed_candidate(
+        expected_sha=requested_sha,
+        ui_url="https://ui.example.test",
+    )
+    assert exact == {
+        "reusable": True,
+        "observed_revision": requested_sha,
+        "ui_url": "https://ui.example.test",
+        "api_url": "https://ui.example.test",
+        "websocket_url": "wss://socket.example.test/demo",
+    }
+
+    monkeypatch.setattr(
+        acceptance,
+        "_read_json_url",
+        lambda _url: {"status": "live", "revision": "d" * 40},
+    )
+    assert acceptance._probe_deployed_candidate(
+        expected_sha=requested_sha,
+        ui_url="https://ui.example.test",
+    ) == {"reusable": False, "observed_revision": "d" * 40}
+
+
+def test_browser_preflight_fails_closed_on_revision_mismatch(monkeypatch):
+    monkeypatch.setenv("HINDSIGHT_BROWSER_BASE_URL", "https://ui.example.test")
+    monkeypatch.setenv("HOSTED_API_URL", "https://api.example.test")
+    monkeypatch.setenv("HINDSIGHT_WEBSOCKET_URL", "wss://socket.example.test/demo")
+    monkeypatch.setenv("HINDSIGHT_EXPECTED_DEPLOYED_REVISION", "e" * 40)
+    monkeypatch.setattr(
+        acceptance,
+        "_read_json_url",
+        lambda _url: {"status": "live", "revision": "f" * 40},
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        acceptance._verify_hosted_endpoints()
+
+
+def test_browser_revision_mismatch_stops_before_changefeed_or_pytest(monkeypatch):
+    monkeypatch.setattr(acceptance, "_require_gemini_credentials", lambda: None)
+    monkeypatch.setattr(
+        acceptance,
+        "_verify_hosted_endpoints",
+        lambda: (_ for _ in ()).throw(RuntimeError("revision mismatch")),
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_verify_changefeed",
+        lambda _env: pytest.fail("changefeed check must not run after a SHA mismatch"),
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_run_hosted_pytest",
+        lambda *_args, **_kwargs: pytest.fail("browser mutations must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="revision mismatch"):
+        acceptance._run_hosted_product(
+            SimpleNamespace(
+                phase="browser",
+                database_url=(
+                    "postgresql://runtime@cluster.example:26257/"
+                    "hindsight?sslmode=verify-full"
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize("revision", ("short", "A" * 40, "g" * 40))
+def test_hosted_plan_rejects_noncanonical_requested_sha(tmp_path, revision):
+    with pytest.raises(ValueError, match="full lowercase hexadecimal SHA"):
+        acceptance._plan_hosted_acceptance(
+            SimpleNamespace(
+                mode="full",
+                requested_sha=revision,
+                candidate_ui_url="https://ui.example.test",
+                github_output=tmp_path / "github-output",
+            )
+        )
 
 
 @pytest.mark.parametrize(
