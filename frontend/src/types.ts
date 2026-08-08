@@ -39,6 +39,9 @@ export interface TraceRead {
   rank?: number | null;
   distance?: number | null;
   memory_status?: string | null;
+  writer?: string | null;
+  source_ref?: string | null;
+  justification?: string | null;
   embedding_profile_id?: Identifier | null;
   evidence_ids?: Identifier[];
   incoming_lineage_edge_ids?: Identifier[];

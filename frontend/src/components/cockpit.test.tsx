@@ -29,6 +29,18 @@ const scenario: SignatureScenario = {
       decision_id: "decision-rejected",
       plan: "Scale payment workers while downstream retry fanout remains elevated.",
       proposed_action: "Scale payment workers while retry fanout remains elevated.",
+      trace: {
+        reads: [
+          {
+            id: "read-poison",
+            memory_id: "memory-poison",
+            writer: "demo.poison",
+            source_ref: "demo:simulated-memory-poisoning",
+            justification: "Previously approved retry guidance is stale for this incident.",
+            outgoing_lineage_edge_ids: ["edge-poison-reflection"],
+          },
+        ],
+      },
       action_trace: {
         request: { id: "action-rejected", actions: ["scale_workers"] },
         execution: {
@@ -52,6 +64,18 @@ const scenario: SignatureScenario = {
       decision_id: "decision-corrected",
       plan: "Retry fanout amplified processor timeouts; inspect queue depth; throttle retry workers.",
       proposed_action: "Throttle retry fanout while processor health recovers.",
+      trace: {
+        reads: [
+          {
+            id: "read-baseline",
+            memory_id: "memory-baseline",
+            writer: "demo.seed",
+            source_ref: "demo:known-good-payment-incident",
+            justification: "Resolved incident evidence supports throttling retries.",
+            outgoing_lineage_edge_ids: ["edge-baseline-reflection"],
+          },
+        ],
+      },
       action_trace: {
         request: {
           id: "action-corrected",
@@ -153,6 +177,19 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText(/amplified unresolved upstream pressure/)).toBeVisible();
     expect(screen.getByText(/downstream pressure recovered/)).toBeVisible();
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
+    expect(screen.getByText("demo.poison")).toBeVisible();
+    expect(screen.getByText("demo:simulated-memory-poisoning")).toBeVisible();
+    expect(screen.getByText(/Previously approved retry guidance is stale/)).toBeVisible();
+    expect(screen.getByText("demo.seed")).toBeVisible();
+    expect(screen.getAllByText("1 downstream lineage edge")).toHaveLength(2);
+    expect(screen.getByLabelText(/Copy historical cited memory/)).toHaveAttribute(
+      "title",
+      "memory-poison",
+    );
+    expect(screen.getByLabelText(/Copy current cited memory/)).toHaveAttribute(
+      "title",
+      "memory-baseline",
+    );
   });
 
   it("shows the bounded action request before execution is approved", () => {

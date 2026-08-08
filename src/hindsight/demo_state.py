@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from hindsight.db import connect, database_url
 from hindsight.embeddings import EmbeddingProvider
-from hindsight.memory import MemoryStore, Provenance
+from hindsight.memory import APPROVED_POSITIVE_GUIDANCE, MemoryStore, Provenance
 
 DEMO_NAMESPACE = "demo:payments-poison-rewind"
 DEMO_INCIDENT_ID = "demo-payments-checkout-latency"
@@ -119,19 +119,19 @@ def poison_demo_memory(
             provenance=Provenance(
                 writer="demo.poison",
                 source_ref="demo:simulated-memory-poisoning",
-                justification="Scripted memory poisoning for rewind demonstration",
+                justification=(
+                    "Simulate previously approved retry guidance whose applicability "
+                    "is stale for the current incident"
+                ),
             ),
             metadata={
                 "demo": "poison-rewind",
                 "role": "poison",
                 "attack_class": "memory_poisoning",
                 "kind": "procedural_lesson",
-                "operator_disposition": "rejected",
-                "safety_status": "unsafe",
-                "contradiction_status": "contradicted",
-                "evidence_quality": "unverified_claim",
-                "usage_instruction": "audit_only",
+                "evidence_quality": "legacy_runbook",
             },
+            governance=APPROVED_POSITIVE_GUIDANCE,
         )
 
 
@@ -140,9 +140,7 @@ def ensure_poison_rewind_incident(
 ) -> dict[str, Any]:
     service_id = fixture_id or UUID("10000000-0000-0000-0000-000000000001")
     incident_id = fixture_id or UUID("40000000-0000-0000-0000-000000000001")
-    incident_slug = (
-        f"{DEMO_INCIDENT_ID}:{fixture_id.hex}" if fixture_id else DEMO_INCIDENT_ID
-    )
+    incident_slug = f"{DEMO_INCIDENT_ID}:{fixture_id.hex}" if fixture_id else DEMO_INCIDENT_ID
     with connect(db_url or database_url()) as conn:
         with conn.transaction():
             service = conn.execute(

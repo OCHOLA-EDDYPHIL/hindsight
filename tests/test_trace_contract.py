@@ -5,9 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-requires_db = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
-)
+requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
 @requires_db
@@ -78,9 +76,7 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
     assert str(read["memory_id"]) == str(source["id"])
     assert read["belief_id"] == source["belief_id"]
     assert read["version_number"] == source["version_number"]
-    assert read["embedding_profile_id"] == trace["retrievals"][0][
-        "embedding_profile_id"
-    ]
+    assert read["embedding_profile_id"] == trace["retrievals"][0]["embedding_profile_id"]
     assert read["memory_producer_decision_id"] == source["producer_decision_id"]
     assert read["memory_status"] == "invalidated"
     assert read["t_invalid"] is not None
@@ -90,9 +86,7 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
     assert {str(edge["child_semantic_memory_id"]) for edge in trace["lineage_edges"]} == {
         str(child["id"])
     }
-    assert {edge["producer_decision_id"] for edge in trace["lineage_edges"]} == {
-        decision_id
-    }
+    assert {edge["producer_decision_id"] for edge in trace["lineage_edges"]} == {decision_id}
     assert len({edge["created_at"] for edge in trace["lineage_edges"]}) == 1
     lineage_ids = [str(edge["id"]) for edge in trace["lineage_edges"]]
     assert lineage_ids == sorted(lineage_ids)
@@ -162,6 +156,7 @@ def test_explicit_signature_scenario_returns_partial_identity_state():
 def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     from hindsight.db import connect, database_url
     from hindsight.demo_state import (
+        DEMO_INPUT,
         DEMO_NAMESPACE,
         ensure_poison_rewind_incident,
         poison_demo_memory,
@@ -207,6 +202,16 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
         user_input="corrected run",
         db_url=database_url(),
     )
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        bad_retrieval = store.retrieve_semantic(
+            namespace=namespace,
+            query=DEMO_INPUT,
+            decision_id=bad["decision_id"],
+            reader="pytest.trace",
+            purpose="Record the stale guidance that shaped the unsafe decision",
+            positive_guidance_only=True,
+        )
+    assert str(poison["id"]) in {str(row["id"]) for row in bad_retrieval.hits}
     with connect(database_url()) as conn:
         with conn.transaction():
             conn.execute(
@@ -299,6 +304,16 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
             actor="pytest.trace",
             reason="Remove poison",
         )
+    with MemoryStore(url=database_url(), embedding_provider=provider) as store:
+        corrected_retrieval = store.retrieve_semantic(
+            namespace=namespace,
+            query=DEMO_INPUT,
+            decision_id=corrected["decision_id"],
+            reader="pytest.trace",
+            purpose="Record the corrected decision after rewind",
+            positive_guidance_only=True,
+        )
+    assert str(poison["id"]) not in {str(row["id"]) for row in corrected_retrieval.hits}
 
     validation_namespace = reset_poison_rewind_state(
         namespace=f"live-browser:{uuid4()}",
@@ -360,23 +375,26 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert default["stages"]["influenced_decision_id"] == bad["decision_id"]
     assert default["stages"]["rewind_operation_id"] == operation
     assert default["stages"]["corrected_decision_id"] == corrected["decision_id"]
-    bad_trace = next(
-        run for run in default["runs"] if str(run["id"]) == bad["id"]
-    )
-    corrected_trace = next(
-        run for run in default["runs"] if str(run["id"]) == corrected["id"]
-    )
+    bad_trace = next(run for run in default["runs"] if str(run["id"]) == bad["id"])
+    corrected_trace = next(run for run in default["runs"] if str(run["id"]) == corrected["id"])
     assert bad_trace["action_trace"]["score"] == {
         "recovered": False,
         "unsafe_action_count": 1,
     }
+    poison_read = next(
+        read for read in bad_trace["trace"]["reads"] if str(read["memory_id"]) == str(poison["id"])
+    )
+    assert poison_read["writer"] == "demo.poison"
+    assert poison_read["source_ref"] == "demo:simulated-memory-poisoning"
+    assert "applicability is stale" in poison_read["justification"]
     assert corrected_trace["action_trace"]["score"] == {
         "recovered": True,
         "unsafe_action_count": 0,
     }
-    assert next(row for row in default["memories"] if row["id"] == poison["id"])[
-        "t_invalid"
-    ] is not None
+    assert (
+        next(row for row in default["memories"] if row["id"] == poison["id"])["t_invalid"]
+        is not None
+    )
     by_scenario = signature_scenario_trace(
         scenario_id=str(default["scenario_id"]),
         db_url=database_url(),
@@ -405,6 +423,14 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert public.status_code == 200
     assert public.json()["scenario_id"] == str(default["scenario_id"])
     assert "content" not in public.json()["memories"][0]
+    public_poison_read = next(
+        read
+        for run in public.json()["runs"]
+        for read in (run.get("trace") or {}).get("reads", [])
+        if read.get("writer") == "demo.poison"
+    )
+    assert public_poison_read["source_ref"] == "demo:simulated-memory-poisoning"
+    assert "applicability is stale" in public_poison_read["justification"]
     deep_link = client.get(f"/v1/signature-scenarios/{default['scenario_id']}")
     assert deep_link.status_code == 200
     assert deep_link.json()["namespace"] == namespace
