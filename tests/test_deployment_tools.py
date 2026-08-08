@@ -344,8 +344,9 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
     assert 'SE_SKIP_DRIVER_IN_PATH: "true"' in browser_job
-    assert "sudo env DEBIAN_FRONTEND=noninteractive apt-get install" in browser_job
-    assert "--no-install-recommends xvfb xauth" in browser_job
+    assert "apt-get download xvfb xauth xserver-common" in browser_job
+    assert "dpkg-deb --extract" in browser_job
+    assert 'echo "$display_root/root/usr/bin" >> "$GITHUB_PATH"' in browser_job
     assert "xvfb-run -a -s '-screen 0 1440x1000x24'" in browser_job
     assert "run_live_acceptance.py hosted-product --phase browser" in browser_job
     for name, default in (

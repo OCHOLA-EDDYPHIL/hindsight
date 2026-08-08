@@ -478,11 +478,19 @@ jobs:
         shell: bash
         run: |
           if ! command -v xvfb-run >/dev/null; then
-            sudo apt-get update
-            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb xauth
+            display_root="$RUNNER_TEMP/hindsight-xvfb"
+            mkdir -p "$display_root/packages" "$display_root/root"
+            pushd "$display_root/packages" >/dev/null
+            apt-get download xvfb xauth xserver-common libfontenc1 libxfont2 x11-xkb-utils
+            for archive in ./*.deb; do
+              dpkg-deb --extract "$archive" "$display_root/root"
+            done
+            popd >/dev/null
+            echo "$display_root/root/usr/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$display_root/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            test -x "$display_root/root/usr/bin/Xvfb"
+            test -x "$display_root/root/usr/bin/xauth"
           fi
-          command -v Xvfb >/dev/null
-          command -v xauth >/dev/null
       - name: Run browser acceptance
         run: xvfb-run -a -s '-screen 0 1440x1000x24' uv run python scripts/run_live_acceptance.py hosted-product --phase browser
       - if: always()
