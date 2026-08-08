@@ -434,6 +434,7 @@ jobs:
       HOSTED_API_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_api_url || needs.deploy.outputs.api_url }}
       HINDSIGHT_WEBSOCKET_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_websocket_url || needs.deploy.outputs.websocket_url }}
       HINDSIGHT_EXPECTED_DEPLOYED_REVISION: ${{ needs.authorize.outputs.product_sha }}
+      SE_SKIP_DRIVER_IN_PATH: "true"
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
@@ -473,7 +474,17 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Configure browser evidence directory
         run: echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence" >> "$GITHUB_ENV"
-      - run: uv run python scripts/run_live_acceptance.py hosted-product --phase browser
+      - name: Ensure isolated virtual display
+        shell: bash
+        run: |
+          if ! command -v xvfb-run >/dev/null; then
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb xauth
+          fi
+          command -v Xvfb >/dev/null
+          command -v xauth >/dev/null
+      - name: Run browser acceptance
+        run: xvfb-run -a -s '-screen 0 1440x1000x24' uv run python scripts/run_live_acceptance.py hosted-product --phase browser
       - if: always()
         uses: actions/upload-artifact@v4
         with:
