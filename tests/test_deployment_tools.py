@@ -343,11 +343,12 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert 'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"' in browser_job
     assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
-    assert 'SE_SKIP_DRIVER_IN_PATH: "true"' in browser_job
-    assert "apt-get download xvfb xauth xserver-common" in browser_job
-    assert "dpkg-deb --extract" in browser_job
-    assert 'echo "$display_root/root/usr/bin" >> "$GITHUB_PATH"' in browser_job
-    assert "xvfb-run -a -s '-screen 0 1440x1000x24'" in browser_job
+    assert "HINDSIGHT_SELENIUM_REMOTE_URL: http://127.0.0.1:4444" in browser_job
+    assert "selenium/standalone-firefox@sha256:" in browser_job
+    assert "--shm-size=2g" in browser_job
+    assert 'docker ps -aq --filter "name=^/${container_name}$"' in browser_job
+    assert 'docker logs "$container_name"' in browser_job
+    assert 'docker rm -f "$container_name"' in browser_job
     assert "run_live_acceptance.py hosted-product --phase browser" in browser_job
     for name, default in (
         ("HINDSIGHT_DEPLOY_DATABASE_URL_PARAM", "/hindsight/demo/database-url"),
