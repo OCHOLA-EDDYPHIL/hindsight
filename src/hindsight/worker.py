@@ -61,6 +61,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             process_message(
                 message,
                 dead_letter=bool(source_arn and source_arn == os.environ.get(RUN_DLQ_ARN_ENV)),
+                worker_message_id=message_id,
             )
             _log_record_result(
                 status="completed",
@@ -103,7 +104,13 @@ def _log_record_result(
         "source_arn": source_arn,
         "lambda_request_id": str(getattr(context, "aws_request_id", "local")),
     }
-    for key in ("operation_id", "run_id", "incident_id"):
+    for key in (
+        "operation_id",
+        "run_id",
+        "incident_id",
+        "dispatch_id",
+        "dispatch_attempt_id",
+    ):
         value = str(message.get(key) or "").strip()
         if value:
             record[key] = value
@@ -115,7 +122,12 @@ def _log_record_result(
         LOGGER.info(json.dumps(record, sort_keys=True))
 
 
-def process_message(message: dict[str, Any], *, dead_letter: bool = False) -> dict[str, Any] | None:
+def process_message(
+    message: dict[str, Any],
+    *,
+    dead_letter: bool = False,
+    worker_message_id: str | None = None,
+) -> dict[str, Any] | None:
     """Process one start or resume command."""
 
     supplied_tenant = message.get("tenant_id")
@@ -126,11 +138,18 @@ def process_message(message: dict[str, Any], *, dead_letter: bool = False) -> di
         or worker_tenant_id(os.environ.get("HINDSIGHT_WORKER_TENANT_ID", public_demo_tenant_id()))
     )
     with tenant_scope(tenant_id):
-        return _process_tenant_message(message, dead_letter=dead_letter)
+        return _process_tenant_message(
+            message,
+            dead_letter=dead_letter,
+            worker_message_id=worker_message_id,
+        )
 
 
 def _process_tenant_message(
-    message: dict[str, Any], *, dead_letter: bool = False
+    message: dict[str, Any],
+    *,
+    dead_letter: bool = False,
+    worker_message_id: str | None = None,
 ) -> dict[str, Any] | None:
     configure_tracing_from_env(service_name="hindsight-worker")
     command = str(message.get("command") or "start").strip().lower()
@@ -197,6 +216,18 @@ def _process_tenant_message(
     command_generation = message.get("command_generation", 0)
     if type(command_generation) is not int or command_generation < 0:
         raise ValueError("command_generation must be a non-negative integer")
+    dispatch_id = str(message.get("dispatch_id") or "").strip()
+    dispatch_attempt_id = str(message.get("dispatch_attempt_id") or "").strip()
+    dispatch_sequence = message.get("dispatch_sequence")
+    if not dispatch_id or not dispatch_attempt_id:
+        raise ValueError("dispatch_id and dispatch_attempt_id are required")
+    if type(dispatch_sequence) is not int or dispatch_sequence < 1:
+        raise ValueError("dispatch_sequence must be a positive integer")
+    resolved_worker_message_id = str(
+        worker_message_id or f"direct:{dispatch_attempt_id}"
+    ).strip()
+    if not resolved_worker_message_id:
+        raise ValueError("worker_message_id must not be blank")
 
     settings = runtime_settings()
     db_url = settings.database_url
@@ -208,6 +239,10 @@ def _process_tenant_message(
         command_generation=command_generation,
         lease_ttl=timedelta(seconds=lease_seconds),
         max_attempts=max_attempts,
+        dispatch_id=dispatch_id,
+        dispatch_attempt_id=dispatch_attempt_id,
+        dispatch_sequence=dispatch_sequence,
+        worker_message_id=resolved_worker_message_id,
         db_url=db_url,
     )
     if claim.outcome == "busy":

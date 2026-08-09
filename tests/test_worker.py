@@ -8,6 +8,22 @@ from types import SimpleNamespace
 import pytest
 
 
+RUN_DELIVERY = {
+    "dispatch_id": "dispatch-1",
+    "dispatch_attempt_id": "dispatch-attempt-1",
+    "dispatch_sequence": 1,
+}
+
+
+def _run_message(*, command="start", run_id="run-1", **fields):
+    return {
+        "command": command,
+        "run_id": run_id,
+        **RUN_DELIVERY,
+        **fields,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _stub_runtime_providers(monkeypatch):
     from tests.fakes import DeterministicEmbeddingProvider, DeterministicReasoningProvider
@@ -154,7 +170,7 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
         ),
     )
 
-    result = worker.process_message({"command": command, "run_id": "run-1"})
+    result = worker.process_message(_run_message(command=command))
 
     assert result == {"id": "run-1", "status": "existing"}
     assert settings_calls == [True]
@@ -168,6 +184,8 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
                 "command_generation": 0,
                 "lease_ttl": timedelta(seconds=300),
                 "max_attempts": 3,
+                **RUN_DELIVERY,
+                "worker_message_id": "direct:dispatch-attempt-1",
                 "db_url": "postgresql://hosted/database",
             },
         ),
@@ -175,6 +193,119 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
             "get",
             {"run_id": "run-1", "db_url": "postgresql://hosted/database"},
         ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "field", "value", "remove", "error"),
+    [
+        ("start", "dispatch_id", None, True, "dispatch_id and dispatch_attempt_id are required"),
+        (
+            "resume",
+            "dispatch_attempt_id",
+            " ",
+            False,
+            "dispatch_id and dispatch_attempt_id are required",
+        ),
+        (
+            "start",
+            "dispatch_sequence",
+            None,
+            True,
+            "dispatch_sequence must be a positive integer",
+        ),
+        (
+            "resume",
+            "dispatch_sequence",
+            0,
+            False,
+            "dispatch_sequence must be a positive integer",
+        ),
+        (
+            "start",
+            "dispatch_sequence",
+            True,
+            False,
+            "dispatch_sequence must be a positive integer",
+        ),
+        (
+            "start",
+            "dispatch_sequence",
+            "1",
+            False,
+            "dispatch_sequence must be a positive integer",
+        ),
+    ],
+)
+def test_run_commands_reject_missing_or_invalid_delivery_identity(
+    monkeypatch, command, field, value, remove, error
+):
+    import hindsight.worker as worker
+
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: pytest.fail("delivery identity must be validated before database setup"),
+    )
+    message = _run_message(command=command)
+    if remove:
+        message.pop(field)
+    else:
+        message[field] = value
+
+    with pytest.raises(ValueError, match=error):
+        worker.process_message(message)
+
+
+def test_sqs_message_id_is_passed_to_run_delivery_claim(monkeypatch):
+    import hindsight.worker as worker
+
+    claims = []
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: SimpleNamespace(database_url="postgresql://db"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **kwargs: (
+            claims.append(kwargs) or SimpleNamespace(outcome="duplicate", run=None, attempt_id=None)
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "get_run",
+        lambda **kwargs: {"id": kwargs["run_id"], "status": "existing"},
+    )
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "sqs-message-1",
+                    "eventSourceARN": "arn:aws:sqs:region:account:runs",
+                    "body": json.dumps(_run_message()),
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-1"),
+    )
+
+    assert result == {"batchItemFailures": []}
+    assert claims == [
+        {
+            "run_id": "run-1",
+            "command": "start",
+            "command_generation": 0,
+            "lease_ttl": timedelta(seconds=300),
+            "max_attempts": 3,
+            **RUN_DELIVERY,
+            "worker_message_id": "sqs-message-1",
+            "db_url": "postgresql://db",
+        }
     ]
 
 
@@ -270,7 +401,7 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
 
     monkeypatch.setattr(worker, "run_incident_agent", fake_agent)
 
-    result = worker.process_message({"command": "start", "run_id": "run-1"})
+    result = worker.process_message(_run_message())
 
     assert claim_calls == [
         {
@@ -279,6 +410,8 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
             "command_generation": 0,
             "lease_ttl": timedelta(seconds=300),
             "max_attempts": 3,
+            **RUN_DELIVERY,
+            "worker_message_id": "direct:dispatch-attempt-1",
             "db_url": "postgresql://db",
         }
     ]
@@ -342,7 +475,7 @@ def test_provider_setup_failure_uses_durable_attempt_retry_path(monkeypatch):
     )
 
     try:
-        worker.process_message({"command": "start", "run_id": "run-1"})
+        worker.process_message(_run_message())
     except RuntimeError:
         pass
 
@@ -418,13 +551,12 @@ def test_resume_attempt_can_replan_and_return_to_approval(monkeypatch):
     monkeypatch.setattr(worker, "resume_incident_agent", fake_resume)
 
     result = worker.process_message(
-        {
-            "command": "resume",
-            "run_id": "run-1",
-            "approved": True,
-            "recommendation_id": "recommendation:original",
-            "selection_fingerprint": "selection:original",
-        }
+        _run_message(
+            command="resume",
+            approved=True,
+            recommendation_id="recommendation:original",
+            selection_fingerprint="selection:original",
+        )
     )
 
     assert transitions[0]["status"] == "planning"
@@ -532,8 +664,8 @@ def test_exhausted_source_retries_and_dlq_finalizes(monkeypatch):
     )
 
     with pytest.raises(worker.RunAttemptsExhaustedError):
-        worker.process_message({"command": "start", "run_id": "run-1"})
-    result = worker.process_message({"command": "start", "run_id": "run-1"}, dead_letter=True)
+        worker.process_message(_run_message())
+    result = worker.process_message(_run_message(), dead_letter=True)
 
     assert result == {"status": "failed"}
     assert finalized[0]["max_attempts"] == 3

@@ -29,6 +29,7 @@ RUN_STATUSES = frozenset(
     }
 )
 GET_RUN_READ_ATTEMPTS = 3
+CREATE_RUN_ATTEMPTS = 3
 RUN_BUDGET_RESERVATION_ATTEMPTS = 3
 MAX_MODEL_CALLS_PER_RUN = 4
 MAX_CLOUDWATCH_CALLS_PER_RUN = 3
@@ -36,6 +37,10 @@ MAX_CLOUDWATCH_CALLS_PER_RUN = 3
 
 class RunConflictError(RuntimeError):
     """Raised when a requested run transition is no longer valid."""
+
+
+class RunIdempotencyConflictError(RuntimeError):
+    """Raised when an idempotency key is reused for a different request."""
 
 
 class RunNotFoundError(LookupError):
@@ -301,6 +306,56 @@ def create_run(
 
     if retrieval_policy not in {"semantic_strict", "semantic_then_keyword"}:
         raise ValueError(f"unsupported retrieval policy: {retrieval_policy}")
+    normalized_key = idempotency_key.strip() if idempotency_key is not None else None
+    if idempotency_key is not None and not normalized_key:
+        raise ValueError("idempotency key must not be blank")
+    if normalized_key is not None and len(normalized_key) > 500:
+        raise ValueError("idempotency key must not exceed 500 characters")
+    request_fingerprint = (
+        _run_request_fingerprint(
+            incident_slug=incident_slug,
+            namespace=namespace,
+            user_input=user_input,
+            service_slug=service_slug,
+            thread_id=thread_id,
+            retrieval_policy=retrieval_policy,
+        )
+        if normalized_key is not None
+        else None
+    )
+    for attempt in range(CREATE_RUN_ATTEMPTS):
+        try:
+            return _create_run_once(
+                incident_slug=incident_slug,
+                namespace=namespace,
+                user_input=user_input,
+                service_slug=service_slug,
+                thread_id=thread_id,
+                idempotency_key=normalized_key,
+                request_fingerprint=request_fingerprint,
+                retrieval_policy=retrieval_policy,
+                dispatch_available_at=dispatch_available_at,
+                db_url=db_url,
+            )
+        except SerializationFailure:
+            if attempt + 1 == CREATE_RUN_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable run creation retry state")
+
+
+def _create_run_once(
+    *,
+    incident_slug: str,
+    namespace: str,
+    user_input: str,
+    service_slug: str | None,
+    thread_id: str | None,
+    idempotency_key: str | None,
+    request_fingerprint: str | None,
+    retrieval_policy: str,
+    dispatch_available_at: datetime | None,
+    db_url: str | None,
+) -> tuple[dict[str, Any], bool]:
     run_id = uuid4()
     resolved_thread_id = thread_id or f"{incident_slug}:{run_id}"
     decision_id = f"agent:{run_id}:plan"
@@ -308,13 +363,19 @@ def create_run(
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 if idempotency_key:
-                    cur.execute(
-                        "SELECT * FROM agent_runs WHERE idempotency_key = %s",
-                        (idempotency_key,),
+                    existing = _lock_idempotent_run(
+                        cur,
+                        idempotency_key=idempotency_key,
+                        request_fingerprint=request_fingerprint,
+                        incident_slug=incident_slug,
+                        namespace=namespace,
+                        user_input=user_input,
+                        service_slug=service_slug,
+                        thread_id=thread_id,
+                        retrieval_policy=retrieval_policy,
                     )
-                    existing = cur.fetchone()
                     if existing is not None:
-                        return _jsonable(dict(existing)), False
+                        return _jsonable(existing), False
                 cur.execute("SELECT id FROM incidents WHERE slug = %s", (incident_slug,))
                 incident = cur.fetchone()
                 cur.execute(
@@ -335,16 +396,20 @@ def create_run(
                 cur.execute(
                     """
                         INSERT INTO agent_runs (
-                            id, idempotency_key, thread_id, incident_id, incident_slug,
-                            namespace, service_slug, user_input, status, decision_id,
-                            retrieval_policy
+                            id, idempotency_key, request_fingerprint, thread_id,
+                            incident_id, incident_slug, namespace, service_slug,
+                            user_input, status, decision_id, retrieval_policy
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s)
+                        ON CONFLICT (tenant_id, idempotency_key)
+                            WHERE idempotency_key IS NOT NULL
+                            DO NOTHING
                         RETURNING *
                     """,
                     (
                         run_id,
                         idempotency_key,
+                        request_fingerprint,
                         resolved_thread_id,
                         incident["id"] if incident else None,
                         incident_slug,
@@ -355,7 +420,15 @@ def create_run(
                         retrieval_policy,
                     ),
                 )
-                run = dict(cur.fetchone())
+                inserted = cur.fetchone()
+                if inserted is None:
+                    # Roll the entire transaction back so the candidate decision
+                    # disappears without requiring runtime DELETE privileges. A
+                    # fresh serializable transaction can then lock the winner.
+                    raise SerializationFailure(
+                        "idempotent run lost a concurrent unique-key race"
+                    )
+                run = dict(inserted)
                 cur.execute(
                     "UPDATE memory_decisions SET run_id = %s WHERE id = %s",
                     (run_id, decision_id),
@@ -380,6 +453,92 @@ def create_run(
                     available_at=dispatch_available_at,
                 )
         return _jsonable(run), True
+
+
+def _run_request_fingerprint(
+    *,
+    incident_slug: str,
+    namespace: str,
+    user_input: str,
+    service_slug: str | None,
+    thread_id: str | None,
+    retrieval_policy: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "incident_slug": incident_slug,
+        "namespace": namespace,
+        "user_input": user_input,
+        "service_slug": service_slug,
+        "thread_id": thread_id,
+        "retrieval_policy": retrieval_policy,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _lock_idempotent_run(
+    cur: Any,
+    *,
+    idempotency_key: str,
+    request_fingerprint: str | None,
+    incident_slug: str,
+    namespace: str,
+    user_input: str,
+    service_slug: str | None,
+    thread_id: str | None,
+    retrieval_policy: str,
+) -> dict[str, Any] | None:
+    cur.execute(
+        """
+            SELECT * FROM agent_runs
+            WHERE tenant_id = current_hindsight_tenant_id()
+                AND idempotency_key = %s
+            FOR UPDATE
+        """,
+        (idempotency_key,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    existing = dict(row)
+    persisted_fingerprint = existing.get("request_fingerprint")
+    if persisted_fingerprint is None:
+        comparable = (
+            existing["incident_slug"] == incident_slug
+            and existing["namespace"] == namespace
+            and existing["user_input"] == user_input
+            and existing.get("service_slug") == service_slug
+            and existing.get("retrieval_policy") == retrieval_policy
+            and (thread_id is None or existing["thread_id"] == thread_id)
+        )
+        if not comparable or request_fingerprint is None:
+            raise RunIdempotencyConflictError(
+                "idempotency key is already bound to a different run request"
+            )
+        cur.execute(
+            """
+                UPDATE agent_runs
+                SET request_fingerprint = %s
+                WHERE id = %s AND request_fingerprint IS NULL
+                RETURNING *
+            """,
+            (request_fingerprint, existing["id"]),
+        )
+        updated = cur.fetchone()
+        if updated is not None:
+            existing = dict(updated)
+        return existing
+    if persisted_fingerprint != request_fingerprint:
+        raise RunIdempotencyConflictError(
+            "idempotency key is already bound to a different run request"
+        )
+    return existing
 
 
 def get_run(*, run_id: str | UUID, db_url: str | None = None) -> dict[str, Any] | None:
@@ -426,6 +585,10 @@ def claim_run_attempt(
     command_generation: int,
     lease_ttl: timedelta,
     max_attempts: int,
+    dispatch_id: str | UUID | None = None,
+    dispatch_attempt_id: str | UUID | None = None,
+    dispatch_sequence: int | None = None,
+    worker_message_id: str | None = None,
     db_url: str | None = None,
 ) -> RunAttemptClaim:
     """Claim or recover one database-authoritative worker attempt."""
@@ -438,6 +601,22 @@ def claim_run_attempt(
         raise ValueError("lease_ttl must be positive")
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
+    delivery_values = (
+        dispatch_id,
+        dispatch_attempt_id,
+        dispatch_sequence,
+        worker_message_id,
+    )
+    if any(value is not None for value in delivery_values) and not all(
+        value is not None for value in delivery_values
+    ):
+        raise ValueError("complete dispatch delivery identity is required")
+    if dispatch_sequence is not None and (
+        type(dispatch_sequence) is not int or dispatch_sequence < 1
+    ):
+        raise ValueError("dispatch_sequence must be a positive integer")
+    if worker_message_id is not None and not worker_message_id.strip():
+        raise ValueError("worker_message_id must not be blank")
 
     expected_status = "queued" if command == "start" else "resuming"
     initial_status = "triaging" if command == "start" else "reflecting"
@@ -454,7 +633,30 @@ def claim_run_attempt(
                 if row is None:
                     return RunAttemptClaim("missing", None, None)
                 run = dict(row)
+                delivery = (
+                    _lock_run_dispatch_delivery(
+                        cur,
+                        run_id=run_id,
+                        command=command,
+                        command_generation=command_generation,
+                        dispatch_id=dispatch_id,
+                        dispatch_attempt_id=dispatch_attempt_id,
+                        dispatch_sequence=dispatch_sequence,
+                    )
+                    if dispatch_id is not None
+                    else None
+                )
+
+                def acknowledge_delivery() -> None:
+                    if delivery is not None:
+                        _acknowledge_run_dispatch_delivery(
+                            cur,
+                            delivery=delivery,
+                            worker_message_id=str(worker_message_id),
+                        )
+
                 if int(run.get("command_generation") or 0) != command_generation:
+                    acknowledge_delivery()
                     return RunAttemptClaim("duplicate", _jsonable(run), None)
                 same_generation = (
                     run["worker_attempt_command"] == command
@@ -473,8 +675,10 @@ def claim_run_attempt(
 
                 reclaiming = active
                 if run["status"] != expected_status and not reclaiming:
+                    acknowledge_delivery()
                     return RunAttemptClaim("duplicate", _jsonable(run), None)
                 if count >= max_attempts:
+                    acknowledge_delivery()
                     return RunAttemptClaim("exhausted", _jsonable(run), None)
 
                 attempt_id = uuid4()
@@ -522,6 +726,15 @@ def claim_run_attempt(
                         "command": command,
                         **(
                             {
+                                "dispatch_id": str(delivery["dispatch_id"]),
+                                "dispatch_attempt_id": str(delivery["attempt_id"]),
+                                "dispatch_sequence": int(delivery["sequence"]),
+                            }
+                            if delivery is not None
+                            else {}
+                        ),
+                        **(
+                            {
                                 "previous_status": previous_status,
                                 "previous_attempt_id": str(previous_attempt_id),
                             }
@@ -530,7 +743,101 @@ def claim_run_attempt(
                         ),
                     },
                 )
+                acknowledge_delivery()
                 return RunAttemptClaim("claimed", _jsonable(claimed), str(attempt_id))
+
+
+def _lock_run_dispatch_delivery(
+    cur: Any,
+    *,
+    run_id: str | UUID,
+    command: str,
+    command_generation: int,
+    dispatch_id: str | UUID | None,
+    dispatch_attempt_id: str | UUID | None,
+    dispatch_sequence: int | None,
+) -> dict[str, Any]:
+    cur.execute(
+        """
+            SELECT
+                attempt.id AS attempt_id,
+                attempt.dispatch_id,
+                attempt.sequence,
+                attempt.worker_message_id,
+                attempt.acknowledged_at AS attempt_acknowledged_at,
+                dispatch.command,
+                dispatch.command_generation,
+                dispatch.status,
+                dispatch.acknowledged_attempt_id
+            FROM agent_run_dispatch_attempts AS attempt
+            JOIN agent_run_dispatches AS dispatch
+                ON dispatch.tenant_id = attempt.tenant_id
+                AND dispatch.id = attempt.dispatch_id
+            WHERE dispatch.id = %s
+                AND attempt.id = %s
+                AND attempt.sequence = %s
+                AND dispatch.run_id = %s
+            FOR UPDATE
+        """,
+        (dispatch_id, dispatch_attempt_id, dispatch_sequence, run_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError("dispatch delivery identity does not match the run")
+    delivery = dict(row)
+    if delivery["command"] != command:
+        raise ValueError("dispatch delivery command does not match the worker command")
+    if int(delivery["command_generation"]) != command_generation:
+        raise ValueError("dispatch delivery generation does not match the worker command")
+    return delivery
+
+
+def _acknowledge_run_dispatch_delivery(
+    cur: Any,
+    *,
+    delivery: dict[str, Any],
+    worker_message_id: str,
+) -> None:
+    cur.execute(
+        """
+            UPDATE agent_run_dispatch_attempts
+            SET worker_message_id = COALESCE(worker_message_id, %s),
+                acknowledged_at = COALESCE(acknowledged_at, now()),
+                updated_at = now()
+            WHERE id = %s
+                AND dispatch_id = %s
+                AND (
+                    worker_message_id IS NULL
+                    OR worker_message_id = %s
+                )
+            RETURNING id
+        """,
+        (
+            worker_message_id,
+            delivery["attempt_id"],
+            delivery["dispatch_id"],
+            worker_message_id,
+        ),
+    )
+    if cur.fetchone() is None:
+        raise ValueError("dispatch attempt was acknowledged by a different message")
+    cur.execute(
+        """
+            UPDATE agent_run_dispatches
+            SET status = 'acknowledged',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                acknowledged_attempt_id = COALESCE(acknowledged_attempt_id, %s),
+                acknowledged_at = COALESCE(acknowledged_at, now()),
+                updated_at = now(),
+                last_error = NULL
+            WHERE id = %s
+            RETURNING id
+        """,
+        (delivery["attempt_id"], delivery["dispatch_id"]),
+    )
+    if cur.fetchone() is None:
+        raise ValueError("dispatch disappeared before acknowledgement")
 
 
 def transition_run(

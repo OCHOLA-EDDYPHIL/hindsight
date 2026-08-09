@@ -25,8 +25,8 @@ def test_inline_queue_uses_handler_and_retries_transient_batch_failure(monkeypat
     monkeypatch.setenv(queueing.INLINE_WORKER_ENV, "1")
     monkeypatch.setattr(queueing.threading, "Thread", ImmediateThread)
 
-    def process(message, *, dead_letter=False):
-        calls.append((message, dead_letter))
+    def process(message, *, dead_letter=False, worker_message_id=None):
+        calls.append((message, dead_letter, worker_message_id))
         if len(calls) == 1:
             raise RuntimeError("transient local delivery")
 
@@ -36,7 +36,7 @@ def test_inline_queue_uses_handler_and_retries_transient_batch_failure(monkeypat
     result = queueing.enqueue_run({"command": "start", "run_id": "run-1"})
 
     assert result == "inline:hindsight-run-run-1"
-    assert calls == [
+    assert [(message, dead_letter) for message, dead_letter, _ in calls] == [
         (
             {
                 "command": "start",
@@ -54,6 +54,8 @@ def test_inline_queue_uses_handler_and_retries_transient_batch_failure(monkeypat
             False,
         ),
     ]
+    assert calls[0][2]
+    assert calls[0][2] == calls[1][2]
 
 
 def test_queue_tenant_follows_bound_context_and_accepts_trusted_internal_messages(
