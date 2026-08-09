@@ -78,7 +78,12 @@ def test_run_dispatch_outbox_grants_only_required_product_role_access():
 
 
 def test_agent_run_call_budget_migration_caps_calls_and_allows_resume_replanning():
-    migration = (MIGRATIONS / "0026_agent_run_call_budgets.sql").read_text()
+    migration = "\n".join(
+        (
+            (MIGRATIONS / "0026_agent_run_call_budgets.sql").read_text(),
+            (MIGRATIONS / "0026a_agent_run_call_budget_guards.sql").read_text(),
+        )
+    )
 
     assert "model_call_count INT8 NOT NULL DEFAULT 0" in migration
     assert "cloudwatch_call_count INT8 NOT NULL DEFAULT 0" in migration
