@@ -1,0 +1,102 @@
+name: local CockroachDB recovery drill
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hindsight-recovery-drill
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.authorization.outputs.source_sha }}
+    steps:
+      - id: authorization
+        name: Require repository owner on exact main
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/recovery-drill.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "The recovery drill requires the repository owner on exact main." >&2
+            exit 1
+          }
+          echo "source_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+
+  recovery_drill:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: hindsight_recovery_${{ github.run_id }}_${{ github.run_attempt }}
+      DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+      EVIDENCE_PATH: build/recovery-drill/recovery-drill.json
+      SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - name: Start isolated CockroachDB
+        run: docker compose up -d crdb
+      - name: Wait for CockroachDB
+        shell: bash
+        run: |
+          ready=false
+          for _ in $(seq 1 60); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+      - name: Run destructive isolated recovery drill
+        shell: bash
+        run: |
+          run_id="$(printf '%s' "${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}" | sha256sum | cut -c1-16)"
+          source_database="hindsight_recovery_source_${run_id}"
+          uv run python scripts/run_recovery_drill.py \
+            --admin-url "$DATABASE_URL" \
+            --run-id "$run_id" \
+            --source-sha "$SOURCE_SHA" \
+            --confirm-source-loss "drop:${source_database}" \
+            --output "$EVIDENCE_PATH" \
+            --timeout-seconds 900
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-drill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove isolated CockroachDB and storage
+        if: always()
+        run: docker compose down --volumes --remove-orphans

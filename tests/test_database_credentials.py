@@ -55,6 +55,8 @@ class FakeConnection:
         del params
         if "rolsuper, rolbypassrls" in str(statement):
             return SimpleNamespace(fetchone=lambda: (False, False))
+        if "pg_has_role" in str(statement):
+            return SimpleNamespace(fetchone=lambda: (True,))
         return SimpleNamespace(fetchone=lambda: (self.identity,))
 
 
@@ -97,7 +99,7 @@ def test_prepare_uses_dala_and_writes_distinct_secure_strings(monkeypatch, capsy
 
     monkeypatch.setattr(provision.psycopg, "connect", connect)
     monkeypatch.setattr(provision.secrets, "token_hex", lambda _size: "abc123def456")
-    generated = iter(("api-secret", "worker-secret"))
+    generated = iter(("api-secret", "worker-secret", "lifecycle-secret"))
     monkeypatch.setattr(provision.secrets, "token_urlsafe", lambda _size: next(generated))
 
     provision.prepare(
@@ -106,23 +108,27 @@ def test_prepare_uses_dala_and_writes_distinct_secure_strings(monkeypatch, capsy
         deploy_parameter="/deploy",
         api_parameter="/api",
         worker_parameter="/worker",
+        lifecycle_parameter="/lifecycle",
         metadata_parameter="/rotation",
     )
 
     assert sessions == [("dala", "us-east-1")]
     api_value, api_type = ssm.parameters["/api"]
     worker_value, worker_type = ssm.parameters["/worker"]
-    assert api_type == worker_type == "SecureString"
-    assert api_value != worker_value != deploy_url
+    lifecycle_value, lifecycle_type = ssm.parameters["/lifecycle"]
+    assert api_type == worker_type == lifecycle_type == "SecureString"
+    assert len({api_value, worker_value, lifecycle_value, deploy_url}) == 4
     assert all(
         parse_qs(urlsplit(url).query)["sslrootcert"] == [certifi.where()]
         for url in connected_urls
     )
     assert "sslrootcert" not in parse_qs(urlsplit(api_value).query)
     assert "sslrootcert" not in parse_qs(urlsplit(worker_value).query)
+    assert "sslrootcert" not in parse_qs(urlsplit(lifecycle_value).query)
     output = capsys.readouterr().out
     assert "api-secret" not in output
     assert "worker-secret" not in output
+    assert "lifecycle-secret" not in output
     assert deploy_url not in output
 
 
@@ -156,6 +162,7 @@ def test_prepare_preserves_explicit_tls_root(monkeypatch):
         deploy_parameter="/deploy",
         api_parameter="/api",
         worker_parameter="/worker",
+        lifecycle_parameter="/lifecycle",
         metadata_parameter="/rotation",
     )
 
@@ -180,5 +187,6 @@ def test_prepare_rejects_reused_parameter_paths_before_aws(monkeypatch):
             deploy_parameter="/same",
             api_parameter="/same",
             worker_parameter="/worker",
+            lifecycle_parameter="/lifecycle",
             metadata_parameter="/rotation",
         )

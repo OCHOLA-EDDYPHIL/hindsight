@@ -66,6 +66,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     assert "snapshots.py" in api["modules"]
     assert "trace_contract.py" in api["modules"]
     assert {"realtime_ticket.py", "server_tenants.py", "tenant.py"} <= set(api["modules"])
+    assert {"lifecycle.py", "lifecycle_aws.py"}.isdisjoint(api["modules"])
 
 
 def test_worker_artifact_does_not_include_frontend_or_api_framework():
@@ -85,6 +86,7 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
         "server_tenants.py",
         "tenant.py",
     } <= set(worker["modules"])
+    assert {"lifecycle.py", "lifecycle_aws.py"}.isdisjoint(worker["modules"])
 
 
 def test_artifact_smoke_uses_every_terraform_configured_handler():

@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import os
+import hashlib
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from hindsight.db import TenantConnection
+from hindsight.lifecycle import (
+    begin_export,
+    begin_purge,
+    finalize_purge,
+    purge_database_tenant,
+    record_export,
+    record_principal_hashes,
+    record_verified_export,
+    utc_now,
+)
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
@@ -23,6 +36,106 @@ def _runtime_connection(url: str, *, tenant_id: str) -> TenantConnection:
     raw.execute("SET ROLE hindsight_agent_writer")
     raw.commit()
     return TenantConnection(raw, tenant_id=tenant_id)
+
+
+def _purge_test_tenants(url: str, tenant_ids: tuple[object, ...]) -> None:
+    with psycopg.connect(url, autocommit=True) as admin:
+        session_user = str(admin.execute("SELECT session_user").fetchone()[0])
+        already_member = bool(
+            admin.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_auth_members AS membership
+                    JOIN pg_catalog.pg_roles AS granted_role
+                      ON granted_role.oid = membership.roleid
+                    JOIN pg_catalog.pg_roles AS member_role
+                      ON member_role.oid = membership.member
+                    WHERE granted_role.rolname = 'hindsight_lifecycle'
+                      AND member_role.rolname = %s
+                )
+                """,
+                (session_user,),
+            ).fetchone()[0]
+        )
+        if not already_member:
+            admin.execute(
+                sql.SQL("GRANT hindsight_lifecycle TO {}").format(
+                    sql.Identifier(session_user)
+                )
+            )
+    try:
+        with psycopg.connect(url, autocommit=True) as connection:
+            for raw_tenant_id in tenant_ids:
+                tenant_id = str(raw_tenant_id)
+                connection.execute(
+                    "SELECT set_config('hindsight.tenant_id', %s, false)",
+                    (tenant_id,),
+                )
+                if connection.execute(
+                    "SELECT 1 FROM tenants WHERE id = %s", (tenant_id,)
+                ).fetchone() is None:
+                    continue
+                operation_id = str(uuid4())
+                lease_owner = str(uuid4())
+                fingerprint = hashlib.sha256(
+                    f"tenant-isolation:{operation_id}".encode()
+                ).hexdigest()
+                preparation = begin_export(
+                    connection,
+                    tenant_id=tenant_id,
+                    operation_id=operation_id,
+                    lease_owner=lease_owner,
+                )
+                record_export(
+                    connection,
+                    operation_id=operation_id,
+                    lease_owner=lease_owner,
+                    snapshot_hlc="1.0000000000",
+                    schema_hash=preparation.schema_identity_sha256,
+                    content_hash=hashlib.sha256(operation_id.encode()).hexdigest(),
+                    fingerprint=fingerprint,
+                    bucket="tenant-isolation-cleanup",
+                    data_key=f"{operation_id}/tenant.ndjson",
+                    data_version_id="fixture-data-version",
+                    manifest_key=f"{operation_id}/manifest.json",
+                    manifest_version_id="fixture-manifest-version",
+                    retention_until=utc_now() + timedelta(days=1),
+                )
+                record_verified_export(
+                    connection,
+                    operation_id=operation_id,
+                    fingerprint=fingerprint,
+                )
+                begin_purge(
+                    connection,
+                    operation_id=operation_id,
+                    confirmed_fingerprint=fingerprint,
+                    lease_owner=lease_owner,
+                )
+                record_principal_hashes(
+                    connection,
+                    operation_id=operation_id,
+                    lease_owner=lease_owner,
+                )
+                purge_database_tenant(
+                    connection,
+                    operation_id=operation_id,
+                    lease_owner=lease_owner,
+                )
+                finalize_purge(
+                    connection,
+                    operation_id=operation_id,
+                    lease_owner=lease_owner,
+                )
+    finally:
+        if not already_member:
+            with psycopg.connect(url, autocommit=True) as admin:
+                admin.execute(
+                    sql.SQL("REVOKE hindsight_lifecycle FROM {}").format(
+                        sql.Identifier(session_user)
+                    )
+                )
 
 
 @requires_db
@@ -69,7 +182,9 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
             assert connection.execute("SELECT slug FROM services ORDER BY slug").fetchall() == [
                 (first_service_slug,)
             ]
-            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with pytest.raises(
+                (psycopg.errors.InsufficientPrivilege, psycopg.errors.RaiseException)
+            ):
                 connection.execute(
                     """
                         INSERT INTO services (
@@ -129,7 +244,11 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
             missing.execute("SET ROLE hindsight_agent_writer")
             assert missing.execute("SELECT count(*) FROM services").fetchone() == (0,)
             with pytest.raises(
-                (psycopg.errors.NotNullViolation, psycopg.errors.InsufficientPrivilege)
+                (
+                    psycopg.errors.NotNullViolation,
+                    psycopg.errors.InsufficientPrivilege,
+                    psycopg.errors.RaiseException,
+                )
             ):
                 missing.execute(
                     "INSERT INTO services (slug, name, owner_team, tier) "
@@ -190,20 +309,4 @@ def test_tenant_rls_relationships_connection_reuse_and_outbox_are_fail_closed():
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 cdc.execute("SELECT count(*) FROM incidents")
     finally:
-        with psycopg.connect(target_url, autocommit=True) as admin:
-            admin.execute(
-                "DELETE FROM incidents WHERE tenant_id IN (%s, %s)",
-                (first_tenant, second_tenant),
-            )
-            admin.execute(
-                "DELETE FROM tenant_event_outbox WHERE tenant_id IN (%s, %s)",
-                (first_tenant, second_tenant),
-            )
-            admin.execute(
-                "DELETE FROM services WHERE tenant_id IN (%s, %s)",
-                (first_tenant, second_tenant),
-            )
-            admin.execute(
-                "DELETE FROM tenants WHERE id IN (%s, %s)",
-                (first_tenant, second_tenant),
-            )
+        _purge_test_tenants(target_url, (first_tenant, second_tenant))

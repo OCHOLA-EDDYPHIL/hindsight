@@ -22,6 +22,7 @@ from hindsight.aws import aws_client_config
 from hindsight.queueing import enqueue_run
 from hindsight.realtime_ticket import TICKET_TABLE_ENV, consume_realtime_ticket
 from hindsight.security import safe_error_detail
+from hindsight.tenant import tenant_lifecycle_fence_key
 
 CONNECTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
 SUBSCRIPTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE"
@@ -94,6 +95,8 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             )
             if expires_at <= connected_at:
                 return _response(401, {"error": "realtime ticket is invalid or expired"})
+            if _tenant_realtime_fenced(table, claims.tenant_id):
+                return _response(410, {"error": "tenant realtime access is retired"})
             table.put_item(
                 Item={
                     "connection_id": connection_id,
@@ -129,6 +132,10 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _delete_subscriptions(subscriptions, connection_id)
             table.delete_item(Key={"connection_id": connection_id})
             return _response(401, {"error": "connection session has expired"})
+        if _tenant_realtime_fenced(table, tenant_id):
+            _delete_subscriptions(subscriptions, connection_id)
+            table.delete_item(Key={"connection_id": connection_id})
+            return _response(410, {"error": "tenant realtime access is retired"})
 
         payload = _event_body(event)
         message_type = str(payload.get("type") or "").strip().lower()
@@ -153,6 +160,7 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     Item={
                         "topic_key": topic_key,
                         "connection_id": connection_id,
+                        "tenant_id": tenant_id,
                         "expires_at": expires_at,
                     }
                 )
@@ -177,6 +185,15 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return _response(400, {"error": str(exc)})
     except Exception as exc:
         return _response(500, {"error": safe_error_detail(exc)})
+
+
+def _tenant_realtime_fenced(table: Any, tenant_id: str) -> bool:
+    response = table.get_item(
+        Key={"connection_id": tenant_lifecycle_fence_key(tenant_id)},
+        ConsistentRead=True,
+    )
+    item = response.get("Item")
+    return isinstance(item, dict) and item.get("lifecycle_fence") is True
 
 
 def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:

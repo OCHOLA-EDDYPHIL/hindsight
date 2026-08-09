@@ -106,6 +106,10 @@ def test_websocket_connect_requires_a_valid_short_lived_ticket(monkeypatch):
         def put_item(self, **kwargs):
             self.puts.append(kwargs["Item"])
 
+        def get_item(self, **kwargs):
+            del kwargs
+            return {}
+
     connections = FakeTable()
     subscriptions = FakeTable()
     tickets = FakeTable()
@@ -167,6 +171,75 @@ def test_websocket_connect_requires_a_valid_short_lived_ticket(monkeypatch):
             "expires_at": 500,
         }
     ]
+
+
+def test_websocket_connect_refuses_a_permanent_tenant_lifecycle_fence(monkeypatch):
+    import hindsight.realtime as realtime
+    from hindsight.realtime_ticket import RealtimeTicketClaims
+    from hindsight.tenant import tenant_lifecycle_fence_key
+
+    tenant_id = "00000000-0000-0000-0000-000000000003"
+
+    class Connections:
+        def __init__(self):
+            self.puts = []
+
+        def get_item(self, **kwargs):
+            assert kwargs == {
+                "Key": {"connection_id": tenant_lifecycle_fence_key(tenant_id)},
+                "ConsistentRead": True,
+            }
+            return {
+                "Item": {
+                    "connection_id": tenant_lifecycle_fence_key(tenant_id),
+                    "lifecycle_fence": True,
+                }
+            }
+
+        def put_item(self, **kwargs):
+            self.puts.append(kwargs["Item"])
+
+    connections = Connections()
+    inert = object()
+    resource = type(
+        "Resource",
+        (),
+        {
+            "Table": lambda self, name: connections
+            if name == "connections"
+            else inert
+        },
+    )()
+    monkeypatch.setenv(realtime.CONNECTION_TABLE_ENV, "connections")
+    monkeypatch.setenv(realtime.SUBSCRIPTION_TABLE_ENV, "subscriptions")
+    monkeypatch.setenv(realtime.TICKET_TABLE_ENV, "tickets")
+    monkeypatch.setattr(realtime.boto3, "resource", lambda *args, **kwargs: resource)
+    monkeypatch.setattr(realtime.time, "time", lambda: 100)
+    monkeypatch.setattr(
+        realtime,
+        "consume_realtime_ticket",
+        lambda *args, **kwargs: RealtimeTicketClaims(
+            tenant_id=tenant_id,
+            access_class="viewer",
+            principal_id="principal-3",
+            redeem_before=160,
+            session_expires_at=500,
+        ),
+    )
+
+    response = realtime.websocket_handler(
+        {
+            "requestContext": {"routeKey": "$connect", "connectionId": "client-1"},
+            "queryStringParameters": {"ticket": "valid-ticket"},
+        },
+        None,
+    )
+
+    assert response["statusCode"] == 410
+    assert json.loads(response["body"]) == {
+        "error": "tenant realtime access is retired"
+    }
+    assert connections.puts == []
 
 
 def test_changefeed_rows_share_one_versioned_envelope():
@@ -447,6 +520,9 @@ def test_websocket_subscribe_updates_ephemeral_registry(monkeypatch):
     assert {item["topic_key"] for item in subscriptions.puts} == {
         "tenant:00000000-0000-0000-0000-000000000002:namespace:demo:payments",
         "tenant:00000000-0000-0000-0000-000000000002:run:run-1",
+    }
+    assert {item["tenant_id"] for item in subscriptions.puts} == {
+        "00000000-0000-0000-0000-000000000002"
     }
 
 

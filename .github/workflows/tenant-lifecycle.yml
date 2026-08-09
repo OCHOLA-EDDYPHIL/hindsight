@@ -1,0 +1,168 @@
+name: tenant lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Privileged lifecycle transition
+        required: true
+        type: choice
+        options:
+          - export
+          - verify
+          - purge
+          - status
+          - abort
+      tenant_id:
+        description: Tenant UUID; required only for export
+        required: false
+        type: string
+      operation_id:
+        description: Lifecycle operation UUID; optional only for export
+        required: false
+        type: string
+      export_fingerprint:
+        description: Verified SHA-256 fingerprint; required only for purge
+        required: false
+        type: string
+      confirmation:
+        description: For purge type purge-<operation UUID>; for abort type abort-<operation UUID>
+        required: false
+        type: string
+      deployment_environment:
+        description: Protected deployed environment
+        required: true
+        type: choice
+        default: demo
+        options:
+          - demo
+          - demo-candidate
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: hindsight-${{ inputs.deployment_environment }}-environment-v2
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    environment: ${{ inputs.deployment_environment }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      DEPLOYED_STAGE: ${{ vars.HINDSIGHT_STAGE }}
+      LIFECYCLE_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_LIFECYCLE_DATABASE_URL_PARAM }}
+      HINDSIGHT_LIFECYCLE_EXPORT_BUCKET: ${{ vars.HINDSIGHT_LIFECYCLE_EXPORT_BUCKET }}
+      HINDSIGHT_REALTIME_TICKET_TABLE: ${{ vars.HINDSIGHT_REALTIME_TICKET_TABLE }}
+      HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE: ${{ vars.HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE }}
+      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE: ${{ vars.HINDSIGHT_WEBSOCKET_CONNECTION_TABLE }}
+      HINDSIGHT_COGNITO_USER_POOL_ID: ${{ vars.HINDSIGHT_COGNITO_USER_POOL_ID }}
+      HINDSIGHT_COGNITO_ISSUER: ${{ vars.HINDSIGHT_COGNITO_ISSUER }}
+      HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT: ${{ vars.HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_LIFECYCLE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Verify fixed lifecycle environment
+        shell: bash
+        env:
+          REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment }}
+        run: |
+          test -n "$EXPECTED_AWS_ACCOUNT_ID"
+          test "$DEPLOYED_STAGE" = "$REQUESTED_ENVIRONMENT"
+          test "$LIFECYCLE_DATABASE_PARAMETER" = "/hindsight/$DEPLOYED_STAGE/lifecycle-database-url"
+          test -n "$HINDSIGHT_LIFECYCLE_EXPORT_BUCKET"
+          test -n "$HINDSIGHT_REALTIME_TICKET_TABLE"
+          test -n "$HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE"
+          test -n "$HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
+          test -n "$HINDSIGHT_COGNITO_USER_POOL_ID"
+          test -n "$HINDSIGHT_COGNITO_ISSUER"
+          test -n "$HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT"
+          ACTUAL_AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          test "$ACTUAL_AWS_ACCOUNT_ID" = "$EXPECTED_AWS_ACCOUNT_ID"
+          test "$HINDSIGHT_LIFECYCLE_EXPORT_BUCKET" = "hindsight-$DEPLOYED_STAGE-lifecycle-exports-$ACTUAL_AWS_ACCOUNT_ID"
+          test "$HINDSIGHT_REALTIME_TICKET_TABLE" = "hindsight-$DEPLOYED_STAGE-realtime-tickets"
+          test "$HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE" = "hindsight-$DEPLOYED_STAGE-websocket-subscriptions"
+          test "$HINDSIGHT_WEBSOCKET_CONNECTION_TABLE" = "hindsight-$DEPLOYED_STAGE-websocket-connections"
+          test "$HINDSIGHT_COGNITO_ISSUER" = "https://cognito-idp.$AWS_REGION.amazonaws.com/$HINDSIGHT_COGNITO_USER_POOL_ID"
+          [[ "$HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT" == https://*.execute-api."$AWS_REGION".amazonaws.com/"$DEPLOYED_STAGE" ]]
+      - run: uv sync --frozen
+      - name: Execute fenced lifecycle operation
+        shell: bash
+        env:
+          REQUESTED_OPERATION: ${{ inputs.operation }}
+          REQUESTED_TENANT_ID: ${{ inputs.tenant_id }}
+          REQUESTED_OPERATION_ID: ${{ inputs.operation_id }}
+          REQUESTED_FINGERPRINT: ${{ inputs.export_fingerprint }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$LIFECYCLE_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          mkdir -p build
+          command=(uv run python scripts/tenant_lifecycle.py --region "$AWS_REGION")
+          case "$REQUESTED_OPERATION" in
+          export)
+              test -n "$REQUESTED_TENANT_ID"
+              if [[ -z "$REQUESTED_OPERATION_ID" ]]; then
+                REQUESTED_OPERATION_ID="$(uv run python -c 'import uuid; print(uuid.uuid4())')"
+              fi
+              echo "Lifecycle export operation ID: $REQUESTED_OPERATION_ID"
+              command+=(export --tenant-id "$REQUESTED_TENANT_ID" --operation-id "$REQUESTED_OPERATION_ID")
+              ;;
+            verify|status)
+              test -n "$REQUESTED_OPERATION_ID"
+              command+=("$REQUESTED_OPERATION" --operation-id "$REQUESTED_OPERATION_ID")
+              ;;
+            purge)
+              test -n "$REQUESTED_OPERATION_ID"
+              test "$REQUESTED_CONFIRMATION" = "purge-$REQUESTED_OPERATION_ID"
+              command+=(purge --operation-id "$REQUESTED_OPERATION_ID" --confirm-fingerprint "$REQUESTED_FINGERPRINT")
+              ;;
+            abort)
+              test -n "$REQUESTED_OPERATION_ID"
+              test "$REQUESTED_CONFIRMATION" = "abort-$REQUESTED_OPERATION_ID"
+              command+=(abort --operation-id "$REQUESTED_OPERATION_ID")
+              ;;
+            *)
+              echo "Unsupported lifecycle operation." >&2
+              exit 1
+              ;;
+          esac
+          if "${command[@]}" | tee build/tenant-lifecycle-result.json; then
+            :
+          else
+            exit_code="${PIPESTATUS[0]}"
+            jq -cn \
+              --arg operation_id "$REQUESTED_OPERATION_ID" \
+              --arg operation "$REQUESTED_OPERATION" \
+              '{operation_id:$operation_id,operation:$operation,status:"failed"}' \
+              > build/tenant-lifecycle-result.json
+            exit "$exit_code"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tenant-lifecycle-${{ inputs.operation }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/tenant-lifecycle-result.json
+          if-no-files-found: error
+          retention-days: 7

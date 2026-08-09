@@ -215,9 +215,12 @@ def test_product_principal_roles_and_prompt_safety_are_staged_fail_closed():
     assert "CREATE POLICY" not in guards
     assert "ENABLE ROW LEVEL SECURITY" not in columns + guards
 
-    assert roles.count("product_principal_roles") == 1
     agent_select = roles.split("TO hindsight_agent_writer;", 1)[0]
     assert "product_principal_roles" in agent_select
+    lifecycle_select = roles.rsplit("TO hindsight_lifecycle;", 1)[0].rsplit(
+        "GRANT SELECT ON TABLE", 1
+    )[1]
+    assert "product_principal_roles" in lifecycle_select
 
 
 def _database_url(name: str) -> str:
