@@ -8,6 +8,8 @@ locals {
   run_dispatch_schedule         = "rate(1 minute)"
   run_dispatch_schedule_seconds = 60
   operation_poll_seconds        = (local.run_max_attempts - 1) * local.run_queue_visibility_seconds + local.worker_timeout_seconds + 60
+  changefeed_timeout_seconds    = 30
+  changefeed_lease_seconds      = 60
 
   api_zip      = var.api_zip_path != null ? var.api_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-api.zip"
   worker_zip   = var.worker_zip_path != null ? var.worker_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip"
@@ -431,7 +433,12 @@ data "aws_iam_policy_document" "changefeed" {
     ]
   }
   statement {
-    actions = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+    actions = [
+      "dynamodb:DeleteItem",
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem"
+    ]
     resources = [
       aws_dynamodb_table.changefeed_idempotency.arn
     ]
@@ -566,7 +573,7 @@ resource "aws_lambda_function" "changefeed" {
   runtime       = "python3.12"
   handler       = "hindsight.realtime.changefeed_handler"
   memory_size   = 256
-  timeout       = 30
+  timeout       = local.changefeed_timeout_seconds
 
   s3_bucket        = aws_s3_bucket.artifacts.id
   s3_key           = aws_s3_object.lambda_artifact["realtime"].key
@@ -581,7 +588,15 @@ resource "aws_lambda_function" "changefeed" {
       HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT = "https://${aws_apigatewayv2_api.websocket.id}.execute-api.${var.aws_region}.amazonaws.com/${var.stage}"
       HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM   = var.changefeed_token_parameter_name
       HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE  = aws_dynamodb_table.changefeed_idempotency.name
+      HINDSIGHT_CHANGEFEED_LEASE_SECONDS      = tostring(local.changefeed_lease_seconds)
       HINDSIGHT_RUN_QUEUE_URL                 = aws_sqs_queue.runs.url
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = local.changefeed_timeout_seconds < local.changefeed_lease_seconds
+      error_message = "The changefeed processing lease must outlive the Lambda timeout."
     }
   }
 }

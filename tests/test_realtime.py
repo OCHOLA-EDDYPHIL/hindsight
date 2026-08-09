@@ -1,10 +1,98 @@
 """CockroachDB changefeed normalization and WebSocket delivery tests."""
 
 import json
+import re
 import time
 from types import SimpleNamespace
 
 from botocore.exceptions import ClientError
+
+
+class FakeConditionalCheckFailed(Exception):
+    pass
+
+
+class FakeLeaseTable:
+    """Small stateful fake for the changefeed lease expressions."""
+
+    def __init__(self, item=None):
+        self.item = dict(item) if item else None
+        self.updates = []
+        self.reads = []
+        self.meta = SimpleNamespace(
+            client=SimpleNamespace(
+                exceptions=SimpleNamespace(
+                    ConditionalCheckFailedException=FakeConditionalCheckFailed
+                )
+            )
+        )
+
+    def update_item(self, **kwargs):
+        self.updates.append(kwargs)
+        values = kwargs["ExpressionAttributeValues"]
+        expression = kwargs["UpdateExpression"]
+        if "#state = :processing" in expression:
+            now = values[":now"]
+            claimable = self.item is None
+            if self.item is not None:
+                claimable = (
+                    self.item.get("state") == "processing"
+                    and self.item.get("lease_expires_at", now + 1) <= now
+                ) or (
+                    "state" not in self.item
+                    and self.item.get("expires_at", now + 1) <= now
+                )
+            if not claimable:
+                raise FakeConditionalCheckFailed()
+            previous = self.item or {"event_id": kwargs["Key"]["event_id"]}
+            self.item = {
+                **previous,
+                "state": "processing",
+                "lease_owner": values[":owner"],
+                "lease_expires_at": values[":lease_expires_at"],
+                "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+                "started_at": previous.get("started_at", now),
+                "updated_at": now,
+                "expires_at": values[":expires_at"],
+            }
+            self.item.pop("completed_at", None)
+            return {}
+        if "#state = :completed" in expression:
+            now = values[":now"]
+            if not (
+                self.item
+                and self.item.get("state") == "processing"
+                and self.item.get("lease_owner") == values[":owner"]
+                and self.item.get("lease_expires_at", 0) > now
+            ):
+                raise FakeConditionalCheckFailed()
+            self.item.update(
+                state="completed",
+                completed_at=now,
+                updated_at=now,
+                expires_at=values[":expires_at"],
+            )
+            self.item.pop("lease_owner", None)
+            self.item.pop("lease_expires_at", None)
+            return {}
+        if "lease_expires_at = :expired" in expression:
+            if not (
+                self.item
+                and self.item.get("state") == "processing"
+                and self.item.get("lease_owner") == values[":owner"]
+            ):
+                raise FakeConditionalCheckFailed()
+            self.item.update(
+                lease_expires_at=values[":expired"],
+                updated_at=values[":now"],
+                expires_at=values[":expires_at"],
+            )
+            return {}
+        raise AssertionError(f"unexpected update expression: {expression}")
+
+    def get_item(self, **kwargs):
+        self.reads.append(kwargs)
+        return {"Item": dict(self.item)} if self.item is not None else {}
 
 
 def test_websocket_connect_requires_a_valid_short_lived_ticket(monkeypatch):
@@ -337,6 +425,7 @@ def test_outbox_changefeed_exposes_only_sanitized_references():
     envelope = normalize_changefeed_row(
         {
             "topic": "tenant_event_outbox",
+            "updated": "1783960000000000000.0000000001",
             "after": {
                 "id": "event-1",
                 "tenant_id": "tenant-1",
@@ -348,14 +437,18 @@ def test_outbox_changefeed_exposes_only_sanitized_references():
     )
 
     assert envelope == {
-        "version": 1,
+        "version": 2,
         "event_id": "event-1",
+        "cursor": {
+            "hlc": "1783960000000000000.0000000001",
+            "event_id": "event-1",
+        },
         "tenant_id": "tenant-1",
         "topic_keys": ["tenant:tenant-1:namespace:demo"],
         "type": "memory",
         "namespace": None,
         "run_id": None,
-        "occurred_at": envelope["occurred_at"],
+        "occurred_at": "1783960000000000000.0000000001",
         "data": {"reference": {"id": "memory-1", "status": "active"}},
     }
 
@@ -364,16 +457,16 @@ def test_duplicate_outbox_delivery_is_ignored(monkeypatch):
     import hindsight.realtime as realtime
 
     monkeypatch.setattr(realtime, "_CHANGEFEED_TOKEN_CACHE", "webhook-secret")
-    claimed = set()
-
-    def claim(event_id):
-        if event_id in claimed:
-            return False
-        claimed.add(event_id)
-        return True
+    claims = iter(
+        [
+            realtime.OutboxEventClaim("claimed", "owner-1"),
+            realtime.OutboxEventClaim("completed"),
+        ]
+    )
 
     delivered = []
-    monkeypatch.setattr(realtime, "_claim_outbox_event", claim)
+    monkeypatch.setattr(realtime, "_claim_outbox_event", lambda _event_id: next(claims))
+    monkeypatch.setattr(realtime, "_complete_outbox_event", lambda *_args: True)
     monkeypatch.setattr(
         realtime,
         "fanout_event",
@@ -381,6 +474,7 @@ def test_duplicate_outbox_delivery_is_ignored(monkeypatch):
     )
     row = {
         "topic": "tenant_event_outbox",
+        "updated": "1783960000000000000.0000000001",
         "after": {
             "id": "event-1",
             "tenant_id": "00000000-0000-0000-0000-000000000002",
@@ -402,40 +496,161 @@ def test_duplicate_outbox_delivery_is_ignored(monkeypatch):
     assert len(delivered) == 1
 
 
-def test_outbox_event_claim_uses_one_conditional_ttl_record(monkeypatch):
+def test_outbox_event_claim_takeover_and_completion_are_owner_fenced(monkeypatch):
     import hindsight.realtime as realtime
 
-    class ConditionalCheckFailed(Exception):
-        pass
+    monkeypatch.setenv(realtime.EVENT_LEASE_SECONDS_ENV, "60")
+    table = FakeLeaseTable()
 
-    class FakeTable:
-        def __init__(self, duplicate=False):
-            self.duplicate = duplicate
-            self.puts = []
-            self.meta = SimpleNamespace(
-                client=SimpleNamespace(
-                    exceptions=SimpleNamespace(
-                        ConditionalCheckFailedException=ConditionalCheckFailed
-                    )
-                )
-            )
+    first = realtime._claim_outbox_event("event-1", table=table, owner="owner-1", now=100)
+    busy = realtime._claim_outbox_event("event-1", table=table, owner="owner-2", now=159)
+    takeover = realtime._claim_outbox_event(
+        "event-1", table=table, owner="owner-2", now=160
+    )
 
-        def put_item(self, **kwargs):
-            self.puts.append(kwargs)
-            if self.duplicate:
-                raise ConditionalCheckFailed()
+    assert first == realtime.OutboxEventClaim("claimed", "owner-1")
+    assert busy == realtime.OutboxEventClaim("busy")
+    assert busy.owner is None
+    assert table.reads[-1]["ConsistentRead"] is True
+    assert takeover == realtime.OutboxEventClaim("claimed", "owner-2")
+    assert table.item["attempt_count"] == 2
+    assert realtime._complete_outbox_event(
+        "event-1", "owner-1", table=table, now=161
+    ) is False
+    assert realtime._release_outbox_event(
+        "event-1", "owner-1", table=table, now=161
+    ) is False
+    assert table.item["lease_owner"] == "owner-2"
+    assert realtime._complete_outbox_event(
+        "event-1", "owner-2", table=table, now=161
+    ) is True
+    assert table.item["state"] == "completed"
+    assert realtime._claim_outbox_event(
+        "event-1", table=table, owner="owner-3", now=162
+    ) == realtime.OutboxEventClaim("completed")
+    for update in table.updates:
+        expressions = update["UpdateExpression"] + " " + update["ConditionExpression"]
+        assert set(update["ExpressionAttributeValues"]) == set(
+            re.findall(r":[a-z_]+", expressions)
+        )
+        assert set(update.get("ExpressionAttributeNames", {})) == set(
+            re.findall(r"#[a-z_]+", expressions)
+        )
 
+
+def test_legacy_claim_fails_closed_until_its_existing_ttl_expires(monkeypatch):
+    import hindsight.realtime as realtime
+
+    monkeypatch.setenv(realtime.EVENT_LEASE_SECONDS_ENV, "60")
+    table = FakeLeaseTable({"event_id": "event-1", "expires_at": 101})
+
+    assert realtime._claim_outbox_event(
+        "event-1", table=table, owner="owner-1", now=100
+    ) == realtime.OutboxEventClaim("busy")
+    assert realtime._claim_outbox_event(
+        "event-1", table=table, owner="owner-1", now=101
+    ) == realtime.OutboxEventClaim("claimed", "owner-1")
+
+
+def test_active_outbox_lease_returns_retryable_503_without_projection(monkeypatch):
+    import hindsight.realtime as realtime
+
+    monkeypatch.setattr(realtime, "_CHANGEFEED_TOKEN_CACHE", "webhook-secret")
+    monkeypatch.setenv(realtime.EVENT_LEASE_SECONDS_ENV, "60")
+    table = FakeLeaseTable()
+    realtime._claim_outbox_event("event-1", table=table, owner="owner-1", now=100)
+    monkeypatch.setattr(realtime, "_idempotency_table", lambda: table)
+    monkeypatch.setattr(realtime.time, "time", lambda: 120)
+    projected = []
+    monkeypatch.setattr(realtime, "fanout_event", lambda event: projected.append(event))
+
+    response = realtime.changefeed_handler(_outbox_webhook_event(), None)
+
+    assert response["statusCode"] == 503
+    assert response["headers"]["retry-after"] == "1"
+    assert json.loads(response["body"])["retryable"] is True
+    assert projected == []
+
+
+def test_projection_failure_releases_only_its_owner_for_immediate_retry(monkeypatch):
+    import hindsight.realtime as realtime
+
+    monkeypatch.setattr(realtime, "_CHANGEFEED_TOKEN_CACHE", "webhook-secret")
+    monkeypatch.setenv(realtime.EVENT_LEASE_SECONDS_ENV, "60")
     monkeypatch.setattr(realtime.time, "time", lambda: 100)
-    first = FakeTable()
-    duplicate = FakeTable(duplicate=True)
+    table = FakeLeaseTable()
+    monkeypatch.setattr(realtime, "_idempotency_table", lambda: table)
+    attempts = 0
 
-    assert realtime._claim_outbox_event("event-1", table=first) is True
-    assert realtime._claim_outbox_event("event-1", table=duplicate) is False
-    assert first.puts[0]["Item"] == {
-        "event_id": "event-1",
-        "expires_at": 100 + realtime.EVENT_IDEMPOTENCY_TTL_SECONDS,
+    def fanout(_event):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("delivery failed")
+        return {"delivered": 1, "stale": 0}
+
+    monkeypatch.setattr(realtime, "fanout_event", fanout)
+
+    first = realtime.changefeed_handler(_outbox_webhook_event(), None)
+    second = realtime.changefeed_handler(_outbox_webhook_event(), None)
+
+    assert first["statusCode"] == 500
+    assert second["statusCode"] == 200
+    assert json.loads(second["body"])["delivered"] == 1
+    assert attempts == 2
+    assert table.item["state"] == "completed"
+    assert table.item["attempt_count"] == 2
+
+
+def test_outbox_completion_happens_only_after_projection(monkeypatch):
+    import hindsight.realtime as realtime
+
+    monkeypatch.setattr(realtime, "_CHANGEFEED_TOKEN_CACHE", "webhook-secret")
+    order = []
+    monkeypatch.setattr(
+        realtime,
+        "_claim_outbox_event",
+        lambda _event_id: order.append("claim")
+        or realtime.OutboxEventClaim("claimed", "owner-1"),
+    )
+    monkeypatch.setattr(
+        realtime,
+        "fanout_event",
+        lambda _event: order.append("project") or {"delivered": 1, "stale": 0},
+    )
+    monkeypatch.setattr(
+        realtime,
+        "_complete_outbox_event",
+        lambda *_args: order.append("complete") or True,
+    )
+
+    response = realtime.changefeed_handler(_outbox_webhook_event(), None)
+
+    assert response["statusCode"] == 200
+    assert order == ["claim", "project", "complete"]
+
+
+def _outbox_webhook_event():
+    return {
+        "headers": {"authorization": "Bearer webhook-secret"},
+        "body": {
+            "payload": [
+                {
+                    "topic": "tenant_event_outbox",
+                    "updated": "1783960000000000000.0000000001",
+                    "after": {
+                        "id": "event-1",
+                        "tenant_id": "00000000-0000-0000-0000-000000000002",
+                        "aggregate_type": "semantic_memories",
+                        "topics": [
+                            "tenant:00000000-0000-0000-0000-000000000002:namespace:demo"
+                        ],
+                        "payload": {"id": "memory-1"},
+                    },
+                }
+            ]
+        },
     }
-    assert "ConditionExpression" in first.puts[0]
 
 
 def test_websocket_unsubscribe_and_disconnect_remove_indexed_subscriptions(monkeypatch):

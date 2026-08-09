@@ -6,13 +6,16 @@ import base64
 import hmac
 import json
 import os
+import re
 import time
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 import boto3
-from boto3.dynamodb.conditions import Attr, Key
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 from hindsight.aws import aws_client_config
@@ -23,15 +26,35 @@ from hindsight.security import safe_error_detail
 CONNECTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
 SUBSCRIPTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE"
 IDEMPOTENCY_TABLE_ENV = "HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE"
+EVENT_LEASE_SECONDS_ENV = "HINDSIGHT_CHANGEFEED_LEASE_SECONDS"
 MANAGEMENT_ENDPOINT_ENV = "HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT"
 CHANGEFEED_TOKEN_ENV = "HINDSIGHT_CHANGEFEED_AUTH_TOKEN"
 CHANGEFEED_TOKEN_PARAM_ENV = "HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM"
 TICKET_SECRET_PARAM_ENV = "HINDSIGHT_REALTIME_TICKET_SECRET_PARAM"
 CONNECTION_TTL_SECONDS = 24 * 60 * 60
 EVENT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
-EVENT_VERSION = 1
+DEFAULT_EVENT_LEASE_SECONDS = 60
+EVENT_VERSION = 2
+LEGACY_EVENT_VERSION = 1
+_HLC_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 _CHANGEFEED_TOKEN_CACHE: str | None = None
 _TICKET_SECRET_CACHE: str | None = None
+
+
+@dataclass(frozen=True)
+class OutboxEventClaim:
+    """Result of attempting to own one durable outbox projection."""
+
+    status: Literal["claimed", "busy", "completed"]
+    owner: str | None = None
+
+
+class OutboxEventBusy(RuntimeError):
+    """The event is still owned by another live changefeed invocation."""
+
+
+class OutboxEventLeaseLost(RuntimeError):
+    """The event lease expired or was taken over before completion."""
 
 
 def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -151,10 +174,19 @@ def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         consolidation_jobs = 0
         for row in rows:
             event_id = _outbox_event_id(row)
-            if event_id is not None and not _claim_outbox_event(event_id):
-                duplicates_ignored += 1
-                continue
+            claim: OutboxEventClaim | None = None
+            if event_id is not None:
+                claim = _claim_outbox_event(event_id)
+                if claim.status == "completed":
+                    duplicates_ignored += 1
+                    continue
+                if claim.status == "busy":
+                    raise OutboxEventBusy("changefeed event is already being processed")
             try:
+                row_consolidation_jobs = 0
+                row_accepted = 0
+                row_delivered = 0
+                row_stale = 0
                 transition = _resolved_incident_transition(row)
                 if transition is not None:
                     enqueue_run(
@@ -169,16 +201,25 @@ def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                             ),
                         }
                     )
-                    consolidation_jobs += 1
+                    row_consolidation_jobs = 1
                 envelope = normalize_changefeed_row(row)
                 if envelope is not None:
                     result = fanout_event(envelope)
-                    accepted += 1
-                    delivered += result["delivered"]
-                    stale += result["stale"]
+                    row_accepted = 1
+                    row_delivered = result["delivered"]
+                    row_stale = result["stale"]
+                if event_id is not None and claim is not None:
+                    if claim.owner is None or not _complete_outbox_event(event_id, claim.owner):
+                        raise OutboxEventLeaseLost(
+                            "changefeed event ownership was lost before completion"
+                        )
+                consolidation_jobs += row_consolidation_jobs
+                accepted += row_accepted
+                delivered += row_delivered
+                stale += row_stale
             except Exception:
-                if event_id is not None:
-                    _release_outbox_event(event_id)
+                if event_id is not None and claim is not None and claim.owner is not None:
+                    _release_outbox_event(event_id, claim.owner)
                 raise
         return _response(
             200,
@@ -189,6 +230,12 @@ def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 "stale_connections_removed": stale,
                 "consolidation_jobs_queued": consolidation_jobs,
             },
+        )
+    except (OutboxEventBusy, OutboxEventLeaseLost) as exc:
+        return _response(
+            503,
+            {"error": str(exc), "retryable": True},
+            headers={"retry-after": "1"},
         )
     except (ValueError, json.JSONDecodeError) as exc:
         return _response(400, {"error": str(exc)})
@@ -207,7 +254,13 @@ def normalize_changefeed_row(row: Any) -> dict[str, Any] | None:
     if not isinstance(after, dict):
         return None
     topic = str(row.get("topic") or row.get("table") or "").split(".")[-1]
-    updated = row.get("updated") or after.get("updated_at") or datetime.now(UTC).isoformat()
+    updated = (
+        row.get("updated")
+        or after.get("updated_at")
+        or after.get("created_at")
+        or after.get("written_at")
+        or "0"
+    )
     if topic == "tenant_event_outbox":
         aggregate_type = str(after.get("aggregate_type") or "")
         event_type = {
@@ -227,15 +280,19 @@ def normalize_changefeed_row(row: Any) -> dict[str, Any] | None:
         topic_keys = [str(value) for value in topics]
         if any(not value.startswith(f"tenant:{tenant_id}:") for value in topic_keys):
             raise ValueError("outbox topic tenant does not match event tenant")
+        hlc = _required_changefeed_hlc(row.get("updated"))
         return {
             "version": EVENT_VERSION,
             "event_id": event_id,
+            "cursor": {"hlc": hlc, "event_id": event_id},
             "tenant_id": tenant_id,
             "topic_keys": topic_keys,
             "type": event_type,
             "namespace": None,
             "run_id": str(payload.get("run_id")) if payload.get("run_id") else None,
-            "occurred_at": str(updated),
+            "occurred_at": str(
+                payload.get("updated_at") or after.get("created_at") or hlc
+            ),
             "data": {"reference": _jsonable(payload)},
         }
     namespace = after.get("namespace")
@@ -256,7 +313,7 @@ def normalize_changefeed_row(row: Any) -> dict[str, Any] | None:
     else:
         return None
     return {
-        "version": EVENT_VERSION,
+        "version": LEGACY_EVENT_VERSION,
         "type": event_type,
         "namespace": namespace,
         "run_id": str(run_id) if run_id is not None else None,
@@ -471,24 +528,136 @@ def _idempotency_table() -> Any:
     ).Table(table_name)
 
 
-def _claim_outbox_event(event_id: str, *, table: Any | None = None) -> bool:
-    resolved_table = table or _idempotency_table()
-    now = int(time.time())
+def _event_lease_seconds() -> int:
+    raw = os.environ.get(EVENT_LEASE_SECONDS_ENV, str(DEFAULT_EVENT_LEASE_SECONDS))
     try:
-        resolved_table.put_item(
-            Item={
-                "event_id": event_id,
-                "expires_at": now + EVENT_IDEMPOTENCY_TTL_SECONDS,
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{EVENT_LEASE_SECONDS_ENV} must be an integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{EVENT_LEASE_SECONDS_ENV} must be greater than zero")
+    return value
+
+
+def _claim_outbox_event(
+    event_id: str,
+    *,
+    table: Any | None = None,
+    owner: str | None = None,
+    now: int | None = None,
+) -> OutboxEventClaim:
+    resolved_table = table or _idempotency_table()
+    claimed_at = int(time.time()) if now is None else now
+    lease_owner = owner or str(uuid4())
+    lease_expires_at = claimed_at + _event_lease_seconds()
+    try:
+        resolved_table.update_item(
+            Key={"event_id": event_id},
+            UpdateExpression=(
+                "SET #state = :processing, lease_owner = :owner, "
+                "lease_expires_at = :lease_expires_at, "
+                "attempt_count = if_not_exists(attempt_count, :zero) + :one, "
+                "started_at = if_not_exists(started_at, :now), "
+                "updated_at = :now, expires_at = :expires_at REMOVE completed_at"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":processing": "processing",
+                ":owner": lease_owner,
+                ":lease_expires_at": lease_expires_at,
+                ":zero": 0,
+                ":one": 1,
+                ":now": claimed_at,
+                ":expires_at": claimed_at + EVENT_IDEMPOTENCY_TTL_SECONDS,
             },
-            ConditionExpression=(Attr("event_id").not_exists() | Attr("expires_at").lt(now)),
+            ConditionExpression=(
+                "attribute_not_exists(event_id) OR "
+                "(#state = :processing AND lease_expires_at <= :now) OR "
+                "(attribute_not_exists(#state) AND expires_at <= :now)"
+            ),
+        )
+    except resolved_table.meta.client.exceptions.ConditionalCheckFailedException:
+        existing = resolved_table.get_item(
+            Key={"event_id": event_id},
+            ConsistentRead=True,
+        ).get("Item")
+        if isinstance(existing, dict) and existing.get("state") == "completed":
+            return OutboxEventClaim("completed")
+        return OutboxEventClaim("busy")
+    return OutboxEventClaim("claimed", lease_owner)
+
+
+def _complete_outbox_event(
+    event_id: str,
+    owner: str,
+    *,
+    table: Any | None = None,
+    now: int | None = None,
+) -> bool:
+    resolved_table = table or _idempotency_table()
+    completed_at = int(time.time()) if now is None else now
+    try:
+        resolved_table.update_item(
+            Key={"event_id": event_id},
+            UpdateExpression=(
+                "SET #state = :completed, completed_at = :now, updated_at = :now, "
+                "expires_at = :expires_at REMOVE lease_owner, lease_expires_at"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":processing": "processing",
+                ":completed": "completed",
+                ":owner": owner,
+                ":now": completed_at,
+                ":expires_at": completed_at + EVENT_IDEMPOTENCY_TTL_SECONDS,
+            },
+            ConditionExpression=(
+                "#state = :processing AND lease_owner = :owner "
+                "AND lease_expires_at > :now"
+            ),
         )
     except resolved_table.meta.client.exceptions.ConditionalCheckFailedException:
         return False
     return True
 
 
-def _release_outbox_event(event_id: str, *, table: Any | None = None) -> None:
-    (table or _idempotency_table()).delete_item(Key={"event_id": event_id})
+def _release_outbox_event(
+    event_id: str,
+    owner: str,
+    *,
+    table: Any | None = None,
+    now: int | None = None,
+) -> bool:
+    """Expire only the caller's processing lease so a retry can take over."""
+
+    resolved_table = table or _idempotency_table()
+    released_at = int(time.time()) if now is None else now
+    try:
+        resolved_table.update_item(
+            Key={"event_id": event_id},
+            UpdateExpression=(
+                "SET lease_expires_at = :expired, updated_at = :now, expires_at = :expires_at"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":processing": "processing",
+                ":owner": owner,
+                ":expired": released_at - 1,
+                ":now": released_at,
+                ":expires_at": released_at + EVENT_IDEMPOTENCY_TTL_SECONDS,
+            },
+            ConditionExpression="#state = :processing AND lease_owner = :owner",
+        )
+    except resolved_table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    return True
+
+
+def _required_changefeed_hlc(value: Any) -> str:
+    hlc = str(value or "").strip()
+    if not _HLC_PATTERN.fullmatch(hlc):
+        raise ValueError("outbox changefeed row requires a CockroachDB updated HLC")
+    return hlc
 
 
 def _management_client() -> Any:
@@ -523,10 +692,15 @@ def _optional_subscription(value: Any, name: str) -> str | None:
     return result or None
 
 
-def _response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
+def _response(
+    status_code: int,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     return {
         "statusCode": status_code,
-        "headers": {"content-type": "application/json"},
+        "headers": {"content-type": "application/json", **(headers or {})},
         "body": json.dumps(payload, sort_keys=True),
     }
 

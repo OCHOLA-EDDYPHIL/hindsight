@@ -139,10 +139,16 @@ run "complete_demo_graph" {
   assert {
     condition = (
       aws_dynamodb_table.changefeed_idempotency.hash_key == "event_id" &&
+      aws_dynamodb_table.changefeed_idempotency.billing_mode == "PAY_PER_REQUEST" &&
       aws_dynamodb_table.changefeed_idempotency.ttl[0].enabled &&
-      aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE == aws_dynamodb_table.changefeed_idempotency.name
+      aws_dynamodb_table.changefeed_idempotency.ttl[0].attribute_name == "expires_at" &&
+      aws_dynamodb_table.changefeed_idempotency.server_side_encryption[0].enabled &&
+      aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE == aws_dynamodb_table.changefeed_idempotency.name &&
+      aws_lambda_function.changefeed.timeout == 30 &&
+      tonumber(aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_CHANGEFEED_LEASE_SECONDS) == 60 &&
+      aws_lambda_function.changefeed.timeout < tonumber(aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_CHANGEFEED_LEASE_SECONDS)
     )
-    error_message = "Changefeed delivery must use bounded event-id claims."
+    error_message = "Changefeed delivery must use encrypted bounded event-id leases that outlive one invocation."
   }
 
   assert {

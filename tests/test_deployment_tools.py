@@ -341,6 +341,8 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert "needs.deploy.outputs.websocket_url" in browser_job
     assert "HINDSIGHT_EXPECTED_DEPLOYED_REVISION" in browser_job
     assert 'CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER"' in browser_job
+    assert "aws lambda get-function-configuration" in browser_job
+    assert "HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE" in browser_job
     assert (
         'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"'
         in browser_job

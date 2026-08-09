@@ -9,6 +9,23 @@ export interface RuntimeConfig {
   operationPollSeconds?: number;
 }
 
+export type RealtimeEventType = "memory" | "operation" | "run" | "run_event";
+
+export interface RealtimeCursor {
+  hlc: string;
+  event_id: Identifier;
+}
+
+export interface RealtimeEnvelopeV2 {
+  version: 2;
+  event_id: Identifier;
+  cursor: RealtimeCursor;
+  type: RealtimeEventType;
+  namespace?: string | null;
+  run_id?: Identifier | null;
+  data: Record<string, unknown>;
+}
+
 export interface Incident {
   id?: Identifier;
   slug: string;

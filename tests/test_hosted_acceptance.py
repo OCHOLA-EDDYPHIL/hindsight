@@ -374,6 +374,12 @@ def test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe()
             token=changefeed_token,
             namespace=namespace,
         )
+        await _wait_for_expired_changefeed_lease_takeover(
+            first,
+            api_url=api_url,
+            token=changefeed_token,
+            namespace=namespace,
+        )
         await first.close(code=1000)
         await first.wait_closed()
         assert first.close_code == 1000
@@ -427,11 +433,29 @@ async def _wait_for_websocket_delivery(
         if result["delivered"] == 1:
             message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
             assert message["type"] == "run"
+            assert message["version"] == 2
+            assert message["event_id"] == result["event_id"]
+            assert message["cursor"] == {
+                "hlc": result["hlc"],
+                "event_id": result["event_id"],
+            }
             assert message["tenant_id"] == PUBLIC_DEMO_TENANT_ID
             assert message["topic_keys"] == [
                 f"tenant:{PUBLIC_DEMO_TENANT_ID}:namespace:{namespace}"
             ]
             assert message["data"]["reference"]["run_id"] == result["event_id"]
+            duplicate = await asyncio.to_thread(
+                _inject_changefeed_event,
+                api_url=api_url,
+                token=token,
+                namespace=namespace,
+                event_id=str(result["event_id"]),
+                hlc=str(result["hlc"]),
+                expected_accepted=0,
+            )
+            assert duplicate["duplicates_ignored"] == 1
+            assert duplicate["delivered"] == 0
+            await _assert_no_websocket_message(socket)
             return
         assert result["delivered"] == 0
         await asyncio.sleep(0.5)
@@ -472,32 +496,129 @@ async def _assert_no_websocket_message(socket) -> None:
         await asyncio.wait_for(socket.recv(), timeout=2)
 
 
-def _inject_changefeed_event(
-    *, api_url: str, token: str, namespace: str
-) -> dict[str, object]:
+async def _wait_for_expired_changefeed_lease_takeover(
+    socket, *, api_url: str, token: str, namespace: str
+) -> None:
     event_id = str(uuid4())
+    hlc = f"{time.time_ns()}.0000000000"
+    lease_expires_at = await asyncio.to_thread(
+        _seed_processing_changefeed_lease,
+        event_id=event_id,
+        lease_seconds=3,
+    )
+    status, busy = await asyncio.to_thread(
+        _post_changefeed_event,
+        api_url=api_url,
+        token=token,
+        namespace=namespace,
+        event_id=event_id,
+        hlc=hlc,
+    )
+    assert status == 503
+    assert busy["retryable"] is True
+
+    await asyncio.sleep(max(0, lease_expires_at - int(time.time()) + 1))
+    recovered = await asyncio.to_thread(
+        _inject_changefeed_event,
+        api_url=api_url,
+        token=token,
+        namespace=namespace,
+        event_id=event_id,
+        hlc=hlc,
+    )
+    assert recovered["delivered"] == 1
+    message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+    assert message["event_id"] == event_id
+    assert message["cursor"] == {"hlc": hlc, "event_id": event_id}
+
+
+def _seed_processing_changefeed_lease(*, event_id: str, lease_seconds: int) -> int:
+    import boto3
+
+    from hindsight.aws import aws_client_config
+
+    now = int(time.time())
+    lease_expires_at = now + lease_seconds
+    table = boto3.resource(
+        "dynamodb",
+        region_name=os.environ.get("AWS_REGION"),
+        config=aws_client_config(read_timeout=10),
+    ).Table(_required_env("HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE"))
+    table.put_item(
+        Item={
+            "event_id": event_id,
+            "state": "processing",
+            "lease_owner": "hosted-acceptance-dead-owner",
+            "lease_expires_at": lease_expires_at,
+            "attempt_count": 1,
+            "started_at": now,
+            "updated_at": now,
+            "expires_at": now + 24 * 60 * 60,
+        }
+    )
+    return lease_expires_at
+
+
+def _inject_changefeed_event(
+    *,
+    api_url: str,
+    token: str,
+    namespace: str,
+    event_id: str | None = None,
+    hlc: str | None = None,
+    expected_accepted: int = 1,
+) -> dict[str, object]:
+    event_id = event_id or str(uuid4())
+    hlc = hlc or f"{time.time_ns()}.0000000000"
     response = _post_json(
         f"{api_url}/internal/changefeed",
         token=token,
-        payload={
-            "payload": [
-                {
-                    "topic": "tenant_event_outbox",
-                    "after": {
-                        "id": event_id,
-                        "tenant_id": PUBLIC_DEMO_TENANT_ID,
-                        "aggregate_type": "agent_runs",
-                        "topics": [
-                            f"tenant:{PUBLIC_DEMO_TENANT_ID}:namespace:{namespace}"
-                        ],
-                        "payload": {"run_id": event_id, "status": "triaging"},
-                    },
-                }
-            ]
+        payload=_changefeed_event_payload(namespace=namespace, event_id=event_id, hlc=hlc),
+    )
+    assert response["accepted"] == expected_accepted
+    return {**response, "event_id": event_id, "hlc": hlc}
+
+
+def _post_changefeed_event(
+    *, api_url: str, token: str, namespace: str, event_id: str, hlc: str
+) -> tuple[int, dict[str, object]]:
+    body = json.dumps(
+        _changefeed_event_payload(namespace=namespace, event_id=event_id, hlc=hlc)
+    ).encode()
+    req = request.Request(
+        f"{api_url}/internal/changefeed",
+        data=body,
+        method="POST",
+        headers={
+            "authorization": f"Bearer {token}",
+            "content-type": "application/json",
         },
     )
-    assert response["accepted"] == 1
-    return {**response, "event_id": event_id}
+    try:
+        with request.urlopen(req, timeout=30) as response:  # noqa: S310 - fixed hosted URL
+            return response.status, json.loads(response.read())
+    except error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def _changefeed_event_payload(
+    *, namespace: str, event_id: str, hlc: str
+) -> dict[str, object]:
+    return {
+        "payload": [
+            {
+                "topic": "tenant_event_outbox",
+                "updated": hlc,
+                "after": {
+                    "id": event_id,
+                    "tenant_id": PUBLIC_DEMO_TENANT_ID,
+                    "aggregate_type": "agent_runs",
+                    "topics": [f"tenant:{PUBLIC_DEMO_TENANT_ID}:namespace:{namespace}"],
+                    "payload": {"run_id": event_id, "status": "triaging"},
+                },
+            }
+        ]
+    }
 
 
 def _post_json(url: str, *, token: str, payload: dict[str, object]) -> dict[str, object]:

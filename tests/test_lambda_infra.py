@@ -113,6 +113,32 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert stack.count('state               = var.runtime_active ? "ENABLED" : "DISABLED"') == 2
 
 
+def test_changefeed_relay_has_a_fenced_lease_and_narrow_idempotency_permissions():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    changefeed_policy = stack.split('data "aws_iam_policy_document" "changefeed"', 1)[
+        1
+    ].split('resource "aws_iam_role_policy" "changefeed"', 1)[0]
+    idempotency_statement = changefeed_policy.rsplit("  statement {", 3)[1]
+    changefeed_lambda = stack.split('resource "aws_lambda_function" "changefeed"', 1)[
+        1
+    ].split('resource "aws_lambda_event_source_mapping" "worker"', 1)[0]
+
+    assert 'changefeed_timeout_seconds    = 30' in stack
+    assert 'changefeed_lease_seconds      = 60' in stack
+    assert "timeout       = local.changefeed_timeout_seconds" in changefeed_lambda
+    assert "HINDSIGHT_CHANGEFEED_LEASE_SECONDS" in changefeed_lambda
+    assert "local.changefeed_timeout_seconds < local.changefeed_lease_seconds" in (
+        changefeed_lambda
+    )
+    assert 'aws_dynamodb_table.changefeed_idempotency.arn' in idempotency_statement
+    assert set(re.findall(r'"dynamodb:[A-Za-z]+"', idempotency_statement)) == {
+        '"dynamodb:DeleteItem"',
+        '"dynamodb:GetItem"',
+        '"dynamodb:PutItem"',
+        '"dynamodb:UpdateItem"',
+    }
+
+
 def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
     variables = pathlib.Path("infra/terraform/app/variables.tf").read_text()
