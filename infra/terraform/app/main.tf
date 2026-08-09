@@ -22,6 +22,13 @@ locals {
   public_origin = var.public_origin != null ? var.public_origin : (
     var.domain_name == null ? "" : "https://${var.domain_name}"
   )
+  product_origin = local.public_origin != "" ? local.public_origin : "https://${aws_cloudfront_distribution.ui.domain_name}"
+
+  cognito_domain_prefix      = "${local.name}-${data.aws_caller_identity.current.account_id}"
+  cognito_hosted_ui_base_url = "https://${local.cognito_domain_prefix}.auth.${var.aws_region}.amazoncognito.com"
+  cognito_issuer             = "https://cognito-idp.${var.aws_region}.${data.aws_partition.current.dns_suffix}/${aws_cognito_user_pool.product.id}"
+  cognito_callback_url       = "${local.product_origin}/"
+  cognito_logout_url         = "${local.product_origin}/"
 
   lambda_artifacts = {
     api      = local.api_zip
@@ -33,7 +40,6 @@ locals {
     api_database    = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.api_database_url_parameter_name}"
     worker_database = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.worker_database_url_parameter_name}"
     gemini          = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_keys_parameter_name}"
-    operator        = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.operator_token_parameter_name}"
     changefeed      = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.changefeed_token_parameter_name}"
   }
 
@@ -139,6 +145,79 @@ resource "aws_s3_object" "ui_asset" {
   cache_control = each.key == "index.html" ? "no-cache" : "public, max-age=31536000, immutable"
 }
 
+resource "aws_cognito_user_pool" "product" {
+  name           = "${local.name}-product"
+  user_pool_tier = "LITE"
+
+  username_configuration {
+    case_sensitive = false
+  }
+
+  admin_create_user_config {
+    allow_admin_create_user_only = true
+  }
+
+  password_policy {
+    minimum_length                   = 14
+    require_lowercase                = true
+    require_numbers                  = true
+    require_symbols                  = true
+    require_uppercase                = true
+    temporary_password_validity_days = 1
+  }
+
+  account_recovery_setting {
+    recovery_mechanism {
+      name     = "admin_only"
+      priority = 1
+    }
+  }
+}
+
+resource "aws_cognito_user_group" "viewer" {
+  name         = "viewer"
+  user_pool_id = aws_cognito_user_pool.product.id
+  precedence   = 20
+}
+
+resource "aws_cognito_user_group" "operator" {
+  name         = "operator"
+  user_pool_id = aws_cognito_user_pool.product.id
+  precedence   = 10
+}
+
+resource "aws_cognito_user_pool_domain" "product" {
+  domain       = local.cognito_domain_prefix
+  user_pool_id = aws_cognito_user_pool.product.id
+}
+
+resource "aws_cognito_user_pool_client" "product" {
+  name         = "${local.name}-browser"
+  user_pool_id = aws_cognito_user_pool.product.id
+
+  generate_secret                      = false
+  allowed_oauth_flows_user_pool_client = true
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_scopes                 = ["openid"]
+  callback_urls                        = [local.cognito_callback_url]
+  logout_urls                          = [local.cognito_logout_url]
+  supported_identity_providers         = ["COGNITO"]
+  prevent_user_existence_errors        = "ENABLED"
+  explicit_auth_flows                  = ["ALLOW_ADMIN_USER_PASSWORD_AUTH"]
+
+  access_token_validity  = 15
+  id_token_validity      = 15
+  refresh_token_validity = 1
+
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
+
+  depends_on = [aws_cognito_user_pool_domain.product]
+}
+
 resource "aws_s3_object" "ui_config" {
   bucket        = aws_s3_bucket.ui.id
   key           = "config.js"
@@ -146,12 +225,20 @@ resource "aws_s3_object" "ui_config" {
   cache_control = "no-cache"
   content = <<-JS
     window.HINDSIGHT_CONFIG = ${jsonencode({
-  apiBase              = "/v1"
+  publicApiBase        = "/v1"
+  productApiBase       = "/v2"
   snapshotBase         = null
   websocketUrl         = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "https://", "wss://")}/${aws_apigatewayv2_stage.websocket.name}"
   defaultNamespace     = "demo:payments-poison-rewind"
   pollIntervalMs       = 4000
   operationPollSeconds = local.operation_poll_seconds
+  auth = {
+    hostedUiBaseUrl = local.cognito_hosted_ui_base_url
+    clientId        = aws_cognito_user_pool_client.product.id
+    redirectUri     = local.cognito_callback_url
+    logoutUri       = local.cognito_logout_url
+    scopes          = ["openid"]
+  }
 })};
   JS
 }
@@ -213,6 +300,35 @@ resource "aws_dynamodb_table" "subscriptions" {
     name            = "connection-id-index"
     hash_key        = "connection_id"
     projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  server_side_encryption { enabled = true }
+}
+
+resource "aws_dynamodb_table" "realtime_tickets" {
+  name         = "${local.name}-realtime-tickets"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "ticket_digest"
+
+  attribute {
+    name = "ticket_digest"
+    type = "S"
+  }
+
+  attribute {
+    name = "tenant_id"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "tenant-id-index"
+    hash_key        = "tenant_id"
+    projection_type = "KEYS_ONLY"
   }
 
   ttl {
@@ -330,7 +446,7 @@ resource "aws_iam_role_policy_attachment" "basic_logs" {
 data "aws_iam_policy_document" "api" {
   statement {
     actions   = ["ssm:GetParameter"]
-    resources = [local.parameter_arns.api_database, local.parameter_arns.gemini, local.parameter_arns.operator]
+    resources = [local.parameter_arns.api_database, local.parameter_arns.gemini]
   }
   statement {
     actions = [
@@ -343,6 +459,11 @@ data "aws_iam_policy_document" "api" {
   statement {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.runs.arn]
+  }
+  statement {
+    sid       = "RealtimeTicketIssue"
+    actions   = ["dynamodb:PutItem"]
+    resources = [aws_dynamodb_table.realtime_tickets.arn]
   }
 }
 
@@ -390,10 +511,6 @@ resource "aws_iam_role_policy" "worker" {
 
 data "aws_iam_policy_document" "websocket" {
   statement {
-    actions   = ["ssm:GetParameter"]
-    resources = [local.parameter_arns.operator]
-  }
-  statement {
     actions = [
       "dynamodb:GetItem",
       "dynamodb:PutItem",
@@ -408,6 +525,11 @@ data "aws_iam_policy_document" "websocket" {
       aws_dynamodb_table.subscriptions.arn,
       "${aws_dynamodb_table.subscriptions.arn}/index/connection-id-index"
     ]
+  }
+  statement {
+    sid       = "RealtimeTicketRedeem"
+    actions   = ["dynamodb:DeleteItem"]
+    resources = [aws_dynamodb_table.realtime_tickets.arn]
   }
 }
 
@@ -475,19 +597,20 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM        = var.api_database_url_parameter_name
-      HINDSIGHT_DEPLOYED_REVISION         = var.deployed_revision
-      HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM = var.operator_token_parameter_name
-      HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
-      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
-      HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
-      HINDSIGHT_ALLOWED_ORIGINS           = local.public_origin
-      HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
-      HINDSIGHT_SECURE_COOKIES            = "1"
-      LLM_PROVIDER                        = var.llm_provider
-      EMBEDDING_PROVIDER                  = var.embedding_provider
-      GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
-      HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
+      HINDSIGHT_DATABASE_URL_PARAM      = var.api_database_url_parameter_name
+      HINDSIGHT_DEPLOYED_REVISION       = var.deployed_revision
+      HINDSIGHT_GEMINI_API_KEYS_PARAM   = var.gemini_api_keys_parameter_name
+      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE = aws_dynamodb_table.gemini_key_health.name
+      HINDSIGHT_RUN_QUEUE_URL           = aws_sqs_queue.runs.url
+      HINDSIGHT_ALLOWED_ORIGINS         = local.public_origin
+      HINDSIGHT_REQUIRE_TENANT_CONTEXT  = "1"
+      HINDSIGHT_REALTIME_TICKET_TABLE   = aws_dynamodb_table.realtime_tickets.name
+      HINDSIGHT_COGNITO_ISSUER          = local.cognito_issuer
+      HINDSIGHT_COGNITO_CLIENT_ID       = aws_cognito_user_pool_client.product.id
+      LLM_PROVIDER                      = var.llm_provider
+      EMBEDDING_PROVIDER                = var.embedding_provider
+      GEMINI_EMBEDDING_MODEL            = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION   = var.gemini_embedding_representation
     }
   }
 }
@@ -562,7 +685,7 @@ resource "aws_lambda_function" "websocket" {
     variables = {
       HINDSIGHT_WEBSOCKET_CONNECTION_TABLE   = aws_dynamodb_table.connections.name
       HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE = aws_dynamodb_table.subscriptions.name
-      HINDSIGHT_REALTIME_TICKET_SECRET_PARAM = var.operator_token_parameter_name
+      HINDSIGHT_REALTIME_TICKET_TABLE        = aws_dynamodb_table.realtime_tickets.name
     }
   }
 }
@@ -686,28 +809,90 @@ resource "aws_apigatewayv2_integration" "changefeed" {
   timeout_milliseconds   = 30000
 }
 
-resource "aws_apigatewayv2_route" "api_root" {
-  api_id    = aws_apigatewayv2_api.http.id
-  route_key = "ANY /v1"
-  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+resource "aws_apigatewayv2_authorizer" "product" {
+  api_id           = aws_apigatewayv2_api.http.id
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+  name             = "${local.name}-product"
+
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.product.id]
+    issuer   = local.cognito_issuer
+  }
 }
 
-resource "aws_apigatewayv2_route" "api_proxy" {
+resource "aws_apigatewayv2_route" "public_v1_root_get" {
   api_id    = aws_apigatewayv2_api.http.id
-  route_key = "ANY /v1/{proxy+}"
+  route_key = "GET /v1"
   target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
 }
 
-resource "aws_apigatewayv2_route" "api_v2_root" {
+resource "aws_apigatewayv2_route" "public_v1_proxy_get" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "GET /v1/{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
+}
+
+resource "aws_apigatewayv2_route" "public_v1_ticket_post" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "POST /v1/realtime/ticket"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
+}
+
+resource "aws_apigatewayv2_route" "public_v1_root_options" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "OPTIONS /v1"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
+}
+
+resource "aws_apigatewayv2_route" "public_v1_proxy_options" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "OPTIONS /v1/{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
+}
+
+resource "aws_apigatewayv2_route" "product_v2_root" {
   api_id    = aws_apigatewayv2_api.http.id
   route_key = "ANY /v2"
   target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.product.id
 }
 
-resource "aws_apigatewayv2_route" "api_v2_proxy" {
+resource "aws_apigatewayv2_route" "product_v2_proxy" {
   api_id    = aws_apigatewayv2_api.http.id
   route_key = "ANY /v2/{proxy+}"
   target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.product.id
+}
+
+resource "aws_apigatewayv2_route" "product_v2_root_options" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "OPTIONS /v2"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
+}
+
+resource "aws_apigatewayv2_route" "product_v2_proxy_options" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "OPTIONS /v2/{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "NONE"
 }
 
 resource "aws_apigatewayv2_route" "changefeed" {
@@ -846,12 +1031,75 @@ resource "aws_cloudfront_origin_access_control" "ui" {
   signing_protocol                  = "sigv4"
 }
 
+resource "aws_wafv2_web_acl" "ui" {
+  count    = var.enable_waf ? 1 : 0
+  provider = aws.us_east_1
+
+  name  = "${local.name}-cloudfront"
+  scope = "CLOUDFRONT"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "ip-rate-limit"
+    priority = 10
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        aggregate_key_type = "IP"
+        limit              = 300
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-ip-rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "aws-managed-common"
+    priority = 20
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-aws-managed-common"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${local.name}-cloudfront"
+    sampled_requests_enabled   = true
+  }
+}
+
 resource "aws_cloudfront_distribution" "ui" {
   enabled             = true
   is_ipv6_enabled     = true
   default_root_object = "index.html"
   price_class         = "PriceClass_100"
   aliases             = local.cloudfront_aliases
+  web_acl_id          = var.enable_waf ? aws_wafv2_web_acl.ui[0].arn : null
 
   origin {
     domain_name              = aws_s3_bucket.ui.bucket_regional_domain_name

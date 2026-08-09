@@ -1,5 +1,7 @@
 window.HINDSIGHT_CONFIG = {
-  apiBase: "/v1",
+  publicApiBase: "/v1",
+  productApiBase: "/v2",
+  auth: null,
   snapshotBase: null,
   websocketUrl: null,
   defaultNamespace: "demo:payments-poison-rewind",

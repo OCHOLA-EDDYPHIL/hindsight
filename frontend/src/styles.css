@@ -909,8 +909,7 @@ input[type="range"] {
   gap: 0.35rem;
 }
 
-.field label,
-#operatorForm label {
+.field label {
   color: var(--color-muted);
   font: 700 0.62rem/1 var(--font-mono);
 }
@@ -946,11 +945,39 @@ textarea:focus-visible {
   box-shadow: 0 0 0 2px rgb(183 236 87 / 0.25);
 }
 
-.form-help {
-  margin: 0;
+.identity-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 1.25rem 0 0;
+}
+
+.identity-facts > div {
+  border-top: 1px solid var(--color-line-strong);
+  padding-top: 0.6rem;
+}
+
+.identity-facts dt {
   color: var(--color-muted);
-  font-size: 0.72rem;
-  line-height: 1.5;
+  font: 700 0.58rem/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.identity-facts dd {
+  margin: 0.35rem 0 0;
+  color: var(--color-text);
+  font: 650 0.78rem/1.3 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.identity-scope {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 1rem 0 0;
+  color: var(--color-muted);
+  font: 600 0.66rem/1.45 var(--font-mono);
 }
 
 .operator-actions,
@@ -1488,17 +1515,21 @@ textarea:focus-visible {
     gap: 0.35rem;
   }
 
-  #operatorButton {
+  #identityButton {
     width: 2.5rem;
     padding: 0;
   }
 
-  #operatorLabel {
+  #identityLabel {
     position: absolute;
     width: 1px;
     height: 1px;
     overflow: hidden;
     clip: rect(0, 0, 0, 0);
+  }
+
+  .identity-facts {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   main {

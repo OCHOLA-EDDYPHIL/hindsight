@@ -45,12 +45,6 @@ variable "gemini_api_keys_parameter_name" {
   default     = "/hindsight/demo/gemini-api-keys"
 }
 
-variable "operator_token_parameter_name" {
-  description = "Existing SecureString parameter containing the operator token."
-  type        = string
-  default     = "/hindsight/demo/operator-token"
-}
-
 variable "changefeed_token_parameter_name" {
   description = "Existing SecureString parameter containing the CockroachDB webhook token."
   type        = string
@@ -204,4 +198,10 @@ variable "alarm_actions" {
   description = "Optional SNS topic ARNs for operational alarms."
   type        = list(string)
   default     = []
+}
+
+variable "enable_waf" {
+  description = "Create and attach the CloudFront Web ACL."
+  type        = bool
+  default     = false
 }

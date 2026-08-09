@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import dataclasses
-import hashlib
-import hmac
 import json
 import os
 import time
@@ -16,14 +15,12 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import (
-    Cookie,
     Depends,
     FastAPI,
     Header,
     HTTPException,
     Query,
     Request,
-    Response,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,6 +40,13 @@ from hindsight.demo_state import (
     seed_good_demo_memory,
 )
 from hindsight.embeddings import embedding_provider_from_env
+from hindsight.identity import (
+    IdentityForbidden,
+    IdentityUnauthenticated,
+    IdentityUnavailable,
+    ProductIdentity,
+    resolve_product_identity,
+)
 from hindsight.memory import MemoryStore
 from hindsight.operations import (
     OperationAuthorizationError,
@@ -58,12 +62,11 @@ from hindsight.queueing import RunQueueUnavailableError, enqueue_run
 from hindsight.run_dispatch import dispatch_run_commands
 from hindsight.runtime import (
     RuntimeSettings,
-    function_auth_token,
     runtime_database_url,
     runtime_settings,
 )
 from hindsight.realtime_ticket import issue_realtime_ticket
-from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, public_demo_tenant_id
+from hindsight.server_tenants import public_demo_tenant_id
 from hindsight.snapshots import memory_snapshot
 from hindsight.tenant import current_tenant_id, tenant_scope
 from hindsight.runs import (
@@ -85,8 +88,11 @@ from hindsight.trace_contract import (
 
 API_PREFIX = "/v1"
 V2_PREFIX = "/v2"
-OPERATOR_COOKIE = "hindsight_operator_session"
-OPERATOR_SESSION_TTL_SECONDS = 4 * 60 * 60
+PUBLIC_REALTIME_SESSION_SECONDS = 60 * 60
+TENANT_SELECTOR_HEADERS = frozenset(
+    {"x-tenant-id", "x-hindsight-tenant", "x-hindsight-tenant-id"}
+)
+TENANT_SELECTOR_QUERY_KEYS = frozenset({"tenant", "tenant_id"})
 
 
 def _normalize_origin(value: str) -> str | None:
@@ -136,8 +142,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(_configured_allowed_origins()),
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["authorization", "content-type", "idempotency-key"],
 )
 
@@ -146,40 +152,58 @@ app.add_middleware(
 async def bind_server_tenant(request: Request, call_next):
     """Bind product routes without accepting a tenant selector."""
 
+    if request.method == "OPTIONS" and request.url.path.startswith(
+        (f"{API_PREFIX}/", f"{V2_PREFIX}/")
+    ):
+        return await call_next(request)
+    if request.url.path.startswith((f"{API_PREFIX}/", f"{V2_PREFIX}/")):
+        if _request_has_tenant_selector(request):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "tenant selectors are not accepted"},
+            )
     if request.url.path.startswith(f"{API_PREFIX}/"):
         with tenant_scope(public_demo_tenant_id()):
             return await call_next(request)
     if request.url.path.startswith(f"{V2_PREFIX}/"):
         try:
             identity = _v2_identity(request)
-        except HTTPException as exc:
-            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        except IdentityUnauthenticated:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "verified product identity is required"},
+            )
+        except IdentityForbidden:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "product authorization is unavailable"},
+            )
+        except IdentityUnavailable:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "product identity service is unavailable"},
+            )
+        request.state.v2_identity = identity
         request.state.v2_scopes = identity.scopes
         with tenant_scope(identity.tenant_id):
             return await call_next(request)
     return await call_next(request)
 
 
-@dataclasses.dataclass(frozen=True)
-class V2Identity:
-    tenant_id: str
-    scopes: frozenset[str]
+def _request_has_tenant_selector(request: Request) -> bool:
+    if TENANT_SELECTOR_HEADERS.intersection(request.headers):
+        return True
+    return any(key.lower() in TENANT_SELECTOR_QUERY_KEYS for key in request.query_params)
 
 
-def _v2_identity(request: Request) -> V2Identity:
-    authorization = request.headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="protected bearer credential required")
+def _v2_identity(request: Request) -> ProductIdentity:
     try:
-        expected = _operator_secret()
+        db_url = _api_database_url()
     except HTTPException as exc:
-        raise HTTPException(status_code=503, detail=exc.detail) from exc
-    if not hmac.compare_digest(token, expected):
-        raise HTTPException(status_code=401, detail="invalid protected credential")
-    return V2Identity(
-        tenant_id=ACCEPTANCE_TENANT_ID,
-        scopes=frozenset({"read", "write", "realtime"}),
+        raise IdentityUnavailable("product identity service is unavailable") from exc
+    return resolve_product_identity(
+        request.scope,
+        db_url=db_url,
     )
 
 
@@ -191,8 +215,18 @@ def _v2_scope(scope: str):
     return required
 
 
-class IncidentCreate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+def _current_identity(request: Request) -> ProductIdentity:
+    identity = getattr(request.state, "v2_identity", None)
+    if not isinstance(identity, ProductIdentity):
+        raise HTTPException(status_code=401, detail="verified product identity is required")
+    return identity
+
+
+class StrictRequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class IncidentCreate(StrictRequestModel):
 
     slug: str = Field(min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9:-]*$")
     title: str = Field(min_length=1, max_length=300)
@@ -201,8 +235,7 @@ class IncidentCreate(BaseModel):
     service_slug: str | None = Field(default=None, max_length=200)
 
 
-class RunCreate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+class RunCreate(StrictRequestModel):
 
     user_input: str = Field(min_length=1, max_length=20_000)
     namespace: str = Field(min_length=1, max_length=500)
@@ -210,7 +243,7 @@ class RunCreate(BaseModel):
     retrieval_policy: Literal["semantic_strict", "semantic_then_keyword"] = "semantic_strict"
 
 
-class ApprovalRequest(BaseModel):
+class ApprovalRequest(StrictRequestModel):
     approved: bool
     recommendation_id: str = Field(
         min_length=79,
@@ -220,24 +253,24 @@ class ApprovalRequest(BaseModel):
     selection_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
 
 
-class IncidentResolutionRequest(BaseModel):
+class IncidentResolutionRequest(StrictRequestModel):
     root_cause: str = Field(min_length=1, max_length=10_000)
     action: str = Field(min_length=1, max_length=10_000)
     observation: str = Field(min_length=1, max_length=10_000)
     recovered: bool
 
 
-class RewindRequest(BaseModel):
+class RewindRequest(StrictRequestModel):
     target_timestamp: datetime
     reason: str = Field(min_length=1, max_length=500)
 
 
-class OperationApprovalRequest(BaseModel):
+class OperationApprovalRequest(StrictRequestModel):
     preview_id: str = Field(min_length=1, max_length=100)
     fingerprint: str = Field(min_length=64, max_length=64)
 
 
-class RetractionPreviewRequest(BaseModel):
+class RetractionPreviewRequest(StrictRequestModel):
     root_memory_id: str
     reason: str = Field(min_length=1, max_length=500)
     authorized_namespaces: list[str] = Field(min_length=1)
@@ -249,21 +282,17 @@ class SupersessionPreviewRequest(RetractionPreviewRequest):
     structured_payload: dict[str, Any]
 
 
-class ReviewResolutionPreviewRequest(BaseModel):
+class ReviewResolutionPreviewRequest(StrictRequestModel):
     action: Literal["confirmed", "retracted"]
     reason: str = Field(min_length=1, max_length=500)
     authorized_namespaces: list[str] = Field(min_length=1)
 
 
-class OperatorSessionRequest(BaseModel):
-    token: str = Field(min_length=1, max_length=1000)
-
-
-class DemoResetRequest(BaseModel):
+class DemoResetRequest(StrictRequestModel):
     namespace: str = Field(default=DEMO_NAMESPACE, min_length=1, max_length=500)
 
 
-class DemoPoisonRequest(BaseModel):
+class DemoPoisonRequest(StrictRequestModel):
     namespace: str = Field(default=DEMO_NAMESPACE, min_length=1, max_length=500)
 
 
@@ -283,8 +312,7 @@ def _encode_incident_cursor(row: dict[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    signature = hmac.new(_operator_secret().encode(), payload, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(payload + signature).decode().rstrip("=")
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 def _decode_incident_cursor(value: str | None) -> tuple[str | None, str | None]:
@@ -294,18 +322,18 @@ def _decode_incident_cursor(value: str | None) -> tuple[str | None, str | None]:
         raise HTTPException(status_code=422, detail="cursor is too long")
     try:
         padding = "=" * (-len(value) % 4)
-        decoded = base64.urlsafe_b64decode(value + padding)
-        payload, signature = decoded[:-32], decoded[-32:]
-        expected = hmac.new(_operator_secret().encode(), payload, hashlib.sha256).digest()
-        if len(signature) != 32 or not hmac.compare_digest(signature, expected):
-            raise ValueError("signature")
-        parsed = json.loads(payload)
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(decoded).decode().rstrip("=") != value:
+            raise ValueError("non-canonical encoding")
+        parsed = json.loads(decoded)
+        if not isinstance(parsed, dict) or set(parsed) != {"started_at", "id"}:
+            raise ValueError("shape")
         started_at = str(parsed["started_at"])
         incident_id = str(parsed["id"])
-        if not started_at or not incident_id:
+        if not started_at or not incident_id or len(started_at) > 100 or len(incident_id) > 100:
             raise ValueError("empty")
         return started_at, incident_id
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=422, detail="cursor is invalid") from exc
 
 
@@ -327,14 +355,6 @@ def _api_database_url() -> str:
             status_code=503,
             detail="runtime configuration is unavailable",
         ) from exc
-
-
-def _operator_required(
-    request: Request,
-    authorization: Annotated[str | None, Header()] = None,
-    session: Annotated[str | None, Cookie(alias=OPERATOR_COOKIE)] = None,
-) -> None:
-    _operator_required_impl(request, authorization=authorization, session=session)
 
 
 @app.get(f"{API_PREFIX}/health/live", tags=["health"])
@@ -362,12 +382,24 @@ def v2_health_ready() -> dict[str, str]:
     return health_ready()
 
 
+@app.get(
+    f"{V2_PREFIX}/me",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
+def v2_me(request: Request) -> dict[str, Any]:
+    return _current_identity(request).public_payload()
+
+
 @app.post(f"{API_PREFIX}/realtime/ticket", tags=["realtime"])
 def public_realtime_ticket() -> dict[str, Any]:
+    now = int(time.time())
     return {
         "ticket": issue_realtime_ticket(
             tenant_id=current_tenant_id(required=True),
-            secret=_operator_secret(),
+            access_class="public",
+            session_expires_at=now + PUBLIC_REALTIME_SESSION_SECONDS,
+            now=now,
         ),
         "expires_in": 60,
     }
@@ -378,8 +410,17 @@ def public_realtime_ticket() -> dict[str, Any]:
     tags=["v2"],
     dependencies=[Depends(_v2_scope("realtime"))],
 )
-def v2_realtime_ticket() -> dict[str, Any]:
-    return public_realtime_ticket()
+def v2_realtime_ticket(request: Request) -> dict[str, Any]:
+    identity = _current_identity(request)
+    return {
+        "ticket": issue_realtime_ticket(
+            tenant_id=identity.tenant_id,
+            access_class=identity.effective_role,
+            principal_id=identity.principal_id,
+            session_expires_at=identity.expires_at,
+        ),
+        "expires_in": 60,
+    }
 
 
 @app.get(
@@ -435,20 +476,6 @@ def incidents_index(limit: Annotated[int, Field(ge=1, le=100)] = 30) -> dict[str
     return {"items": rows, "count": len(rows)}
 
 
-@app.post(
-    f"{API_PREFIX}/incidents",
-    tags=["incidents"],
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(_operator_required)],
-)
-def incidents_create(payload: IncidentCreate) -> dict[str, Any]:
-    db_url = _api_database_url()
-    try:
-        return create_incident(**payload.model_dump(), db_url=db_url)
-    except psycopg_errors.UniqueViolation as exc:
-        raise HTTPException(status_code=409, detail="incident slug already exists") from exc
-
-
 @app.get(f"{API_PREFIX}/incidents/{{slug}}", tags=["incidents"])
 def incidents_get(slug: str) -> dict[str, Any]:
     db_url = _api_database_url()
@@ -459,38 +486,32 @@ def incidents_get(slug: str) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/incidents/{{slug}}/resolution",
-    tags=["incidents"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/incidents/{{slug}}/resolution",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
-def incidents_resolve(slug: str, payload: IncidentResolutionRequest) -> dict[str, Any]:
+def incidents_resolve(
+    slug: str,
+    payload: IncidentResolutionRequest,
+    request: Request,
+) -> dict[str, Any]:
     db_url = _api_database_url()
     try:
         return resolve_incident(
             slug=slug,
-            actor="dashboard.operator",
+            actor=_current_identity(request).actor,
             db_url=db_url,
             **payload.model_dump(),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="incident not found") from exc
 
-
 @app.post(
-    f"{V2_PREFIX}/incidents/{{slug}}/resolution",
+    f"{V2_PREFIX}/incidents/{{slug}}/runs",
     tags=["v2"],
-    dependencies=[Depends(_v2_scope("write"))],
-)
-def v2_incidents_resolve(slug: str, payload: IncidentResolutionRequest) -> dict[str, Any]:
-    return incidents_resolve(slug, payload)
-
-
-@app.post(
-    f"{API_PREFIX}/incidents/{{slug}}/runs",
-    tags=["runs"],
     status_code=status.HTTP_202_ACCEPTED,
     response_model=AcceptedRun,
-    dependencies=[Depends(_operator_required)],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def runs_create(
     slug: str,
@@ -526,6 +547,11 @@ def runs_create(
     return AcceptedRun(run_id=run["id"], status=run["status"], created=created)
 
 
+@app.get(
+    f"{V2_PREFIX}/runs/{{run_id}}",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/runs/{{run_id}}", tags=["runs"])
 def runs_get(run_id: str) -> dict[str, Any]:
     db_url = _api_database_url()
@@ -536,10 +562,10 @@ def runs_get(run_id: str) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/runs/{{run_id}}/approval",
-    tags=["runs"],
+    f"{V2_PREFIX}/runs/{{run_id}}/approval",
+    tags=["v2"],
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(_operator_required)],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
     db_url = _api_database_url()
@@ -570,6 +596,11 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
     }
 
 
+@app.get(
+    f"{V2_PREFIX}/namespaces/{{namespace}}/beliefs",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/namespaces/{{namespace}}/beliefs", tags=["memory"])
 def beliefs_get(
     namespace: str,
@@ -605,6 +636,11 @@ def beliefs_get(
     )
 
 
+@app.get(
+    f"{V2_PREFIX}/memories/{{memory_kind}}/{{memory_id}}",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/memories/{{memory_kind}}/{{memory_id}}", tags=["memory"])
 def memories_get(memory_kind: Literal["episodic", "semantic"], memory_id: str) -> dict[str, Any]:
     db_url = _api_database_url()
@@ -619,6 +655,11 @@ def memories_get(memory_kind: Literal["episodic", "semantic"], memory_id: str) -
     return {"memory": _jsonable(memory), "provenance": _jsonable(provenance)}
 
 
+@app.get(
+    f"{V2_PREFIX}/decisions/{{decision_id}}/influence",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/decisions/{{decision_id}}/influence", tags=["memory"])
 def decisions_influence(decision_id: str) -> dict[str, Any]:
     return _jsonable(
@@ -626,6 +667,11 @@ def decisions_influence(decision_id: str) -> dict[str, Any]:
     )
 
 
+@app.get(
+    f"{V2_PREFIX}/signature-scenarios",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/signature-scenarios", tags=["memory"])
 def signature_scenarios_get(
     decision_id: str | None = None,
@@ -644,6 +690,11 @@ def signature_scenarios_get(
     return _jsonable(scenario)
 
 
+@app.get(
+    f"{V2_PREFIX}/signature-scenarios/{{scenario_id}}",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/signature-scenarios/{{scenario_id}}", tags=["memory"])
 def signature_scenarios_get_by_id(scenario_id: str) -> dict[str, Any]:
     scenario = signature_scenario_trace(
@@ -656,17 +707,21 @@ def signature_scenarios_get_by_id(scenario_id: str) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/namespaces/{{namespace}}/rewinds/preview",
-    tags=["memory"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/namespaces/{{namespace}}/rewinds/preview",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
-def rewind_preview(namespace: str, payload: RewindRequest) -> dict[str, Any]:
+def rewind_preview(
+    namespace: str,
+    payload: RewindRequest,
+    request: Request,
+) -> dict[str, Any]:
     db_url = _api_database_url()
     return _jsonable(
         preview_rewind(
             namespace=namespace,
             target_timestamp=payload.target_timestamp,
-            actor="dashboard.operator",
+            actor=_current_identity(request).actor,
             reason=payload.reason,
             db_url=db_url,
         )
@@ -674,10 +729,10 @@ def rewind_preview(namespace: str, payload: RewindRequest) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/namespaces/{{namespace}}/rewinds",
-    tags=["memory"],
+    f"{V2_PREFIX}/namespaces/{{namespace}}/rewinds",
+    tags=["v2"],
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(_operator_required)],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def rewind_execute(
     namespace: str,
@@ -692,17 +747,17 @@ def rewind_execute(
 
 
 @app.post(
-    f"{API_PREFIX}/memory/retractions/preview",
-    tags=["memory"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/memory/retractions/preview",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
-def retraction_preview(payload: RetractionPreviewRequest) -> dict[str, Any]:
+def retraction_preview(payload: RetractionPreviewRequest, request: Request) -> dict[str, Any]:
     db_url = _api_database_url()
     try:
         return _jsonable(
             preview_retraction(
                 root_memory_id=payload.root_memory_id,
-                actor="dashboard.operator",
+                actor=_current_identity(request).actor,
                 reason=payload.reason,
                 authorized_namespaces=payload.authorized_namespaces,
                 db_url=db_url,
@@ -713,11 +768,14 @@ def retraction_preview(payload: RetractionPreviewRequest) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/memory/supersessions/preview",
-    tags=["memory"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/memory/supersessions/preview",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
-def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
+def supersession_preview(
+    payload: SupersessionPreviewRequest,
+    request: Request,
+) -> dict[str, Any]:
     db_url = _api_database_url()
     try:
         return _jsonable(
@@ -726,7 +784,7 @@ def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
                 intent=payload.intent,
                 content=payload.content,
                 structured_payload=payload.structured_payload,
-                actor="dashboard.operator",
+                actor=_current_identity(request).actor,
                 reason=payload.reason,
                 authorized_namespaces=payload.authorized_namespaces,
                 db_url=db_url,
@@ -737,12 +795,14 @@ def supersession_preview(payload: SupersessionPreviewRequest) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/memory/reviews/{{review_item_id}}/preview",
-    tags=["memory"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/memory/reviews/{{review_item_id}}/preview",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def review_resolution_preview(
-    review_item_id: str, payload: ReviewResolutionPreviewRequest
+    review_item_id: str,
+    payload: ReviewResolutionPreviewRequest,
+    request: Request,
 ) -> dict[str, Any]:
     db_url = _api_database_url()
     try:
@@ -750,7 +810,7 @@ def review_resolution_preview(
             preview_review_resolution(
                 review_item_id=review_item_id,
                 action=payload.action,
-                actor="dashboard.operator",
+                actor=_current_identity(request).actor,
                 reason=payload.reason,
                 authorized_namespaces=payload.authorized_namespaces,
                 db_url=db_url,
@@ -763,10 +823,10 @@ def review_resolution_preview(
 
 
 @app.post(
-    f"{API_PREFIX}/memory/operations",
-    tags=["memory"],
+    f"{V2_PREFIX}/memory/operations",
+    tags=["v2"],
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(_operator_required)],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def operations_create(
     payload: OperationApprovalRequest,
@@ -775,6 +835,11 @@ def operations_create(
     return _approve_operation(payload=payload, idempotency_key=idempotency_key)
 
 
+@app.get(
+    f"{V2_PREFIX}/memory/operations/{{operation_id}}",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
 @app.get(f"{API_PREFIX}/memory/operations/{{operation_id}}", tags=["memory"])
 def operations_get(operation_id: str) -> dict[str, Any]:
     db_url = _api_database_url()
@@ -810,14 +875,14 @@ def _approve_operation(
         "operation_id": str(operation["id"]),
         "status": operation["status"],
         "created": created,
-        "operation_url": f"{API_PREFIX}/memory/operations/{operation['id']}",
+        "operation_url": f"{V2_PREFIX}/memory/operations/{operation['id']}",
     }
 
 
 @app.post(
-    f"{API_PREFIX}/demo/poison-rewind/reset",
-    tags=["demo"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/demo/poison-rewind/reset",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
     settings = _api_runtime_settings()
@@ -847,9 +912,9 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
 
 
 @app.post(
-    f"{API_PREFIX}/demo/poison-rewind/poison",
-    tags=["demo"],
-    dependencies=[Depends(_operator_required)],
+    f"{V2_PREFIX}/demo/poison-rewind/poison",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
 )
 def demo_poison(payload: DemoPoisonRequest) -> dict[str, Any]:
     settings = _api_runtime_settings()
@@ -861,104 +926,6 @@ def demo_poison(payload: DemoPoisonRequest) -> dict[str, Any]:
             embedding_provider=embedding_provider,
         )
     )
-
-
-@app.get(f"{API_PREFIX}/operator/session", tags=["operator"])
-def operator_session_status(
-    authorization: Annotated[str | None, Header()] = None,
-    session: Annotated[str | None, Cookie(alias=OPERATOR_COOKIE)] = None,
-) -> dict[str, bool]:
-    return {"operator": _operator_valid(authorization=authorization, session=session)}
-
-
-@app.post(f"{API_PREFIX}/operator/session", tags=["operator"])
-def operator_session_create(payload: OperatorSessionRequest, response: Response) -> dict[str, bool]:
-    secret = _operator_secret()
-    if not hmac.compare_digest(payload.token, secret):
-        raise HTTPException(status_code=403, detail="invalid operator token")
-    response.set_cookie(
-        OPERATOR_COOKIE,
-        _signed_session(secret),
-        max_age=OPERATOR_SESSION_TTL_SECONDS,
-        httponly=True,
-        secure=_secure_cookies(),
-        samesite="strict",
-        path="/",
-    )
-    return {"operator": True}
-
-
-@app.delete(f"{API_PREFIX}/operator/session", tags=["operator"])
-def operator_session_delete(response: Response) -> dict[str, bool]:
-    response.delete_cookie(OPERATOR_COOKIE, path="/")
-    return {"operator": False}
-
-
-def _operator_required_impl(
-    request: Request,
-    authorization: Annotated[str | None, Header()] = None,
-    session: Annotated[str | None, Cookie(alias=OPERATOR_COOKIE)] = None,
-) -> None:
-    if not _operator_valid(authorization=authorization, session=session):
-        raise HTTPException(status_code=403, detail="operator authorization required")
-    if session and not authorization:
-        origin = request.headers.get("origin")
-        if origin and not _operator_origin_allowed(request=request, origin=origin):
-            raise HTTPException(status_code=403, detail="cross-origin operator request denied")
-
-
-def _operator_origin_allowed(*, request: Request, origin: str) -> bool:
-    supplied_origin = _normalize_origin(origin)
-    request_origin = _normalize_origin(f"{request.url.scheme}://{request.url.netloc}")
-    return supplied_origin is not None and (
-        supplied_origin == request_origin or supplied_origin in _configured_allowed_origins()
-    )
-
-
-def _operator_valid(*, authorization: str | None, session: str | None) -> bool:
-    try:
-        secret = _operator_secret()
-    except HTTPException:
-        return False
-    if authorization:
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() == "bearer" and token and hmac.compare_digest(token, secret):
-            return True
-    return bool(session and _valid_session(session, secret))
-
-
-def _operator_secret() -> str:
-    direct = os.environ.get("HINDSIGHT_FUNCTION_AUTH_TOKEN")
-    if direct:
-        return direct
-    try:
-        return function_auth_token()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail="operator authorization is not configured"
-        ) from exc
-
-
-def _signed_session(secret: str) -> str:
-    expires = str(int(time.time()) + OPERATOR_SESSION_TTL_SECONDS)
-    digest = hmac.new(secret.encode(), expires.encode(), hashlib.sha256).hexdigest()
-    return f"{expires}.{digest}"
-
-
-def _valid_session(value: str, secret: str) -> bool:
-    expires, separator, digest = value.partition(".")
-    if not separator or not expires.isdigit() or int(expires) <= int(time.time()):
-        return False
-    expected = hmac.new(secret.encode(), expires.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(digest, expected)
-
-
-def _secure_cookies() -> bool:
-    return os.environ.get("HINDSIGHT_SECURE_COOKIES", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-    }
 
 
 def _jsonable(value: Any) -> Any:

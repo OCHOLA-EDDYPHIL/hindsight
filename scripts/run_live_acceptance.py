@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
 import re
-import secrets
 import subprocess
 import sys
 import tempfile
@@ -259,7 +259,9 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
     if parts.scheme != "http" or parts.hostname not in LOCAL_DATABASE_HOSTS or parts.port is None:
         raise ValueError("local-product-full requires an explicit loopback HTTP port")
     _require_gemini_credentials()
-    token = secrets.token_hex(32)
+    issuer = f"{base_url}/local-user-pool"
+    client_id = "local-browser-client"
+    _configure_local_product_identity(database_url=database_url, issuer=issuer)
     env = _product_environment(database_url)
     for name in (
         "RUN_HOSTED_ACCEPTANCE",
@@ -276,13 +278,14 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
             "HINDSIGHT_DATABASE_URL_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEY_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEYS_PARAM": "",
-            "HINDSIGHT_FUNCTION_AUTH_TOKEN": token,
+            "HINDSIGHT_COGNITO_ISSUER": issuer,
+            "HINDSIGHT_COGNITO_CLIENT_ID": client_id,
+            "HINDSIGHT_LOCAL_PRODUCT_ORIGIN": base_url,
             "HINDSIGHT_INLINE_WORKER": "1",
             "HINDSIGHT_RUN_DLQ_ARN": "local:sqs:hindsight-run-dlq",
-            "HINDSIGHT_SECURE_COOKIES": "0",
             "HINDSIGHT_ALLOWED_ORIGINS": base_url,
             "HINDSIGHT_BROWSER_BASE_URL": base_url,
-            "HINDSIGHT_BROWSER_OPERATOR_TOKEN": token,
+            "HINDSIGHT_LOCAL_AUTH_AUTO": "1",
         }
     )
     artifact_dir = _acceptance_artifact_dir("local-browser")
@@ -292,7 +295,7 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
             sys.executable,
             "-m",
             "uvicorn",
-            "hindsight.api:app",
+            "tests.local_product_app:app",
             "--host",
             str(parts.hostname),
             "--port",
@@ -316,6 +319,33 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=15)
+
+
+def _configure_local_product_identity(*, database_url: str, issuer: str) -> None:
+    from tests.local_product_app import LOCAL_SUBJECT
+
+    principal_hash = hashlib.sha256(f"{issuer}\0{LOCAL_SUBJECT}".encode()).hexdigest()
+    with psycopg.connect(
+        database_url,
+        application_name="hindsight-local-product-identity",
+    ) as connection:
+        connection.execute(
+            """
+                INSERT INTO product_principal_roles (
+                    principal_hash,
+                    tenant_id,
+                    role,
+                    status
+                )
+                VALUES (%s, %s, 'operator', 'active')
+                ON CONFLICT (principal_hash) DO UPDATE
+                SET tenant_id = excluded.tenant_id,
+                    role = 'operator',
+                    status = 'active',
+                    updated_at = now()
+            """,
+            (principal_hash, PUBLIC_DEMO_TENANT_ID),
+        )
 
 
 def _wait_for_http_ready(url: str, *, server: subprocess.Popen[Any]) -> None:
@@ -361,7 +391,7 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
         env["RUN_LIVE_GEMINI_ACCEPTANCE"] = "1"
     if args.phase == "consolidation":
         _required_https_env("HOSTED_API_URL")
-        _required_env("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
+        _required_env("HINDSIGHT_PRODUCT_ACCESS_TOKEN")
         _verify_changefeed(env)
     elif args.phase == "worker":
         for name in (
@@ -373,7 +403,8 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
             _required_positive_int_env(name)
     elif args.phase == "browser":
         _verify_hosted_endpoints()
-        _required_env("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
+        _required_env("HINDSIGHT_OPERATOR_USERNAME")
+        _required_env("HINDSIGHT_OPERATOR_PASSWORD")
         _required_env("HINDSIGHT_CHANGEFEED_AUTH_TOKEN")
         _verify_changefeed(env)
     _run_hosted_pytest(selectors, env=env, phase=args.phase)
@@ -422,8 +453,13 @@ def _probe_deployed_candidate(*, expected_sha: str, ui_url: str) -> dict[str, An
             }
         config = _read_runtime_config(f"{ui_url}/config.js")
         websocket_url = config.get("websocketUrl")
-        if config.get("apiBase") != "/v1":
-            raise ValueError("candidate API base is not the public /v1 route")
+        if config.get("publicApiBase") != "/v1":
+            raise ValueError("candidate public API base is not /v1")
+        if config.get("productApiBase") != "/v2":
+            raise ValueError("candidate product API base is not /v2")
+        auth = config.get("auth")
+        if not isinstance(auth, dict) or not isinstance(auth.get("clientId"), str):
+            raise ValueError("candidate product identity configuration is unavailable")
         if not isinstance(websocket_url, str) or not websocket_url.startswith("wss://"):
             raise ValueError("candidate WebSocket endpoint must use WSS")
     except (OSError, ValueError):
@@ -464,7 +500,7 @@ def _write_github_outputs(path: pathlib.Path, outputs: dict[str, str]) -> None:
 
 
 def _hosted_phase_tenant_id(phase: str) -> str:
-    if phase in {"worker", "browser"}:
+    if phase in {"consolidation", "worker", "browser"}:
         return PUBLIC_DEMO_TENANT_ID
     return ACCEPTANCE_TENANT_ID
 

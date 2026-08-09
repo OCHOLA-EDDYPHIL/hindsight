@@ -30,7 +30,6 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
-  OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
   GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
   GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
@@ -337,7 +336,10 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
       DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
-      OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
+      HINDSIGHT_OPERATOR_USERNAME: ${{ vars.HINDSIGHT_OPERATOR_USERNAME || 'hindsight-operator' }}
+      HINDSIGHT_OPERATOR_PASSWORD: ${{ secrets.HINDSIGHT_OPERATOR_PASSWORD }}
+      COGNITO_USER_POOL_ID: ${{ needs.deploy.outputs.cognito_user_pool_id }}
+      COGNITO_USER_POOL_CLIENT_ID: ${{ needs.deploy.outputs.cognito_user_pool_client_id }}
       GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
       GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       HOSTED_API_URL: ${{ needs.deploy.outputs.api_url }}
@@ -362,11 +364,16 @@ jobs:
         run: |
           DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN"; do
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$HINDSIGHT_OPERATOR_PASSWORD" "$COGNITO_USER_POOL_ID" "$COGNITO_USER_POOL_CLIENT_ID"; do
             [[ -n "$value" && "$value" != "None" ]] || exit 1
             echo "::add-mask::$value"
           done
+          PRODUCT_ACCESS_TOKEN="$(uv run python scripts/cognito_access_token.py \
+            --region "$AWS_REGION" \
+            --user-pool-id "$COGNITO_USER_POOL_ID" \
+            --client-id "$COGNITO_USER_POOL_CLIENT_ID")"
+          [[ -n "$PRODUCT_ACCESS_TOKEN" ]] || exit 1
+          echo "::add-mask::$PRODUCT_ACCESS_TOKEN"
           while IFS= read -r api_key; do [[ -n "$api_key" ]] && echo "::add-mask::$api_key"; done < <(
             GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
               'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
@@ -374,7 +381,7 @@ jobs:
           delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
           {
             printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
-            printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
+            printf 'HINDSIGHT_PRODUCT_ACCESS_TOKEN=%s\n' "$PRODUCT_ACCESS_TOKEN"
             echo "GEMINI_API_KEYS<<$delimiter"
             printf '%s\n' "$GEMINI_MATERIAL"
             echo "$delimiter"
@@ -441,8 +448,9 @@ jobs:
       HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
       GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
       DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
-      OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
       CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      HINDSIGHT_OPERATOR_USERNAME: ${{ vars.HINDSIGHT_OPERATOR_USERNAME || 'hindsight-operator' }}
+      HINDSIGHT_OPERATOR_PASSWORD: ${{ secrets.HINDSIGHT_OPERATOR_PASSWORD }}
       GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
       GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       HINDSIGHT_BROWSER_BASE_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_ui_url || needs.deploy.outputs.ui_url }}
@@ -471,13 +479,12 @@ jobs:
         run: |
           DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_IDEMPOTENCY_TABLE="$(aws lambda get-function-configuration --function-name "hindsight-${HINDSIGHT_STAGE}-changefeed" --query 'Environment.Variables.HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE' --output text)"
-          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN" "$CHANGEFEED_IDEMPOTENCY_TABLE"; do
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$HINDSIGHT_OPERATOR_USERNAME" "$HINDSIGHT_OPERATOR_PASSWORD" "$CHANGEFEED_TOKEN" "$CHANGEFEED_IDEMPOTENCY_TABLE"; do
             [[ -n "$value" && "$value" != "None" ]] || exit 1
           done
-          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"; do echo "::add-mask::$value"; done
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$HINDSIGHT_OPERATOR_PASSWORD" "$CHANGEFEED_TOKEN"; do echo "::add-mask::$value"; done
           while IFS= read -r api_key; do [[ -n "$api_key" ]] && echo "::add-mask::$api_key"; done < <(
             GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
               'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
@@ -485,7 +492,6 @@ jobs:
           delimiter="HINDSIGHT_GEMINI_KEYS_${GITHUB_RUN_ID}_${RANDOM}"
           {
             printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
-            printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
             printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
             printf 'HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE=%s\n' "$CHANGEFEED_IDEMPOTENCY_TABLE"
             echo "GEMINI_API_KEYS<<$delimiter"

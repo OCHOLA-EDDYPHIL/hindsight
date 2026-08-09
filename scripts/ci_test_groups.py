@@ -22,6 +22,10 @@ MIGRATION_CASES = {
         "tests/test_migrations_and_roles.py::"
         "test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write"
     ),
+    "prompt_safety_upgrade": (
+        "tests/test_migrations_and_roles.py::"
+        "test_populated_prompt_safety_upgrade_is_fail_closed_and_principal_lookup_is_read_only"
+    ),
     "dispatch_upgrade": (
         "tests/test_run_dispatch.py::test_outbox_migration_backfills_queued_and_resuming_runs"
     ),

@@ -12,11 +12,13 @@ import pytest
 from hindsight.demo_state import DEMO_NAMESPACE
 
 BASE_URL = os.environ.get("HINDSIGHT_BROWSER_BASE_URL")
-OPERATOR_TOKEN = os.environ.get("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
+OPERATOR_USERNAME = os.environ.get("HINDSIGHT_OPERATOR_USERNAME")
+OPERATOR_PASSWORD = os.environ.get("HINDSIGHT_OPERATOR_PASSWORD")
+LOCAL_AUTH_AUTO = os.environ.get("HINDSIGHT_LOCAL_AUTH_AUTO") == "1"
 
 requires_browser = pytest.mark.skipif(
-    not BASE_URL or not OPERATOR_TOKEN,
-    reason="browser URL and operator token are not configured",
+    not BASE_URL or (not LOCAL_AUTH_AUTO and (not OPERATOR_USERNAME or not OPERATOR_PASSWORD)),
+    reason="browser URL and operator identity are not configured",
 )
 
 
@@ -236,11 +238,12 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         _capture_console_errors(driver)
         wait.until(lambda browser: "Live" in browser.find_element(By.ID, "connection").text)
-        assert driver.find_element(By.ID, "startRun").get_attribute("disabled")
+        assert not driver.find_elements(By.ID, "startRun")
 
-        driver.find_element(By.ID, "operatorButton").click()
-        driver.find_element(By.ID, "operatorToken").send_keys(OPERATOR_TOKEN)
-        driver.find_element(By.CSS_SELECTOR, "#operatorForm button[type=submit]").click()
+        driver.find_element(By.ID, "identityButton").click()
+        driver.find_element(By.ID, "identitySignIn").click()
+        _complete_operator_sign_in(driver, wait)
+        wait.until(expected.presence_of_element_located((By.ID, "startRun")))
         wait.until_not(
             lambda browser: browser.find_element(By.ID, "startRun").get_attribute("disabled")
         )
@@ -353,9 +356,9 @@ def test_operator_can_run_and_explain_signature_workflow():
         assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
         assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
 
-        driver.find_element(By.ID, "lockButton").click()
+        driver.find_element(By.ID, "signOutButton").click()
         wait.until(
-            lambda browser: browser.find_element(By.ID, "operatorLabel").text == "Operator access"
+            lambda browser: browser.find_element(By.ID, "identityLabel").text == "Sign in"
         )
         driver.get(_public_browser_url())
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
@@ -378,12 +381,51 @@ def test_operator_can_run_and_explain_signature_workflow():
         assert "demo:stale-runbook-import" in historical_evidence
         assert "previously approved payment runbook" in historical_evidence
         assert "demo.seed" in current_evidence
-        assert not driver.find_element(By.CSS_SELECTOR, ".operator-console").is_displayed()
+        assert not driver.find_elements(By.CSS_SELECTOR, ".operator-console")
         assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
         assert driver.execute_script("return window.__HINDSIGHT_VISIBLE_ERRORS || [];") == []
     finally:
         _write_browser_evidence(driver, operation_id=operation_id, signature=signature)
         driver.quit()
+
+
+def _complete_operator_sign_in(driver, wait) -> None:
+    from selenium.webdriver.common.by import By
+
+    if not LOCAL_AUTH_AUTO:
+        username = wait.until(
+            lambda browser: _first_displayed(
+                browser,
+                By.CSS_SELECTOR,
+                'input[name="username"], #signInFormUsername, input[type="email"]',
+            )
+        )
+        password = wait.until(
+            lambda browser: _first_displayed(
+                browser,
+                By.CSS_SELECTOR,
+                'input[name="password"], #signInFormPassword, input[type="password"]',
+            )
+        )
+        username.clear()
+        username.send_keys(OPERATOR_USERNAME)
+        password.send_keys(OPERATOR_PASSWORD)
+        submit = wait.until(
+            lambda browser: _first_displayed(
+                browser,
+                By.CSS_SELECTOR,
+                'button[type="submit"], input[type="submit"]',
+            )
+        )
+        submit.click()
+    wait.until(lambda browser: browser.find_element(By.ID, "identityLabel").text == "Operator")
+
+
+def _first_displayed(driver, by, selector):
+    for element in driver.find_elements(by, selector):
+        if element.is_displayed():
+            return element
+    return False
 
 
 def _ready_reset_namespace(driver, previous_namespace: str) -> str | bool:

@@ -97,7 +97,7 @@ class FakeLeaseTable:
 
 def test_websocket_connect_requires_a_valid_short_lived_ticket(monkeypatch):
     import hindsight.realtime as realtime
-    from hindsight.realtime_ticket import issue_realtime_ticket
+    from hindsight.realtime_ticket import RealtimeTicketClaims
 
     class FakeTable:
         def __init__(self):
@@ -108,19 +108,38 @@ def test_websocket_connect_requires_a_valid_short_lived_ticket(monkeypatch):
 
     connections = FakeTable()
     subscriptions = FakeTable()
+    tickets = FakeTable()
     resource = type(
         "Resource",
         (),
-        {"Table": lambda self, name: connections if name == "connections" else subscriptions},
+        {
+            "Table": lambda self, name: {
+                "connections": connections,
+                "subscriptions": subscriptions,
+                "tickets": tickets,
+            }[name]
+        },
     )()
     monkeypatch.setenv(realtime.CONNECTION_TABLE_ENV, "connections")
     monkeypatch.setenv(realtime.SUBSCRIPTION_TABLE_ENV, "subscriptions")
+    monkeypatch.setenv(realtime.TICKET_TABLE_ENV, "tickets")
     monkeypatch.setattr(realtime.boto3, "resource", lambda *args, **kwargs: resource)
-    monkeypatch.setattr(realtime, "_TICKET_SECRET_CACHE", "ticket-secret")
-    ticket = issue_realtime_ticket(
-        tenant_id="00000000-0000-0000-0000-000000000003",
-        secret="ticket-secret",
-    )
+    monkeypatch.setattr(realtime.time, "time", lambda: 100)
+    consumed = []
+
+    def consume(ticket, *, table):
+        consumed.append((ticket, table))
+        if ticket != "valid-ticket":
+            raise ValueError("realtime ticket is invalid or expired")
+        return RealtimeTicketClaims(
+            tenant_id="00000000-0000-0000-0000-000000000003",
+            access_class="viewer",
+            principal_id="principal-3",
+            redeem_before=160,
+            session_expires_at=500,
+        )
+
+    monkeypatch.setattr(realtime, "consume_realtime_ticket", consume)
 
     denied = realtime.websocket_handler(
         {"requestContext": {"routeKey": "$connect", "connectionId": "client-1"}},
@@ -129,14 +148,25 @@ def test_websocket_connect_requires_a_valid_short_lived_ticket(monkeypatch):
     accepted = realtime.websocket_handler(
         {
             "requestContext": {"routeKey": "$connect", "connectionId": "client-1"},
-            "queryStringParameters": {"ticket": ticket},
+            "queryStringParameters": {"ticket": "valid-ticket"},
         },
         None,
     )
 
     assert denied["statusCode"] == 401
     assert accepted["statusCode"] == 200
-    assert connections.puts[0]["tenant_id"] == "00000000-0000-0000-0000-000000000003"
+    assert consumed == [("", tickets), ("valid-ticket", tickets)]
+    assert connections.puts == [
+        {
+            "connection_id": "client-1",
+            "namespace": "",
+            "run_id": "",
+            "tenant_id": "00000000-0000-0000-0000-000000000003",
+            "access_class": "viewer",
+            "principal_id": "principal-3",
+            "expires_at": 500,
+        }
+    ]
 
 
 def test_changefeed_rows_share_one_versioned_envelope():
@@ -375,6 +405,7 @@ def test_websocket_subscribe_updates_ephemeral_registry(monkeypatch):
                 "Item": {
                     "connection_id": "client-1",
                     "tenant_id": "00000000-0000-0000-0000-000000000002",
+                    "expires_at": int(time.time()) + 60,
                 }
             }
 
@@ -417,6 +448,72 @@ def test_websocket_subscribe_updates_ephemeral_registry(monkeypatch):
         "tenant:00000000-0000-0000-0000-000000000002:namespace:demo:payments",
         "tenant:00000000-0000-0000-0000-000000000002:run:run-1",
     }
+
+
+def test_websocket_rejects_expired_connection_before_ping(monkeypatch):
+    import hindsight.realtime as realtime
+
+    class FakeConnections:
+        def __init__(self):
+            self.deleted = []
+
+        def get_item(self, **kwargs):
+            del kwargs
+            return {
+                "Item": {
+                    "connection_id": "client-1",
+                    "tenant_id": "00000000-0000-0000-0000-000000000002",
+                    "expires_at": 100,
+                }
+            }
+
+        def delete_item(self, **kwargs):
+            self.deleted.append(kwargs["Key"])
+
+    class FakeSubscriptions:
+        def __init__(self):
+            self.deleted = []
+
+        def query(self, **kwargs):
+            assert kwargs["IndexName"] == "connection-id-index"
+            return {
+                "Items": [
+                    {
+                        "topic_key": "tenant:t1:namespace:demo",
+                        "connection_id": "client-1",
+                    }
+                ]
+            }
+
+        def delete_item(self, **kwargs):
+            self.deleted.append(kwargs["Key"])
+
+    connections = FakeConnections()
+    subscriptions = FakeSubscriptions()
+    resource = type(
+        "Resource",
+        (),
+        {"Table": lambda self, name: connections if name == "connections" else subscriptions},
+    )()
+    monkeypatch.setenv(realtime.CONNECTION_TABLE_ENV, "connections")
+    monkeypatch.setenv(realtime.SUBSCRIPTION_TABLE_ENV, "subscriptions")
+    monkeypatch.setattr(realtime.boto3, "resource", lambda *args, **kwargs: resource)
+    monkeypatch.setattr(realtime.time, "time", lambda: 100)
+
+    response = realtime.websocket_handler(
+        {
+            "requestContext": {"routeKey": "$default", "connectionId": "client-1"},
+            "body": {"type": "ping"},
+        },
+        None,
+    )
+
+    assert response["statusCode"] == 401
+    assert json.loads(response["body"]) == {"error": "connection session has expired"}
+    assert connections.deleted == [{"connection_id": "client-1"}]
+    assert subscriptions.deleted == [
+        {"topic_key": "tenant:t1:namespace:demo", "connection_id": "client-1"}
+    ]
 
 
 def test_outbox_changefeed_exposes_only_sanitized_references():
@@ -667,6 +764,7 @@ def test_websocket_unsubscribe_and_disconnect_remove_indexed_subscriptions(monke
                 "Item": {
                     "connection_id": "client-1",
                     "tenant_id": "00000000-0000-0000-0000-000000000002",
+                    "expires_at": int(time.time()) + 60,
                 }
             }
 

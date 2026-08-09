@@ -178,6 +178,48 @@ def test_product_writers_have_only_foreign_key_read_access_to_learning_preparati
     assert "benchmark_variant_preparations" not in worker_update
 
 
+def test_product_principal_roles_and_prompt_safety_are_staged_fail_closed():
+    columns_path = MIGRATIONS / "0028_product_identity_and_prompt_safety_columns.sql"
+    guards_path = MIGRATIONS / "0028a_product_identity_and_prompt_safety_guards.sql"
+    columns = columns_path.read_text()
+    guards = guards_path.read_text()
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+
+    assert columns_path.name < guards_path.name
+    assert "CREATE TABLE IF NOT EXISTS product_principal_roles" in columns
+    for field in (
+        "principal_hash STRING(64) NOT NULL UNIQUE",
+        "provisioning_key STRING(64) NOT NULL UNIQUE",
+        "tenant_id UUID NOT NULL",
+        "role STRING NOT NULL",
+        "status STRING NOT NULL DEFAULT 'active'",
+    ):
+        assert field in columns
+    assert "principal_hash ~ '^[0-9a-f]{64}$'" in columns
+    assert "provisioning_key ~ '^[0-9a-f]{64}$'" in columns
+    assert "role IN ('viewer', 'operator')" in columns
+    assert "status IN ('active', 'revoked')" in columns
+    assert "FOREIGN KEY (tenant_id) REFERENCES tenants (id)" in columns
+    assert "prompt_safety_status STRING" in columns
+    assert "prompt_safety_scanner_version STRING" in columns
+    assert "prompt_safety_reason_codes JSONB" in columns
+
+    assert "prompt_safety_status = 'unassessed'" in guards
+    assert "legacy.unassessed" in guards
+    assert "ALTER COLUMN prompt_safety_status SET NOT NULL" in guards
+    assert "prompt_safety_status IN ('clear', 'suspected', 'unassessed')" in guards
+    assert "jsonb_typeof(prompt_safety_reason_codes) = 'array'" in guards
+    assert "(NEW).prompt_safety_status IS DISTINCT FROM (OLD).prompt_safety_status" in guards
+    assert "CREATE OR REPLACE VIEW current_semantic_memories" in guards
+    assert "GRANT SELECT ON TABLE product_principal_roles TO hindsight_agent_writer" in guards
+    assert "CREATE POLICY" not in guards
+    assert "ENABLE ROW LEVEL SECURITY" not in columns + guards
+
+    assert roles.count("product_principal_roles") == 1
+    agent_select = roles.split("TO hindsight_agent_writer;", 1)[0]
+    assert "product_principal_roles" in agent_select
+
+
 def _database_url(name: str) -> str:
     parts = urlsplit(os.environ["DATABASE_URL"])
     return urlunsplit(parts._replace(path=f"/{name}"))
@@ -816,4 +858,133 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database_name))
+            )
+
+
+@requires_db
+@pytest.mark.migration_acceptance
+def test_populated_prompt_safety_upgrade_is_fail_closed_and_principal_lookup_is_read_only():
+    database_name = f"hindsight_safety_upgrade_{uuid4().hex}"
+    target_url = _database_url(database_name)
+    admin_url = _database_url("defaultdb")
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
+    try:
+        all_migrations = sorted(MIGRATIONS.glob("[0-9]*.sql"))
+        pre_upgrade = [
+            path
+            for path in all_migrations
+            if path.name <= "0027a_loss_safe_run_delivery_guards.sql"
+        ]
+        namespace = f"prompt-safety-upgrade-{uuid4()}"
+        memory_id = uuid4()
+        belief_id = uuid4()
+        decision_id = f"prompt-safety-upgrade:{uuid4()}"
+        with psycopg.connect(target_url, autocommit=True) as conn:
+            _apply(conn, pre_upgrade)
+            conn.execute(
+                "INSERT INTO memory_namespaces (namespace) VALUES (%s)",
+                (namespace,),
+            )
+            conn.execute(
+                """
+                    INSERT INTO memory_decisions (
+                        id, actor, decision_kind, purpose, namespace, status
+                    ) VALUES (%s, 'pytest', 'semantic_write',
+                              'seed pre-safety memory', %s, 'open')
+                """,
+                (decision_id, namespace),
+            )
+            conn.execute(
+                "INSERT INTO semantic_beliefs (id, namespace) VALUES (%s, %s)",
+                (belief_id, namespace),
+            )
+            conn.execute(
+                """
+                    INSERT INTO semantic_memories (
+                        id, belief_id, version_number, namespace, content, metadata,
+                        writer, source_ref, justification, producer_decision_id,
+                        transition_kind, content_schema, structured_payload,
+                        payload_digest, lineage_status, trust_status
+                    ) VALUES (
+                        %s, %s, 1, %s, 'legacy approved guidance',
+                        '{"operator_disposition":"approved","safety_status":"safe",
+                          "contradiction_status":"supported",
+                          "usage_instruction":"positive_guidance"}'::JSONB,
+                        'pytest', 'evidence:legacy', 'pre-safety fixture', %s,
+                        'assertion', 'semantic.v1', '{}'::JSONB,
+                        'legacy-digest', 'complete', 'active'
+                    )
+                """,
+                (memory_id, belief_id, namespace, decision_id),
+            )
+            conn.execute(
+                "UPDATE memory_decisions SET status = 'sealed', sealed_at = now() WHERE id = %s",
+                (decision_id,),
+            )
+
+            _apply(
+                conn,
+                [
+                    MIGRATIONS / "0028_product_identity_and_prompt_safety_columns.sql",
+                    MIGRATIONS / "0028a_product_identity_and_prompt_safety_guards.sql",
+                ],
+            )
+
+            upgraded = conn.execute(
+                """
+                    SELECT prompt_safety_status, prompt_safety_scanner_version,
+                           prompt_safety_reason_codes
+                    FROM semantic_memories WHERE id = %s
+                """,
+                (memory_id,),
+            ).fetchone()
+            assert upgraded == (
+                "unassessed",
+                "legacy.unassessed",
+                ["legacy_unassessed"],
+            )
+            assert conn.execute(
+                "SELECT prompt_safety_status FROM current_semantic_memories WHERE id = %s",
+                (memory_id,),
+            ).fetchone() == ("unassessed",)
+
+            with pytest.raises(
+                psycopg.errors.RaiseException, match="prompt safety are immutable"
+            ):
+                conn.execute(
+                    "UPDATE semantic_memories "
+                    "SET prompt_safety_scanner_version = 'tampered.v1' WHERE id = %s",
+                    (memory_id,),
+                )
+
+            principal_hash = "a" * 64
+            provisioning_key = "b" * 64
+            conn.execute(
+                """
+                    INSERT INTO product_principal_roles (
+                        principal_hash, provisioning_key, tenant_id, role, status
+                    ) VALUES (%s, %s, '00000000-0000-0000-0000-000000000001',
+                              'operator', 'active')
+                """,
+                (principal_hash, provisioning_key),
+            )
+            conn.execute("SET ROLE hindsight_agent_writer")
+            assert conn.execute(
+                "SELECT role, status FROM product_principal_roles WHERE principal_hash = %s",
+                (principal_hash,),
+            ).fetchone() == ("operator", "active")
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(
+                    "UPDATE product_principal_roles SET status = 'revoked' "
+                    "WHERE principal_hash = %s",
+                    (principal_hash,),
+                )
+            conn.execute("RESET ROLE")
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(
+                    sql.Identifier(database_name)
+                )
             )

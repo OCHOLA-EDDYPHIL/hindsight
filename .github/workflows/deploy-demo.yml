@@ -65,6 +65,12 @@ on:
       websocket_url:
         description: Deployed WebSocket endpoint
         value: ${{ jobs.apply.outputs.websocket_url }}
+      cognito_user_pool_id:
+        description: Product Cognito user pool
+        value: ${{ jobs.apply.outputs.cognito_user_pool_id }}
+      cognito_user_pool_client_id:
+        description: Product browser client
+        value: ${{ jobs.apply.outputs.cognito_user_pool_client_id }}
       worker_timeout_seconds:
         description: Applied worker timeout
         value: ${{ jobs.apply.outputs.worker_timeout_seconds }}
@@ -99,8 +105,8 @@ env:
   TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
   TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-  TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+  TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}
   TF_VAR_llm_provider: ${{ inputs.validation_mode && 'gemini' || vars.HINDSIGHT_LLM_PROVIDER || 'gemini' }}
   TF_VAR_gemini_model: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
   TF_VAR_embedding_provider: ${{ inputs.validation_mode && 'gemini' || vars.HINDSIGHT_EMBEDDING_PROVIDER || 'gemini' }}
@@ -223,8 +229,8 @@ jobs:
       TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
       TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-      TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
       TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}
       TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
       TF_VAR_public_origin: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
       TF_VAR_cloudfront_aliases: ${{ vars.HINDSIGHT_CLOUDFRONT_ALIASES || format('["{0}"]', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
@@ -323,8 +329,8 @@ jobs:
       TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
       TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-      TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
       TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}
       TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
       TF_VAR_public_origin: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
       TF_VAR_cloudfront_aliases: ${{ vars.HINDSIGHT_CLOUDFRONT_ALIASES || format('["{0}"]', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
@@ -337,6 +343,8 @@ jobs:
       ui_url: ${{ steps.stack_outputs.outputs.ui_url }}
       api_url: ${{ steps.stack_outputs.outputs.api_url }}
       websocket_url: ${{ steps.stack_outputs.outputs.websocket_url }}
+      cognito_user_pool_id: ${{ steps.stack_outputs.outputs.cognito_user_pool_id }}
+      cognito_user_pool_client_id: ${{ steps.stack_outputs.outputs.cognito_user_pool_client_id }}
       worker_timeout_seconds: ${{ steps.stack_outputs.outputs.worker_timeout_seconds }}
       run_attempt_lease_seconds: ${{ steps.stack_outputs.outputs.run_attempt_lease_seconds }}
       run_queue_visibility_seconds: ${{ steps.stack_outputs.outputs.run_queue_visibility_seconds }}
@@ -385,6 +393,41 @@ jobs:
           path: build
       - name: Verify planned deployment artifacts
         run: sha256sum --check build/lambda-artifacts.sha256
+      - name: Verify product identity inputs
+        if: env.TF_VAR_runtime_active == 'true'
+        shell: bash
+        env:
+          HINDSIGHT_VIEWER_PASSWORD: ${{ secrets.HINDSIGHT_VIEWER_PASSWORD }}
+          HINDSIGHT_OPERATOR_PASSWORD: ${{ secrets.HINDSIGHT_OPERATOR_PASSWORD }}
+          VIEWER_USERNAME: ${{ vars.HINDSIGHT_VIEWER_USERNAME || 'hindsight-viewer' }}
+          OPERATOR_USERNAME: ${{ vars.HINDSIGHT_OPERATOR_USERNAME || 'hindsight-operator' }}
+        run: |
+          validate_password() {
+            local label="$1"
+            local value="$2"
+            if [[ ${#value} -lt 14 || ! "$value" =~ [[:lower:]] || ! "$value" =~ [[:upper:]] || ! "$value" =~ [[:digit:]] || ! "$value" =~ [^[:alnum:]] ]]; then
+              echo "::error::${label} must satisfy the configured Cognito password policy"
+              return 1
+            fi
+          }
+          if [[ -z "$VIEWER_USERNAME" || -z "$OPERATOR_USERNAME" ]]; then
+            echo "::error::Product identity usernames are required"
+            exit 1
+          fi
+          if [[ "$VIEWER_USERNAME" == "$OPERATOR_USERNAME" ]]; then
+            echo "::error::Viewer and operator usernames must be distinct"
+            exit 1
+          fi
+          if [[ -z "$HINDSIGHT_VIEWER_PASSWORD" || -z "$HINDSIGHT_OPERATOR_PASSWORD" ]]; then
+            echo "::error::Product identity password secrets are required"
+            exit 1
+          fi
+          if [[ "$HINDSIGHT_VIEWER_PASSWORD" == "$HINDSIGHT_OPERATOR_PASSWORD" ]]; then
+            echo "::error::Viewer and operator passwords must be distinct"
+            exit 1
+          fi
+          validate_password "Viewer password" "$HINDSIGHT_VIEWER_PASSWORD"
+          validate_password "Operator password" "$HINDSIGHT_OPERATOR_PASSWORD"
       - name: Verify durable dependencies
         run: >-
           uv run python scripts/deployment_preflight.py
@@ -396,7 +439,6 @@ jobs:
           --gemini-parameter "$TF_VAR_gemini_api_keys_parameter_name"
           --llm-provider "$TF_VAR_llm_provider"
           --embedding-provider "$TF_VAR_embedding_provider"
-          --operator-parameter "$TF_VAR_operator_token_parameter_name"
           --changefeed-parameter "$TF_VAR_changefeed_token_parameter_name"
       - name: Apply database migrations and initialize agent persistence
         shell: bash
@@ -418,6 +460,27 @@ jobs:
           -backend-config="encrypt=true"
           -backend-config="use_lockfile=true"
       - run: terraform -chdir=infra/terraform/app apply -input=false -auto-approve "$GITHUB_WORKSPACE/build/demo.tfplan"
+      - name: Configure product identities
+        if: env.TF_VAR_runtime_active == 'true'
+        shell: bash
+        env:
+          HINDSIGHT_VIEWER_PASSWORD: ${{ secrets.HINDSIGHT_VIEWER_PASSWORD }}
+          HINDSIGHT_OPERATOR_PASSWORD: ${{ secrets.HINDSIGHT_OPERATOR_PASSWORD }}
+          VIEWER_USERNAME: ${{ vars.HINDSIGHT_VIEWER_USERNAME || 'hindsight-viewer' }}
+          OPERATOR_USERNAME: ${{ vars.HINDSIGHT_OPERATOR_USERNAME || 'hindsight-operator' }}
+        run: |
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          USER_POOL_ID="$(terraform -chdir=infra/terraform/app output -raw cognito_user_pool_id)"
+          COGNITO_ISSUER="$(terraform -chdir=infra/terraform/app output -raw cognito_issuer)"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          uv run python scripts/configure_product_identities.py \
+            --region "$AWS_REGION" \
+            --user-pool-id "$USER_POOL_ID" \
+            --issuer "$COGNITO_ISSUER" \
+            --tenant-id "00000000-0000-0000-0000-000000000002" \
+            --viewer-username "$VIEWER_USERNAME" \
+            --operator-username "$OPERATOR_USERNAME"
       - name: Configure embedding profile
         if: env.TF_VAR_runtime_active == 'true'
         shell: bash
@@ -467,6 +530,8 @@ jobs:
           UI_URL="$(terraform -chdir=infra/terraform/app output -raw ui_url)"
           API_URL="$(terraform -chdir=infra/terraform/app output -raw api_url)"
           WEBSOCKET_URL="$(terraform -chdir=infra/terraform/app output -raw websocket_url)"
+          COGNITO_USER_POOL_ID="$(terraform -chdir=infra/terraform/app output -raw cognito_user_pool_id)"
+          COGNITO_USER_POOL_CLIENT_ID="$(terraform -chdir=infra/terraform/app output -raw cognito_user_pool_client_id)"
           WORKER_TIMEOUT_SECONDS="$(terraform -chdir=infra/terraform/app output -raw worker_timeout_seconds)"
           RUN_ATTEMPT_LEASE_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_attempt_lease_seconds)"
           RUN_QUEUE_VISIBILITY_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_queue_visibility_seconds)"
@@ -476,6 +541,8 @@ jobs:
             echo "ui_url=$UI_URL"
             echo "api_url=$API_URL"
             echo "websocket_url=$WEBSOCKET_URL"
+            echo "cognito_user_pool_id=$COGNITO_USER_POOL_ID"
+            echo "cognito_user_pool_client_id=$COGNITO_USER_POOL_CLIENT_ID"
             echo "worker_timeout_seconds=$WORKER_TIMEOUT_SECONDS"
             echo "run_attempt_lease_seconds=$RUN_ATTEMPT_LEASE_SECONDS"
             echo "run_queue_visibility_seconds=$RUN_QUEUE_VISIBILITY_SECONDS"

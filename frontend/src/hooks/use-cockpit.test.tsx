@@ -2,7 +2,8 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useCockpit } from "@/hooks/use-cockpit";
-import type { SignatureScenario, Snapshot } from "@/types";
+import { LocalAuthAdapter } from "@/test/local-auth-adapter";
+import type { EffectiveIdentity, SignatureScenario, Snapshot } from "@/types";
 
 const currentSnapshot: Snapshot = {
   mode: "current",
@@ -54,6 +55,26 @@ function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
     status: 200,
     headers: { "content-type": "application/json" },
+  });
+}
+
+function effectiveIdentity(role: "viewer" | "operator" = "operator"): EffectiveIdentity {
+  return {
+    principal_id: "principal-1",
+    tenant_id: "tenant-1",
+    tenant_slug: "payments",
+    token_role: role,
+    mapped_role: role,
+    effective_role: role,
+    scopes: role === "operator" ? ["read", "realtime", "write"] : ["read", "realtime"],
+    expires_at: 4_102_444_800,
+  };
+}
+
+function signedInAdapter() {
+  return new LocalAuthAdapter({
+    accessToken: "test-access-token",
+    expiresAt: Date.now() + 60_000,
   });
 }
 
@@ -123,7 +144,8 @@ describe("cockpit historical snapshot selection", () => {
     fakeSocketInstances = [];
     window.history.replaceState({}, "", "/");
     window.HINDSIGHT_CONFIG = {
-      apiBase: "/v1",
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
       snapshotBase: "/snapshot",
       defaultNamespace: currentSnapshot.namespace,
       pollIntervalMs: 1500,
@@ -158,9 +180,6 @@ describe("cockpit historical snapshot selection", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: false }));
-        }
         if (url.pathname === "/v1/incidents") {
           return Promise.resolve(jsonResponse({ items: [] }));
         }
@@ -207,9 +226,6 @@ describe("cockpit historical snapshot selection", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: false }));
-        }
         if (url.pathname === "/v1/incidents") {
           return Promise.resolve(jsonResponse({ items: [] }));
         }
@@ -253,9 +269,6 @@ describe("cockpit historical snapshot selection", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: false }));
-        }
         if (url.pathname === "/v1/incidents") {
           return Promise.resolve(jsonResponse({ items: [] }));
         }
@@ -313,9 +326,6 @@ describe("cockpit historical snapshot selection", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: false }));
-        }
         if (url.pathname === "/v1/incidents") {
           return Promise.resolve(jsonResponse({ items: [] }));
         }
@@ -366,9 +376,6 @@ describe("cockpit historical snapshot selection", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: false }));
-        }
         if (url.pathname === "/v1/incidents") {
           return Promise.resolve(jsonResponse({ items: [] }));
         }
@@ -433,31 +440,121 @@ describe("cockpit historical snapshot selection", () => {
     expect(snapshotRequests).toBe(settledRequests);
   });
 
-  it("binds approval to the exact recommendation and memory selection", async () => {
+  it("uses the protected one-use realtime ticket after identity resolution", async () => {
     window.HINDSIGHT_CONFIG = {
-      apiBase: "/v1",
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
+      websocketUrl: "wss://socket.example.test/demo",
       defaultNamespace: currentSnapshot.namespace,
-      pollIntervalMs: 60_000,
     };
-    const approvalBodies: unknown[] = [];
+    const ticketPaths: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: true }));
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity("viewer")));
         }
-        if (url.pathname === "/v1/signature-scenarios") {
+        if (url.pathname === "/v2/signature-scenarios") {
           return Promise.resolve(jsonResponse(approvalScenario()));
         }
-        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
           return Promise.resolve(jsonResponse(currentSnapshot));
         }
-        if (url.pathname === "/v1/runs/run-approval/approval") {
+        if (url.pathname.endsWith("/realtime/ticket")) {
+          ticketPaths.push(url.pathname);
+          expect(new Headers(init?.headers).get("authorization")).toBe(
+            "Bearer test-access-token",
+          );
+          return Promise.resolve(jsonResponse({ ticket: "protected-ticket" }));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const authAdapter = signedInAdapter();
+    const { result } = renderHook(() => useCockpit({ authAdapter }));
+    await waitFor(() => expect(result.current.authStatus).toBe("authenticated"));
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+
+    expect(ticketPaths).toEqual(["/v2/realtime/ticket"]);
+    expect(String(fakeSocketInstances[0].url)).toContain("ticket=protected-ticket");
+    expect(String(fakeSocketInstances[0].url)).not.toContain("test-access-token");
+  });
+
+  it("fails closed when a viewer invokes a mutation callback directly", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    let mutationRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        if (init?.method === "POST") mutationRequests += 1;
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity("viewer")));
+        }
+        if (url.pathname === "/v2/signature-scenarios") {
+          return Promise.resolve(jsonResponse(approvalScenario()));
+        }
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const authAdapter = signedInAdapter();
+    const { result } = renderHook(() => useCockpit({ authAdapter }));
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    expect(result.current.canWrite).toBe(false);
+    await act(async () => result.current.resetDemo());
+
+    expect(mutationRequests).toBe(0);
+    expect(result.current.notice).toEqual({
+      kind: "error",
+      message: "Operator authorization with write scope is required.",
+    });
+  });
+
+  it("binds approval to the exact recommendation and memory selection", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    const approvalBodies: unknown[] = [];
+    const requestedPaths: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        requestedPaths.push(url.pathname);
+        if (url.pathname.startsWith("/v2/")) {
+          expect(new Headers(init?.headers).get("authorization")).toBe(
+            "Bearer test-access-token",
+          );
+        }
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity()));
+        }
+        if (url.pathname === "/v2/signature-scenarios") {
+          return Promise.resolve(jsonResponse(approvalScenario()));
+        }
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v2/runs/run-approval/approval") {
           approvalBodies.push(JSON.parse(String(init?.body)));
           return Promise.resolve(jsonResponse({ status: "resuming" }));
         }
-        if (url.pathname === "/v1/runs/run-approval") {
+        if (url.pathname === "/v2/runs/run-approval") {
           return Promise.resolve(
             jsonResponse({ ...approvalScenario().runs[0], status: "completed" }),
           );
@@ -466,8 +563,10 @@ describe("cockpit historical snapshot selection", () => {
       }),
     );
 
-    const { result } = renderHook(() => useCockpit());
+    const { result } = renderHook(() => useCockpit({ authAdapter: signedInAdapter() }));
     await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    expect(requestedPaths[0]).toBe("/v2/me");
+    expect(result.current.canWrite).toBe(true);
     await act(async () => result.current.decideRun(true));
 
     expect(approvalBodies).toEqual([
@@ -481,7 +580,8 @@ describe("cockpit historical snapshot selection", () => {
 
   it("fails visibly without approval-bound identities and does not post", async () => {
     window.HINDSIGHT_CONFIG = {
-      apiBase: "/v1",
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
       defaultNamespace: currentSnapshot.namespace,
       pollIntervalMs: 60_000,
     };
@@ -490,13 +590,13 @@ describe("cockpit historical snapshot selection", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = new URL(String(input), window.location.origin);
-        if (url.pathname === "/v1/operator/session") {
-          return Promise.resolve(jsonResponse({ operator: true }));
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity()));
         }
-        if (url.pathname === "/v1/signature-scenarios") {
+        if (url.pathname === "/v2/signature-scenarios") {
           return Promise.resolve(jsonResponse(approvalScenario(false)));
         }
-        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
           return Promise.resolve(jsonResponse(currentSnapshot));
         }
         if (url.pathname.endsWith("/approval")) approvalRequests += 1;
@@ -504,7 +604,7 @@ describe("cockpit historical snapshot selection", () => {
       }),
     );
 
-    const { result } = renderHook(() => useCockpit());
+    const { result } = renderHook(() => useCockpit({ authAdapter: signedInAdapter() }));
     await waitFor(() => expect(result.current.loadState).toBe("ready"));
     await act(async () => result.current.decideRun(false));
 

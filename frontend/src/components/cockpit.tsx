@@ -6,9 +6,9 @@ import {
   Copy,
   Fingerprint,
   Flask,
-  LockKey,
   Pulse,
   ShieldCheck,
+  SignIn,
   Warning,
 } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
@@ -567,7 +567,7 @@ export function LoadingSurface() {
   );
 }
 
-export function EmptySurface({ onOperator }: { onOperator: () => void }) {
+export function EmptySurface({ onSignIn }: { onSignIn: () => void }) {
   return (
     <section className="state-surface" aria-labelledby="emptyHeading">
       <Fingerprint aria-hidden="true" size={32} />
@@ -577,9 +577,9 @@ export function EmptySurface({ onOperator }: { onOperator: () => void }) {
         Public replay begins only after a rejected decision, audited rewind, and corrected decision form
         one coherent trace.
       </p>
-      <Button type="button" variant="primary" onClick={onOperator}>
-        <LockKey aria-hidden="true" size={16} weight="bold" />
-        Operator access
+      <Button type="button" variant="primary" onClick={onSignIn}>
+        <SignIn aria-hidden="true" size={16} weight="bold" />
+        Sign in
       </Button>
     </section>
   );

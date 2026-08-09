@@ -1,32 +1,25 @@
-"""Product API contract and operator-boundary tests."""
+"""Product API contract and Cognito-backed authorization-boundary tests."""
 
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from starlette.requests import Request
 
 
-def _operator_request(
-    *, origin: str, host: str = "api.example.test", forwarded_host: str | None = None
-) -> Request:
-    headers = [(b"host", host.encode()), (b"origin", origin.encode())]
-    if forwarded_host is not None:
-        headers.append((b"x-forwarded-host", forwarded_host.encode()))
-    return Request(
-        {
-            "type": "http",
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "https",
-            "path": "/v1/demo/poison-rewind/reset",
-            "raw_path": b"/v1/demo/poison-rewind/reset",
-            "query_string": b"",
-            "headers": headers,
-            "server": (host, 443),
-            "client": ("127.0.0.1", 12345),
-        }
+def _product_identity(*, role: str = "operator"):
+    from hindsight.identity import ProductIdentity, ROLE_SCOPES
+    from hindsight.server_tenants import ACCEPTANCE_TENANT_ID
+
+    return ProductIdentity(
+        principal_id="00000000-0000-0000-0000-000000000099",
+        tenant_id=ACCEPTANCE_TENANT_ID,
+        tenant_slug="acceptance",
+        token_role=role,
+        mapped_role=role,
+        effective_role=role,
+        scopes=ROLE_SCOPES[role],
+        expires_at=2_000_000_000,
     )
 
 
@@ -36,21 +29,26 @@ def test_openapi_exposes_narrow_product_contract():
     schema = app.openapi()
     paths = schema["paths"]
 
-    assert "/v1/incidents" in paths
-    assert "/v1/incidents/{slug}/runs" in paths
-    assert "/v2/incidents/{slug}/resolution" in paths
-    assert "/v1/runs/{run_id}/approval" in paths
+    assert set(paths["/v1/incidents"]) == {"get"}
+    assert set(paths["/v1/realtime/ticket"]) == {"post"}
+    assert "/v1/operator/session" not in paths
+    assert "/v1/incidents/{slug}/runs" not in paths
+    assert "post" in paths["/v2/incidents/{slug}/runs"]
+    assert "post" in paths["/v2/incidents/{slug}/resolution"]
+    assert "post" in paths["/v2/runs/{run_id}/approval"]
     assert "/v1/decisions/{decision_id}/influence" in paths
     assert "/v1/signature-scenarios" in paths
     assert "/v1/signature-scenarios/{scenario_id}" in paths
-    assert "/v1/namespaces/{namespace}/rewinds/preview" in paths
-    assert "/v1/demo/poison-rewind/poison" in paths
+    assert "/v1/namespaces/{namespace}/rewinds/preview" not in paths
+    assert "post" in paths["/v2/namespaces/{namespace}/rewinds/preview"]
+    assert "/v1/demo/poison-rewind/poison" not in paths
+    assert "post" in paths["/v2/demo/poison-rewind/poison"]
+    assert "get" in paths["/v2/me"]
 
 
-def test_public_health_and_guarded_mutation(monkeypatch):
+def test_public_surface_has_no_mutation_or_operator_session():
     from hindsight.api import app
 
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
     client = TestClient(app)
 
     assert client.get("/v1/health/live").json() == {
@@ -75,21 +73,21 @@ def test_public_health_and_guarded_mutation(monkeypatch):
         json={"namespace": "demo:payments-poison-rewind:session:untrusted"},
     )
 
-    assert denied.status_code == 403
-    assert denied_reset.status_code == 403
-    assert denied_poison.status_code == 403
+    assert denied.status_code == 405
+    assert denied_reset.status_code in {404, 405}
+    assert denied_poison.status_code in {404, 405}
+    assert client.get("/v1/operator/session").status_code in {404, 405}
 
 
-def test_server_binds_v1_and_v2_without_tenant_request_selectors(monkeypatch):
+def test_server_binds_public_and_product_tenants_without_request_selectors(monkeypatch):
     import hindsight.api as api
-    from hindsight.realtime_ticket import verify_realtime_ticket
     from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, PUBLIC_DEMO_TENANT_ID
     from hindsight.tenant import current_tenant_id
 
     calls = []
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "protected-secret")
     monkeypatch.setenv("HINDSIGHT_DEPLOYED_REVISION", "a" * 40)
     monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
 
     def incidents(**kwargs):
         calls.append((current_tenant_id(required=True), kwargs))
@@ -114,57 +112,16 @@ def test_server_binds_v1_and_v2_without_tenant_request_selectors(monkeypatch):
             return {"slug": slug}
         return None
 
-    created = []
-
-    def create(**kwargs):
-        created.append((current_tenant_id(required=True), kwargs))
-        return {"slug": kwargs["slug"]}
-
     monkeypatch.setattr(api, "get_incident", incident)
-    monkeypatch.setattr(api, "create_incident", create)
     client = TestClient(api.app)
 
-    public = client.get(
-        "/v1/incidents?limit=1&tenant_id=00000000-0000-0000-0000-000000000003",
-        headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
-    )
+    public = client.get("/v1/incidents?limit=1")
     assert public.status_code == 200
     assert calls[0][0] == PUBLIC_DEMO_TENANT_ID
-    hidden = client.get(
-        "/v1/incidents/hidden",
-        headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
-    )
+    hidden = client.get("/v1/incidents/hidden")
     assert hidden.status_code == 404
 
-    public_create = client.post(
-        "/v1/incidents",
-        headers={
-            "Authorization": "Bearer protected-secret",
-            "X-Tenant-Id": ACCEPTANCE_TENANT_ID,
-        },
-        json={
-            "slug": "public-incident",
-            "title": "Public incident",
-            "severity": "sev3",
-            "summary": "Public tenant write",
-            "tenant_id": ACCEPTANCE_TENANT_ID,
-        },
-    )
-    assert public_create.status_code == 201
-    assert created[-1][0] == PUBLIC_DEMO_TENANT_ID
-    assert "tenant_id" not in created[-1][1]
-
-    assert client.get("/v2/incidents").status_code == 401
-    assert (
-        client.get("/v2/incidents", headers={"Authorization": "Bearer invalid"}).status_code == 401
-    )
-    protected = client.get(
-        "/v2/incidents?limit=1",
-        headers={
-            "Authorization": "Bearer protected-secret",
-            "X-Tenant-Id": PUBLIC_DEMO_TENANT_ID,
-        },
-    )
+    protected = client.get("/v2/incidents?limit=1")
     assert protected.status_code == 200
     next_cursor = protected.json()["next_cursor"]
     assert next_cursor
@@ -177,44 +134,23 @@ def test_server_binds_v1_and_v2_without_tenant_request_selectors(monkeypatch):
     }
     protected_hidden = client.get(
         "/v2/incidents/hidden",
-        headers={"Authorization": "Bearer protected-secret"},
     )
     assert protected_hidden.status_code == 200
     assert calls[-1][0] == ACCEPTANCE_TENANT_ID
     assert (
         client.get(
             f"/v2/incidents?limit=1&cursor={next_cursor}x",
-            headers={"Authorization": "Bearer protected-secret"},
         ).status_code
         == 422
     )
 
-    public_ticket = client.post("/v1/realtime/ticket").json()["ticket"]
-    protected_ticket = client.post(
-        "/v2/realtime/ticket",
-        headers={"Authorization": "Bearer protected-secret"},
-    ).json()["ticket"]
-    assert verify_realtime_ticket(public_ticket, secret="protected-secret") == PUBLIC_DEMO_TENANT_ID
-    assert (
-        verify_realtime_ticket(protected_ticket, secret="protected-secret") == ACCEPTANCE_TENANT_ID
-    )
-    health = client.get(
-        "/v2/health/ready",
-        headers={"Authorization": "Bearer protected-secret"},
-    )
-    assert health.status_code in {200, 503}
-
     monkeypatch.setattr(
         api,
         "_v2_identity",
-        lambda _request: api.V2Identity(
-            tenant_id=ACCEPTANCE_TENANT_ID,
-            scopes=frozenset({"read"}),
-        ),
+        lambda _request: _product_identity(role="viewer"),
     )
     forbidden = client.post(
         "/v2/incidents",
-        headers={"Authorization": "Bearer protected-secret"},
         json={
             "slug": "forbidden-write",
             "title": "Forbidden write",
@@ -225,101 +161,119 @@ def test_server_binds_v1_and_v2_without_tenant_request_selectors(monkeypatch):
     assert forbidden.status_code == 403
 
 
-def test_operator_session_sets_httponly_cookie(monkeypatch):
-    from hindsight.api import app
+def test_tenant_selectors_and_tenant_body_fields_fail_closed(monkeypatch):
+    import hindsight.api as api
+    from hindsight.server_tenants import ACCEPTANCE_TENANT_ID
 
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
-    monkeypatch.setenv("HINDSIGHT_SECURE_COOKIES", "0")
-    client = TestClient(app)
+    monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
+    monkeypatch.setattr(api, "create_incident", lambda **_values: pytest.fail("write reached"))
+    client = TestClient(api.app)
 
-    response = client.post(
-        "/v1/operator/session",
-        json={"token": "operator-secret"},
+    assert client.get(
+        "/v1/incidents",
+        headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
+    ).status_code == 400
+    assert client.get(
+        f"/v2/incidents?tenant_id={ACCEPTANCE_TENANT_ID}",
+    ).status_code == 400
+    body_selector = client.post(
+        "/v2/incidents",
+        json={
+            "slug": "body-selector",
+            "title": "Body selector",
+            "severity": "sev3",
+            "summary": "The tenant must be server-derived.",
+            "tenant_id": ACCEPTANCE_TENANT_ID,
+        },
     )
-
-    assert response.status_code == 200
-    assert "HttpOnly" in response.headers["set-cookie"]
-    assert "SameSite=strict" in response.headers["set-cookie"]
-    assert client.get("/v1/operator/session").json() == {"operator": True}
+    assert body_selector.status_code == 422
 
 
-def test_operator_cookie_accepts_configured_product_origin(monkeypatch):
+def test_bearer_header_cannot_replace_gateway_verified_claims(monkeypatch):
     import hindsight.api as api
 
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
-    monkeypatch.setenv("HINDSIGHT_ALLOWED_ORIGINS", "https://product.example.test")
+    monkeypatch.setenv("HINDSIGHT_COGNITO_ISSUER", "https://issuer.example.test/pool")
+    monkeypatch.setenv("HINDSIGHT_COGNITO_CLIENT_ID", "client-id")
     monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+    response = TestClient(api.app).get(
+        "/v2/me",
+        headers={"Authorization": "Bearer legacy-shared-secret"},
+    )
+    assert response.status_code == 401
+    assert response.json() == {"detail": "verified product identity is required"}
+
+
+def test_v2_identity_configuration_failure_is_a_structured_503(monkeypatch):
+    import hindsight.api as api
+
+    def unavailable_database_url():
+        raise RuntimeError("parameter lookup failed")
+
+    monkeypatch.setattr(api, "runtime_database_url", unavailable_database_url)
+    response = TestClient(api.app, raise_server_exceptions=False).get("/v2/me")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "product identity service is unavailable"}
+
+
+def test_v2_cors_preflight_does_not_require_product_identity(monkeypatch):
+    import hindsight.api as api
+
     monkeypatch.setattr(
         api,
-        "create_incident",
-        lambda **values: {"id": "incident-1", **values},
+        "_v2_identity",
+        lambda _request: pytest.fail("preflight reached product identity resolution"),
     )
-    client = TestClient(api.app, base_url="https://api.example.test")
-
-    unlocked = client.post(
-        "/v1/operator/session",
-        json={"token": "operator-secret"},
-    )
-    created = client.post(
-        "/v1/incidents",
-        headers={"Origin": "https://product.example.test"},
-        json={
-            "slug": "proxy-session",
-            "title": "Proxy session",
-            "severity": "sev3",
-            "summary": "Validate the configured product origin.",
+    response = TestClient(api.app).options(
+        "/v2/incidents",
+        headers={
+            "Origin": "https://product.example.test",
+            "Access-Control-Request-Method": "POST",
         },
     )
 
-    assert unlocked.status_code == 200
-    assert created.status_code == 201
-    assert created.json()["slug"] == "proxy-session"
+    assert response.status_code != 401
 
 
-def test_operator_cookie_accepts_direct_same_origin(monkeypatch):
+def test_me_and_realtime_tickets_use_effective_identity(monkeypatch):
     import hindsight.api as api
+    from hindsight.server_tenants import ACCEPTANCE_TENANT_ID, PUBLIC_DEMO_TENANT_ID
 
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
-    monkeypatch.delenv("HINDSIGHT_ALLOWED_ORIGINS", raising=False)
-
-    api._operator_required_impl(
-        _operator_request(
-            origin="https://api.example.test",
-            host="api.example.test",
-        ),
-        session=api._signed_session("operator-secret"),
+    issued = []
+    monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
+    monkeypatch.setattr(api.time, "time", lambda: 1_900_000_000)
+    monkeypatch.setattr(
+        api,
+        "issue_realtime_ticket",
+        lambda **kwargs: issued.append(kwargs) or f"ticket-{len(issued)}",
     )
+    client = TestClient(api.app)
 
+    me = client.get("/v2/me")
+    public_ticket = client.post("/v1/realtime/ticket")
+    protected_ticket = client.post("/v2/realtime/ticket")
 
-def test_operator_cookie_rejects_foreign_origin_and_forwarded_host(monkeypatch):
-    import hindsight.api as api
-
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
-    monkeypatch.setenv("HINDSIGHT_ALLOWED_ORIGINS", "https://product.example.test")
-
-    with pytest.raises(HTTPException) as raised:
-        api._operator_required_impl(
-            _operator_request(
-                origin="https://foreign.example.test",
-                forwarded_host="foreign.example.test",
-            ),
-            session=api._signed_session("operator-secret"),
-        )
-
-    assert raised.value.status_code == 403
-    assert raised.value.detail == "cross-origin operator request denied"
-
-
-def test_operator_bearer_authorization_does_not_require_origin_match(monkeypatch):
-    import hindsight.api as api
-
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
-
-    api._operator_required_impl(
-        _operator_request(origin="https://foreign.example.test"),
-        authorization="Bearer operator-secret",
-        session=api._signed_session("operator-secret"),
-    )
+    assert me.status_code == 200
+    assert me.json()["effective_role"] == "operator"
+    assert me.json()["scopes"] == ["read", "realtime", "write"]
+    assert public_ticket.json() == {"ticket": "ticket-1", "expires_in": 60}
+    assert protected_ticket.json() == {"ticket": "ticket-2", "expires_in": 60}
+    assert issued == [
+        {
+            "tenant_id": PUBLIC_DEMO_TENANT_ID,
+            "access_class": "public",
+            "session_expires_at": 1_900_003_600,
+            "now": 1_900_000_000,
+        },
+        {
+            "tenant_id": ACCEPTANCE_TENANT_ID,
+            "access_class": "operator",
+            "principal_id": "00000000-0000-0000-0000-000000000099",
+            "session_expires_at": 2_000_000_000,
+        },
+    ]
 
 
 def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatch):
@@ -330,8 +284,8 @@ def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatc
         provider_env={},
     )
     database_calls = []
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
     monkeypatch.setattr(api, "runtime_database_url", lambda: settings.database_url)
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
     monkeypatch.setattr(
         api,
         "get_incident",
@@ -363,9 +317,8 @@ def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatc
     client = TestClient(api.app)
 
     response = client.post(
-        "/v1/incidents/checkout-latency/runs",
+        "/v2/incidents/checkout-latency/runs",
         headers={
-            "Authorization": "Bearer operator-secret",
             "Idempotency-Key": "request-1",
         },
         json={
@@ -395,8 +348,8 @@ def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatc
 def test_run_creation_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
     import hindsight.api as api
 
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
     monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
     monkeypatch.setattr(
         api,
         "get_incident",
@@ -415,8 +368,7 @@ def test_run_creation_remains_accepted_when_immediate_dispatch_fails(monkeypatch
     client = TestClient(api.app)
 
     response = client.post(
-        "/v1/incidents/checkout-latency/runs",
-        headers={"Authorization": "Bearer operator-secret"},
+        "/v2/incidents/checkout-latency/runs",
         json={"namespace": "demo:payments", "user_input": "checkout p99 is above SLO"},
     )
 
@@ -511,8 +463,8 @@ def test_approval_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
     import hindsight.api as api
 
     transitions = []
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
     monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
     monkeypatch.setattr(
         api,
         "prepare_approval",
@@ -526,8 +478,7 @@ def test_approval_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
     client = TestClient(api.app)
 
     response = client.post(
-        "/v1/runs/run-pending/approval",
-        headers={"Authorization": "Bearer operator-secret"},
+        "/v2/runs/run-pending/approval",
         json={
             "approved": True,
             "recommendation_id": f"recommendation:{'a' * 64}",
@@ -562,8 +513,8 @@ def test_rewind_execute_rejects_stale_preview(monkeypatch):
         provider_env={},
     )
     calls = []
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
     monkeypatch.setattr(api, "runtime_database_url", lambda: settings.database_url)
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
     monkeypatch.setattr(
         api,
         "enqueue_operation",
@@ -575,9 +526,8 @@ def test_rewind_execute_rejects_stale_preview(monkeypatch):
     client = TestClient(api.app)
 
     response = client.post(
-        "/v1/namespaces/demo:payments/rewinds",
+        "/v2/namespaces/demo:payments/rewinds",
         headers={
-            "Authorization": "Bearer operator-secret",
             "Idempotency-Key": "rewind-test",
         },
         json={
@@ -677,7 +627,7 @@ def test_runtime_database_resolution_failure_does_not_reach_db_helpers(monkeypat
 def test_request_validation_precedes_database_resolution(monkeypatch):
     import hindsight.api as api
 
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "operator-secret")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
     monkeypatch.setattr(
         api,
         "runtime_database_url",
@@ -687,8 +637,7 @@ def test_request_validation_precedes_database_resolution(monkeypatch):
 
     invalid_limit = client.get("/v1/namespaces/demo:payments/beliefs?limit=0")
     missing_idempotency_key = client.post(
-        "/v1/memory/operations",
-        headers={"Authorization": "Bearer operator-secret"},
+        "/v2/memory/operations",
         json={"preview_id": "preview-1", "fingerprint": "b" * 64},
     )
 

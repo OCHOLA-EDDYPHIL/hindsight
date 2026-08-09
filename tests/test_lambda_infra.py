@@ -139,6 +139,64 @@ def test_changefeed_relay_has_a_fenced_lease_and_narrow_idempotency_permissions(
     }
 
 
+def test_product_identity_boundary_is_jwt_gated_with_opaque_realtime_tickets():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    variables = pathlib.Path("infra/terraform/app/variables.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/app/outputs.tf").read_text()
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+    destroy = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
+    api_policy = stack.split('data "aws_iam_policy_document" "api"', 1)[1].split(
+        'resource "aws_iam_role_policy" "api"', 1
+    )[0]
+    websocket_policy = stack.split('data "aws_iam_policy_document" "websocket"', 1)[
+        1
+    ].split('resource "aws_iam_role_policy" "websocket"', 1)[0]
+
+    assert 'resource "aws_cognito_user_pool" "product"' in stack
+    assert 'user_pool_tier = "LITE"' in stack
+    assert "allow_admin_create_user_only = true" in stack
+    assert "case_sensitive = false" in stack
+    assert 'name     = "admin_only"' in stack
+    assert "username_attributes" not in stack
+    assert "auto_verified_attributes" not in stack
+    assert 'allowed_oauth_flows                  = ["code"]' in stack
+    assert "generate_secret                      = false" in stack
+    assert '"ALLOW_ADMIN_USER_PASSWORD_AUTH"' in stack
+    assert '"ALLOW_USER_PASSWORD_AUTH"' not in stack
+    assert 'resource "aws_apigatewayv2_authorizer" "product"' in stack
+    assert 'route_key = "GET /v1/{proxy+}"' in stack
+    assert 'route_key = "POST /v1/realtime/ticket"' in stack
+    assert stack.count('authorization_type = "JWT"') == 2
+    assert stack.count('route_key = "OPTIONS /v2') == 2
+    assert 'resource "aws_dynamodb_table" "realtime_tickets"' in stack
+    assert 'hash_key     = "ticket_digest"' in stack
+    assert 'name            = "tenant-id-index"' in stack
+    assert 'sid       = "RealtimeTicketIssue"' in api_policy
+    assert 'actions   = ["dynamodb:PutItem"]' in api_policy
+    assert 'sid       = "RealtimeTicketRedeem"' in websocket_policy
+    assert 'actions   = ["dynamodb:DeleteItem"]' in websocket_policy
+    assert "HINDSIGHT_REALTIME_TICKET_SECRET_PARAM" not in stack
+    assert "HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM" not in stack
+    assert "operator_token_parameter_name" not in variables
+    assert "publicApiBase" in stack
+    assert "productApiBase" in stack
+    assert 'output "cognito_authorize_endpoint"' in outputs
+    assert 'output "cognito_logout_endpoint"' in outputs
+    assert 'output "cognito_issuer"' in outputs
+    assert 'output "cognito_hosted_ui_base_url"' in outputs
+    assert 'variable "enable_waf"' in variables
+    assert "count    = var.enable_waf ? 1 : 0" in stack
+    assert "web_acl_id          = var.enable_waf" in stack
+    assert "TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}" in deploy
+    assert "TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}" in destroy
+    assert "Verify product identity inputs" in deploy
+    assert "Product identity password secrets are required" in deploy
+    assert "Viewer and operator passwords must be distinct" in deploy
+    assert "cognito-idp:AdminInitiateAuth" in bootstrap
+    assert "wafv2:CreateWebACL" in bootstrap
+
+
 def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
     variables = pathlib.Path("infra/terraform/app/variables.tf").read_text()
@@ -155,7 +213,7 @@ def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():
         assert f'variable "{variable}"' in variables
     assert "aliases             = local.cloudfront_aliases" in stack
     assert "count = var.manage_public_dns ? 1 : 0" in stack
-    assert "HINDSIGHT_ALLOWED_ORIGINS           = local.public_origin" in stack
+    assert re.search(r"HINDSIGHT_ALLOWED_ORIGINS\s*= local\.public_origin", stack)
     assert 'output "cloudfront_distribution_domain_name"' in outputs
     assert 'output "runtime_active"' in outputs
     assert "TF_VAR_runtime_active" in deploy

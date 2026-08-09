@@ -235,7 +235,9 @@ def test_candidate_probe_requires_exact_revision_and_runtime_endpoints(monkeypat
         acceptance,
         "_read_runtime_config",
         lambda _url: {
-            "apiBase": "/v1",
+            "publicApiBase": "/v1",
+            "productApiBase": "/v2",
+            "auth": {"clientId": "product-client"},
             "websocketUrl": "wss://socket.example.test/demo",
         },
     )
@@ -451,6 +453,11 @@ def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, t
     monkeypatch.setattr(acceptance, "_acceptance_artifact_dir", lambda _phase: tmp_path)
     monkeypatch.setattr(
         acceptance,
+        "_configure_local_product_identity",
+        lambda **kwargs: calls.append(("identity", kwargs)),
+    )
+    monkeypatch.setattr(
+        acceptance,
         "_run_strict_pytest",
         lambda selectors, *, env, phase, artifact_dir: calls.append(
             (selectors, env, phase, artifact_dir)
@@ -462,13 +469,22 @@ def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, t
         base_url="http://127.0.0.1:8766",
     )
 
-    selectors, env, phase, artifact_dir = calls[0]
+    assert calls[0] == (
+        "identity",
+        {
+            "database_url": "postgresql://root@localhost:26257/product?sslmode=disable",
+            "issuer": "http://127.0.0.1:8766/local-user-pool",
+        },
+    )
+    selectors, env, phase, artifact_dir = calls[1]
     assert "RUN_HOSTED_ACCEPTANCE" not in env
     assert "HOSTED_API_URL" not in env
     assert env["EMBEDDING_PROVIDER"] == "gemini"
     assert env["LLM_PROVIDER"] == "gemini"
     assert env["HINDSIGHT_INLINE_WORKER"] == "1"
     assert env["HINDSIGHT_ALLOWED_ORIGINS"] == "http://127.0.0.1:8766"
+    assert env["HINDSIGHT_COGNITO_CLIENT_ID"] == "local-browser-client"
+    assert env["HINDSIGHT_LOCAL_AUTH_AUTO"] == "1"
     assert selectors == acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS
     assert set(acceptance.SHARED_BROWSER_CONTRACT_SELECTORS).issubset(selectors)
     assert phase == "local-browser"
