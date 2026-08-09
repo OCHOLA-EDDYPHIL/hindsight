@@ -146,6 +146,9 @@ jobs:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - id: plan
         name: Resolve exact-SHA execution mode
@@ -191,6 +194,9 @@ jobs:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - name: Start isolated CockroachDB
         run: docker compose up -d crdb
@@ -289,6 +295,9 @@ jobs:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -341,6 +350,9 @@ jobs:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -392,6 +404,9 @@ jobs:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -443,6 +458,9 @@ jobs:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -534,6 +552,9 @@ jobs:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
