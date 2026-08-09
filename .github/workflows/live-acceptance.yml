@@ -473,10 +473,11 @@ jobs:
           GEMINI_MATERIAL="$(aws ssm get-parameter --name "$GEMINI_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           OPERATOR_TOKEN="$(aws ssm get-parameter --name "$OPERATOR_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER" --with-decryption --query Parameter.Value --output text)"
-          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"; do
+          CHANGEFEED_IDEMPOTENCY_TABLE="$(aws lambda get-function-configuration --function-name "hindsight-${HINDSIGHT_STAGE}-changefeed" --query 'Environment.Variables.HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE' --output text)"
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN" "$CHANGEFEED_IDEMPOTENCY_TABLE"; do
             [[ -n "$value" && "$value" != "None" ]] || exit 1
-            echo "::add-mask::$value"
           done
+          for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"; do echo "::add-mask::$value"; done
           while IFS= read -r api_key; do [[ -n "$api_key" ]] && echo "::add-mask::$api_key"; done < <(
             GEMINI_API_KEYS="$GEMINI_MATERIAL" uv run python -c \
               'from hindsight.gemini import parse_gemini_credentials; import os; [print(item.api_key) for item in parse_gemini_credentials(os.environ)]'
@@ -486,6 +487,7 @@ jobs:
             printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
             printf 'HINDSIGHT_BROWSER_OPERATOR_TOKEN=%s\n' "$OPERATOR_TOKEN"
             printf 'HINDSIGHT_CHANGEFEED_AUTH_TOKEN=%s\n' "$CHANGEFEED_TOKEN"
+            printf 'HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE=%s\n' "$CHANGEFEED_IDEMPOTENCY_TABLE"
             echo "GEMINI_API_KEYS<<$delimiter"
             printf '%s\n' "$GEMINI_MATERIAL"
             echo "$delimiter"

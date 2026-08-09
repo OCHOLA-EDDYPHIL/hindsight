@@ -57,8 +57,70 @@ function jsonResponse(payload: unknown): Response {
   });
 }
 
+const fakeSocketOpen = 1;
+let fakeSocketInstances: FakeWebSocket[] = [];
+
+class FakeWebSocket {
+
+  readyState = 0;
+  listeners = new Map<string, Array<(event: any) => void>>();
+  sent: string[] = [];
+
+  constructor(public url: string) {
+    fakeSocketInstances.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: any) => void) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  send(payload: string) {
+    this.sent.push(payload);
+  }
+
+  open() {
+    this.readyState = fakeSocketOpen;
+    this.emit("open", {});
+  }
+
+  message(payload: unknown) {
+    this.emit("message", { data: JSON.stringify(payload) });
+  }
+
+  serverClose() {
+    this.readyState = 3;
+    this.emit("close", {});
+  }
+
+  close() {
+    if (this.readyState === 3) return;
+    this.serverClose();
+  }
+
+  private emit(type: string, event: unknown) {
+    for (const listener of this.listeners.get(type) || []) listener(event);
+  }
+}
+
+Object.assign(FakeWebSocket, { OPEN: fakeSocketOpen });
+
+function realtimeReference(eventId: string, hlc: string, type = "memory") {
+  return {
+    version: 2,
+    event_id: eventId,
+    cursor: { hlc, event_id: eventId },
+    type,
+    namespace: currentSnapshot.namespace,
+    run_id: null,
+    data: { reference: { id: `${type}-${eventId}` } },
+  };
+}
+
 describe("cockpit historical snapshot selection", () => {
   beforeEach(() => {
+    fakeSocketInstances = [];
     window.history.replaceState({}, "", "/");
     window.HINDSIGHT_CONFIG = {
       apiBase: "/v1",
@@ -162,42 +224,213 @@ describe("cockpit historical snapshot selection", () => {
       }),
     );
 
-    let latestSocket: FakeWebSocket | undefined;
-    class FakeWebSocket {
-      readyState = 1;
-      listeners = new Map<string, (event: any) => void>();
-
-      constructor(public url: string) {
-        latestSocket = this;
-      }
-
-      addEventListener(type: string, listener: (event: any) => void) {
-        this.listeners.set(type, listener);
-      }
-
-      send() {}
-
-      close() {}
-    }
-    Object.assign(FakeWebSocket, { OPEN: 1 });
     vi.stubGlobal("WebSocket", FakeWebSocket);
 
     const { result } = renderHook(() => useCockpit());
     await waitFor(() => expect(result.current.loadState).toBe("ready"));
-    await waitFor(() => expect(latestSocket).toBeDefined());
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+    const latestSocket = fakeSocketInstances[0];
     expect(String(latestSocket?.url)).toContain("ticket=signed-ticket");
     expect(snapshotRequests).toBe(1);
 
     act(() => {
-      latestSocket?.listeners.get("message")?.({
-        data: JSON.stringify({
-          type: "memory",
-          data: { reference: { id: "memory-1", status: "active" } },
-        }),
+      latestSocket.message({
+        type: "memory",
+        data: { reference: { id: "memory-1", status: "active" } },
       });
     });
 
     await waitFor(() => expect(snapshotRequests).toBe(2));
+  });
+
+  it("deduplicates replayed v2 events and reconciles unseen events below high-water", async () => {
+    window.HINDSIGHT_CONFIG = {
+      ...window.HINDSIGHT_CONFIG,
+      websocketUrl: "wss://socket.example.test/demo",
+    };
+    let snapshotRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/operator/session") {
+          return Promise.resolve(jsonResponse({ operator: false }));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/realtime/ticket") {
+          return Promise.resolve(jsonResponse({ ticket: "signed-ticket" }));
+        }
+        if (url.pathname === "/snapshot") {
+          snapshotRequests += 1;
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+    const socket = fakeSocketInstances[0];
+    const latest = realtimeReference("event-latest", "30.0", "operation");
+
+    act(() => {
+      socket.message(latest);
+      socket.message(latest);
+    });
+    await waitFor(() => expect(snapshotRequests).toBe(2));
+
+    act(() => socket.message(realtimeReference("event-reordered", "29.0")));
+    await waitFor(() => expect(snapshotRequests).toBe(3));
+  });
+
+  it("immediately fences an older snapshot response when a newer event arrives", async () => {
+    window.HINDSIGHT_CONFIG = {
+      ...window.HINDSIGHT_CONFIG,
+      websocketUrl: "wss://socket.example.test/demo",
+    };
+    const staleSnapshot: Snapshot = {
+      ...currentSnapshot,
+      memories: [{ id: "memory-stale", content: "stale projection" }],
+    };
+    const latestSnapshot: Snapshot = {
+      ...currentSnapshot,
+      memories: [{ id: "memory-latest", content: "latest projection" }],
+    };
+    let snapshotRequests = 0;
+    let resolveStale: (response: Response) => void = () => undefined;
+    let resolveLatest: (response: Response) => void = () => undefined;
+    const pendingStale = new Promise<Response>((resolve) => {
+      resolveStale = resolve;
+    });
+    const pendingLatest = new Promise<Response>((resolve) => {
+      resolveLatest = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/operator/session") {
+          return Promise.resolve(jsonResponse({ operator: false }));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/realtime/ticket") {
+          return Promise.resolve(jsonResponse({ ticket: "signed-ticket" }));
+        }
+        if (url.pathname === "/snapshot") {
+          snapshotRequests += 1;
+          if (snapshotRequests === 1) return Promise.resolve(jsonResponse(currentSnapshot));
+          if (snapshotRequests === 2) return pendingStale;
+          if (snapshotRequests === 3) return pendingLatest;
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+    const socket = fakeSocketInstances[0];
+
+    act(() => socket.message(realtimeReference("event-before", "40.0")));
+    await waitFor(() => expect(snapshotRequests).toBe(2));
+    act(() => socket.message(realtimeReference("event-after", "41.0")));
+    await act(async () => {
+      resolveStale(jsonResponse(staleSnapshot));
+      await Promise.resolve();
+    });
+    expect(result.current.snapshot?.memories).toEqual([]);
+
+    await waitFor(() => expect(snapshotRequests).toBe(3));
+    await act(async () => {
+      resolveLatest(jsonResponse(latestSnapshot));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.snapshot?.memories[0]?.id).toBe("memory-latest"));
+  });
+
+  it("reconciles after reconnect while ignoring replay and superseded socket messages", async () => {
+    window.HINDSIGHT_CONFIG = {
+      ...window.HINDSIGHT_CONFIG,
+      websocketUrl: "wss://socket.example.test/demo",
+    };
+    let snapshotRequests = 0;
+    let ticketRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/operator/session") {
+          return Promise.resolve(jsonResponse({ operator: false }));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/realtime/ticket") {
+          ticketRequests += 1;
+          return Promise.resolve(jsonResponse({ ticket: `signed-ticket-${ticketRequests}` }));
+        }
+        if (url.pathname === "/snapshot") {
+          snapshotRequests += 1;
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    let reconnect: (() => void) | undefined;
+    vi.spyOn(window, "setTimeout").mockImplementation(
+      ((handler: TimerHandler, timeout?: number, ...args: any[]) => {
+        if (timeout === 1600) {
+          reconnect = () => {
+            if (typeof handler === "function") handler(...args);
+          };
+          return 99;
+        }
+        return nativeSetTimeout(handler, timeout, ...args);
+      }) as typeof window.setTimeout,
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+    const first = fakeSocketInstances[0];
+    act(() => first.open());
+    await waitFor(() => expect(snapshotRequests).toBe(2));
+    expect(JSON.parse(first.sent[0])).toMatchObject({
+      type: "subscribe",
+      namespace: currentSnapshot.namespace,
+    });
+
+    const delivered = realtimeReference("event-delivered", "50.0");
+    act(() => first.message(delivered));
+    await waitFor(() => expect(snapshotRequests).toBe(3));
+    act(() => first.serverClose());
+    expect(result.current.connection).toBe("reconnecting");
+    expect(reconnect).toBeTypeOf("function");
+
+    act(() => reconnect?.());
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(2));
+    const second = fakeSocketInstances[1];
+    act(() => second.open());
+    await waitFor(() => expect(snapshotRequests).toBe(4));
+    const settledRequests = snapshotRequests;
+
+    act(() => {
+      second.message(delivered);
+      first.message(realtimeReference("event-from-old-socket", "51.0"));
+    });
+    await act(async () => {
+      await new Promise((resolve) => nativeSetTimeout(resolve, 150));
+    });
+    expect(snapshotRequests).toBe(settledRequests);
   });
 
   it("binds approval to the exact recommendation and memory selection", async () => {

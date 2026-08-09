@@ -40,7 +40,13 @@ def test_live_events_from_a_previous_namespace_are_ignored():
         "const subscribeSocket", 1
     )[0]
 
-    assert "payload.namespace !== namespaceRef.current" in handler
+    namespace_guard = "eventNamespace !== namespaceRef.current"
+    tracker_observation = "realtimeTracker.current.observe"
+    assert namespace_guard in handler
+    assert handler.index(namespace_guard) < handler.index(tracker_observation)
+    assert handler.index('snapshotView.current !== "live"') < handler.index(
+        tracker_observation
+    )
 
 
 def test_explicit_namespace_renders_before_incident_defaults_are_loaded():

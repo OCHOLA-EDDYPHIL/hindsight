@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiError, requestJson, snapshotUrl } from "@/lib/api";
 import { isoToLocalInput, localInputToIso } from "@/lib/format";
+import { BoundedRealtimeTracker, parseRealtimeEnvelopeV2 } from "@/lib/realtime";
 import type {
   Incident,
   InfluenceItem,
@@ -90,6 +91,7 @@ export function useCockpit() {
   const incidentRequest = useRef(0);
   const runRequest = useRef(0);
   const influenceRequest = useRef(0);
+  const realtimeTracker = useRef(new BoundedRealtimeTracker());
   const initialized = useRef(false);
 
   const updateNamespace = useCallback((value: string, updateUrl = true) => {
@@ -139,6 +141,26 @@ export function useCockpit() {
       }
     },
     [applySnapshot, config],
+  );
+
+  const scheduleSnapshotRefresh = useCallback(
+    (delay = 100) => {
+      if (snapshotView.current !== "live") return;
+      const scheduledNamespace = namespaceRef.current;
+      const requestFence = ++snapshotRequest.current;
+      window.clearTimeout(snapshotRefreshTimer.current);
+      snapshotRefreshTimer.current = window.setTimeout(() => {
+        if (
+          snapshotView.current !== "live" ||
+          namespaceRef.current !== scheduledNamespace ||
+          snapshotRequest.current !== requestFence
+        ) {
+          return;
+        }
+        void loadSnapshot(null, scheduledNamespace).catch(() => undefined);
+      }, delay);
+    },
+    [loadSnapshot],
   );
 
   const loadInfluence = useCallback(
@@ -350,17 +372,30 @@ export function useCockpit() {
   }, [establishOperatorSession, retryInitialLoad]);
 
   const handleLiveEvent = useCallback(
-    (payload: Record<string, any>) => {
-      if (payload.namespace && payload.namespace !== namespaceRef.current) return;
+    (payload: unknown) => {
+      const envelope = parseRealtimeEnvelopeV2(payload);
+      const raw = payload as Record<string, any>;
+      const eventNamespace = envelope?.namespace || raw.namespace;
+      if (eventNamespace && eventNamespace !== namespaceRef.current) return;
       if (snapshotView.current !== "live") return;
-      const type = payload.type || payload.event;
-      const data = payload.data || payload;
+      if (envelope) {
+        const disposition = realtimeTracker.current.observe(namespaceRef.current, envelope);
+        if (disposition === "duplicate") return;
+        if (["memory", "operation"].includes(envelope.type)) {
+          scheduleSnapshotRefresh();
+          return;
+        }
+        const reference = envelope.data.reference as Record<string, unknown> | undefined;
+        const runId = envelope.run_id ||
+          (typeof reference?.run_id === "string" ? reference.run_id : null);
+        if (runId) void loadRun(runId);
+        return;
+      }
+
+      const type = raw.type || raw.event;
+      const data = raw.data || raw;
       if (["memory", "operation"].includes(type) && data.reference) {
-        window.clearTimeout(snapshotRefreshTimer.current);
-        snapshotRefreshTimer.current = window.setTimeout(
-          () => void loadSnapshot(null).catch(() => undefined),
-          100,
-        );
+        scheduleSnapshotRefresh();
         return;
       }
       if (type === "memory" && data.memory) {
@@ -393,11 +428,11 @@ export function useCockpit() {
         }
       }
       if (["run", "run_event"].includes(type)) {
-        const runId = payload.run_id || data.run_id;
+        const runId = raw.run_id || data.run_id;
         if (runId) void loadRun(runId);
       }
     },
-    [applySnapshot, loadRun, loadSnapshot],
+    [applySnapshot, loadRun, scheduleSnapshotRefresh],
   );
 
   const subscribeSocket = useCallback((targetNamespace = namespaceRef.current) => {
@@ -431,11 +466,17 @@ export function useCockpit() {
           const socket = new WebSocket(url);
           socketRef.current = socket;
           socket.addEventListener("open", () => {
-            if (disposed) return;
-            if (snapshotView.current === "live") setConnection("live");
+            if (disposed || socketRef.current !== socket) return;
             subscribeSocket(namespaceRef.current);
+            if (snapshotView.current === "live") {
+              setConnection("live");
+              scheduleSnapshotRefresh(0);
+              const active = runRef.current;
+              if (active) void loadRun(active.id);
+            }
           });
           socket.addEventListener("message", (event) => {
+            if (disposed || socketRef.current !== socket) return;
             try {
               handleLiveEvent(JSON.parse(event.data));
             } catch {
@@ -443,12 +484,14 @@ export function useCockpit() {
             }
           });
           socket.addEventListener("close", () => {
-            if (disposed) return;
+            if (disposed || socketRef.current !== socket) return;
             if (snapshotView.current === "live") setConnection("reconnecting");
-            if (socketRef.current === socket) socketRef.current = null;
+            socketRef.current = null;
             reconnectTimer = window.setTimeout(() => void connect(), 1600);
           });
-          socket.addEventListener("error", () => socket.close());
+          socket.addEventListener("error", () => {
+            if (socketRef.current === socket) socket.close();
+          });
         } catch {
           if (disposed) return;
           if (snapshotView.current === "live") setConnection("reconnecting");
@@ -480,12 +523,12 @@ export function useCockpit() {
     };
   }, [
     announce,
-    applySnapshot,
     config,
     handleLiveEvent,
     loadRun,
     loadSnapshot,
     namespace,
+    scheduleSnapshotRefresh,
     subscribeSocket,
   ]);
 
