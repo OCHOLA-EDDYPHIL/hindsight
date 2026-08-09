@@ -119,6 +119,29 @@ def test_canonical_digest_is_stable_and_type_sensitive():
     assert drill._sha256({"value": b"1"}) != drill._sha256({"value": "1"})
 
 
+def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch):
+    drill = _module()
+    calls = []
+
+    def run_repository_script(script, args, *, database_url, deadline):
+        calls.append((script, args, database_url, deadline))
+        output = Path(args[args.index("--output") + 1])
+        output.write_text('{"tables": []}')
+
+    monkeypatch.setattr(drill, "_run_repository_script", run_repository_script)
+    deadline = drill.Deadline.after(60)
+
+    assert drill._schema_manifest("postgresql://fixture", deadline) == {"tables": []}
+    assert calls == [
+        (
+            "schema_manifest.py",
+            ["export", "--output", calls[0][1][2], "--apply-roles"],
+            "postgresql://fixture",
+            deadline,
+        )
+    ]
+
+
 def test_clean_start_collision_never_deletes_unowned_resources(monkeypatch, tmp_path: Path):
     drill = _module()
     output = tmp_path / "evidence.json"

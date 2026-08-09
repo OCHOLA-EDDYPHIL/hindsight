@@ -226,7 +226,7 @@ def _schema_manifest(database_url: str, deadline: Deadline) -> dict[str, Any]:
         output = Path(directory) / "schema.json"
         _run_repository_script(
             "schema_manifest.py",
-            ["export", "--output", str(output)],
+            ["export", "--output", str(output), "--apply-roles"],
             database_url=database_url,
             deadline=deadline,
         )
