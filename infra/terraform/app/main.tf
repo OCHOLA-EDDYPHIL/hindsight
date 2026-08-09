@@ -523,8 +523,8 @@ resource "aws_lambda_function" "worker" {
       HINDSIGHT_RUN_DLQ_ARN               = aws_sqs_queue.run_dlq.arn
       HINDSIGHT_RUN_MAX_ATTEMPTS          = tostring(local.run_max_attempts)
       HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS = tostring(local.run_attempt_lease_seconds)
-      HINDSIGHT_AWS_ACCOUNT_ID             = data.aws_caller_identity.current.account_id
-      HINDSIGHT_STAGE                      = var.stage
+      HINDSIGHT_AWS_ACCOUNT_ID            = data.aws_caller_identity.current.account_id
+      HINDSIGHT_STAGE                     = var.stage
       HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
       HINDSIGHT_WORKER_TENANT_ID          = "00000000-0000-0000-0000-000000000002"
       LLM_PROVIDER                        = var.llm_provider
