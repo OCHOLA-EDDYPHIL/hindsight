@@ -18,6 +18,23 @@ from hindsight.db import database_url  # noqa: E402
 MIGRATIONS_DIR = pathlib.Path(__file__).resolve().parents[1] / "migrations"
 
 
+def _blocking_lifecycle_operations(
+    conn: psycopg.Connection,
+) -> tuple[tuple[str, str], ...]:
+    try:
+        rows = conn.execute(
+            """
+                SELECT id::STRING, status
+                FROM tenant_lifecycle_operations
+                WHERE status IN ('purging', 'database_purged')
+                ORDER BY id
+            """
+        ).fetchall()
+    except psycopg.errors.UndefinedTable:
+        return ()
+    return tuple((str(row[0]), str(row[1])) for row in rows)
+
+
 def ensure_database(url: str) -> None:
     parts = urlsplit(url)
     dbname = parts.path.lstrip("/") or "defaultdb"
@@ -47,6 +64,17 @@ def apply_migrations(url: str, *, through: str | None = None) -> int:
         if not pending:
             print("migrations: up to date")
             return 0
+        blocking_operations = _blocking_lifecycle_operations(conn)
+        if blocking_operations:
+            details = ", ".join(
+                f"{operation_id} ({status})"
+                for operation_id, status in blocking_operations
+            )
+            raise RuntimeError(
+                "database migrations are fenced while tenant purges await recovery: "
+                f"{details}; resume or finalize those purge operations before applying "
+                "schema changes"
+            )
         for path in pending:
             print(f"applying {path.name}")
             with conn.transaction():

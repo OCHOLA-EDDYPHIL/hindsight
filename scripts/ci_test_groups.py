@@ -56,6 +56,7 @@ DATABASE_GROUPS = {
         "tests/test_embedding_rotation.py",
         "tests/test_learning_evidence_foundation.py",
         "tests/test_migrations_and_roles.py",
+        "tests/test_tenant_lifecycle_database.py",
     ),
 }
 

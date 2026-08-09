@@ -65,7 +65,7 @@ from hindsight.runtime import (
     runtime_database_url,
     runtime_settings,
 )
-from hindsight.realtime_ticket import issue_realtime_ticket
+from hindsight.realtime_ticket import RealtimeTenantRetiredError, issue_realtime_ticket
 from hindsight.server_tenants import public_demo_tenant_id
 from hindsight.snapshots import memory_snapshot
 from hindsight.tenant import current_tenant_id, tenant_scope
@@ -394,15 +394,16 @@ def v2_me(request: Request) -> dict[str, Any]:
 @app.post(f"{API_PREFIX}/realtime/ticket", tags=["realtime"])
 def public_realtime_ticket() -> dict[str, Any]:
     now = int(time.time())
-    return {
-        "ticket": issue_realtime_ticket(
+    try:
+        ticket = issue_realtime_ticket(
             tenant_id=current_tenant_id(required=True),
             access_class="public",
             session_expires_at=now + PUBLIC_REALTIME_SESSION_SECONDS,
             now=now,
-        ),
-        "expires_in": 60,
-    }
+        )
+    except RealtimeTenantRetiredError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    return {"ticket": ticket, "expires_in": 60}
 
 
 @app.post(
@@ -412,15 +413,16 @@ def public_realtime_ticket() -> dict[str, Any]:
 )
 def v2_realtime_ticket(request: Request) -> dict[str, Any]:
     identity = _current_identity(request)
-    return {
-        "ticket": issue_realtime_ticket(
+    try:
+        ticket = issue_realtime_ticket(
             tenant_id=identity.tenant_id,
             access_class=identity.effective_role,
             principal_id=identity.principal_id,
             session_expires_at=identity.expires_at,
-        ),
-        "expires_in": 60,
-    }
+        )
+    except RealtimeTenantRetiredError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    return {"ticket": ticket, "expires_in": 60}
 
 
 @app.get(

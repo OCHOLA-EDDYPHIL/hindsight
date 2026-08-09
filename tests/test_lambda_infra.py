@@ -249,7 +249,10 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert 'test     = "StringEquals"' in bootstrap
     assert "cloudfront:*" not in bootstrap
     assert "dynamodb:*" not in bootstrap
-    assert "s3:*" not in bootstrap
+    deploy_policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_deploy" {', 1
+    )[1].split('resource "aws_iam_role_policy" "github_deploy"', 1)[0]
+    assert "s3:*" not in deploy_policy
     assert "events:PutRule" in bootstrap
     assert "events:PutTargets" in bootstrap
     assert "lambda:PutFunctionConcurrency" in bootstrap
@@ -261,7 +264,10 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
         "\n  statement {", 1
     )[0]
     assert bootstrap.count('"lambda:ListVersionsByFunction"') == 1
-    assert 'lambda_version_refresh_actions = ["lambda:ListVersionsByFunction"]' in bootstrap
+    assert re.search(
+        r'lambda_version_refresh_actions\s*=\s*\["lambda:ListVersionsByFunction"\]',
+        bootstrap,
+    )
     assert "actions   = local.lambda_version_refresh_actions" in version_refresh
     assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle

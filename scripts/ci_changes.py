@@ -55,6 +55,12 @@ WORKFLOW_COMPONENTS = {
     ".github/workflows/migration-compatibility.yml": frozenset(
         {"database", "main_qualification"}
     ),
+    ".github/workflows/recovery-drill.yml": frozenset(
+        {"database", "main_qualification"}
+    ),
+    ".github/workflows/tenant-lifecycle.yml": frozenset(
+        {"database", "main_qualification", "terraform"}
+    ),
     ".github/workflows/verify-deployed.yml": frozenset({"database", "frontend"}),
 }
 MAIN_QUALIFICATION_SCRIPTS = frozenset(

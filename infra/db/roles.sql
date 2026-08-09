@@ -8,23 +8,27 @@ CREATE ROLE IF NOT EXISTS hindsight_mcp_readonly LOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_dashboard_reader LOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_archive NOLOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_cdc NOLOGIN;
+CREATE ROLE IF NOT EXISTS hindsight_lifecycle NOLOGIN;
 
 ALTER ROLE hindsight_agent_writer NOLOGIN;
 ALTER ROLE hindsight_memory_worker NOLOGIN;
 ALTER ROLE hindsight_archive NOLOGIN;
 ALTER ROLE hindsight_cdc NOLOGIN;
+ALTER ROLE hindsight_lifecycle NOLOGIN;
 ALTER ROLE hindsight_agent_writer NOBYPASSRLS;
 ALTER ROLE hindsight_memory_worker NOBYPASSRLS;
 ALTER ROLE hindsight_mcp_readonly NOBYPASSRLS;
 ALTER ROLE hindsight_dashboard_reader NOBYPASSRLS;
 ALTER ROLE hindsight_archive NOBYPASSRLS;
 ALTER ROLE hindsight_cdc NOBYPASSRLS;
+ALTER ROLE hindsight_lifecycle NOBYPASSRLS;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO
     hindsight_agent_writer,
     hindsight_memory_worker,
     hindsight_archive,
-    hindsight_cdc;
+    hindsight_cdc,
+    hindsight_lifecycle;
 
 GRANT SELECT ON TABLE
     tenants,
@@ -343,3 +347,149 @@ REVOKE SELECT, UPDATE, DELETE ON TABLE tenant_event_outbox
 FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive;
 REVOKE INSERT, UPDATE, DELETE ON TABLE tenant_event_outbox
 FROM hindsight_archive, hindsight_cdc;
+
+-- The lifecycle role can export exactly one RLS-bound tenant and can delete
+-- only through the database lifecycle guards. It is never granted to any
+-- application runtime role.
+REVOKE ALL ON TABLE tenant_lifecycle_operations FROM PUBLIC;
+REVOKE ALL ON TABLE tenant_lifecycle_tables FROM PUBLIC;
+REVOKE ALL ON TABLE tenant_purge_tombstones FROM PUBLIC;
+REVOKE ALL ON TABLE tenant_lifecycle_completeness_issues FROM PUBLIC;
+REVOKE ALL ON TABLE tenant_lifecycle_schema_change_blockers FROM PUBLIC;
+REVOKE ALL ON TABLE tenant_lifecycle_operations, tenant_lifecycle_tables,
+    tenant_purge_tombstones, tenant_lifecycle_completeness_issues,
+    tenant_lifecycle_schema_change_blockers
+FROM hindsight_agent_writer, hindsight_memory_worker,
+    hindsight_mcp_readonly, hindsight_dashboard_reader,
+    hindsight_archive, hindsight_cdc;
+
+GRANT SELECT ON TABLE
+    tenants,
+    agent_chat_messages,
+    agent_reflections,
+    agent_run_dispatch_attempts,
+    agent_run_dispatches,
+    agent_run_events,
+    agent_runs,
+    benchmark_actions,
+    benchmark_confirmation_bindings,
+    benchmark_confirmation_preregistrations,
+    benchmark_experiments,
+    benchmark_trials,
+    benchmark_variant_preparations,
+    checkpoint_blobs,
+    checkpoint_writes,
+    checkpoints,
+    consolidation_jobs,
+    demo_sessions,
+    embedding_backfill_tasks,
+    episodic_memories,
+    incident_events,
+    incident_runbooks,
+    incident_semantic_beliefs,
+    incident_semantic_memories,
+    incident_services,
+    incidents,
+    learning_evidence_records,
+    learning_execution_authorizations,
+    learning_protocol_authorizations,
+    learning_qualification_attempts,
+    learning_qualification_family_terminals,
+    mcp_audit_events,
+    memory_decisions,
+    memory_external_evidence,
+    memory_lineage_edges,
+    memory_namespaces,
+    memory_operation_effects,
+    memory_operation_events,
+    memory_operation_previews,
+    memory_operations,
+    memory_reads,
+    memory_retrievals,
+    memory_review_items,
+    product_credential_locators,
+    product_principal_roles,
+    runbooks,
+    semantic_beliefs,
+    semantic_memories,
+    semantic_memory_embeddings,
+    semantic_memory_vectors,
+    services,
+    tenant_event_outbox,
+    tenant_lifecycle_tables,
+    tenant_lifecycle_completeness_issues,
+    tenant_lifecycle_schema_change_blockers
+TO hindsight_lifecycle;
+-- CockroachDB checks DELETE privileges for each table in a tenant cascade;
+-- lifecycle row guards make these grants usable only under the verified
+-- operation, matching fingerprint, target tenant, and live lease.
+GRANT DELETE ON TABLE
+    agent_chat_messages,
+    agent_reflections,
+    agent_run_dispatch_attempts,
+    agent_run_dispatches,
+    agent_run_events,
+    agent_runs,
+    benchmark_actions,
+    benchmark_confirmation_bindings,
+    benchmark_confirmation_preregistrations,
+    benchmark_experiments,
+    benchmark_trials,
+    benchmark_variant_preparations,
+    checkpoint_blobs,
+    checkpoint_writes,
+    checkpoints,
+    consolidation_jobs,
+    demo_sessions,
+    embedding_backfill_tasks,
+    episodic_memories,
+    incident_events,
+    incident_runbooks,
+    incident_semantic_beliefs,
+    incident_semantic_memories,
+    incident_services,
+    incidents,
+    learning_evidence_records,
+    learning_execution_authorizations,
+    learning_protocol_authorizations,
+    learning_qualification_attempts,
+    learning_qualification_family_terminals,
+    mcp_audit_events,
+    memory_decisions,
+    memory_external_evidence,
+    memory_lineage_edges,
+    memory_namespaces,
+    memory_operation_effects,
+    memory_operation_events,
+    memory_operation_previews,
+    memory_operations,
+    memory_reads,
+    memory_retrievals,
+    memory_review_items,
+    product_credential_locators,
+    product_principal_roles,
+    runbooks,
+    semantic_beliefs,
+    semantic_memories,
+    semantic_memory_embeddings,
+    semantic_memory_vectors,
+    services,
+    tenant_event_outbox
+TO hindsight_lifecycle;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE tenant_lifecycle_operations
+TO hindsight_lifecycle;
+GRANT SELECT, INSERT ON TABLE tenant_purge_tombstones TO hindsight_lifecycle;
+GRANT UPDATE, DELETE ON TABLE tenants TO hindsight_lifecycle;
+-- Required only because CockroachDB privilege-checks the existing outbox
+-- trigger's non-lifecycle INSERT branch while building a tenant cascade.
+GRANT INSERT ON TABLE tenant_event_outbox TO hindsight_lifecycle;
+GRANT UPDATE ON TABLE
+    agent_reflections,
+    agent_runs,
+    incidents,
+    memory_decisions
+TO hindsight_lifecycle;
+
+REVOKE DELETE ON TABLE tenants FROM hindsight_agent_writer,
+    hindsight_memory_worker, hindsight_mcp_readonly,
+    hindsight_dashboard_reader, hindsight_archive, hindsight_cdc;

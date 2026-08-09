@@ -10,6 +10,7 @@ locals {
   operation_poll_seconds        = (local.run_max_attempts - 1) * local.run_queue_visibility_seconds + local.worker_timeout_seconds + 60
   changefeed_timeout_seconds    = 30
   changefeed_lease_seconds      = 60
+  websocket_management_endpoint = "${aws_apigatewayv2_api.websocket.api_endpoint}/${var.stage}"
 
   api_zip      = var.api_zip_path != null ? var.api_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-api.zip"
   worker_zip   = var.worker_zip_path != null ? var.worker_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip"
@@ -42,6 +43,7 @@ locals {
     gemini          = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.gemini_api_keys_parameter_name}"
     changefeed      = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.changefeed_token_parameter_name}"
   }
+  connection_table_arn = "arn:${data.aws_partition.current.partition}:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/${local.name}-websocket-connections"
 
   content_types = {
     ".css"  = "text/css; charset=utf-8"
@@ -272,6 +274,17 @@ resource "aws_dynamodb_table" "connections" {
     type = "S"
   }
 
+  attribute {
+    name = "tenant_id"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "tenant-id-index"
+    hash_key        = "tenant_id"
+    projection_type = "KEYS_ONLY"
+  }
+
   ttl {
     attribute_name = "expires_at"
     enabled        = true
@@ -296,10 +309,21 @@ resource "aws_dynamodb_table" "subscriptions" {
     type = "S"
   }
 
+  attribute {
+    name = "tenant_id"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "connection-id-index"
     hash_key        = "connection_id"
     projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "tenant-id-index"
+    hash_key        = "tenant_id"
+    projection_type = "KEYS_ONLY"
   }
 
   ttl {
@@ -465,6 +489,11 @@ data "aws_iam_policy_document" "api" {
     actions   = ["dynamodb:PutItem"]
     resources = [aws_dynamodb_table.realtime_tickets.arn]
   }
+  statement {
+    sid       = "TenantLifecycleFenceRead"
+    actions   = ["dynamodb:GetItem"]
+    resources = [local.connection_table_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "api" {
@@ -597,20 +626,21 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM      = var.api_database_url_parameter_name
-      HINDSIGHT_DEPLOYED_REVISION       = var.deployed_revision
-      HINDSIGHT_GEMINI_API_KEYS_PARAM   = var.gemini_api_keys_parameter_name
-      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE = aws_dynamodb_table.gemini_key_health.name
-      HINDSIGHT_RUN_QUEUE_URL           = aws_sqs_queue.runs.url
-      HINDSIGHT_ALLOWED_ORIGINS         = local.public_origin
-      HINDSIGHT_REQUIRE_TENANT_CONTEXT  = "1"
-      HINDSIGHT_REALTIME_TICKET_TABLE   = aws_dynamodb_table.realtime_tickets.name
-      HINDSIGHT_COGNITO_ISSUER          = local.cognito_issuer
-      HINDSIGHT_COGNITO_CLIENT_ID       = aws_cognito_user_pool_client.product.id
-      LLM_PROVIDER                      = var.llm_provider
-      EMBEDDING_PROVIDER                = var.embedding_provider
-      GEMINI_EMBEDDING_MODEL            = var.gemini_embedding_model
-      HINDSIGHT_GEMINI_REPRESENTATION   = var.gemini_embedding_representation
+      HINDSIGHT_DATABASE_URL_PARAM         = var.api_database_url_parameter_name
+      HINDSIGHT_DEPLOYED_REVISION          = var.deployed_revision
+      HINDSIGHT_GEMINI_API_KEYS_PARAM      = var.gemini_api_keys_parameter_name
+      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE    = aws_dynamodb_table.gemini_key_health.name
+      HINDSIGHT_RUN_QUEUE_URL              = aws_sqs_queue.runs.url
+      HINDSIGHT_ALLOWED_ORIGINS            = local.public_origin
+      HINDSIGHT_REQUIRE_TENANT_CONTEXT     = "1"
+      HINDSIGHT_REALTIME_TICKET_TABLE      = aws_dynamodb_table.realtime_tickets.name
+      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE = aws_dynamodb_table.connections.name
+      HINDSIGHT_COGNITO_ISSUER             = local.cognito_issuer
+      HINDSIGHT_COGNITO_CLIENT_ID          = aws_cognito_user_pool_client.product.id
+      LLM_PROVIDER                         = var.llm_provider
+      EMBEDDING_PROVIDER                   = var.embedding_provider
+      GEMINI_EMBEDDING_MODEL               = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION      = var.gemini_embedding_representation
     }
   }
 }
@@ -708,7 +738,7 @@ resource "aws_lambda_function" "changefeed" {
     variables = {
       HINDSIGHT_WEBSOCKET_CONNECTION_TABLE    = aws_dynamodb_table.connections.name
       HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE  = aws_dynamodb_table.subscriptions.name
-      HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT = "https://${aws_apigatewayv2_api.websocket.id}.execute-api.${var.aws_region}.amazonaws.com/${var.stage}"
+      HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT = local.websocket_management_endpoint
       HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM   = var.changefeed_token_parameter_name
       HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE  = aws_dynamodb_table.changefeed_idempotency.name
       HINDSIGHT_CHANGEFEED_LEASE_SECONDS      = tostring(local.changefeed_lease_seconds)

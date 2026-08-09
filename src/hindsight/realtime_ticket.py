@@ -17,9 +17,10 @@ import boto3
 from boto3.dynamodb.conditions import Attr
 
 from hindsight.aws import aws_client_config
-from hindsight.tenant import normalize_tenant_id
+from hindsight.tenant import normalize_tenant_id, tenant_lifecycle_fence_key
 
 TICKET_TABLE_ENV = "HINDSIGHT_REALTIME_TICKET_TABLE"
+LIFECYCLE_FENCE_TABLE_ENV = "HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
 MAX_TICKET_TTL_SECONDS = 300
 DEFAULT_TICKET_TTL_SECONDS = 60
 TICKET_ENTROPY_BYTES = 32
@@ -28,6 +29,10 @@ _PRINCIPAL_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _ACCESS_CLASSES = frozenset({"public", "viewer", "operator"})
 
 AccessClass = Literal["public", "viewer", "operator"]
+
+
+class RealtimeTenantRetiredError(RuntimeError):
+    """The tenant has entered an irreversible lifecycle purge."""
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,7 @@ def issue_realtime_ticket(
     ttl_seconds: int = DEFAULT_TICKET_TTL_SECONDS,
     now: int | None = None,
     table: Any | None = None,
+    fence_table: Any | None = None,
 ) -> str:
     """Persist a digest-only ticket record and return its 256-bit bearer value."""
 
@@ -63,6 +69,16 @@ def issue_realtime_ticket(
         raise ValueError("realtime session has already expired")
 
     normalized_tenant = normalize_tenant_id(tenant_id)
+    resolved_fence_table = (
+        fence_table if fence_table is not None else _lifecycle_fence_table()
+    )
+    if resolved_fence_table is not None:
+        fence = resolved_fence_table.get_item(
+            Key={"connection_id": tenant_lifecycle_fence_key(normalized_tenant)},
+            ConsistentRead=True,
+        ).get("Item")
+        if isinstance(fence, dict) and fence.get("lifecycle_fence") is True:
+            raise RealtimeTenantRetiredError("tenant realtime access is retired")
     normalized_access, normalized_principal = _normalize_access(access_class, principal_id)
     redeem_before = min(issued_at + ttl_seconds, session_expiry)
     resolved_table = table or _ticket_table()
@@ -193,6 +209,17 @@ def _ticket_table() -> Any:
     table_name = os.environ.get(TICKET_TABLE_ENV)
     if not table_name:
         raise RuntimeError(f"{TICKET_TABLE_ENV} is required")
+    return boto3.resource(
+        "dynamodb",
+        region_name=os.environ.get("AWS_REGION"),
+        config=aws_client_config(read_timeout=10),
+    ).Table(table_name)
+
+
+def _lifecycle_fence_table() -> Any | None:
+    table_name = os.environ.get(LIFECYCLE_FENCE_TABLE_ENV)
+    if not table_name:
+        return None
     return boto3.resource(
         "dynamodb",
         region_name=os.environ.get("AWS_REGION"),

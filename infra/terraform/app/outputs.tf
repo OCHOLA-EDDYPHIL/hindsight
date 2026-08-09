@@ -54,6 +54,10 @@ output "websocket_url" {
   value = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "https://", "wss://")}/${aws_apigatewayv2_stage.websocket.name}"
 }
 
+output "websocket_management_endpoint" {
+  value = local.websocket_management_endpoint
+}
+
 output "changefeed_webhook_url" {
   value = "${aws_apigatewayv2_api.http.api_endpoint}/internal/changefeed"
 }
@@ -100,6 +104,14 @@ output "gemini_key_health_table" {
 
 output "realtime_ticket_table" {
   value = aws_dynamodb_table.realtime_tickets.name
+}
+
+output "websocket_connection_table" {
+  value = aws_dynamodb_table.connections.name
+}
+
+output "websocket_subscription_table" {
+  value = aws_dynamodb_table.subscriptions.name
 }
 
 output "waf_web_acl_arn" {

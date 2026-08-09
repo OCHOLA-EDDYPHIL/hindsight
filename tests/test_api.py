@@ -276,6 +276,22 @@ def test_me_and_realtime_tickets_use_effective_identity(monkeypatch):
     ]
 
 
+def test_realtime_ticket_endpoint_reports_a_retired_tenant(monkeypatch):
+    import hindsight.api as api
+    from hindsight.realtime_ticket import RealtimeTenantRetiredError
+
+    def retired(**kwargs):
+        del kwargs
+        raise RealtimeTenantRetiredError("tenant realtime access is retired")
+
+    monkeypatch.setattr(api, "issue_realtime_ticket", retired)
+
+    response = TestClient(api.app).post("/v1/realtime/ticket")
+
+    assert response.status_code == 410
+    assert response.json() == {"detail": "tenant realtime access is retired"}
+
+
 def test_run_creation_returns_accepted_and_dispatches_durable_command(monkeypatch):
     import hindsight.api as api
 

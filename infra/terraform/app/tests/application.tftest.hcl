@@ -37,6 +37,7 @@ mock_provider "aws" {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
     }
   }
+
 }
 
 mock_provider "aws" {
@@ -123,8 +124,14 @@ run "complete_demo_graph" {
   }
 
   assert {
-    condition     = aws_dynamodb_table.connections.ttl[0].enabled
-    error_message = "WebSocket connection records must expire."
+    condition = (
+      aws_dynamodb_table.connections.ttl[0].enabled &&
+      anytrue([
+        for index in aws_dynamodb_table.connections.global_secondary_index :
+        index.hash_key == "tenant_id" && index.name == "tenant-id-index" && index.projection_type == "KEYS_ONLY"
+      ])
+    )
+    error_message = "WebSocket connection records must expire and support tenant-bound lifecycle cleanup."
   }
 
   assert {
@@ -135,9 +142,22 @@ run "complete_demo_graph" {
         for index in aws_dynamodb_table.subscriptions.global_secondary_index :
         index.hash_key == "connection_id" && index.name == "connection-id-index"
       ]) &&
+      anytrue([
+        for index in aws_dynamodb_table.subscriptions.global_secondary_index :
+        index.hash_key == "tenant_id" && index.name == "tenant-id-index" && index.projection_type == "KEYS_ONLY"
+      ]) &&
       aws_dynamodb_table.subscriptions.ttl[0].enabled
     )
-    error_message = "Realtime fanout must use expiring exact-topic subscriptions with indexed connection cleanup."
+    error_message = "Realtime fanout must use expiring exact-topic subscriptions with indexed connection and tenant cleanup."
+  }
+
+  assert {
+    condition = (
+      output.realtime_ticket_table == aws_dynamodb_table.realtime_tickets.name &&
+      output.websocket_connection_table == aws_dynamodb_table.connections.name &&
+      output.websocket_subscription_table == aws_dynamodb_table.subscriptions.name
+    )
+    error_message = "Lifecycle automation must receive all ephemeral table names and the WebSocket management endpoint from Terraform outputs."
   }
 
   assert {
@@ -215,9 +235,12 @@ run "complete_demo_graph" {
         index.hash_key == "tenant_id" && index.name == "tenant-id-index"
       ]) &&
       aws_lambda_function.api.environment[0].variables.HINDSIGHT_REALTIME_TICKET_TABLE == aws_dynamodb_table.realtime_tickets.name &&
-      aws_lambda_function.websocket.environment[0].variables.HINDSIGHT_REALTIME_TICKET_TABLE == aws_dynamodb_table.realtime_tickets.name
+      aws_lambda_function.api.environment[0].variables.HINDSIGHT_WEBSOCKET_CONNECTION_TABLE == aws_dynamodb_table.connections.name &&
+      aws_lambda_function.websocket.environment[0].variables.HINDSIGHT_REALTIME_TICKET_TABLE == aws_dynamodb_table.realtime_tickets.name &&
+      aws_lambda_function.api.timeout == 30 &&
+      aws_lambda_function.websocket.timeout == 10
     )
-    error_message = "Realtime tickets must use encrypted expiring digest records with a tenant cleanup index."
+    error_message = "Realtime tickets must use encrypted expiring digest records with a tenant cleanup index and a bounded writer timeout."
   }
 
   assert {
@@ -235,9 +258,20 @@ run "complete_demo_graph" {
         ]) == 1 && toset(one([
           for statement in data.aws_iam_policy_document.websocket.statement : statement
           if statement.sid == "RealtimeTicketRedeem"
-      ]).actions) == toset(["dynamodb:DeleteItem"])
+      ]).actions) == toset(["dynamodb:DeleteItem"]) &&
+      length([
+        for statement in data.aws_iam_policy_document.api.statement : statement
+        if statement.sid == "TenantLifecycleFenceRead"
+        ]) == 1 && toset(one([
+          for statement in data.aws_iam_policy_document.api.statement : statement
+          if statement.sid == "TenantLifecycleFenceRead"
+      ]).actions) == toset(["dynamodb:GetItem"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.api.statement : statement
+        if statement.sid == "TenantLifecycleFenceRead"
+      ]).resources) == toset([local.connection_table_arn])
     )
-    error_message = "The API may only issue ticket rows and the WebSocket runtime may only atomically redeem them."
+    error_message = "The API may issue tickets only after reading the tenant fence, and the WebSocket runtime may only atomically redeem them."
   }
 
   assert {

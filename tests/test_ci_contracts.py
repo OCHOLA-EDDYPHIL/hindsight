@@ -208,6 +208,8 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
         "destroy-demo.yml",
         "live-acceptance.yml",
         "migration-compatibility.yml",
+        "recovery-drill.yml",
+        "tenant-lifecycle.yml",
         "verify-deployed.yml",
     }
     assert set(workflows["ci.yml"]) == {"push", "pull_request"}
@@ -216,6 +218,8 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
         "destroy-demo.yml",
         "live-acceptance.yml",
         "migration-compatibility.yml",
+        "recovery-drill.yml",
+        "tenant-lifecycle.yml",
         "verify-deployed.yml",
     ):
         assert set(workflows[name]) == {"workflow_dispatch"}
@@ -318,6 +322,47 @@ def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path
 
     with pytest.raises(ValueError, match="unknown migration filename"):
         migrate.apply_migrations("postgresql://unused/db", through="missing.sql")
+
+
+def test_migrate_fences_schema_changes_during_interrupted_purge(
+    monkeypatch, tmp_path: Path
+):
+    migrate = _load_script("migrate")
+    (tmp_path / "0030_change.sql").write_text("SELECT 1")
+
+    class Result:
+        def __init__(self, rows=()):
+            self._rows = rows
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            sql = str(statement)
+            if "FROM tenant_lifecycle_operations" in sql:
+                return Result(
+                    (("00000000-0000-0000-0000-000000000123", "purging"),)
+                )
+            return Result()
+
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
+    monkeypatch.setattr(migrate, "ensure_database", lambda _url: None)
+    monkeypatch.setattr(
+        migrate.psycopg, "connect", lambda *_args, **_kwargs: Connection()
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="resume or finalize those purge operations before applying schema changes",
+    ):
+        migrate.apply_migrations("postgresql://unused/db")
 
 
 def test_schema_manifest_compare_reports_differing_sections(tmp_path: Path):

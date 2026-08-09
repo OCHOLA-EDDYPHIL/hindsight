@@ -77,10 +77,17 @@ def prepare(
     deploy_parameter: str,
     api_parameter: str,
     worker_parameter: str,
+    lifecycle_parameter: str,
     metadata_parameter: str,
 ) -> None:
-    parameter_names = {deploy_parameter, api_parameter, worker_parameter, metadata_parameter}
-    if len(parameter_names) != 4:
+    parameter_names = {
+        deploy_parameter,
+        api_parameter,
+        worker_parameter,
+        lifecycle_parameter,
+        metadata_parameter,
+    }
+    if len(parameter_names) != 5:
         raise RuntimeError("database and rotation parameter paths must be distinct")
     session = boto3.Session(profile_name=profile, region_name=region)
     ssm = session.client("ssm")
@@ -89,11 +96,13 @@ def prepare(
     ]
     api_snapshot = _snapshot(ssm, api_parameter)
     worker_snapshot = _snapshot(ssm, worker_parameter)
+    lifecycle_snapshot = _snapshot(ssm, lifecycle_parameter)
     metadata_snapshot = _snapshot(ssm, metadata_parameter)
     generation = secrets.token_hex(6)
     roles = {
         "api": f"hindsight_api_{generation}",
         "worker": f"hindsight_worker_{generation}",
+        "lifecycle": f"hindsight_lifecycle_{generation}",
     }
     passwords = {label: secrets.token_urlsafe(48) for label in roles}
     runtime_urls = {
@@ -116,11 +125,11 @@ def prepare(
                     (passwords[label],),
                 )
                 created_roles.append(role)
-                permission_role = (
-                    "hindsight_agent_writer"
-                    if label == "api"
-                    else "hindsight_memory_worker"
-                )
+                permission_role = {
+                    "api": "hindsight_agent_writer",
+                    "worker": "hindsight_memory_worker",
+                    "lifecycle": "hindsight_lifecycle",
+                }[label]
                 connection.execute(
                     sql.SQL("GRANT {} TO {}").format(
                         sql.Identifier(permission_role), sql.Identifier(role)
@@ -134,10 +143,21 @@ def prepare(
                 role_flags = connection.execute(
                     "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
                 ).fetchone()
+                expected_permission_role = {
+                    "api": "hindsight_agent_writer",
+                    "worker": "hindsight_memory_worker",
+                    "lifecycle": "hindsight_lifecycle",
+                }[label]
+                has_permission_role = connection.execute(
+                    "SELECT pg_has_role(current_user, %s, 'member')",
+                    (expected_permission_role,),
+                ).fetchone()[0]
             if identity != roles[label]:
                 raise RuntimeError("runtime database identity verification failed")
             if role_flags != (False, False):
                 raise RuntimeError("runtime database identity can bypass tenant isolation")
+            if has_permission_role is not True:
+                raise RuntimeError("runtime database identity is missing its permission role")
         _put_secure_string(
             ssm, name=api_parameter, value=runtime_urls["api"], key_id=api_snapshot.key_id
         )
@@ -146,6 +166,12 @@ def prepare(
             name=worker_parameter,
             value=runtime_urls["worker"],
             key_id=worker_snapshot.key_id,
+        )
+        _put_secure_string(
+            ssm,
+            name=lifecycle_parameter,
+            value=runtime_urls["lifecycle"],
+            key_id=lifecycle_snapshot.key_id,
         )
         ssm.put_parameter(
             Name=metadata_parameter,
@@ -159,6 +185,7 @@ def prepare(
     except Exception:
         _restore(ssm, name=api_parameter, snapshot=api_snapshot)
         _restore(ssm, name=worker_parameter, snapshot=worker_snapshot)
+        _restore(ssm, name=lifecycle_parameter, snapshot=lifecycle_snapshot)
         _restore(ssm, name=metadata_parameter, snapshot=metadata_snapshot)
         if created_roles:
             try:
@@ -172,7 +199,10 @@ def prepare(
             except Exception:
                 pass
         raise RuntimeError("runtime database credential preparation failed") from None
-    print(f"runtime database credentials prepared in {api_parameter} and {worker_parameter}")
+    print(
+        "runtime database credentials prepared in "
+        f"{api_parameter}, {worker_parameter}, and {lifecycle_parameter}"
+    )
 
 
 def main() -> None:
@@ -184,6 +214,9 @@ def main() -> None:
     parser.add_argument("--api-parameter", default="/hindsight/demo/api-database-url")
     parser.add_argument("--worker-parameter", default="/hindsight/demo/worker-database-url")
     parser.add_argument(
+        "--lifecycle-parameter", default="/hindsight/demo/lifecycle-database-url"
+    )
+    parser.add_argument(
         "--metadata-parameter", default="/hindsight/demo/database-runtime-rotation"
     )
     args = parser.parse_args()
@@ -193,6 +226,7 @@ def main() -> None:
         deploy_parameter=args.deploy_parameter,
         api_parameter=args.api_parameter,
         worker_parameter=args.worker_parameter,
+        lifecycle_parameter=args.lifecycle_parameter,
         metadata_parameter=args.metadata_parameter,
     )
 

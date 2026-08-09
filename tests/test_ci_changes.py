@@ -154,6 +154,19 @@ def test_ci_control_and_unknown_paths_fail_closed(event_name: str, path: str):
             selection("python_static", "database", "main_qualification"),
         ),
         (
+            ".github/workflows/recovery-drill.yml",
+            selection("python_static", "database", "main_qualification"),
+        ),
+        (
+            ".github/workflows/tenant-lifecycle.yml",
+            selection(
+                "python_static",
+                "database",
+                "main_qualification",
+                "terraform",
+            ),
+        ),
+        (
             ".github/workflows/verify-deployed.yml",
             selection("python_static", "database", "frontend"),
         ),

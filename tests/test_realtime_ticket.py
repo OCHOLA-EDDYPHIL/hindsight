@@ -127,6 +127,37 @@ def test_realtime_ticket_redeem_window_is_capped_by_session_expiry():
         consume_realtime_ticket(ticket, now=130, table=table)
 
 
+def test_realtime_ticket_issue_fails_closed_for_a_purged_tenant():
+    from hindsight.realtime_ticket import (
+        RealtimeTenantRetiredError,
+        issue_realtime_ticket,
+    )
+    from hindsight.tenant import tenant_lifecycle_fence_key
+
+    tenant_id = "00000000-0000-0000-0000-000000000002"
+
+    class FenceTable:
+        def get_item(self, **kwargs):
+            assert kwargs == {
+                "Key": {"connection_id": tenant_lifecycle_fence_key(tenant_id)},
+                "ConsistentRead": True,
+            }
+            return {"Item": {"lifecycle_fence": True}}
+
+    ticket_table = FakeTicketTable()
+    with pytest.raises(RealtimeTenantRetiredError, match="retired"):
+        issue_realtime_ticket(
+            tenant_id=tenant_id,
+            access_class="public",
+            session_expires_at=200,
+            now=100,
+            table=ticket_table,
+            fence_table=FenceTable(),
+        )
+
+    assert ticket_table.puts == []
+
+
 def test_public_realtime_ticket_has_no_principal_and_rejects_tampering():
     from hindsight.realtime_ticket import consume_realtime_ticket, issue_realtime_ticket
 
