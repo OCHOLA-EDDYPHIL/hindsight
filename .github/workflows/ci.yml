@@ -19,6 +19,7 @@ jobs:
   changes:
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     outputs:
+      python_static: ${{ steps.classify.outputs.python_static }}
       database: ${{ steps.classify.outputs.database }}
       main_qualification: ${{ steps.classify.outputs.main_qualification }}
       frontend: ${{ steps.classify.outputs.frontend }}
@@ -42,6 +43,7 @@ jobs:
 
   python_static:
     needs: changes
+    if: needs.changes.outputs.python_static == 'true'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       EMBEDDING_PROVIDER: deterministic
@@ -235,7 +237,8 @@ jobs:
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       CI_SELECTIONS: >-
-        {"database":"${{ needs.changes.outputs.database }}",
+        {"python_static":"${{ needs.changes.outputs.python_static }}",
+        "database":"${{ needs.changes.outputs.database }}",
         "main_qualification":"${{ needs.changes.outputs.main_qualification }}",
         "frontend":"${{ needs.changes.outputs.frontend }}",
         "lambda_artifacts":"${{ needs.changes.outputs.lambda_artifacts }}",

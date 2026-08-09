@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("ci_changes", ROOT / "scripts/ci_changes.py")
@@ -10,105 +12,188 @@ SPEC.loader.exec_module(ci_changes)
 COMPONENTS = ci_changes.COMPONENTS
 classify_paths = ci_changes.classify_paths
 write_github_output = ci_changes.write_github_output
-GROUP_SPEC = importlib.util.spec_from_file_location(
-    "ci_test_groups", ROOT / "scripts/ci_test_groups.py"
+
+
+def selection(*enabled: str) -> dict[str, bool]:
+    return {component: component in enabled for component in COMPONENTS}
+
+
+@pytest.mark.parametrize("event_name", ["pull_request", "push"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "README.md",
+        "docs/architecture.md",
+        "infra/db/README.md",
+        "infra/terraform/app/README.md",
+        "src/hindsight/README.md",
+        "LICENSE",
+    ],
 )
-assert GROUP_SPEC is not None and GROUP_SPEC.loader is not None
-ci_test_groups = importlib.util.module_from_spec(GROUP_SPEC)
-GROUP_SPEC.loader.exec_module(ci_test_groups)
+def test_documentation_wins_before_component_directories(event_name: str, path: str):
+    assert classify_paths([path], event_name=event_name) == selection()
 
 
-def test_main_adds_product_schema_lambda_and_main_qualification():
-    assert classify_paths(["docs/architecture.md"], event_name="push") == {
-        "database": True,
-        "main_qualification": True,
-        "frontend": False,
-        "lambda_artifacts": True,
-        "terraform": False,
-    }
+@pytest.mark.parametrize("event_name", ["pull_request", "push"])
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        (
+            ["src/hindsight/memory.py"],
+            selection("python_static", "database", "lambda_artifacts"),
+        ),
+        (
+            ["migrations/0026_future.sql"],
+            selection("python_static", "database", "main_qualification"),
+        ),
+        (
+            ["infra/db/roles.sql"],
+            selection("python_static", "database", "main_qualification"),
+        ),
+        (
+            ["frontend/src/App.tsx"],
+            selection("python_static", "frontend", "lambda_artifacts"),
+        ),
+        (
+            ["src/hindsight/web/assets/app.js"],
+            selection("python_static", "frontend", "lambda_artifacts"),
+        ),
+        (
+            ["infra/terraform/app/main.tf"],
+            selection("python_static", "terraform"),
+        ),
+        (
+            ["pyproject.toml", "uv.lock"],
+            selection(
+                "python_static",
+                "database",
+                "main_qualification",
+                "lambda_artifacts",
+            ),
+        ),
+        (
+            ["package-lock.json"],
+            selection("python_static", "frontend", "lambda_artifacts"),
+        ),
+        (
+            ["docker-compose.yml"],
+            selection("python_static", "database", "main_qualification"),
+        ),
+        (
+            ["tests/test_api.py"],
+            selection("python_static"),
+        ),
+        (
+            ["tests/test_memory.py"],
+            selection("python_static", "database"),
+        ),
+        (
+            ["tests/test_migrations_and_roles.py"],
+            selection("python_static", "main_qualification"),
+        ),
+    ],
+)
+def test_explicit_component_matrix_is_identical_for_pr_and_main(
+    event_name: str, paths: list[str], expected: dict[str, bool]
+):
+    assert classify_paths(paths, event_name=event_name) == expected
 
 
-def test_path_classifier_tracks_only_fast_product_test_inventory():
-    assert ci_changes.PRODUCT_TEST_FILES == {
-        Path(path).name for path in ci_test_groups.database_test_files("product")
-    }
-
-
-def test_frontend_and_terraform_paths_select_only_their_dependencies():
-    selected = classify_paths(
-        ["frontend/src/App.tsx", "infra/terraform/app/main.tf"],
-        event_name="pull_request",
+@pytest.mark.parametrize("event_name", ["pull_request", "push"])
+def test_multi_component_changes_union_owned_checks(event_name: str):
+    assert classify_paths(
+        ["README.md", "src/hindsight/api.py", "frontend/src/App.tsx", "infra/terraform/app/main.tf"],
+        event_name=event_name,
+    ) == selection(
+        "python_static",
+        "database",
+        "frontend",
+        "lambda_artifacts",
+        "terraform",
     )
 
-    assert selected == {
-        "database": False,
-        "main_qualification": False,
-        "frontend": True,
-        "lambda_artifacts": True,
-        "terraform": True,
-    }
 
-
-def test_backend_and_fresh_migration_paths_select_product_and_packaging_only():
-    for path in ("src/hindsight/memory.py", "migrations/0026_future.sql"):
-        selected = classify_paths([path], event_name="pull_request")
-        assert selected == {
-            "database": True,
-            "main_qualification": False,
-            "frontend": False,
-            "lambda_artifacts": True,
-            "terraform": False,
-        }
-
-
-def test_all_owned_database_tests_select_the_database_job():
-    selected = classify_paths(
-        ["tests/test_learning_evidence_foundation.py"], event_name="pull_request"
-    )
-
-    assert selected["database"] is True
-
-
-def test_ci_control_changes_do_not_force_expensive_jobs():
-    for path in (
+@pytest.mark.parametrize("event_name", ["pull_request", "push"])
+@pytest.mark.parametrize(
+    "path",
+    [
         ".github/workflows/ci.yml",
-        ".github/workflows/migration-compatibility.yml",
         "scripts/ci_changes.py",
-        "scripts/run_affected_ci.py",
-        "tests/test_ci_contracts.py",
-    ):
-        selected = classify_paths([path], event_name="pull_request")
-        assert not any(selected.values()), path
+        ".github/workflows/future-control.yml",
+        "scripts/unclassified_new_tool.py",
+        "unclassified.config",
+    ],
+)
+def test_ci_control_and_unknown_paths_fail_closed(event_name: str, path: str):
+    assert classify_paths([path], event_name=event_name) == selection(*COMPONENTS)
 
 
-def test_test_group_ownership_change_selects_one_database_job_only():
-    selected = classify_paths(["scripts/ci_test_groups.py"], event_name="pull_request")
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (
+            ".github/workflows/deploy-demo.yml",
+            selection(
+                "python_static",
+                "database",
+                "main_qualification",
+                "lambda_artifacts",
+                "terraform",
+            ),
+        ),
+        (
+            ".github/workflows/destroy-demo.yml",
+            selection("python_static", "lambda_artifacts", "terraform"),
+        ),
+        (
+            ".github/workflows/live-acceptance.yml",
+            selection(*COMPONENTS),
+        ),
+        (
+            ".github/workflows/migration-compatibility.yml",
+            selection("python_static", "database", "main_qualification"),
+        ),
+        (
+            ".github/workflows/verify-deployed.yml",
+            selection("python_static", "database", "frontend"),
+        ),
+    ],
+)
+def test_manual_workflow_controls_select_only_owned_components(
+    path: str, expected: dict[str, bool]
+):
+    assert classify_paths([path], event_name="pull_request") == expected
 
-    assert selected == {
-        "database": True,
-        "main_qualification": False,
-        "frontend": False,
-        "lambda_artifacts": False,
-        "terraform": False,
-    }
+
+@pytest.mark.parametrize("event_name", ["pull_request", "push"])
+def test_empty_diff_fails_closed(event_name: str):
+    assert classify_paths([], event_name=event_name) == selection(*COMPONENTS)
 
 
-def test_unknown_and_empty_diffs_fail_safe_to_product_database_only():
-    expected = {
-        "database": True,
-        "main_qualification": False,
-        "frontend": False,
-        "lambda_artifacts": False,
-        "terraform": False,
-    }
-    assert classify_paths(["unclassified.config"], event_name="pull_request") == expected
-    assert classify_paths([], event_name="pull_request") == expected
+def test_changed_paths_uses_event_specific_range_and_exposes_both_sides_of_renames(
+    monkeypatch,
+):
+    calls: list[list[str]] = []
 
+    class Result:
+        stdout = "old.py\nnew.md\n"
 
-def test_documentation_only_pull_request_keeps_component_jobs_disabled():
-    selected = classify_paths(["docs/architecture.md"], event_name="pull_request")
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return Result()
 
-    assert not any(selected.values())
+    monkeypatch.setattr(ci_changes.subprocess, "run", fake_run)
+
+    assert ci_changes.changed_paths(
+        event_name="pull_request", base_sha="base", head_sha="head"
+    ) == ["old.py", "new.md"]
+    assert ci_changes.changed_paths(
+        event_name="push", base_sha="base", head_sha="head"
+    ) == ["old.py", "new.md"]
+    assert calls == [
+        ["git", "diff", "--name-only", "--no-renames", "base...head"],
+        ["git", "diff", "--name-only", "--no-renames", "base..head"],
+    ]
 
 
 def test_github_outputs_are_explicit_booleans(tmp_path: Path):
@@ -120,3 +205,8 @@ def test_github_outputs_are_explicit_booleans(tmp_path: Path):
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert set(values) == set(COMPONENTS)
     assert set(values.values()) <= {"true", "false"}
+
+
+def test_unsupported_events_are_rejected():
+    with pytest.raises(ValueError, match="unsupported normal CI event"):
+        classify_paths(["README.md"], event_name="schedule")

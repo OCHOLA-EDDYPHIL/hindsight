@@ -75,3 +75,27 @@ def test_always_required_jobs_cannot_be_skipped():
     assert aggregate.verify(
         event_name="pull_request", selections=_selections("false"), results=results
     )[0] == "required job changes ended as skipped"
+
+
+def test_documentation_only_accepts_every_component_skipped():
+    selections = _selections("false")
+    results = _results("skipped")
+    results["changes"] = "success"
+
+    assert aggregate.verify(
+        event_name="push", selections=selections, results=results
+    ) == []
+
+
+def test_missing_or_extra_contract_keys_fail_closed():
+    selections = _selections()
+    results = _results()
+    selections.pop("terraform")
+    results["unexpected"] = "success"
+
+    errors = aggregate.verify(
+        event_name="pull_request", selections=selections, results=results
+    )
+
+    assert any("component selection keys differ" in error for error in errors)
+    assert any("job result keys differ" in error for error in errors)

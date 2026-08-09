@@ -105,6 +105,112 @@ def run_database(env: dict[str, str]) -> None:
         run([*compose, "down", "--volumes", "--remove-orphans"], env=env)
 
 
+def run_main_qualification(env: dict[str, str]) -> None:
+    token = re.sub(r"[^a-z0-9]+", "_", f"{os.getpid()}_{int(time.time())}")
+    project = f"hindsight_local_main_{token}"[:63]
+    compose = [*docker_command(), "compose", "-p", project]
+    fresh_url = f"postgresql://root@localhost:26257/hindsight_fresh_{token}?sslmode=disable"
+    populated_url = (
+        f"postgresql://root@localhost:26257/hindsight_populated_{token}?sslmode=disable"
+    )
+    schema_dir = ROOT / "build" / "schema"
+    fresh_manifest = schema_dir / f"fresh-{token}.json"
+    populated_manifest = schema_dir / f"populated-{token}.json"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run([*compose, "up", "-d", "crdb"], env=env)
+        wait_for_database(compose)
+        run(
+            [
+                *compose,
+                "exec",
+                "-T",
+                "crdb",
+                "cockroach",
+                "sql",
+                "--insecure",
+                "-e",
+                "SET CLUSTER SETTING feature.vector_index.enabled = true",
+            ],
+            env=env,
+        )
+
+        fresh_env = {**env, "DATABASE_URL": fresh_url}
+        run(["uv", "run", "python", "scripts/migrate.py"], env=fresh_env)
+        run(
+            ["uv", "run", "python", "scripts/initialize_agent_storage.py"],
+            env=fresh_env,
+        )
+
+        populated_env = {**env, "DATABASE_URL": populated_url}
+        run(
+            [
+                "uv",
+                "run",
+                "python",
+                "scripts/migrate.py",
+                "--through",
+                "0018_agent_run_attempt_fencing.sql",
+            ],
+            env=populated_env,
+        )
+        run(
+            ["uv", "run", "python", "scripts/populated_upgrade_fixture.py", "seed"],
+            env=populated_env,
+        )
+        run(["uv", "run", "python", "scripts/migrate.py"], env=populated_env)
+        run(
+            ["uv", "run", "python", "scripts/initialize_agent_storage.py"],
+            env=populated_env,
+        )
+        run(
+            ["uv", "run", "python", "scripts/populated_upgrade_fixture.py", "verify"],
+            env=populated_env,
+        )
+
+        run(
+            [
+                "uv",
+                "run",
+                "python",
+                "scripts/schema_manifest.py",
+                "export",
+                "--apply-roles",
+                "--output",
+                str(fresh_manifest),
+            ],
+            env=fresh_env,
+        )
+        run(
+            [
+                "uv",
+                "run",
+                "python",
+                "scripts/schema_manifest.py",
+                "export",
+                "--apply-roles",
+                "--output",
+                str(populated_manifest),
+            ],
+            env=populated_env,
+        )
+        run(
+            [
+                "uv",
+                "run",
+                "python",
+                "scripts/schema_manifest.py",
+                "compare",
+                str(fresh_manifest),
+                str(populated_manifest),
+            ],
+            env=env,
+        )
+
+    finally:
+        run([*compose, "down", "--volumes", "--remove-orphans"], env=env)
+
+
 def run_frontend(env: dict[str, str]) -> None:
     for command in (
         ["npm", "ci"],
@@ -130,16 +236,36 @@ def run_terraform(env: dict[str, str]) -> None:
         run(["terraform", f"-chdir={directory}", "test"], env=env)
 
 
+def component_actions(env: dict[str, str]):
+    return {
+        "python_static": lambda: run_static(env),
+        "database": lambda: run_database(env),
+        "main_qualification": lambda: run_main_qualification(env),
+        "frontend": lambda: run_frontend(env),
+        "lambda_artifacts": lambda: run_lambda(env),
+        "terraform": lambda: run_terraform(env),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-sha", default="origin/main")
     parser.add_argument("--head-sha", default="HEAD")
+    parser.add_argument(
+        "--event-name",
+        choices=("pull_request", "push"),
+        default="pull_request",
+    )
     parser.add_argument("--path", action="append", dest="paths")
     parser.add_argument("--list", action="store_true", help="print selection without running checks")
     args = parser.parse_args()
 
-    paths = args.paths or changed_paths(base_sha=args.base_sha, head_sha=args.head_sha)
-    selected = classify_paths(paths, event_name="pull_request")
+    paths = args.paths or changed_paths(
+        event_name=args.event_name,
+        base_sha=args.base_sha,
+        head_sha=args.head_sha,
+    )
+    selected = classify_paths(paths, event_name=args.event_name)
     print(json.dumps({"paths": paths, "selected": selected}, indent=2), flush=True)
     if args.list:
         return 0
@@ -153,13 +279,7 @@ def main() -> int:
     for name in ("GEMINI_API_KEY", "GEMINI_API_KEYS"):
         env.pop(name, None)
     timings: dict[str, float] = {}
-    timings["python_static"] = timed("python_static", lambda: run_static(env))
-    actions = {
-        "database": lambda: run_database(env),
-        "frontend": lambda: run_frontend(env),
-        "lambda_artifacts": lambda: run_lambda(env),
-        "terraform": lambda: run_terraform(env),
-    }
+    actions = component_actions(env)
     for component, action in actions.items():
         if selected[component]:
             timings[component] = timed(component, action)

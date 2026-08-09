@@ -5,22 +5,31 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ci_changes import COMPONENTS  # noqa: E402
 
-ALWAYS_REQUIRED = ("changes", "python_static")
-JOB_SELECTIONS = {
-    "database": "database",
-    "main_qualification": "main_qualification",
-    "frontend": "frontend",
-    "lambda_artifacts": "lambda_artifacts",
-    "terraform": "terraform",
-}
+ALWAYS_REQUIRED = ("changes",)
+JOB_SELECTIONS = {component: component for component in COMPONENTS}
 
 
 def verify(
     *, event_name: str, selections: dict[str, str], results: dict[str, str]
 ) -> list[str]:
     errors: list[str] = []
+    expected_selections = set(JOB_SELECTIONS.values())
+    expected_results = set(ALWAYS_REQUIRED).union(JOB_SELECTIONS)
+    if set(selections) != expected_selections:
+        errors.append(
+            "component selection keys differ: "
+            f"expected={sorted(expected_selections)} actual={sorted(selections)}"
+        )
+    if set(results) != expected_results:
+        errors.append(
+            "job result keys differ: "
+            f"expected={sorted(expected_results)} actual={sorted(results)}"
+        )
     for job in ALWAYS_REQUIRED:
         if results.get(job) != "success":
             errors.append(f"required job {job} ended as {results.get(job, 'missing')}")

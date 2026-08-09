@@ -26,6 +26,7 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
   TF_IN_AUTOMATION: "true"
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
@@ -75,7 +76,15 @@ jobs:
         run: test "$CONFIRMATION" = "destroy-$DEPLOYMENT_ENVIRONMENT"
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - uses: hashicorp/setup-terraform@v3
+      - uses: actions/cache@v4
+        with:
+          path: .terraform.d/plugin-cache
+          key: terraform-${{ runner.os }}-${{ hashFiles('infra/terraform/**/.terraform.lock.hcl') }}
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}

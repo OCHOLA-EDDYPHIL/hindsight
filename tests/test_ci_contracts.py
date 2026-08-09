@@ -11,7 +11,9 @@ RUNNER_EXPRESSION = "${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}"
 RUNNER_ROUTED_WORKFLOWS = (
     "ci.yml",
     "deploy-demo.yml",
+    "destroy-demo.yml",
     "live-acceptance.yml",
+    "verify-deployed.yml",
 )
 
 
@@ -41,10 +43,18 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     jobs = workflow["jobs"]
     aggregate = jobs["test"]
+    selector = _load_script("ci_changes")
+    verifier = _load_script("verify_ci_components")
 
     assert aggregate["if"] == "always()"
     assert set(aggregate["needs"]) == set(jobs) - {"test"}
     assert aggregate["steps"][-1]["run"] == "python scripts/verify_ci_components.py"
+    assert set(jobs["changes"]["outputs"]) == set(selector.COMPONENTS)
+    assert set(verifier.JOB_SELECTIONS) == set(selector.COMPONENTS)
+    for component in selector.COMPONENTS:
+        assert jobs[component]["if"] == (
+            f"needs.changes.outputs.{component} == 'true'"
+        )
     assert "migration_compatibility" not in jobs
     assert "research" not in jobs
     migration_runner = _load_script("run_migration_compatibility")
@@ -182,6 +192,85 @@ def test_frozen_research_workflows_and_normal_ci_commands_are_absent():
         "v4-corpus-construction.yml",
     ):
         assert not (ROOT / ".github/workflows" / name).exists()
+
+
+def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
+    workflow_dir = ROOT / ".github/workflows"
+    workflows = {
+        path.name: yaml.load(path.read_text(), Loader=yaml.BaseLoader)["on"]
+        for path in workflow_dir.glob("*.yml")
+    }
+
+    assert set(workflows) == {
+        "ci.yml",
+        "deploy-demo.yml",
+        "destroy-demo.yml",
+        "live-acceptance.yml",
+        "migration-compatibility.yml",
+        "verify-deployed.yml",
+    }
+    assert set(workflows["ci.yml"]) == {"push", "pull_request"}
+    assert set(workflows["deploy-demo.yml"]) == {"workflow_call", "workflow_dispatch"}
+    for name in (
+        "destroy-demo.yml",
+        "live-acceptance.yml",
+        "migration-compatibility.yml",
+        "verify-deployed.yml",
+    ):
+        assert set(workflows[name]) == {"workflow_dispatch"}
+
+
+def test_every_uv_workflow_setup_uses_the_dependency_cache():
+    for path in (ROOT / ".github/workflows").glob("*.yml"):
+        workflow = yaml.safe_load(path.read_text())
+        for job in workflow["jobs"].values():
+            for step in job.get("steps", []):
+                if step.get("uses", "").startswith("astral-sh/setup-uv@"):
+                    assert step["with"] == {
+                        "enable-cache": True,
+                        "cache-dependency-glob": "uv.lock",
+                    }, f"{path.name}: {step}"
+
+
+@pytest.mark.parametrize(
+    "workflow_name", ("ci.yml", "deploy-demo.yml", "destroy-demo.yml")
+)
+def test_terraform_workflows_cache_provider_plugins(workflow_name: str):
+    workflow = yaml.safe_load((ROOT / ".github/workflows" / workflow_name).read_text())
+    terraform_jobs = [
+        job
+        for job in workflow["jobs"].values()
+        if any(
+            step.get("uses", "").startswith("hashicorp/setup-terraform@")
+            for step in job.get("steps", [])
+        )
+    ]
+
+    assert terraform_jobs
+    for job in terraform_jobs:
+        cache_dir = job.get("env", {}).get(
+            "TF_PLUGIN_CACHE_DIR",
+            workflow.get("env", {}).get("TF_PLUGIN_CACHE_DIR"),
+        )
+        assert cache_dir == (
+            "${{ github.workspace }}/.terraform.d/plugin-cache"
+        )
+        assert any(
+            step.get("uses", "").startswith("actions/cache@")
+            and step.get("with", {}).get("path") == ".terraform.d/plugin-cache"
+            for step in job["steps"]
+        )
+        assert any(
+            step.get("run") == 'mkdir -p "$TF_PLUGIN_CACHE_DIR"'
+            for step in job["steps"]
+        )
+
+
+def test_local_affected_runner_implements_every_selected_component():
+    selector = _load_script("ci_changes")
+    runner = _load_script("run_affected_ci")
+
+    assert set(runner.component_actions({})) == set(selector.COMPONENTS)
 
 
 def test_migrate_through_applies_only_the_requested_prefix(monkeypatch, tmp_path: Path):
