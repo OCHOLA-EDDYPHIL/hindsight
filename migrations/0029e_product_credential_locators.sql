@@ -123,8 +123,6 @@ $$;
 
 REVOKE ALL ON TABLE product_credential_locators FROM PUBLIC;
 REVOKE ALL ON TABLE product_credential_locators
-FROM hindsight_agent_writer, hindsight_memory_worker,
-    hindsight_mcp_readonly, hindsight_dashboard_reader,
-    hindsight_archive, hindsight_cdc;
+FROM hindsight_agent_writer, hindsight_memory_worker;
 GRANT SELECT, DELETE ON TABLE product_credential_locators
 TO hindsight_lifecycle;
