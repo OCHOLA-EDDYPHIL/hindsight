@@ -33,8 +33,74 @@ def test_gemini_embedding_provider_requests_1024_dimensions():
     assert calls[0]["config"]["output_dimensionality"] == EMBEDDING_DIMENSIONS
 
 
+@pytest.mark.parametrize(
+    ("representation", "expected_contents", "expected_title"),
+    [
+        ("raw_control", "payment timeout", None),
+        ("generic_title", "payment timeout", "Hindsight operational memory"),
+        (
+            "applicability_instruction",
+            "Operational memory that may contain a relevant situation, check, or action.\n"
+            "Memory:\npayment timeout",
+            "Hindsight operational memory",
+        ),
+    ],
+)
+def test_gemini_document_representation_is_bounded(
+    representation, expected_contents, expected_title
+):
+    from hindsight.embeddings import EMBEDDING_DIMENSIONS, GeminiEmbeddingProvider
+    from hindsight.gemini import PoolExecution
+
+    calls = []
+
+    class FakePool:
+        def execute(self, operation, *, routing_key):
+            class Models:
+                def embed_content(self, **kwargs):
+                    calls.append(kwargs)
+                    return SimpleNamespace(
+                        embeddings=[SimpleNamespace(values=[0.25] * EMBEDDING_DIMENSIONS)]
+                    )
+
+            return PoolExecution(
+                value=operation(SimpleNamespace(models=Models())),
+                slot_id="slot-a",
+                attempts=1,
+            )
+
+    provider = GeminiEmbeddingProvider(credential_pool=FakePool(), representation=representation)
+    provider.embed_document("payment timeout")
+
+    assert calls[0]["contents"] == expected_contents
+    assert calls[0]["config"].get("title") == expected_title
+
+
+def test_embedding_provider_threads_gemini_representation_from_environment():
+    from hindsight.embeddings import embedding_provider_from_env
+
+    provider = embedding_provider_from_env(
+        {
+            "EMBEDDING_PROVIDER": "gemini",
+            "HINDSIGHT_GEMINI_REPRESENTATION": "applicability_instruction",
+        },
+        gemini_pool=object(),
+    )
+
+    assert provider.representation == "applicability_instruction"
+    assert provider.encoder_revision == ("gemini-retrieval-task-v2-applicability_instruction")
+
+
+def test_gemini_embedding_provider_rejects_unknown_representation():
+    from hindsight.embeddings import GeminiEmbeddingProvider
+
+    with pytest.raises(ValueError, match="unsupported Gemini retrieval representation"):
+        GeminiEmbeddingProvider(credential_pool=object(), representation="candidate_metadata")
+
+
 def test_deterministic_embedding_provider_is_stable():
-    from hindsight.embeddings import EMBEDDING_DIMENSIONS, DeterministicEmbeddingProvider
+    from hindsight.embeddings import EMBEDDING_DIMENSIONS
+    from tests.fakes import DeterministicEmbeddingProvider
 
     provider = DeterministicEmbeddingProvider()
 
@@ -46,61 +112,15 @@ def test_deterministic_embedding_provider_is_stable():
     assert any(value != 0 for value in first)
 
 
-def test_default_provider_never_constructs_bedrock(monkeypatch):
+def test_default_provider_constructs_gemini():
     from hindsight.embeddings import (
-        DeterministicEmbeddingProvider,
+        GeminiEmbeddingProvider,
         embedding_provider_from_env,
     )
 
-    def unexpected_bedrock(**_kwargs):
-        pytest.fail("default provider selection constructed Bedrock")
+    provider = embedding_provider_from_env({}, gemini_pool=object())
 
-    monkeypatch.setattr(
-        "hindsight.embeddings.BedrockTitanEmbeddingProvider", unexpected_bedrock
-    )
-
-    provider = embedding_provider_from_env({})
-
-    assert isinstance(provider, DeterministicEmbeddingProvider)
-
-
-@pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_BEDROCK_EMBEDDINGS") != "1",
-    reason="live Bedrock embedding invocation is opt-in",
-)
-def test_live_bedrock_titan_embedding_provider():
-    from hindsight.embeddings import (
-        BEDROCK_TITAN_EMBED_MODEL,
-        EMBEDDING_DIMENSIONS,
-        BedrockTitanEmbeddingProvider,
-    )
-
-    configured_model = (
-        os.environ.get("BEDROCK_EMBEDDING_MODEL") or BEDROCK_TITAN_EMBED_MODEL
-    )
-    provider = BedrockTitanEmbeddingProvider(
-        model_id=configured_model,
-        region_name=os.environ.get("AWS_REGION", "us-east-1"),
-    )
-
-    assert provider.model_name == configured_model
-
-    query = provider.embed_query(
-        "Purchases freeze whenever the remote acquirer hesitates, and every failed "
-        "attempt creates even more work."
-    )
-    relevant = provider.embed_document(
-        "When checkout latency follows downstream processor failures that multiply "
-        "retries, inspect dependency health and reduce retry fanout before adding workers."
-    )
-    distractor = provider.embed_document(
-        "When card gateway certificate expiration breaks checkout, rotate the TLS "
-        "certificate and restart edge connections."
-    )
-
-    assert len(query) == len(relevant) == len(distractor) == EMBEDDING_DIMENSIONS
-    assert any(value != 0 for value in query)
-    assert _cosine_distance(query, relevant) < _cosine_distance(query, distractor)
+    assert isinstance(provider, GeminiEmbeddingProvider)
 
 
 @pytest.mark.skipif(
@@ -111,9 +131,7 @@ def test_live_gemini_embedding_provider_ranks_low_overlap_paraphrase():
     from hindsight.embeddings import DEFAULT_GEMINI_EMBEDDING_MODEL, GeminiEmbeddingProvider
     from hindsight.gemini import gemini_pool_from_env
 
-    configured_model = (
-        os.environ.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
-    )
+    configured_model = os.environ.get("GEMINI_EMBEDDING_MODEL") or DEFAULT_GEMINI_EMBEDDING_MODEL
     provider = GeminiEmbeddingProvider(
         credential_pool=gemini_pool_from_env(),
         model_name=configured_model,

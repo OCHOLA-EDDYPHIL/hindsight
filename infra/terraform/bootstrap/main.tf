@@ -423,6 +423,24 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   statement {
+    sid       = "ControlledIncidentTelemetryWrite"
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["Hindsight/ControlledIncidentTelemetry"]
+    }
+  }
+
+  statement {
+    sid       = "ControlledIncidentTelemetryRead"
+    actions   = ["cloudwatch:GetMetricStatistics"]
+    resources = ["*"]
+  }
+
+  statement {
     sid = "ApplicationIam"
     actions = [
       "iam:AttachRolePolicy",

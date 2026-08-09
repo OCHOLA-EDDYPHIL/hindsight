@@ -64,9 +64,7 @@ def test_pool_honours_retry_after_and_reports_exhaustion_without_keys():
 
     with pytest.raises(GeminiPoolExhaustedError) as raised:
         pool.execute(
-            lambda client: (_ for _ in ()).throw(
-                ProviderError(429, headers={"Retry-After": "60"})
-            ),
+            lambda client: (_ for _ in ()).throw(ProviderError(429, headers={"Retry-After": "60"})),
             routing_key="run-2",
         )
 
@@ -162,9 +160,7 @@ def test_key_document_parsing_supports_versioned_and_local_keys():
 
     document = '{"version":1,"keys":[{"id":"project-a","api_key":"key-a"}]}'
     configured = parse_gemini_credentials({"GEMINI_API_KEYS": document})
-    local = parse_gemini_credentials(
-        {"GEMINI_API_KEY": "key-a", "GEMINI_API_KEY_1": "key-b"}
-    )
+    local = parse_gemini_credentials({"GEMINI_API_KEY": "key-a", "GEMINI_API_KEY_1": "key-b"})
 
     assert [(item.slot_id, item.api_key) for item in configured] == [("project-a", "key-a")]
     assert [item.slot_id for item in local] == ["gemini-1", "gemini-2"]
@@ -201,9 +197,7 @@ def test_dynamodb_store_reads_and_updates_low_level_items():
     store = DynamoDbCooldownStore(table_name="health", client=client)
 
     assert store.get_states(["slot-a"])["slot-a"].failure_count == 2
-    store.record_failure(
-        "slot-a", cooldown_until=120, error_code="rate_limit", now=60
-    )
+    store.record_failure("slot-a", cooldown_until=120, error_code="rate_limit", now=60)
     store.record_success("slot-a", operation_started_at=121)
 
     assert client.update["TableName"] == "health"
@@ -235,6 +229,7 @@ def test_runtime_settings_loads_versioned_pool_from_ssm():
             GEMINI_API_KEYS_PARAM_ENV: "/hindsight/test/gemini-api-keys",
             "LLM_PROVIDER": "gemini",
             "EMBEDDING_PROVIDER": "gemini",
+            "HINDSIGHT_GEMINI_REPRESENTATION": "generic_title",
         },
         ssm_client=FakeSsm(),
         use_cache=False,
@@ -242,6 +237,7 @@ def test_runtime_settings_loads_versioned_pool_from_ssm():
 
     assert settings.provider_env["GEMINI_API_KEYS"] == document
     assert settings.provider_env["EMBEDDING_PROVIDER"] == "gemini"
+    assert settings.provider_env["HINDSIGHT_GEMINI_REPRESENTATION"] == "generic_title"
 
 
 def test_runtime_database_url_does_not_resolve_provider_secrets():

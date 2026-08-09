@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from tests.fakes import DeterministicEmbeddingProvider, FixtureLessonReasoningProvider
 
 requires_db = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
@@ -19,6 +20,22 @@ RESOLUTION_SUMMARY = (
     "Throttle retry fanout, watch processor timeout rate, and hold worker scaling "
     "until downstream processor health recovers."
 )
+
+
+@pytest.fixture(autouse=True)
+def _test_only_providers(monkeypatch):
+    monkeypatch.setattr(
+        "hindsight.consolidation.reasoning_provider_from_env",
+        lambda *_args, **_kwargs: FixtureLessonReasoningProvider(),
+    )
+    monkeypatch.setattr(
+        "hindsight.consolidation.embedding_provider_from_env",
+        lambda *_args, **_kwargs: DeterministicEmbeddingProvider(),
+    )
+    monkeypatch.setattr(
+        "hindsight.embeddings.embedding_provider_from_env",
+        lambda *_args, **_kwargs: DeterministicEmbeddingProvider(),
+    )
 
 
 def open_demo_incident(
@@ -314,7 +331,7 @@ def test_lesson_generation_requests_the_validated_response_schema():
 def test_consolidation_writes_idempotent_lesson_with_provenance():
     import hindsight.consolidation as consolidation
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
     from hindsight.trace_contract import governed_decision_trace
 
@@ -444,7 +461,7 @@ def test_invalid_model_output_publishes_no_lesson_and_records_terminal_reason(
 ):
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
 
     class InvalidOutputProvider:
@@ -499,7 +516,7 @@ def test_invalid_model_output_publishes_no_lesson_and_records_terminal_reason(
 def test_consolidation_rejects_governed_invalid_source_evidence(governance_state):
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
 
     namespace = f"consolidation-unsafe-source-{governance_state}-{uuid4()}"
     incident = open_demo_incident(
@@ -570,7 +587,7 @@ def test_consolidation_excludes_quarantined_rows_from_mixed_source_evidence():
 
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.reasoning import ReasoningResponse
 
@@ -691,7 +708,7 @@ def test_governance_change_during_synthesis_prevents_lesson_publication():
 
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
 
     class QuarantineDuringSynthesisProvider:
@@ -783,7 +800,7 @@ def test_transient_consolidation_failure_reuses_open_decision_and_recovers():
 
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
 
     class FailOnceProvider:
@@ -884,7 +901,7 @@ def test_transient_consolidation_failure_reuses_open_decision_and_recovers():
 def test_consolidation_exhaustion_fails_job_and_decision_together():
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
 
     class AlwaysFailProvider:
         provider_name = "test-model"
@@ -933,7 +950,7 @@ def test_consolidation_exhaustion_fails_job_and_decision_together():
 def test_expired_last_attempt_is_terminalized_without_an_extra_retry():
     import hindsight.consolidation as consolidation
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
 
     class FailProvider:
         provider_name = "test-model"
@@ -1009,7 +1026,7 @@ def test_retry_that_becomes_ineligible_fails_linked_decision_atomically():
         consolidate_resolved_incident,
     )
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
 
     class FailProvider:
         provider_name = "test-model"
@@ -1080,7 +1097,7 @@ def test_retry_that_becomes_ineligible_fails_linked_decision_atomically():
 def test_retry_rejects_a_previously_read_source_after_quarantine():
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
 
     class FailProvider:
         provider_name = "test-model"
@@ -1163,7 +1180,7 @@ def test_expired_attempt_cannot_publish_or_transition_after_overlapping_claim():
 
     import hindsight.consolidation as consolidation
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.reasoning import ReasoningResponse
 
     namespace = f"consolidation-overlap-{uuid4()}"

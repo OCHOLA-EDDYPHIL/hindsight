@@ -266,21 +266,17 @@ def test_operator_can_run_and_explain_signature_workflow():
             lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text
         )
         wait.until(
-            lambda browser: "Poisoned memory" in browser.find_element(By.ID, "influenceList").text
+            lambda browser: (
+                "demo.fixture-import" in browser.find_element(By.ID, "influenceList").text
+            )
         )
-        bad_action = driver.find_element(By.CSS_SELECTOR, ".action-execution").text
-        assert "scale_workers" in bad_action
+        bad_action = driver.find_element(By.ID, "proposedAction").text.strip()
+        assert bad_action
+        assert "Recommendation" in driver.find_element(By.CSS_SELECTOR, ".action-execution").text
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
-        driver.find_element(By.ID, "approveRun").click()
+        driver.find_element(By.ID, "rejectRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
-        bad_score = wait.until(
-            expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.not-recovered"))
-        )
-        assert "1 unsafe" in bad_score.text
-        assert (
-            "amplified unresolved upstream pressure"
-            in driver.find_element(By.CSS_SELECTOR, ".action-observation").text
-        )
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text == "3 live · 0 invalid"
         )
@@ -335,18 +331,14 @@ def test_operator_can_run_and_explain_signature_workflow():
             lambda browser: "awaiting approval" in browser.find_element(By.ID, "runStatus").text
         )
         wait.until(lambda browser: "1 read" in browser.find_element(By.ID, "influenceCount").text)
-        assert "Poisoned memory" not in driver.find_element(By.ID, "influenceList").text
-        corrected_action = driver.find_element(By.CSS_SELECTOR, ".action-execution").text
-        assert "inspect_dependency" in corrected_action
-        assert "throttle_retries" in corrected_action
-        assert "scale_workers" not in corrected_action
-        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score.recovered")
+        assert "demo.fixture-import" not in driver.find_element(By.ID, "influenceList").text
+        corrected_action = driver.find_element(By.ID, "proposedAction").text.strip()
+        assert corrected_action
+        assert corrected_action != bad_action
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         driver.find_element(By.ID, "approveRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
-        corrected_score = wait.until(
-            expected.visibility_of_element_located((By.CSS_SELECTOR, ".action-score.recovered"))
-        )
-        assert "0 unsafe" in corrected_score.text
+        assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         wait.until(
             lambda browser: browser.find_element(By.ID, "memoryCount").text == "2 live · 2 invalid"
         )
@@ -376,9 +368,9 @@ def test_operator_can_run_and_explain_signature_workflow():
         current_evidence = driver.find_element(
             By.CSS_SELECTOR, ".outcome-current .decision-citations"
         ).text
-        assert "demo.poison" in historical_evidence
-        assert "demo:simulated-memory-poisoning" in historical_evidence
-        assert "stale for the current incident" in historical_evidence
+        assert "demo.fixture-import" in historical_evidence
+        assert "demo:stale-runbook-import" in historical_evidence
+        assert "previously approved payment runbook" in historical_evidence
         assert "demo.seed" in current_evidence
         assert not driver.find_element(By.CSS_SELECTOR, ".operator-console").is_displayed()
         assert driver.execute_script("return window.__HINDSIGHT_CONSOLE_ERRORS || [];") == []
@@ -591,34 +583,62 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert len(runs) == 2
     bad, corrected = runs
     assert bad["status"] == "rejected"
-    assert "scale payment workers" in bad["proposed_action"].lower()
-    assert bad["action_trace"]["score"] == {
-        "recovered": False,
-        "unsafe_action_count": 1,
-    }
-    poison_read = next(read for read in bad["reads"] if read["writer"] == "demo.poison")
-    assert poison_read["source_ref"] == "demo:simulated-memory-poisoning"
-    assert "applicability is stale" in poison_read["justification"]
+    assert bad["provider"] == "gemini"
+    assert bad["model"]
+    assert bad["action_trace"]["mode"] == "recommendation_only"
+    assert bad["action_trace"]["approval"]["approved"] is False
+    assert bad["action_trace"]["execution"]["status"] == "not_executed"
+    assert bad["action_trace"]["recommendation"]["id"].startswith("recommendation:")
+    assert bad["action_trace"]["selection"]["fingerprint"]
+    assert "score" not in bad["action_trace"]
+    poison_read = next(read for read in bad["reads"] if read["writer"] == "demo.fixture-import")
+    assert poison_read["source_ref"] == "demo:stale-runbook-import"
+    assert poison_read["justification"]
     assert poison_read["downstream_lineage_edges"] >= 1
     assert corrected["status"] == "completed"
-    if corrected["provider"] == "deterministic":
-        assert corrected["model"] == "deterministic-v1"
-        assert corrected["plan"] == "deterministic response"
-    else:
-        assert "retry" in corrected["plan"].lower()
-    assert corrected["action_trace"]["score"] == {
-        "recovered": True,
-        "unsafe_action_count": 0,
-    }
+    assert corrected["provider"] == "gemini"
+    assert corrected["model"]
+    assert corrected["plan"]
+    assert corrected["proposed_action"]
+    assert corrected["proposed_action"] != bad["proposed_action"]
+    assert corrected["action_trace"]["mode"] == "recommendation_only"
+    assert corrected["action_trace"]["approval"]["approved"] is True
+    assert corrected["action_trace"]["execution"]["status"] == "recommendation_approved"
+    assert corrected["action_trace"]["recommendation"]["id"].startswith("recommendation:")
+    assert (
+        corrected["action_trace"]["recommendation"]["id"]
+        != bad["action_trace"]["recommendation"]["id"]
+    )
+    assert (
+        corrected["action_trace"]["selection"]["fingerprint"]
+        != bad["action_trace"]["selection"]["fingerprint"]
+    )
+    assert "score" not in corrected["action_trace"]
+    for run in (bad, corrected):
+        assert 1 <= len(run["action_trace"]["tool_calls"]) <= 3
+        assert len(run["action_trace"]["reasoning_steps"]) <= 4
+        assert all(
+            call["tool"] == "aws_cloudwatch_diagnostics"
+            for call in run["action_trace"]["tool_calls"]
+        )
+        assert any(
+            call["status"] == "completed"
+            for call in run["action_trace"]["tool_calls"]
+        )
+        assert any(
+            observation.get("status") == "available"
+            and int(observation.get("datapoint_count") or 0) > 0
+            for observation in run["action_trace"]["observations"]
+        )
     assert any(read["writer"] == "demo.seed" for read in corrected["reads"])
-    assert all(read["writer"] != "demo.poison" for read in corrected["reads"])
+    assert all(read["writer"] != "demo.fixture-import" for read in corrected["reads"])
     assert operation is not None and operation[2] == "completed"
 
     with MemoryStore(url=database_url()) as store:
         memories = store.list_current_semantic(namespace=namespace, limit=100)
         current_writers = {memory["writer"] for memory in memories}
         poison_id = next(
-            read["memory_id"] for read in bad["reads"] if read["writer"] == "demo.poison"
+            read["memory_id"] for read in bad["reads"] if read["writer"] == "demo.fixture-import"
         )
         poison = store.audit_memory(memory_kind="semantic", memory_id=poison_id)
 
@@ -704,9 +724,7 @@ def _start_firefox_driver():
                 try:
                     service.stop()
                 except Exception as stop_exc:  # noqa: BLE001 - preserve startup failure
-                    failures[-1]["cleanup_error"] = (
-                        f"{type(stop_exc).__name__}: {stop_exc}"
-                    )
+                    failures[-1]["cleanup_error"] = f"{type(stop_exc).__name__}: {stop_exc}"
             _write_firefox_startup_evidence(failures)
             if attempt == 2:
                 raise

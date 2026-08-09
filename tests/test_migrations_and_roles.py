@@ -77,6 +77,17 @@ def test_run_dispatch_outbox_grants_only_required_product_role_access():
     assert "GRANT SELECT, UPDATE ON TABLE agent_run_dispatches" in migration
 
 
+def test_agent_run_call_budget_migration_caps_calls_and_allows_resume_replanning():
+    migration = (MIGRATIONS / "0026_agent_run_call_budgets.sql").read_text()
+
+    assert "model_call_count INT8 NOT NULL DEFAULT 0" in migration
+    assert "cloudwatch_call_count INT8 NOT NULL DEFAULT 0" in migration
+    assert "model_call_count BETWEEN 0 AND 4" in migration
+    assert "cloudwatch_call_count BETWEEN 0 AND 3" in migration
+    assert "worker_attempt_command IN ('start', 'resume')" in migration
+    assert "agent_run_call_budgets_monotonic" in migration
+
+
 def test_product_writers_have_only_foreign_key_read_access_to_learning_preparations():
     roles = (ROOT / "infra/db/roles.sql").read_text()
     agent_select, agent_insert, agent_update = roles.split(
@@ -112,7 +123,7 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
     from hindsight import runs
     from hindsight.agent import setup_agent_storage
     from hindsight.embedding_index import activate_profile, begin_profile_build, run_backfill_batch
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     database_name = f"hindsight_upgrade_{uuid4().hex}"
@@ -364,7 +375,8 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
             recovered_runs = conn.execute(
                 """
                     SELECT id, status, worker_attempt_id, worker_attempt_count,
-                           worker_attempt_command
+                           worker_attempt_command, model_call_count,
+                           cloudwatch_call_count
                     FROM agent_runs
                     WHERE id IN (%s, %s)
                     ORDER BY id
@@ -372,7 +384,7 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
                 (run_ids[open_decision], run_ids[terminal_decision]),
             ).fetchall()
             assert {row[1] for row in recovered_runs} == {"queued", "resuming"}
-            assert all(row[2:] == (None, 0, None) for row in recovered_runs)
+            assert all(row[2:] == (None, 0, None, 0, 0) for row in recovered_runs)
             assert conn.execute(
                 """
                     SELECT command, status FROM agent_run_dispatches
@@ -590,6 +602,7 @@ def test_populated_upgrade_repairs_run_decisions_and_agent_role_can_write(monkey
             claim = runs.claim_run_attempt(
                 run_id=role_run["id"],
                 command="start",
+                command_generation=0,
                 lease_ttl=timedelta(minutes=5),
                 max_attempts=3,
             )

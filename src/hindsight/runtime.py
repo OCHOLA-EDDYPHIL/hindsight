@@ -91,12 +91,11 @@ def runtime_settings(
         "LLM_PROVIDER": env.get("LLM_PROVIDER", "gemini"),
         "GEMINI_MODEL": env.get("GEMINI_MODEL", ""),
         "GEMINI_EMBEDDING_MODEL": env.get("GEMINI_EMBEDDING_MODEL", ""),
-        "EMBEDDING_PROVIDER": env.get("EMBEDDING_PROVIDER", "deterministic"),
-        "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE": env.get(
-            "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE", ""
+        "EMBEDDING_PROVIDER": env.get("EMBEDDING_PROVIDER", "gemini"),
+        "HINDSIGHT_GEMINI_REPRESENTATION": env.get(
+            "HINDSIGHT_GEMINI_REPRESENTATION", "raw_control"
         ),
-        "BEDROCK_MODEL": env.get("BEDROCK_MODEL", ""),
-        "BEDROCK_EMBEDDING_MODEL": env.get("BEDROCK_EMBEDDING_MODEL", ""),
+        "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE": env.get("HINDSIGHT_GEMINI_KEY_HEALTH_TABLE", ""),
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }

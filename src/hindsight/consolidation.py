@@ -16,12 +16,7 @@ from hindsight.db import connect, database_url
 from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
 from hindsight.memory import APPROVED_POSITIVE_GUIDANCE, MemoryStore, Provenance
-from hindsight.reasoning import (
-    DeterministicReasoningProvider,
-    ReasoningProvider,
-    ReasoningRequest,
-    reasoning_provider_from_env,
-)
+from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.runtime import runtime_settings
 from hindsight.security import safe_error_detail
 
@@ -242,7 +237,7 @@ def process_consolidation_job(
     if job["status"] in TERMINAL_JOB_STATUSES:
         return _result_for_job(job=job, db_url=resolved_url)
     lease_owner = str(job["lease_owner"])
-    provider = reasoning_provider or DeterministicReasoningProvider()
+    provider = reasoning_provider or reasoning_provider_from_env()
     embeddings = embedding_provider or embedding_provider_from_env()
     decision_id = f"consolidation:{job_id}"
     try:
@@ -871,8 +866,6 @@ def _evidence_catalog(context: dict[str, Any]) -> dict[str, str]:
 def _generate_lesson(
     *, provider: ReasoningProvider, context: dict[str, Any], evidence: dict[str, str]
 ) -> dict[str, Any]:
-    if provider.provider_name == "deterministic":
-        return _fixture_lesson(context=context, evidence=evidence)
     response = provider.generate(
         ReasoningRequest(
             system=(
@@ -930,35 +923,6 @@ def _parse_lesson_response(text: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise LessonValidationError("lesson must be a JSON object")
     return value
-
-
-def _fixture_lesson(*, context: dict[str, Any], evidence: dict[str, str]) -> dict[str, Any]:
-    event_id = f"event:{context['resolution_event']['id']}"
-    event_payload = context["resolution_event"]["structured_payload"]
-    memory_id = next(key for key in evidence if key.startswith("memory:"))
-    return {
-        "schema_version": 1,
-        "title": f"Lesson from {context['incident']['slug']}",
-        "claims": [
-            {
-                "kind": "situation",
-                "text": str(context["incident"].get("root_cause") or "Resolved incident pattern"),
-                "citations": [{"evidence_id": memory_id, "quote": evidence[memory_id]}],
-            },
-            {
-                "kind": "safe_action",
-                "text": str(event_payload["action"]),
-                "citations": [{"evidence_id": event_id, "quote": str(event_payload["action"])}],
-            },
-            {
-                "kind": "diagnostic_check",
-                "text": str(event_payload["observation"]),
-                "citations": [
-                    {"evidence_id": event_id, "quote": str(event_payload["observation"])}
-                ],
-            },
-        ],
-    }
 
 
 def _validate_lesson(*, lesson: dict[str, Any], evidence: dict[str, str]) -> None:

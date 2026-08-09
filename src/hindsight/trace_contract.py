@@ -63,7 +63,7 @@ def signature_scenario_trace(
     namespace: str | None = None,
     db_url: str | None = None,
 ) -> dict[str, Any] | None:
-    """Resolve one poison, rewind, and correction scenario without exposing memory content."""
+    """Resolve one compromised-guidance correction without exposing memory content."""
 
     selectors = [value for value in (scenario_id, decision_id, namespace) if value]
     if len(selectors) > 1:
@@ -162,7 +162,7 @@ def signature_scenario_trace(
                            previous_version_id, producer_decision_id, transition_kind,
                            content_schema, lineage_status, trust_status,
                            created_by_operation_id, writer, t_valid, t_invalid,
-                           written_at, invalidated_at
+                           written_at, invalidated_at, metadata
                     FROM semantic_memories
                     WHERE namespace = %s
                     ORDER BY t_valid, written_at
@@ -190,10 +190,22 @@ def signature_scenario_trace(
             None,
         )
         seed = next((row for row in memories if row["writer"] == "demo.seed"), None)
-        poison = next((row for row in memories if row["writer"] == "demo.poison"), None)
+        compromised = next(
+            (
+                row
+                for row in memories
+                if isinstance(row.get("metadata"), dict)
+                and row["metadata"].get("scenario_role") == "compromised_guidance"
+            ),
+            None,
+        )
+        for memory in memories:
+            memory.pop("metadata", None)
         stages = {
             "baseline_memory_id": seed["id"] if seed else None,
-            "poison_memory_id": poison["id"] if poison else None,
+            "compromised_memory_id": compromised["id"] if compromised else None,
+            # Compatibility alias for clients that predate the compromised-guidance scenario.
+            "poison_memory_id": compromised["id"] if compromised else None,
             "influenced_decision_id": rejected["decision_id"] if rejected else None,
             "rewind_operation_id": operation["id"] if operation else None,
             "corrected_decision_id": corrected["decision_id"] if corrected else None,
@@ -230,7 +242,8 @@ def _signature_session(
                 """
                     SELECT id, namespace, status, created_at
                     FROM demo_sessions
-                    WHERE id = %s AND demo_kind = 'poison_rewind'
+                    WHERE id = %s
+                      AND demo_kind IN ('compromised_guidance_rewind', 'poison_rewind')
                 """,
                 (resolved_scenario_id,),
             )
@@ -242,7 +255,10 @@ def _signature_session(
                     FROM agent_runs AS run
                     JOIN demo_sessions AS session ON session.namespace = run.namespace
                     WHERE run.decision_id = %s
-                      AND session.demo_kind = 'poison_rewind'
+                      AND session.demo_kind IN (
+                          'compromised_guidance_rewind',
+                          'poison_rewind'
+                      )
                 """,
                 (decision_id,),
             )
@@ -251,7 +267,8 @@ def _signature_session(
                 """
                     SELECT id, namespace, status, created_at
                     FROM demo_sessions
-                    WHERE namespace = %s AND demo_kind = 'poison_rewind'
+                    WHERE namespace = %s
+                      AND demo_kind IN ('compromised_guidance_rewind', 'poison_rewind')
                 """,
                 (namespace,),
             )
@@ -261,7 +278,10 @@ def _signature_session(
                     SELECT session.id, session.namespace, session.status,
                            session.created_at
                     FROM demo_sessions AS session
-                    WHERE session.demo_kind = 'poison_rewind'
+                    WHERE session.demo_kind IN (
+                        'compromised_guidance_rewind',
+                        'poison_rewind'
+                    )
                       AND session.created_by = 'dashboard.operator'
                       AND session.namespace LIKE %s
                       AND EXISTS (

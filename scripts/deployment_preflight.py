@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument("--changefeed-parameter", required=True)
     parser.add_argument(
         "--llm-provider",
-        choices=("gemini", "deterministic"),
+        choices=("gemini",),
         default=os.environ.get("LLM_PROVIDER", "gemini"),
     )
     parser.add_argument(
@@ -101,7 +101,8 @@ def main() -> None:
         settings = runtime_settings(
             environ={
                 DATABASE_URL_PARAM_ENV: parameter_name,
-                "LLM_PROVIDER": "deterministic",
+                "LLM_PROVIDER": "gemini",
+                "EMBEDDING_PROVIDER": "gemini",
                 "AWS_REGION": args.region,
             },
             ssm_client=ssm,

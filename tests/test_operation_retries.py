@@ -60,7 +60,7 @@ def test_operation_source_reads_close_before_document_embedding(monkeypatch):
 
 def _enqueue_supersession():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, preview_supersession
 
@@ -552,7 +552,7 @@ def test_expired_third_attempt_is_reaped_without_creating_attempt_four():
 @requires_db
 def test_stale_preview_conflict_is_fenced_and_audited():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import (
         enqueue_operation,

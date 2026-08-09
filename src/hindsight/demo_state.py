@@ -1,4 +1,4 @@
-"""Lightweight state mutations for the browser-driven poison/rewind demo."""
+"""Lightweight fixture mutations for the browser-driven correction scenario."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ GOOD_MEMORY_CONTENT = (
     "timeouts triggered retry fanout. The safe fix was to throttle retry fanout, "
     "watch queue depth, and avoid scaling workers until the processor recovered."
 )
-POISONED_MEMORY_CONTENT = (
-    f"Poisoned memory: {DEMO_INPUT} Prior incident response: scale payment workers "
+COMPROMISED_GUIDANCE_CONTENT = (
+    f"Imported legacy guidance: {DEMO_INPUT} Prior incident response: scale payment workers "
     "immediately even while downstream timeouts and retry fanout remain elevated."
 )
 
@@ -62,7 +62,7 @@ def reset_poison_rewind_state(
         conn.execute(
             """
                 INSERT INTO demo_sessions (demo_kind, namespace, created_by)
-                VALUES ('poison_rewind', %s, 'dashboard.operator')
+                VALUES ('compromised_guidance_rewind', %s, 'dashboard.operator')
             """,
             (session_namespace,),
         )
@@ -87,10 +87,12 @@ def seed_good_demo_memory(
             provenance=Provenance(
                 writer="demo.seed",
                 source_ref="demo:known-good-payment-incident",
-                justification="Seed known-good payment latency resolution before poisoning",
+                justification=(
+                    "Seed known-good payment latency resolution before importing stale guidance"
+                ),
             ),
             metadata={
-                "demo": "poison-rewind",
+                "demo": "compromised-guidance-rewind",
                 "role": "known-good",
                 "kind": "procedural_lesson",
                 "operator_disposition": "approved",
@@ -115,19 +117,19 @@ def poison_demo_memory(
         return store.remember(
             memory_kind="semantic",
             namespace=namespace,
-            content=POISONED_MEMORY_CONTENT,
+            content=COMPROMISED_GUIDANCE_CONTENT,
             provenance=Provenance(
-                writer="demo.poison",
-                source_ref="demo:simulated-memory-poisoning",
+                writer="demo.fixture-import",
+                source_ref="demo:stale-runbook-import",
                 justification=(
-                    "Simulate previously approved retry guidance whose applicability "
-                    "is stale for the current incident"
+                    "Import a previously approved payment runbook response through "
+                    "the normal governed memory path"
                 ),
             ),
             metadata={
-                "demo": "poison-rewind",
-                "role": "poison",
-                "attack_class": "memory_poisoning",
+                "demo": "compromised-guidance-rewind",
+                "scenario_role": "compromised_guidance",
+                "risk_class": "stale_operational_guidance",
                 "kind": "procedural_lesson",
                 "evidence_quality": "legacy_runbook",
             },

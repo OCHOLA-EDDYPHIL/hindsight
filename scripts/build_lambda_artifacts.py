@@ -64,7 +64,9 @@ ARTIFACTS = {
         "modules": [
             "__init__.py",
             "agent.py",
+            "agent_decision.py",
             "aws.py",
+            "cloudwatch_diagnostics.py",
             "db.py",
             "consolidation.py",
             "embeddings.py",
@@ -79,7 +81,6 @@ ARTIFACTS = {
             "runtime.py",
             "security.py",
             "server_tenants.py",
-            "simulator.py",
             "tenant.py",
             "tracing.py",
             "worker.py",

@@ -9,66 +9,6 @@ requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DAT
 
 
 @requires_db
-def test_poison_rewind_demo_traces_stale_guidance_then_rewinds_audit_history():
-    from hindsight.db import database_url
-    from hindsight.demo import (
-        BAD_RECOMMENDATION,
-        GOOD_RECOMMENDATION,
-        REWIND_REASON,
-        run_poison_rewind_demo,
-    )
-    from hindsight.memory import MemoryStore
-
-    namespace = f"poison-rewind-test-{uuid4()}"
-
-    result = run_poison_rewind_demo(db_url=database_url(), namespace=namespace)
-
-    assert result.namespace.startswith(f"{namespace}:session:")
-    assert result.clean_run.plan == GOOD_RECOMMENDATION
-    assert result.bad_run.plan == BAD_RECOMMENDATION
-    assert result.bad_run.action_trace["score"] == {
-        "recovered": False,
-        "unsafe_action_count": 1,
-    }
-    assert result.poison_memory["metadata"]["operator_disposition"] == "approved"
-    assert result.poison_memory["metadata"]["usage_instruction"] == "positive_guidance"
-    assert str(result.poison_memory["id"]) in result.bad_run.recalled_memory_ids
-    assert result.diagnosis["decision_id"] == result.bad_run.decision_id
-    assert any(
-        str(item["memory"]["id"]) == str(result.poison_memory["id"])
-        and item["provenance"]["writer"] == "demo.poison"
-        for item in result.diagnosis["memories"]
-    )
-    assert result.rewind.operation["operation_type"] == "rewind"
-    assert result.rewind.operation["reason"] == REWIND_REASON
-
-    invalidated_ids = {str(row["id"]) for row in result.rewind.invalidated_memories}
-    assert str(result.poison_memory["id"]) in invalidated_ids
-    assert result.bad_run.reflected_memory_id in invalidated_ids
-    assert result.corrected_run.plan == GOOD_RECOMMENDATION
-    assert result.corrected_run.action_trace["score"] == {
-        "recovered": True,
-        "unsafe_action_count": 0,
-    }
-    assert str(result.poison_memory["id"]) not in result.corrected_run.recalled_memory_ids
-
-    with MemoryStore(url=database_url()) as store:
-        poison = store.audit_memory(
-            memory_kind="semantic",
-            memory_id=str(result.poison_memory["id"]),
-        )
-        bad_reflection = store.audit_memory(
-            memory_kind="semantic",
-            memory_id=str(result.bad_run.reflected_memory_id),
-        )
-
-    assert poison is not None
-    assert poison["invalidation_reason"] == REWIND_REASON
-    assert bad_reflection is not None
-    assert bad_reflection["invalidation_reason"] == REWIND_REASON
-
-
-@requires_db
 def test_browser_demo_reset_isolates_sessions_and_incidents():
     from hindsight.db import database_url
     from hindsight.demo_state import (
@@ -124,7 +64,7 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
         reset_poison_rewind_state,
         seed_good_demo_memory,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 
@@ -144,6 +84,9 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
         db_url=database_url(),
         embedding_provider=provider,
     )
+    assert poison["metadata"]["scenario_role"] == "compromised_guidance"
+    assert poison["metadata"]["risk_class"] == "stale_operational_guidance"
+    assert "role" not in poison["metadata"]
     with MemoryStore(
         url=database_url(),
         embedding_provider=provider,

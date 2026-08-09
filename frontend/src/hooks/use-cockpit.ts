@@ -79,7 +79,7 @@ export function useCockpit() {
   const [rewindAnchor, setRewindAnchor] = useState<string | null>(null);
   const [rewindTimestamp, setRewindTimestamp] = useState("");
   const [rewindReason, setRewindReason] = useState(
-    "Poisoned memory led to an unsafe recommendation",
+    "Stale guidance led to an unsafe recommendation",
   );
   const [rewindPreview, setRewindPreview] = useState<RewindPreview | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -525,8 +525,8 @@ export function useCockpit() {
       setRewindAnchor(payload.rewind_anchor || null);
       setRewindTimestamp(isoToLocalInput(payload.rewind_anchor));
       setRewindPreview(null);
-      setScenario(null);
-      await loadIncidents(payload.incident?.slug);
+      await loadIncidents(payload.incident?.slug, false);
+      await loadScenario({ namespace: payload.namespace });
       setLoadState("ready");
       announce("Known-good payment memory restored. The replay is ready.");
     } catch (error) {
@@ -534,11 +534,11 @@ export function useCockpit() {
     } finally {
       setBusy(null);
     }
-  }, [announce, config, loadIncidents, subscribeSocket, updateNamespace]);
+  }, [announce, config, loadIncidents, loadScenario, subscribeSocket, updateNamespace]);
 
   const poisonDemo = useCallback(async () => {
     if (!rewindAnchor) {
-      announce("Reset the replay before inserting poisoned memory.", "error");
+      announce("Reset the replay before importing stale guidance.", "error");
       return;
     }
     setBusy("poison");
@@ -547,14 +547,14 @@ export function useCockpit() {
         method: "POST",
         body: JSON.stringify({ namespace: namespaceRef.current }),
       });
-      await loadSnapshot();
-      announce("Poisoned retry-amplifying memory inserted with provenance.");
+      await loadScenario({ namespace: namespaceRef.current });
+      announce("Stale retry-amplifying guidance imported with provenance.");
     } catch (error) {
-      announce(`Poison injection failed: ${(error as Error).message}`, "error");
+      announce(`Guidance import failed: ${(error as Error).message}`, "error");
     } finally {
       setBusy(null);
     }
-  }, [announce, config, loadSnapshot, rewindAnchor]);
+  }, [announce, config, loadScenario, rewindAnchor]);
 
   const startRun = useCallback(async () => {
     if (!incident) {
@@ -587,19 +587,33 @@ export function useCockpit() {
 
   const decideRun = useCallback(
     async (approved: boolean) => {
-      if (!runRef.current) return;
+      const current = runRef.current;
+      if (!current) return;
+      const recommendationId = current.action_trace?.recommendation?.id?.trim();
+      const selectionFingerprint = current.action_trace?.selection?.fingerprint?.trim();
+      if (!recommendationId || !selectionFingerprint) {
+        announce(
+          "Approval identity is unavailable. Refresh or rerun the analysis before deciding.",
+          "error",
+        );
+        return;
+      }
       setBusy(approved ? "approve" : "reject");
       try {
-        await requestJson(config, `/runs/${encodeURIComponent(runRef.current.id)}/approval`, {
+        await requestJson(config, `/runs/${encodeURIComponent(current.id)}/approval`, {
           method: "POST",
-          body: JSON.stringify({ approved }),
+          body: JSON.stringify({
+            approved,
+            recommendation_id: recommendationId,
+            selection_fingerprint: selectionFingerprint,
+          }),
         });
         announce(
           approved
-            ? "Recommendation approved for reflection."
+            ? "Recommendation approved and retained in the audit trail."
             : "Recommendation rejected and retained in the audit trail.",
         );
-        await loadRun(runRef.current.id, true);
+        await loadRun(current.id, true);
       } catch (error) {
         announce(`Decision could not be recorded: ${(error as Error).message}`, "error");
       } finally {

@@ -55,6 +55,10 @@ class ProvenanceError(ValueError):
     """Raised when a memory write or read record lacks required provenance."""
 
 
+class MemorySelectionChangedError(RuntimeError):
+    """Raised when approval-bound memory is no longer the current selection."""
+
+
 @dataclass(frozen=True)
 class MemoryGovernance:
     """Typed governance projected into immutable semantic-memory metadata."""
@@ -184,6 +188,18 @@ class MemoryStore:
     def close(self) -> None:
         if self._owns_connection:
             self._conn.close()
+
+    def namespace_revision(self, *, namespace: str) -> int:
+        """Return the current revision for a semantic-memory namespace."""
+
+        if not namespace or not namespace.strip():
+            raise ProvenanceError("namespace is required")
+        with self._conn.transaction():
+            row = self._fetch_optional(
+                "SELECT revision FROM memory_namespaces WHERE namespace = %s",
+                (namespace,),
+            )
+            return int(row["revision"]) if row is not None else 0
 
     def remember(
         self,
@@ -1013,6 +1029,8 @@ class MemoryStore:
         governance: MemoryGovernance | None = None,
         created_by_operation_id: str | None = None,
         precomputed_embedding: list[float] | None = None,
+        expected_namespace_revision: int | None = None,
+        require_current_parents: bool = False,
     ) -> dict[str, Any]:
         """Write a semantic memory row and return the inserted row."""
 
@@ -1030,6 +1048,13 @@ class MemoryStore:
                 raise ProvenanceError("namespace is required")
             if trust_status not in {"active", "review_required"}:
                 raise ProvenanceError(f"unsupported semantic trust status: {trust_status}")
+            if expected_namespace_revision is not None and (
+                isinstance(expected_namespace_revision, bool)
+                or not isinstance(expected_namespace_revision, int)
+                or expected_namespace_revision < 0
+            ):
+                raise ValueError("expected_namespace_revision must be a non-negative integer")
+            resolved_parent_memory_ids = tuple(str(value) for value in (parent_memory_ids or ()))
             resolved_metadata = _governed_metadata(metadata, governance)
             memory_id = uuid4()
             resolved_belief_id = belief_id or str(uuid4())
@@ -1054,7 +1079,7 @@ class MemoryStore:
             )
             classified_reads = self._prepare_output_reads(
                 producer_decision_id=producer_id,
-                parent_memory_ids=parent_memory_ids,
+                parent_memory_ids=resolved_parent_memory_ids,
                 parent_edge_type="reasserted_from"
                 if transition_kind == "rewind_reassertion"
                 else "derived",
@@ -1062,6 +1087,12 @@ class MemoryStore:
             revision_namespaces = self._lock_output_namespaces(
                 namespace=namespace,
                 classified_reads=classified_reads,
+            )
+            self._validate_locked_memory_selection(
+                namespace=namespace,
+                expected_namespace_revision=expected_namespace_revision,
+                parent_memory_ids=resolved_parent_memory_ids,
+                require_current_parents=require_current_parents,
             )
             query = """
                 INSERT INTO semantic_memories (
@@ -1639,8 +1670,10 @@ class MemoryStore:
         provenance: Provenance,
         parent_memory_ids: Iterable[str],
         guidance_eligible: bool | None = None,
+        expected_namespace_revision: int | None = None,
+        require_current_parents: bool = False,
     ) -> dict[str, Any]:
-        """Atomically persist a reflection memory and its typed projection."""
+        """Atomically validate selection and persist a reflection projection."""
 
         embedding, _ = self._prepare_semantic_embedding(content=content)
         eligible = action_approved if guidance_eligible is None else guidance_eligible
@@ -1676,6 +1709,8 @@ class MemoryStore:
                 precomputed_embedding=embedding,
                 trust_status="active" if eligible else "review_required",
                 governance=governance,
+                expected_namespace_revision=expected_namespace_revision,
+                require_current_parents=require_current_parents,
             )
             self.record_agent_reflection(
                 decision_id=decision_id,
@@ -2052,6 +2087,46 @@ class MemoryStore:
             (ordered,),
         )
         return ordered
+
+    def _validate_locked_memory_selection(
+        self,
+        *,
+        namespace: str,
+        expected_namespace_revision: int | None,
+        parent_memory_ids: Iterable[str],
+        require_current_parents: bool,
+    ) -> None:
+        if expected_namespace_revision is not None:
+            namespace_state = self._fetch_optional(
+                """
+                    SELECT revision FROM memory_namespaces
+                    WHERE namespace = %s
+                    FOR UPDATE
+                """,
+                (namespace,),
+            )
+            if (
+                namespace_state is None
+                or int(namespace_state["revision"]) != expected_namespace_revision
+            ):
+                raise MemorySelectionChangedError("memory selection changed before reflection")
+
+        if not require_current_parents and expected_namespace_revision is None:
+            return
+        required_ids = sorted({str(value) for value in parent_memory_ids})
+        if not required_ids:
+            return
+        rows = self._fetch_all(
+            """
+                SELECT id FROM semantic_memories
+                WHERE id = ANY(%s) AND t_invalid IS NULL
+                ORDER BY id
+            """,
+            (required_ids,),
+        )
+        current_ids = {str(row["id"]) for row in rows}
+        if current_ids != set(required_ids):
+            raise MemorySelectionChangedError("memory selection changed before reflection")
 
     def _insert_semantic_embedding(
         self,

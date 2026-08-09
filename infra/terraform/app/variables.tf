@@ -63,8 +63,8 @@ variable "llm_provider" {
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "deterministic"], var.llm_provider)
-    error_message = "llm_provider must be gemini or deterministic."
+    condition     = var.llm_provider == "gemini"
+    error_message = "hosted llm_provider must be gemini."
   }
 }
 
@@ -86,6 +86,21 @@ variable "embedding_provider" {
 variable "gemini_embedding_model" {
   type    = string
   default = "gemini-embedding-2"
+}
+
+variable "gemini_embedding_representation" {
+  description = "Candidate-neutral Gemini retrieval representation."
+  type        = string
+  default     = "raw_control"
+
+  validation {
+    condition = contains([
+      "raw_control",
+      "generic_title",
+      "applicability_instruction",
+    ], var.gemini_embedding_representation)
+    error_message = "Gemini embedding representation is not supported."
+  }
 }
 
 variable "reasoning_max_attempts" {

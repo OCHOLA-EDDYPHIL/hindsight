@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
+from hindsight.cloudwatch_diagnostics import optional_cloudwatch_diagnostics_from_env
 from hindsight.consolidation import enqueue_consolidation_job, process_consolidation_job
 from hindsight.embeddings import embedding_provider_from_env
 from hindsight.gemini import GeminiPoolExhaustedError, gemini_pool_from_env
@@ -29,6 +30,7 @@ from hindsight.runs import (
     finish_run_attempt,
     get_run,
     record_run_attempt_failure,
+    reserve_run_budget,
     transition_run_attempt,
 )
 from hindsight.security import safe_error_detail
@@ -192,6 +194,9 @@ def _process_tenant_message(
         raise ValueError("run_id is required")
     if command not in {"start", "resume"}:
         raise ValueError(f"unsupported worker command: {command}")
+    command_generation = message.get("command_generation", 0)
+    if type(command_generation) is not int or command_generation < 0:
+        raise ValueError("command_generation must be a non-negative integer")
 
     settings = runtime_settings()
     db_url = settings.database_url
@@ -200,6 +205,7 @@ def _process_tenant_message(
     claim = claim_run_attempt(
         run_id=run_id,
         command=command,
+        command_generation=command_generation,
         lease_ttl=timedelta(seconds=lease_seconds),
         max_attempts=max_attempts,
         db_url=db_url,
@@ -251,6 +257,16 @@ def _process_tenant_message(
             ]
         if state.get("action_trace"):
             metadata["action_trace"] = state["action_trace"]
+        for key in (
+            "plan_payload",
+            "reasoning_steps",
+            "tool_calls",
+            "observations",
+            "embedding_profile",
+        ):
+            value = state.get(key)
+            if value:
+                metadata[key] = value
         reflected = state.get("reflected_memory") or {}
         if reflected.get("id"):
             fields["reflected_memory_id"] = reflected["id"]
@@ -260,8 +276,27 @@ def _process_tenant_message(
             status=status,
             phase=phase,
             summary=_phase_summary(phase, status),
+            command=command,
             metadata=metadata,
             fields=fields,
+            db_url=db_url,
+        )
+
+    def reserve_model_call() -> int:
+        return reserve_run_budget(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            command=command,
+            budget="model",
+            db_url=db_url,
+        )
+
+    def reserve_diagnostic_call() -> int:
+        return reserve_run_budget(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            command=command,
+            budget="cloudwatch",
             db_url=db_url,
         )
 
@@ -285,6 +320,7 @@ def _process_tenant_message(
             settings.provider_env,
             gemini_pool=gemini_pool,
         )
+        diagnostic_tool = optional_cloudwatch_diagnostics_from_env()
         if command == "start":
             result = run_incident_agent(
                 IncidentInput(
@@ -302,15 +338,27 @@ def _process_tenant_message(
                 db_url=db_url,
                 reasoning_provider=provider,
                 embedding_provider=embedding_provider,
+                diagnostic_tool=diagnostic_tool,
+                initial_model_call_count=int(run.get("model_call_count") or 0),
+                initial_diagnostic_call_count=int(run.get("cloudwatch_call_count") or 0),
+                model_call_reservation=reserve_model_call,
+                diagnostic_call_reservation=reserve_diagnostic_call,
                 progress_callback=progress,
             )
         else:
             result = resume_incident_agent(
                 thread_id=run["thread_id"],
                 approved=bool(message.get("approved")),
+                recommendation_id=str(message.get("recommendation_id") or ""),
+                selection_fingerprint=str(message.get("selection_fingerprint") or ""),
                 db_url=db_url,
                 reasoning_provider=provider,
                 embedding_provider=embedding_provider,
+                diagnostic_tool=diagnostic_tool,
+                model_call_count=int(run.get("model_call_count") or 0),
+                diagnostic_call_count=int(run.get("cloudwatch_call_count") or 0),
+                model_call_reservation=reserve_model_call,
+                diagnostic_call_reservation=reserve_diagnostic_call,
                 progress_callback=progress,
             )
     except Exception as exc:
@@ -328,9 +376,7 @@ def _process_tenant_message(
     if result.interrupted:
         interrupt_value = result.interrupt or {}
         action_trace = (
-            interrupt_value.get("action_trace")
-            if isinstance(interrupt_value, dict)
-            else None
+            interrupt_value.get("action_trace") if isinstance(interrupt_value, dict) else None
         )
         return finish_run_attempt(
             run_id=run_id,
@@ -338,6 +384,7 @@ def _process_tenant_message(
             status="awaiting_approval",
             phase="approval",
             summary="Plan is ready for operator review",
+            command=command,
             fields={
                 "plan": result.plan,
                 "proposed_action": interrupt_value.get("proposed_action")
@@ -349,21 +396,20 @@ def _process_tenant_message(
         )
 
     reasoning = result.state.get("reasoning") or {}
-    approved = bool(result.state.get("action_approved", True))
-    guidance_eligible = bool(result.state.get("guidance_eligible", approved))
-    status = "completed" if approved and guidance_eligible else "rejected"
+    approved = bool(result.state.get("action_approved", False))
+    guidance_eligible = bool(result.state.get("guidance_eligible", False))
+    status = "completed" if approved else "rejected"
     if not approved:
         summary = "Agent recommendation was rejected"
-    elif not guidance_eligible:
-        summary = "Bounded action outcome was rejected"
     else:
-        summary = "Agent run completed"
+        summary = "Agent recommendation was approved and retained as audit-only"
     return finish_run_attempt(
         run_id=run_id,
         attempt_id=attempt_id,
         status=status,
         phase="completion",
         summary=summary,
+        command=command,
         fields={
             "plan": result.plan,
             "proposed_action": result.proposed_action,
@@ -374,7 +420,15 @@ def _process_tenant_message(
             "reflected_memory_id": result.reflected_memory_id,
         },
         metadata=(
-            {"action_trace": result.state["action_trace"]}
+            {
+                "action_trace": result.state["action_trace"],
+                "guidance_eligible": guidance_eligible,
+                "plan_payload": result.state.get("plan_payload") or {},
+                "reasoning_steps": result.state.get("reasoning_steps") or [],
+                "tool_calls": result.state.get("tool_calls") or [],
+                "observations": result.state.get("observations") or [],
+                "embedding_profile": result.state.get("embedding_profile") or {},
+            }
             if result.state.get("action_trace")
             else None
         ),
@@ -387,9 +441,10 @@ def _phase_summary(phase: str, status: str) -> str:
         "triage": "Incident context captured",
         "recall": "Relevant memories recalled",
         "plan": "Agent plan generated",
+        "diagnostic": "Read-only diagnostic started",
         "approval": "Plan is waiting for operator review",
         "action": "Approved bounded action started",
-        "observation": "Bounded action observation recorded",
+        "observation": "Read-only diagnostic observation recorded",
         "reflection": "Outcome reflected into long-term memory",
     }
     return summaries.get(phase, f"Agent run entered {status.replace('_', ' ')}")

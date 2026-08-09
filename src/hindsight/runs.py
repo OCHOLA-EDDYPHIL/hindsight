@@ -29,6 +29,9 @@ RUN_STATUSES = frozenset(
     }
 )
 GET_RUN_READ_ATTEMPTS = 3
+RUN_BUDGET_RESERVATION_ATTEMPTS = 3
+MAX_MODEL_CALLS_PER_RUN = 4
+MAX_CLOUDWATCH_CALLS_PER_RUN = 3
 
 
 class RunConflictError(RuntimeError):
@@ -49,6 +52,10 @@ class RunAttemptBusyError(RuntimeError):
 
 class RunAttemptsExhaustedError(RuntimeError):
     """Raised when a run command has used all durable worker attempts."""
+
+
+class RunBudgetExceededError(RuntimeError):
+    """Raised before an external call would exceed a durable per-run budget."""
 
 
 @dataclass(frozen=True)
@@ -364,7 +371,12 @@ def create_run(
                     cur,
                     run_id=run_id,
                     command="start",
-                    payload={"command": "start", "run_id": str(run_id)},
+                    command_generation=0,
+                    payload={
+                        "command": "start",
+                        "run_id": str(run_id),
+                        "command_generation": 0,
+                    },
                     available_at=dispatch_available_at,
                 )
         return _jsonable(run), True
@@ -411,6 +423,7 @@ def claim_run_attempt(
     *,
     run_id: str | UUID,
     command: str,
+    command_generation: int,
     lease_ttl: timedelta,
     max_attempts: int,
     db_url: str | None = None,
@@ -419,6 +432,8 @@ def claim_run_attempt(
 
     if command not in {"start", "resume"}:
         raise ValueError(f"unsupported worker command: {command}")
+    if type(command_generation) is not int or command_generation < 0:
+        raise ValueError("command_generation must be a non-negative integer")
     if lease_ttl <= timedelta(0):
         raise ValueError("lease_ttl must be positive")
     if max_attempts < 1:
@@ -427,9 +442,7 @@ def claim_run_attempt(
     expected_status = "queued" if command == "start" else "resuming"
     initial_status = "triaging" if command == "start" else "reflecting"
     active_statuses = (
-        {"triaging", "recalling", "planning"}
-        if command == "start"
-        else {"reflecting"}
+        {"triaging", "recalling", "planning"} if command == "start" else {"planning", "reflecting"}
     )
     with connect(db_url, application_name="hindsight-worker") as conn:
         with conn.transaction():
@@ -441,9 +454,14 @@ def claim_run_attempt(
                 if row is None:
                     return RunAttemptClaim("missing", None, None)
                 run = dict(row)
-                same_command = run["worker_attempt_command"] == command
-                count = int(run["worker_attempt_count"] or 0) if same_command else 0
-                active = run["status"] in active_statuses and same_command
+                if int(run.get("command_generation") or 0) != command_generation:
+                    return RunAttemptClaim("duplicate", _jsonable(run), None)
+                same_generation = (
+                    run["worker_attempt_command"] == command
+                    and int(run.get("worker_attempt_generation") or 0) == command_generation
+                )
+                count = int(run["worker_attempt_count"] or 0) if same_generation else 0
+                active = run["status"] in active_statuses and same_generation
                 lease_live = (
                     active
                     and run["worker_attempt_id"] is not None
@@ -472,6 +490,7 @@ def claim_run_attempt(
                             worker_attempt_id = %s,
                             worker_attempt_count = %s,
                             worker_attempt_command = %s,
+                            worker_attempt_generation = %s,
                             worker_attempt_lease_expires_at = now() + %s
                         WHERE id = %s
                         RETURNING *
@@ -481,6 +500,7 @@ def claim_run_attempt(
                         attempt_id,
                         attempt_count,
                         command,
+                        command_generation,
                         lease_ttl,
                         run_id,
                     ),
@@ -559,6 +579,7 @@ def transition_run_attempt(
     status: str,
     phase: str,
     summary: str,
+    command: str,
     metadata: dict[str, Any] | None = None,
     fields: dict[str, Any] | None = None,
     db_url: str | None = None,
@@ -567,15 +588,21 @@ def transition_run_attempt(
 
     if status not in {"triaging", "recalling", "planning", "reflecting"}:
         raise ValueError(f"unsupported active run status: {status}")
-    expected_command = "resume" if status == "reflecting" else "start"
+    if command not in {"start", "resume"}:
+        raise ValueError(f"unsupported run attempt command: {command}")
+    allowed_statuses = (
+        {"triaging", "recalling", "planning"} if command == "start" else {"planning", "reflecting"}
+    )
+    if status not in allowed_statuses:
+        raise ValueError(f"status {status} is not valid for a {command} attempt")
     assignments, values = _run_field_assignments(status=status, fields=fields)
-    values.extend((run_id, attempt_id, expected_command))
+    values.extend((run_id, attempt_id, command))
     with connect(db_url, application_name="hindsight-worker") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     f"""
-                        UPDATE agent_runs SET {', '.join(assignments)}
+                        UPDATE agent_runs SET {", ".join(assignments)}
                         WHERE id = %s
                             AND worker_attempt_id = %s
                             AND worker_attempt_command = %s
@@ -600,6 +627,94 @@ def transition_run_attempt(
                 return _jsonable(dict(row))
 
 
+def reserve_run_budget(
+    *,
+    run_id: str | UUID,
+    attempt_id: str | UUID,
+    command: str,
+    budget: Literal["model", "cloudwatch"],
+    db_url: str | None = None,
+) -> int:
+    """Atomically reserve one external call under the current attempt lease."""
+
+    if command not in {"start", "resume"}:
+        raise ValueError(f"unsupported run attempt command: {command}")
+    budget_columns = {
+        "model": ("model_call_count", MAX_MODEL_CALLS_PER_RUN),
+        "cloudwatch": ("cloudwatch_call_count", MAX_CLOUDWATCH_CALLS_PER_RUN),
+    }
+    try:
+        column, limit = budget_columns[budget]
+    except KeyError as exc:
+        raise ValueError(f"unsupported run budget: {budget}") from exc
+
+    for reservation_attempt in range(RUN_BUDGET_RESERVATION_ATTEMPTS):
+        try:
+            return _reserve_run_budget_once(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                command=command,
+                column=column,
+                limit=limit,
+                budget=budget,
+                db_url=db_url,
+            )
+        except SerializationFailure:
+            if reservation_attempt + 1 == RUN_BUDGET_RESERVATION_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable run budget reservation state")
+
+
+def _reserve_run_budget_once(
+    *,
+    run_id: str | UUID,
+    attempt_id: str | UUID,
+    command: str,
+    column: str,
+    limit: int,
+    budget: str,
+    db_url: str | None,
+) -> int:
+    with connect(db_url, application_name="hindsight-worker") as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                        UPDATE agent_runs
+                        SET {column} = {column} + 1, updated_at = now()
+                        WHERE id = %s
+                            AND worker_attempt_id = %s
+                            AND worker_attempt_command = %s
+                            AND worker_attempt_lease_expires_at > now()
+                            AND {column} < %s
+                        RETURNING {column}
+                    """,
+                    (run_id, attempt_id, command, limit),
+                )
+                reserved = cur.fetchone()
+                if reserved is not None:
+                    return int(reserved[column])
+
+                cur.execute(
+                    "SELECT *, now() AS current_time FROM agent_runs WHERE id = %s",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RunNotFoundError(str(run_id))
+                owns_live_attempt = (
+                    str(row["worker_attempt_id"] or "") == str(attempt_id)
+                    and row["worker_attempt_command"] == command
+                    and row["worker_attempt_lease_expires_at"] is not None
+                    and row["worker_attempt_lease_expires_at"] > row["current_time"]
+                )
+                if owns_live_attempt and int(row[column]) >= limit:
+                    raise RunBudgetExceededError(f"agent run {budget} call budget is exhausted")
+                raise RunAttemptLeaseLostError(
+                    f"agent run attempt lease is no longer current: {run_id}"
+                )
+
+
 def finish_run_attempt(
     *,
     run_id: str | UUID,
@@ -607,6 +722,7 @@ def finish_run_attempt(
     status: str,
     phase: str,
     summary: str,
+    command: str | None = None,
     metadata: dict[str, Any] | None = None,
     fields: dict[str, Any] | None = None,
     db_url: str | None = None,
@@ -615,11 +731,11 @@ def finish_run_attempt(
 
     if status not in {"awaiting_approval", "completed", "rejected"}:
         raise ValueError(f"unsupported attempt finish status: {status}")
-    expected_command = "start" if status == "awaiting_approval" else "resume"
+    expected_command = command or ("start" if status == "awaiting_approval" else "resume")
+    if expected_command not in {"start", "resume"}:
+        raise ValueError(f"unsupported run attempt command: {expected_command}")
     assignments, values = _run_field_assignments(status=status, fields=fields)
-    assignments.extend(
-        ["worker_attempt_id = NULL", "worker_attempt_lease_expires_at = NULL"]
-    )
+    assignments.extend(["worker_attempt_id = NULL", "worker_attempt_lease_expires_at = NULL"])
     if status in TERMINAL_RUN_STATUSES:
         assignments.append("completed_at = now()")
     values.extend((run_id, attempt_id, expected_command))
@@ -628,7 +744,7 @@ def finish_run_attempt(
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     f"""
-                        UPDATE agent_runs SET {', '.join(assignments)}
+                        UPDATE agent_runs SET {", ".join(assignments)}
                         WHERE id = %s
                             AND worker_attempt_id = %s
                             AND worker_attempt_command = %s
@@ -767,31 +883,61 @@ def prepare_approval(
     *,
     run_id: str | UUID,
     approved: bool,
+    recommendation_id: str,
+    selection_fingerprint: str,
     db_url: str | None = None,
 ) -> dict[str, Any]:
-    """Move an interrupted run into the resuming queue exactly once."""
+    """Resume exactly the recommendation and memory selection shown to the operator."""
 
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
+                    "SELECT * FROM agent_runs WHERE id = %s FOR UPDATE",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RunNotFoundError(str(run_id))
+                if row["status"] != "awaiting_approval":
+                    raise RunConflictError(f"run {run_id} cannot be approved from {row['status']}")
+                cur.execute(
+                    """
+                        SELECT metadata
+                        FROM agent_run_events
+                        WHERE run_id = %s AND status = 'awaiting_approval'
+                        ORDER BY sequence DESC
+                        LIMIT 1
+                    """,
+                    (run_id,),
+                )
+                event = cur.fetchone()
+                metadata = dict(event["metadata"] or {}) if event is not None else {}
+                action_trace = metadata.get("action_trace") or {}
+                expected_recommendation_id = str(
+                    (action_trace.get("recommendation") or {}).get("id") or ""
+                )
+                expected_selection_fingerprint = str(
+                    (action_trace.get("selection") or {}).get("fingerprint") or ""
+                )
+                if not expected_recommendation_id or not expected_selection_fingerprint:
+                    raise RunConflictError("run has no approval-bound recommendation")
+                if recommendation_id != expected_recommendation_id:
+                    raise RunConflictError("recommendation changed before approval")
+                if selection_fingerprint != expected_selection_fingerprint:
+                    raise RunConflictError("memory selection changed before approval")
+                cur.execute(
                     """
                         UPDATE agent_runs
-                        SET status = 'resuming', action_approved = %s, updated_at = now()
-                        WHERE id = %s AND status = 'awaiting_approval'
+                        SET status = 'resuming', action_approved = %s,
+                            command_generation = command_generation + 1,
+                            updated_at = now()
+                        WHERE id = %s
                         RETURNING *
                     """,
                     (approved, run_id),
                 )
                 row = cur.fetchone()
-                if row is None:
-                    cur.execute("SELECT status FROM agent_runs WHERE id = %s", (run_id,))
-                    current = cur.fetchone()
-                    if current is None:
-                        raise RunNotFoundError(str(run_id))
-                    raise RunConflictError(
-                        f"run {run_id} cannot be approved from {current['status']}"
-                    )
                 _append_event_with_cursor(
                     cur,
                     run_id=run_id,
@@ -800,13 +946,25 @@ def prepare_approval(
                     summary="Operator approved the proposed action"
                     if approved
                     else "Operator rejected the proposed action",
-                    metadata={"approved": approved},
+                    metadata={
+                        "approved": approved,
+                        "recommendation_id": recommendation_id,
+                        "selection_fingerprint": selection_fingerprint,
+                    },
                 )
                 _append_dispatch_with_cursor(
                     cur,
                     run_id=run_id,
                     command="resume",
-                    payload={"command": "resume", "run_id": str(run_id), "approved": approved},
+                    command_generation=int(row["command_generation"]),
+                    payload={
+                        "command": "resume",
+                        "run_id": str(run_id),
+                        "command_generation": int(row["command_generation"]),
+                        "approved": approved,
+                        "recommendation_id": recommendation_id,
+                        "selection_fingerprint": selection_fingerprint,
+                    },
                 )
                 return _jsonable(dict(row))
 
@@ -842,15 +1000,18 @@ def _append_dispatch_with_cursor(
     *,
     run_id: str | UUID,
     command: str,
+    command_generation: int,
     payload: dict[str, Any],
     available_at: datetime | None = None,
 ) -> None:
     cur.execute(
         """
-            INSERT INTO agent_run_dispatches (run_id, command, payload, available_at)
-            VALUES (%s, %s, %s, COALESCE(%s, now()))
+            INSERT INTO agent_run_dispatches (
+                run_id, command, command_generation, payload, available_at
+            )
+            VALUES (%s, %s, %s, %s, COALESCE(%s, now()))
         """,
-        (run_id, command, Jsonb(payload), available_at),
+        (run_id, command, command_generation, Jsonb(payload), available_at),
     )
 
 

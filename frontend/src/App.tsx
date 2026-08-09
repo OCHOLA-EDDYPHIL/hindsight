@@ -80,6 +80,7 @@ export default function App() {
           incidentInput={cockpit.incidentInput}
           busy={cockpit.busy}
           rewindAnchor={cockpit.rewindAnchor}
+          scenario={cockpit.scenario}
           snapshot={cockpit.snapshot}
           rewindTimestamp={cockpit.rewindTimestamp}
           rewindReason={cockpit.rewindReason}

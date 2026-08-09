@@ -11,7 +11,7 @@ requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DAT
 @requires_db
 def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.trace_contract import decision_influence, governed_decision_trace
 
@@ -145,6 +145,7 @@ def test_explicit_signature_scenario_returns_partial_identity_state():
     assert scenario["operation"] is None
     assert scenario["stages"] == {
         "baseline_memory_id": None,
+        "compromised_memory_id": None,
         "poison_memory_id": None,
         "influenced_decision_id": None,
         "rewind_operation_id": None,
@@ -163,7 +164,7 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
         reset_poison_rewind_state,
         seed_good_demo_memory,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
     from hindsight.runs import create_run
     from hindsight.trace_contract import signature_scenario_trace
@@ -371,6 +372,7 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert default["namespace"] == namespace
     assert default["incident"]["slug"] == incident["slug"]
     assert default["stages"]["baseline_memory_id"] == seed["id"]
+    assert default["stages"]["compromised_memory_id"] == poison["id"]
     assert default["stages"]["poison_memory_id"] == poison["id"]
     assert default["stages"]["influenced_decision_id"] == bad["decision_id"]
     assert default["stages"]["rewind_operation_id"] == operation
@@ -384,9 +386,9 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     poison_read = next(
         read for read in bad_trace["trace"]["reads"] if str(read["memory_id"]) == str(poison["id"])
     )
-    assert poison_read["writer"] == "demo.poison"
-    assert poison_read["source_ref"] == "demo:simulated-memory-poisoning"
-    assert "applicability is stale" in poison_read["justification"]
+    assert poison_read["writer"] == "demo.fixture-import"
+    assert poison_read["source_ref"] == "demo:stale-runbook-import"
+    assert "previously approved payment runbook" in poison_read["justification"]
     assert corrected_trace["action_trace"]["score"] == {
         "recovered": True,
         "unsafe_action_count": 0,
@@ -427,10 +429,10 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
         read
         for run in public.json()["runs"]
         for read in (run.get("trace") or {}).get("reads", [])
-        if read.get("writer") == "demo.poison"
+        if read.get("writer") == "demo.fixture-import"
     )
-    assert public_poison_read["source_ref"] == "demo:simulated-memory-poisoning"
-    assert "applicability is stale" in public_poison_read["justification"]
+    assert public_poison_read["source_ref"] == "demo:stale-runbook-import"
+    assert "previously approved payment runbook" in public_poison_read["justification"]
     deep_link = client.get(f"/v1/signature-scenarios/{default['scenario_id']}")
     assert deep_link.status_code == 200
     assert deep_link.json()["namespace"] == namespace

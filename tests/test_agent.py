@@ -10,9 +10,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
-requires_db = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
-)
+requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CHECKPOINT_QUERY = ROOT / "queries" / "agent_checkpoint_rows.sql"
@@ -95,66 +93,42 @@ def test_reasoning_prompt_uses_typed_governance_envelopes():
     assert '"evidence_quality": "resolved_incident"' in prompt
 
 
-def test_signature_action_request_is_memory_causal_and_executes_only_when_called():
-    from hindsight.agent import (
-        _bounded_action_request,
-        _execute_bounded_action,
-        _guidance_eligible,
-        _signature_actions,
-    )
-    from hindsight.simulator import DeterministicIncidentSimulator
+def test_diagnostic_action_is_selected_only_by_structured_model_output():
+    from hindsight.agent import _generate_agent_decision
+    from tests.fakes import DeterministicReasoningProvider, diagnostic_decision
 
-    base = {
+    state = {
         "run_id": "run-1",
+        "decision_id": "decision-1",
         "namespace": "live-browser:isolated-tenant",
         "incident_id": "demo-payments-checkout-latency:isolated-tenant",
+        "user_input": "checkout latency is elevated",
+        "recalled_memories": [
+            {
+                "id": "memory-1",
+                "metadata": {"scenario_role": "compromised_guidance"},
+            }
+        ],
+        "model_turn_count": 0,
+        "diagnostic_call_count": 0,
     }
-    corrected_state = {**base, "recalled_memories": []}
-    poisoned_state = {
-        **base,
-        "recalled_memories": [{"metadata": {"role": "poison"}}],
-    }
-    corrected_actions = _signature_actions(corrected_state)
-    poisoned_actions = _signature_actions(poisoned_state)
-    unrelated_actions = _signature_actions(
-        {
-            **poisoned_state,
-            "incident_id": "unrelated-checkout-latency",
-        }
-    )
-    pending = _bounded_action_request(
-        corrected_state,
-        actions=corrected_actions,
-        tool_name="deterministic_incident_simulator",
-    )
-    corrected = _execute_bounded_action(
-        corrected_state,
-        actions=corrected_actions,
-        trace=pending,
-        tool=DeterministicIncidentSimulator(),
-    )
-    poisoned = _execute_bounded_action(
-        poisoned_state,
-        actions=poisoned_actions,
-        trace=_bounded_action_request(
-            poisoned_state,
-            actions=poisoned_actions,
-            tool_name="deterministic_incident_simulator",
-        ),
-        tool=DeterministicIncidentSimulator(),
+    provider = DeterministicReasoningProvider(
+        response_text=diagnostic_decision("payments.checkout_latency_ms")
     )
 
-    assert "score" not in pending
-    assert corrected["request"]["actions"] == [
-        "inspect_dependency",
-        "throttle_retries",
-    ]
-    assert corrected["score"] == {"recovered": True, "unsafe_action_count": 0}
-    assert poisoned["request"]["actions"] == ["scale_workers"]
-    assert unrelated_actions == ()
-    assert poisoned["score"] == {"recovered": False, "unsafe_action_count": 1}
-    assert _guidance_eligible(action_approved=True, action_trace=corrected)
-    assert not _guidance_eligible(action_approved=True, action_trace=poisoned)
+    decision, response, turns = _generate_agent_decision(
+        state,
+        provider=provider,
+        allowed_query_keys={"payments.checkout_latency_ms"},
+    )
+
+    assert decision.next_step_kind == "diagnostic_tool"
+    assert decision.tool_call is not None
+    assert decision.tool_call.query_key == "payments.checkout_latency_ms"
+    assert response.provider == "test_deterministic"
+    assert turns == 1
+    assert provider.requests[0].response_json_schema is not None
+    assert "role" not in provider.requests[0].prompt
 
 
 def test_review_required_memory_cannot_claim_positive_guidance():
@@ -175,9 +149,473 @@ def test_review_required_memory_cannot_claim_positive_guidance():
     assert envelope["usage_instruction"] == "audit_only"
 
 
+def test_reflection_marks_only_cited_recalled_memories_as_causal(monkeypatch):
+    import hindsight.agent as agent
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        DeterministicReasoningProvider,
+        recommendation_decision,
+    )
+
+    captured = {}
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    class FakeMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def remember_agent_reflection(self, **kwargs):
+            captured.update(kwargs)
+            return {"id": "reflection-1", "belief_id": "belief-1"}
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(
+        agent,
+        "_recall_for_state",
+        lambda *_args, **_kwargs: {
+            "recalled_memories": [
+                {"id": "memory-cited", "content": "Inspect processor saturation first."},
+                {"id": "memory-context", "content": "Check unrelated cache pressure."},
+            ],
+            "retrieval_id": "retrieval-1",
+            "selection_namespace_revision": 2,
+        },
+    )
+    monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
+    provider = DeterministicReasoningProvider(
+        response_text=recommendation_decision(
+            citations=[
+                {
+                    "memory_id": "memory-cited",
+                    "quote": "Inspect processor saturation first.",
+                }
+            ]
+        )
+    )
+
+    agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=provider,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ).compile().invoke(
+        {
+            "run_id": "run-1",
+            "thread_id": "thread-1",
+            "incident_id": "incident-1",
+            "namespace": "namespace-1",
+            "user_input": "checkout latency is above SLO",
+            "metadata": {},
+            "pause_before_act": False,
+            "decision_id": "decision-1",
+            "reasoning_steps": [],
+            "model_turn_count": 0,
+            "tool_calls": [],
+            "observations": [],
+            "diagnostic_call_count": 0,
+        }
+    )
+
+    assert captured["parent_memory_ids"] == ["memory-cited"]
+    assert captured["structured_payload"]["recalled_memory_ids"] == [
+        "memory-cited",
+        "memory-context",
+    ]
+    assert captured["structured_payload"]["cited_memory_ids"] == ["memory-cited"]
+
+
+def test_graph_records_cloudwatch_result_then_replans_to_recommendation(monkeypatch):
+    import hindsight.agent as agent
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        FakeCloudWatchDiagnostics,
+        SequencedReasoningProvider,
+        diagnostic_decision,
+        recommendation_decision,
+    )
+
+    class FakeHistory:
+        def __init__(self):
+            self.messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    class FakeMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def remember_agent_reflection(self, **_kwargs):
+            return {"id": "reflection-1", "belief_id": "belief-1"}
+
+    history = FakeHistory()
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: history)
+    monkeypatch.setattr(
+        agent,
+        "_recall_for_state",
+        lambda *_args, **_kwargs: {"recalled_memories": [], "retrieval_id": "retrieval-1"},
+    )
+    monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
+    reasoning = SequencedReasoningProvider(
+        [
+            diagnostic_decision("payments.checkout_latency_ms"),
+            recommendation_decision("Throttle retry fanout after dependency inspection."),
+        ]
+    )
+    diagnostics = FakeCloudWatchDiagnostics(
+        {
+            "payments.checkout_latency_ms": {
+                "schema_version": 1,
+                "tool": "aws_cloudwatch_diagnostics",
+                "query_key": "payments.checkout_latency_ms",
+                "datapoints": [{"timestamp": "2026-08-09T12:00:00Z", "value": 842.5}],
+                "datapoint_count": 1,
+            },
+        }
+    )
+    model_reservations = iter((1, 2))
+    diagnostic_reservations = iter((1,))
+    progress = []
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+        diagnostic_tool=diagnostics,
+        model_call_reservation=lambda: next(model_reservations),
+        diagnostic_call_reservation=lambda: next(diagnostic_reservations),
+        progress_callback=lambda phase, status, _state: progress.append((phase, status)),
+    ).compile()
+
+    state = graph.invoke(
+        {
+            "run_id": "run-1",
+            "thread_id": "thread-1",
+            "incident_id": "incident-1",
+            "namespace": "namespace-1",
+            "service_slug": "payments-api",
+            "user_input": "checkout latency is above SLO",
+            "metadata": {},
+            "pause_before_act": False,
+            "decision_id": "decision-1",
+            "reasoning_steps": [],
+            "model_turn_count": 0,
+            "tool_calls": [],
+            "observations": [],
+            "diagnostic_call_count": 0,
+        }
+    )
+
+    assert diagnostics.calls == ["payments.checkout_latency_ms"]
+    assert state["model_turn_count"] == 2
+    assert state["diagnostic_call_count"] == 1
+    assert ("diagnostic", "planning") in progress
+    assert state["plan_payload"]["next_step_kind"] == "recommendation"
+    assert state["action_trace"]["mode"] == "recommendation_only"
+    assert state["action_trace"]["tool_calls"][0]["status"] == "completed"
+    assert state["action_trace"]["observations"][0]["status"] == "available"
+    assert state["action_trace"]["observations"][0]["datapoint_count"] == 1
+    assert state["action_approved"] is False
+    assert state["guidance_eligible"] is False
+    assert state["reflected_memory"]["id"] == "reflection-1"
+    assert "842.5" in reasoning.requests[1].prompt
+
+
+def test_unavailable_cloudwatch_result_cannot_authorize_a_recommendation(monkeypatch):
+    import hindsight.agent as agent
+    from hindsight.cloudwatch_diagnostics import CloudWatchDiagnosticsUnavailableError
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        FakeCloudWatchDiagnostics,
+        SequencedReasoningProvider,
+        diagnostic_decision,
+        recommendation_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(
+        agent,
+        "_recall_for_state",
+        lambda *_args, **_kwargs: {"recalled_memories": [], "retrieval_id": "retrieval-1"},
+    )
+    reasoning = SequencedReasoningProvider(
+        [
+            diagnostic_decision("payments.checkout_latency_ms"),
+            recommendation_decision(),
+            recommendation_decision(),
+        ]
+    )
+    diagnostics = FakeCloudWatchDiagnostics(
+        {
+            "payments.checkout_latency_ms": CloudWatchDiagnosticsUnavailableError(
+                "cloudwatch_timeout",
+                "CloudWatch diagnostics request timed out or could not connect",
+            )
+        }
+    )
+    model_reservations = iter((1, 2, 3))
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+        diagnostic_tool=diagnostics,
+        model_call_reservation=lambda: next(model_reservations),
+        diagnostic_call_reservation=lambda: 1,
+    ).compile()
+
+    with pytest.raises(agent.AgentDecisionError, match="valid bounded decision"):
+        graph.invoke(
+            {
+                "run_id": "run-1",
+                "thread_id": "thread-1",
+                "incident_id": "incident-1",
+                "namespace": "namespace-1",
+                "user_input": "checkout latency is above SLO",
+                "metadata": {},
+                "pause_before_act": False,
+                "decision_id": "decision-1",
+                "reasoning_steps": [],
+                "model_turn_count": 0,
+                "tool_calls": [],
+                "observations": [],
+                "diagnostic_call_count": 0,
+            }
+        )
+
+    assert diagnostics.calls == ["payments.checkout_latency_ms"]
+    assert "cloudwatch_timeout" in reasoning.requests[1].prompt
+
+
+def test_concurrent_memory_change_invalidates_approval_and_forces_replan(monkeypatch):
+    import hindsight.agent as agent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.types import Command
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        SequencedReasoningProvider,
+        recommendation_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    selections = [
+        [{"id": "memory-v1", "belief_id": "belief-1", "version_number": 1}],
+        [{"id": "memory-v2", "belief_id": "belief-1", "version_number": 2}],
+    ]
+
+    def fake_recall(*_args, **_kwargs):
+        return {
+            "recalled_memories": selections.pop(0),
+            "retrieval_id": f"retrieval-{2 - len(selections)}",
+        }
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(agent, "_recall_for_state", fake_recall)
+    reasoning = SequencedReasoningProvider(
+        [
+            recommendation_decision("Apply the first bounded recommendation."),
+            recommendation_decision("Apply the replanned bounded recommendation."),
+        ]
+    )
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ).compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-stale"}}
+    initial = graph.invoke(
+        {
+            "run_id": "run-stale",
+            "thread_id": "thread-stale",
+            "incident_id": "incident-stale",
+            "namespace": "namespace-stale",
+            "service_slug": "payments-api",
+            "user_input": "checkout latency is above SLO",
+            "metadata": {},
+            "pause_before_act": True,
+            "decision_id": "decision-stale",
+            "reasoning_steps": [],
+            "model_turn_count": 0,
+            "tool_calls": [],
+            "observations": [],
+            "diagnostic_call_count": 0,
+        },
+        config,
+    )
+    first_interrupt = initial["__interrupt__"][0].value
+
+    replanned = graph.invoke(
+        Command(
+            resume={
+                "approved": True,
+                "recommendation_id": first_interrupt["recommendation_id"],
+                "selection_fingerprint": first_interrupt["selection_fingerprint"],
+            }
+        ),
+        config,
+    )
+    second_interrupt = replanned["__interrupt__"][0].value
+
+    assert len(reasoning.requests) == 2
+    assert replanned["model_turn_count"] == 2
+    assert second_interrupt["recommendation_id"] != first_interrupt["recommendation_id"]
+    assert second_interrupt["selection_fingerprint"] != first_interrupt["selection_fingerprint"]
+    assert "replanned" in second_interrupt["proposed_action"].lower()
+
+
+def test_memory_change_during_reflection_rolls_back_and_forces_replan(monkeypatch):
+    import hindsight.agent as agent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.types import Command
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        SequencedReasoningProvider,
+        recommendation_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    class ChangedMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def remember_agent_reflection(self, **_kwargs):
+            raise agent.MemorySelectionChangedError("memory selection changed before reflection")
+
+    selections = [
+        {
+            "recalled_memories": [
+                {"id": "memory-v1", "belief_id": "belief-1", "version_number": 1}
+            ],
+            "retrieval_id": "retrieval-initial",
+            "selection_namespace_revision": 1,
+        },
+        {
+            "recalled_memories": [
+                {"id": "memory-v1", "belief_id": "belief-1", "version_number": 1}
+            ],
+            "retrieval_id": "retrieval-approval",
+            "selection_namespace_revision": 1,
+        },
+        {
+            "recalled_memories": [
+                {"id": "memory-v2", "belief_id": "belief-1", "version_number": 2}
+            ],
+            "retrieval_id": "retrieval-reflection-conflict",
+            "selection_namespace_revision": 2,
+        },
+    ]
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(agent, "_recall_for_state", lambda *_args, **_kwargs: selections.pop(0))
+    monkeypatch.setattr(agent, "MemoryStore", ChangedMemoryStore)
+    reasoning = SequencedReasoningProvider(
+        [
+            recommendation_decision("Apply the approval-bound recommendation."),
+            recommendation_decision("Apply the transactionally replanned recommendation."),
+        ]
+    )
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ).compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-reflection-race"}}
+    initial = graph.invoke(
+        {
+            "run_id": "run-reflection-race",
+            "thread_id": "thread-reflection-race",
+            "incident_id": "incident-reflection-race",
+            "namespace": "namespace-reflection-race",
+            "service_slug": "payments-api",
+            "user_input": "checkout latency is above SLO",
+            "metadata": {},
+            "pause_before_act": True,
+            "decision_id": "decision-reflection-race",
+            "reasoning_steps": [],
+            "model_turn_count": 0,
+            "tool_calls": [],
+            "observations": [],
+            "diagnostic_call_count": 0,
+        },
+        config,
+    )
+    first_interrupt = initial["__interrupt__"][0].value
+
+    replanned = graph.invoke(
+        Command(
+            resume={
+                "approved": True,
+                "recommendation_id": first_interrupt["recommendation_id"],
+                "selection_fingerprint": first_interrupt["selection_fingerprint"],
+            }
+        ),
+        config,
+    )
+    second_interrupt = replanned["__interrupt__"][0].value
+
+    assert selections == []
+    assert len(reasoning.requests) == 2
+    assert replanned["model_turn_count"] == 2
+    assert second_interrupt["recommendation_id"] != first_interrupt["recommendation_id"]
+    assert second_interrupt["selection_fingerprint"] != first_interrupt["selection_fingerprint"]
+    assert "transactionally replanned" in second_interrupt["proposed_action"].lower()
+    assert replanned.get("reflected_memory") is None
+
+
 def test_recall_does_not_silently_fall_back_after_vector_error(monkeypatch):
     import hindsight.agent as agent
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
 
     calls = []
 
@@ -194,6 +632,9 @@ def test_recall_does_not_silently_fall_back_after_vector_error(monkeypatch):
 
         def retrieve_semantic(self, **kwargs):
             raise RuntimeError("semantic_memory_embeddings is missing")
+
+        def namespace_revision(self, **_kwargs):
+            return 0
 
     monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
 
@@ -288,8 +729,7 @@ def test_start_reports_uninitialized_storage_without_creating_it():
         IncidentInput,
         run_incident_agent,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import DeterministicEmbeddingProvider, DeterministicReasoningProvider
 
     database_name = f"hindsight_agent_missing_{uuid4().hex}"
     target_url = _create_database(database_name)
@@ -337,8 +777,7 @@ def test_sync_agent_entrypoint_rejects_running_event_loop():
 
 def test_async_run_incident_agent_wraps_sync_graph(monkeypatch):
     import hindsight.agent as agent
-    from hindsight.embeddings import DeterministicEmbeddingProvider
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import DeterministicEmbeddingProvider, DeterministicReasoningProvider
 
     calls = []
     reasoning_provider = DeterministicReasoningProvider(response_text="plan")
@@ -385,15 +824,16 @@ def test_async_run_incident_agent_wraps_sync_graph(monkeypatch):
         "db_url": "postgresql://db",
         "reasoning_provider": reasoning_provider,
         "embedding_provider": embedding_provider,
-        "action_tool": None,
+        "diagnostic_tool": None,
+        "model_call_reservation": None,
+        "diagnostic_call_reservation": None,
         "progress_callback": None,
     }
 
 
 def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
     import hindsight.agent as agent
-    from hindsight.embeddings import DeterministicEmbeddingProvider
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import DeterministicEmbeddingProvider, DeterministicReasoningProvider
 
     calls = []
     reasoning_provider = DeterministicReasoningProvider(response_text="plan")
@@ -413,6 +853,8 @@ def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
         return await agent.resume_incident_agent_async(
             thread_id="thread-2",
             approved=False,
+            recommendation_id=f"recommendation:{'a' * 64}",
+            selection_fingerprint="b" * 64,
             db_url="postgresql://db",
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
@@ -424,13 +866,19 @@ def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
     assert result.proposed_action == "hold change"
     assert result.reflected_memory_id == "memory-2"
     command, kwargs = calls[0]
-    assert command.resume is False
+    assert command.resume == {
+        "approved": False,
+        "recommendation_id": f"recommendation:{'a' * 64}",
+        "selection_fingerprint": "b" * 64,
+    }
     assert kwargs == {
         "thread_id": "thread-2",
         "db_url": "postgresql://db",
         "reasoning_provider": reasoning_provider,
         "embedding_provider": embedding_provider,
-        "action_tool": None,
+        "diagnostic_tool": None,
+        "model_call_reservation": None,
+        "diagnostic_call_reservation": None,
         "progress_callback": None,
     }
 
@@ -439,8 +887,11 @@ def test_async_resume_incident_agent_wraps_sync_graph(monkeypatch):
 def test_incident_graph_checkpoints_and_reflects_to_memory():
     from hindsight.agent import IncidentInput, run_incident_agent
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        DeterministicReasoningProvider,
+        recommendation_decision,
+    )
 
     thread_id = f"agent-{uuid4()}"
     result = run_incident_agent(
@@ -454,13 +905,15 @@ def test_incident_graph_checkpoints_and_reflects_to_memory():
         ),
         thread_id=thread_id,
         reasoning_provider=DeterministicReasoningProvider(
-            response_text="throttle retry fanout, check processor latency, watch checkout SLO"
+            response_text=recommendation_decision(
+                "Throttle retry fanout, check processor latency, and watch checkout SLO."
+            )
         ),
         embedding_provider=DeterministicEmbeddingProvider(),
     )
 
     assert not result.interrupted
-    assert result.plan == "throttle retry fanout, check processor latency, watch checkout SLO"
+    assert "Throttle retry fanout" in result.plan
     assert result.proposed_action is not None
     assert result.reflected_memory_id is not None
 
@@ -550,8 +1003,11 @@ def test_reflection_projection_failure_rolls_back_semantic_output(monkeypatch):
 def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
     from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        DeterministicReasoningProvider,
+        recommendation_decision,
+    )
 
     thread_id = f"agent-resume-{uuid4()}"
     incident = IncidentInput(
@@ -562,13 +1018,16 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
         severity="sev2",
         title="Search error spike",
     )
+    reasoning_provider = DeterministicReasoningProvider(
+        response_text=recommendation_decision(
+            "Roll back the deploy candidate and verify error rate."
+        )
+    )
     first = run_incident_agent(
         incident,
         thread_id=thread_id,
         pause_before_act=True,
-        reasoning_provider=DeterministicReasoningProvider(
-            response_text="roll back the deploy candidate and verify error rate"
-        ),
+        reasoning_provider=reasoning_provider,
         embedding_provider=DeterministicEmbeddingProvider(),
     )
 
@@ -579,6 +1038,9 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
     resumed = resume_incident_agent(
         thread_id=thread_id,
         approved=True,
+        recommendation_id=first.interrupt["recommendation_id"],
+        selection_fingerprint=first.interrupt["selection_fingerprint"],
+        reasoning_provider=reasoning_provider,
         embedding_provider=DeterministicEmbeddingProvider(),
     )
 
@@ -596,29 +1058,27 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
 
     assert len(checkpoint_rows) >= 2
     assert [row[1] for row in chat_rows] == ["human", "ai"]
-    assert "roll back the deploy candidate" in chat_rows[1][2]
-    assert reflected_trust == ("active",)
+    assert "Roll back the deploy candidate" in chat_rows[1][2]
+    assert reflected_trust == ("review_required",)
 
 
 @requires_db
 def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
     from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import DeterministicReasoningProvider, recommendation_decision
 
     thread_id = f"agent-rejected-{uuid4()}"
     namespace = f"demo:payments-poison-rewind:rejected:{uuid4()}"
     provider = DeterministicEmbeddingProvider()
 
-    class RejectIfExecuted:
-        name = "reject_if_executed"
-
-        def execute(self, _request):
-            raise AssertionError("rejected action must not execute")
-
-    action_tool = RejectIfExecuted()
+    reasoning_provider = DeterministicReasoningProvider(
+        response_text=recommendation_decision(
+            "Roll back the deploy candidate and verify error rate."
+        )
+    )
     first = run_incident_agent(
         IncidentInput(
             user_input="search-api error rate spiked after the deploy",
@@ -628,19 +1088,18 @@ def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
         ),
         thread_id=thread_id,
         pause_before_act=True,
-        reasoning_provider=DeterministicReasoningProvider(
-            response_text="roll back the deploy candidate and verify error rate"
-        ),
+        reasoning_provider=reasoning_provider,
         embedding_provider=provider,
-        action_tool=action_tool,
     )
     assert first.interrupted
 
     rejected = resume_incident_agent(
         thread_id=thread_id,
         approved=False,
+        recommendation_id=first.interrupt["recommendation_id"],
+        selection_fingerprint=first.interrupt["selection_fingerprint"],
+        reasoning_provider=reasoning_provider,
         embedding_provider=provider,
-        action_tool=action_tool,
     )
     memory_id = str(rejected.reflected_memory_id)
     with MemoryStore(url=database_url(), embedding_provider=provider) as store:
@@ -657,7 +1116,7 @@ def test_rejected_reflection_is_auditable_but_not_positive_retrieval():
     assert audit["trust_status"] == "review_required"
     assert audit["structured_payload"]["action_approved"] is False
     assert rejected.state["action_trace"]["execution"]["status"] == "not_executed"
-    assert "observations" not in rejected.state.get("action_trace", {})
+    assert rejected.state["action_trace"]["observations"] == []
     assert memory_id not in {str(hit["id"]) for hit in result.hits}
 
 
@@ -670,8 +1129,11 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
         run_incident_agent,
         setup_agent_storage,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider
-    from hindsight.reasoning import DeterministicReasoningProvider
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        DeterministicReasoningProvider,
+        recommendation_decision,
+    )
 
     database_name = f"hindsight_agent_runtime_{uuid4().hex}"
     role_name = f"agent_runtime_{uuid4().hex}"
@@ -689,9 +1151,7 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
             conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role_name)))
             conn.execute((ROOT / "infra/db/roles.sql").read_text())
             conn.execute(
-                sql.SQL("GRANT hindsight_memory_worker TO {}").format(
-                    sql.Identifier(role_name)
-                )
+                sql.SQL("GRANT hindsight_memory_worker TO {}").format(sql.Identifier(role_name))
             )
             conn.execute(
                 sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
@@ -709,6 +1169,11 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
                 runtime_conn.execute("DELETE FROM semantic_memories WHERE false")
 
         thread_id = f"restricted-role-{uuid4()}"
+        reasoning_provider = DeterministicReasoningProvider(
+            response_text=recommendation_decision(
+                "Roll back the deploy candidate and verify error rate."
+            )
+        )
         first = run_incident_agent(
             IncidentInput(
                 user_input="search-api error rate spiked after the deploy",
@@ -721,9 +1186,7 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
             thread_id=thread_id,
             pause_before_act=True,
             db_url=runtime_url,
-            reasoning_provider=DeterministicReasoningProvider(
-                response_text="roll back the deploy candidate and verify error rate"
-            ),
+            reasoning_provider=reasoning_provider,
             embedding_provider=DeterministicEmbeddingProvider(),
         )
         assert first.interrupted
@@ -731,7 +1194,10 @@ def test_preinitialized_agent_storage_supports_start_and_resume_without_create_p
         resumed = resume_incident_agent(
             thread_id=thread_id,
             approved=True,
+            recommendation_id=first.interrupt["recommendation_id"],
+            selection_fingerprint=first.interrupt["selection_fingerprint"],
             db_url=runtime_url,
+            reasoning_provider=reasoning_provider,
             embedding_provider=DeterministicEmbeddingProvider(),
         )
         assert not resumed.interrupted
