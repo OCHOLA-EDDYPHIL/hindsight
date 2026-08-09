@@ -142,6 +142,27 @@ def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch)
     ]
 
 
+def test_recovery_initializes_agent_storage_as_part_of_the_backup_fixture(monkeypatch):
+    drill = _module()
+    calls = []
+    monkeypatch.setattr(
+        drill,
+        "_run_repository_script",
+        lambda script, args, **kwargs: calls.append((script, args, kwargs)),
+    )
+    deadline = drill.Deadline.after(60)
+
+    drill._initialize_agent_storage("postgresql://fixture", deadline)
+
+    assert calls == [
+        (
+            "initialize_agent_storage.py",
+            [],
+            {"database_url": "postgresql://fixture", "deadline": deadline},
+        )
+    ]
+
+
 def test_clean_start_collision_never_deletes_unowned_resources(monkeypatch, tmp_path: Path):
     drill = _module()
     output = tmp_path / "evidence.json"

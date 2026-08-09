@@ -221,6 +221,15 @@ def _apply_all_migrations(database_url: str, deadline: Deadline) -> None:
     _run_repository_script("migrate.py", [], database_url=database_url, deadline=deadline)
 
 
+def _initialize_agent_storage(database_url: str, deadline: Deadline) -> None:
+    _run_repository_script(
+        "initialize_agent_storage.py",
+        [],
+        database_url=database_url,
+        deadline=deadline,
+    )
+
+
 def _schema_manifest(database_url: str, deadline: Deadline) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="hindsight-recovery-schema-") as directory:
         output = Path(directory) / "schema.json"
@@ -546,6 +555,8 @@ def run_drill(
         _apply_all_migrations(source_url, deadline)
         timeline["migrations_completed_at"] = _timestamp(_utc_now())
         evidence["migrations"] = _migration_summary(source_url, deadline)
+        _initialize_agent_storage(source_url, deadline)
+        timeline["agent_storage_initialized_at"] = _timestamp(_utc_now())
 
         pre_payload = f"pre-backup:{run_id}:{source_sha}"
         pre_marker_at = _insert_marker(source_url, PRE_BACKUP_MARKER_KEY, pre_payload, deadline)
