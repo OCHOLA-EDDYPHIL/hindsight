@@ -6,8 +6,10 @@
 ALTER TABLE agent_run_dispatches
     ADD COLUMN IF NOT EXISTS command_generation INT8 NOT NULL DEFAULT 0;
 
-ALTER TABLE agent_run_dispatches
-    DROP CONSTRAINT IF EXISTS agent_run_dispatches_run_id_command_key;
+-- CockroachDB represents this UNIQUE constraint as an index and does not
+-- implement ALTER TABLE DROP CONSTRAINT for it.
+DROP INDEX IF EXISTS
+    agent_run_dispatches@agent_run_dispatches_run_id_command_key CASCADE;
 
 ALTER TABLE agent_run_dispatches
     ADD CONSTRAINT agent_run_dispatches_run_command_generation_key
