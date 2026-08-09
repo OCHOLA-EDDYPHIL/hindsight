@@ -68,6 +68,7 @@ from hindsight.snapshots import memory_snapshot
 from hindsight.tenant import current_tenant_id, tenant_scope
 from hindsight.runs import (
     RunConflictError,
+    RunIdempotencyConflictError,
     RunNotFoundError,
     create_incident,
     create_run,
@@ -500,16 +501,22 @@ def runs_create(
     incident = get_incident(slug=slug, db_url=db_url)
     if incident is None:
         raise HTTPException(status_code=404, detail="incident not found")
-    run, created = create_run(
-        incident_slug=slug,
-        namespace=payload.namespace,
-        user_input=payload.user_input,
-        service_slug=incident.get("service_slug"),
-        thread_id=payload.thread_id,
-        idempotency_key=idempotency_key,
-        retrieval_policy=payload.retrieval_policy,
-        db_url=db_url,
-    )
+    try:
+        run, created = create_run(
+            incident_slug=slug,
+            namespace=payload.namespace,
+            user_input=payload.user_input,
+            service_slug=incident.get("service_slug"),
+            thread_id=payload.thread_id,
+            idempotency_key=idempotency_key,
+            retrieval_policy=payload.retrieval_policy,
+            db_url=db_url,
+        )
+    except RunIdempotencyConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="idempotency key is already bound to a different request",
+        ) from exc
     dispatch_run_commands(
         db_url=db_url,
         run_id=run["id"],

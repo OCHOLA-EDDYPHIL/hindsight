@@ -3,7 +3,7 @@ locals {
 
   worker_timeout_seconds        = var.validation_mode ? 30 : 180
   run_attempt_lease_seconds     = var.validation_mode ? 60 : 300
-  run_queue_visibility_seconds  = var.validation_mode ? 180 : 360
+  run_queue_visibility_seconds  = var.validation_mode ? 180 : 1080
   run_max_attempts              = 3
   run_dispatch_schedule         = "rate(1 minute)"
   run_dispatch_schedule_seconds = 60
@@ -164,7 +164,7 @@ resource "aws_sqs_queue" "run_dlq" {
 resource "aws_sqs_queue" "runs" {
   name                       = "${local.name}-runs"
   visibility_timeout_seconds = local.run_queue_visibility_seconds
-  message_retention_seconds  = 86400
+  message_retention_seconds  = 1209600
   receive_wait_time_seconds  = 10
   sqs_managed_sse_enabled    = true
   redrive_policy = jsonencode({
@@ -589,15 +589,19 @@ resource "aws_lambda_function" "changefeed" {
 resource "aws_lambda_event_source_mapping" "worker" {
   event_source_arn        = aws_sqs_queue.runs.arn
   function_name           = aws_lambda_function.worker.arn
-  batch_size              = 5
+  batch_size              = 1
   function_response_types = ["ReportBatchItemFailures"]
   enabled                 = var.runtime_active
+
+  scaling_config {
+    maximum_concurrency = 2
+  }
 }
 
 resource "aws_lambda_event_source_mapping" "worker_dlq" {
   event_source_arn        = aws_sqs_queue.run_dlq.arn
   function_name           = aws_lambda_function.worker.arn
-  batch_size              = 5
+  batch_size              = 1
   function_response_types = ["ReportBatchItemFailures"]
   enabled                 = var.runtime_active
 }

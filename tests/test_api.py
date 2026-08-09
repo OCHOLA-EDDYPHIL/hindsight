@@ -469,6 +469,44 @@ def test_idempotent_run_request_retries_its_pending_dispatch(monkeypatch):
     ]
 
 
+def test_run_creation_rejects_mismatched_idempotency_key_without_dispatch(monkeypatch):
+    import hindsight.api as api
+
+    dispatches = []
+    monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "get_incident",
+        lambda **_kwargs: {"slug": "checkout-latency", "service_slug": "payments-api"},
+    )
+    monkeypatch.setattr(
+        api,
+        "create_run",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            api.RunIdempotencyConflictError("different request")
+        ),
+    )
+    monkeypatch.setattr(
+        api,
+        "dispatch_run_commands",
+        lambda **kwargs: dispatches.append(kwargs),
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        api.runs_create(
+            "checkout-latency",
+            api.RunCreate(
+                namespace="demo:payments",
+                user_input="a different request body",
+            ),
+            idempotency_key="request-1",
+        )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail == "idempotency key is already bound to a different request"
+    assert dispatches == []
+
+
 def test_approval_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
     import hindsight.api as api
 

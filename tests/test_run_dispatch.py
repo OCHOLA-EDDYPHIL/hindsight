@@ -7,7 +7,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -29,13 +29,36 @@ APPROVAL_METADATA = {
 class RecordingSqs:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
+        self.attempted_messages: list[dict[str, object]] = []
         self.messages: list[dict[str, object]] = []
 
     def send_message(self, *, QueueUrl: str, MessageBody: str) -> dict[str, str]:
+        message = {"queue_url": QueueUrl, "body": json.loads(MessageBody)}
+        self.attempted_messages.append(message)
         if self.fail:
             raise RuntimeError("SQS unavailable")
-        self.messages.append({"queue_url": QueueUrl, "body": json.loads(MessageBody)})
+        self.messages.append(message)
         return {"MessageId": f"message-{len(self.messages)}"}
+
+
+def _assert_delivery_envelope(
+    body: object,
+    *,
+    run: dict[str, object],
+    sequence: int,
+    dispatch_id: str | None = None,
+) -> dict[str, object]:
+    assert isinstance(body, dict)
+    assert body["run_id"] == run["id"]
+    assert body["tenant_id"] == run["tenant_id"]
+    assert UUID(str(body["dispatch_id"]))
+    assert UUID(str(body["dispatch_attempt_id"]))
+    assert body["dispatch_sequence"] == sequence
+    assert type(body["dispatch_sequence"]) is int
+    assert body["dispatch_sequence"] > 0
+    if dispatch_id is not None:
+        assert body["dispatch_id"] == dispatch_id
+    return body
 
 
 def _database_url(name: str) -> str:
@@ -400,7 +423,234 @@ def test_approval_rolls_back_when_resume_dispatch_cannot_be_persisted(monkeypatc
 
 
 @requires_db
-def test_queue_failure_leaves_pending_command_for_a_later_sweep(monkeypatch):
+def test_enqueue_body_contains_persisted_delivery_identity(monkeypatch):
+    from hindsight.run_dispatch import dispatch_run_commands
+    from hindsight.runs import create_run
+
+    monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
+    run, _ = create_run(
+        incident_slug=f"dispatch-envelope-{uuid4().hex}",
+        namespace="dispatch-envelope",
+        user_input="checkout latency",
+    )
+    client = RecordingSqs()
+
+    result = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+
+    assert result == {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+    assert len(client.attempted_messages) == 1
+    body = _assert_delivery_envelope(
+        client.attempted_messages[0]["body"],
+        run=run,
+        sequence=1,
+    )
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        persisted = conn.execute(
+            """
+                SELECT
+                    dispatch.id,
+                    dispatch.tenant_id,
+                    dispatch.status,
+                    attempt.id,
+                    attempt.sequence,
+                    attempt.transport_message_id,
+                    attempt.sent_at IS NOT NULL
+                FROM agent_run_dispatches AS dispatch
+                JOIN agent_run_dispatch_attempts AS attempt
+                    ON attempt.tenant_id = dispatch.tenant_id
+                    AND attempt.dispatch_id = dispatch.id
+                WHERE dispatch.run_id = %s AND dispatch.command = 'start'
+            """,
+            (run["id"],),
+        ).fetchone()
+
+    assert persisted == (
+        UUID(str(body["dispatch_id"])),
+        UUID(str(body["tenant_id"])),
+        "sent",
+        UUID(str(body["dispatch_attempt_id"])),
+        1,
+        "message-1",
+        True,
+    )
+
+
+@requires_db
+def test_sent_unacknowledged_dispatch_retries_with_a_new_attempt(monkeypatch):
+    from hindsight.run_dispatch import dispatch_run_commands
+    from hindsight.runs import create_run
+
+    monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
+    run, _ = create_run(
+        incident_slug=f"dispatch-unacknowledged-{uuid4().hex}",
+        namespace="dispatch-unacknowledged",
+        user_input="checkout latency",
+    )
+    client = RecordingSqs()
+
+    first = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    not_due = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    first_body = _assert_delivery_envelope(
+        client.messages[0]["body"],
+        run=run,
+        sequence=1,
+    )
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        conn.execute(
+            """
+                UPDATE agent_run_dispatches
+                SET available_at = now() - INTERVAL '1 second'
+                WHERE id = %s
+            """,
+            (first_body["dispatch_id"],),
+        )
+        conn.commit()
+
+    retried = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    second_body = _assert_delivery_envelope(
+        client.messages[1]["body"],
+        run=run,
+        sequence=2,
+        dispatch_id=str(first_body["dispatch_id"]),
+    )
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        persisted = conn.execute(
+            """
+                SELECT status, attempt_count, transport_message_id
+                FROM agent_run_dispatches
+                WHERE id = %s
+            """,
+            (first_body["dispatch_id"],),
+        ).fetchone()
+        attempts = conn.execute(
+            """
+                SELECT id, sequence, transport_message_id, sent_at IS NOT NULL
+                FROM agent_run_dispatch_attempts
+                WHERE dispatch_id = %s
+                ORDER BY sequence
+            """,
+            (first_body["dispatch_id"],),
+        ).fetchall()
+
+    assert first == {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+    assert not_due == {"leased": 0, "dispatched": 0, "failed": 0, "lease_lost": 0}
+    assert retried == {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+    assert second_body["dispatch_attempt_id"] != first_body["dispatch_attempt_id"]
+    assert persisted == ("sent", 2, "message-2")
+    assert attempts == [
+        (UUID(str(first_body["dispatch_attempt_id"])), 1, "message-1", True),
+        (UUID(str(second_body["dispatch_attempt_id"])), 2, "message-2", True),
+    ]
+
+
+@requires_db
+def test_acknowledged_dispatch_is_never_resent(monkeypatch):
+    from hindsight.run_dispatch import dispatch_run_commands
+    from hindsight.runs import claim_run_attempt, create_run
+
+    monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
+    run, _ = create_run(
+        incident_slug=f"dispatch-acknowledged-{uuid4().hex}",
+        namespace="dispatch-acknowledged",
+        user_input="checkout latency",
+    )
+    client = RecordingSqs()
+    sent = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    body = _assert_delivery_envelope(client.messages[0]["body"], run=run, sequence=1)
+
+    claimed = claim_run_attempt(
+        run_id=run["id"],
+        command="start",
+        command_generation=0,
+        lease_ttl=timedelta(minutes=5),
+        max_attempts=3,
+        dispatch_id=str(body["dispatch_id"]),
+        dispatch_attempt_id=str(body["dispatch_attempt_id"]),
+        dispatch_sequence=1,
+        worker_message_id="worker-message-1",
+    )
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        acknowledged = conn.execute(
+            """
+                SELECT
+                    dispatch.status,
+                    dispatch.acknowledged_attempt_id,
+                    dispatch.acknowledged_at IS NOT NULL,
+                    attempt.worker_message_id,
+                    attempt.acknowledged_at IS NOT NULL
+                FROM agent_run_dispatches AS dispatch
+                JOIN agent_run_dispatch_attempts AS attempt
+                    ON attempt.id = dispatch.acknowledged_attempt_id
+                WHERE dispatch.id = %s
+            """,
+            (body["dispatch_id"],),
+        ).fetchone()
+        conn.execute(
+            """
+                UPDATE agent_runs
+                SET status = 'queued', worker_attempt_id = NULL,
+                    worker_attempt_lease_expires_at = NULL
+                WHERE id = %s
+            """,
+            (run["id"],),
+        )
+        conn.execute(
+            """
+                UPDATE agent_run_dispatches
+                SET available_at = now() - INTERVAL '1 second'
+                WHERE id = %s
+            """,
+            (body["dispatch_id"],),
+        )
+        conn.commit()
+
+    swept = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+
+    assert sent == {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+    assert claimed.outcome == "claimed"
+    assert acknowledged == (
+        "acknowledged",
+        UUID(str(body["dispatch_attempt_id"])),
+        True,
+        "worker-message-1",
+        True,
+    )
+    assert swept == {"leased": 0, "dispatched": 0, "failed": 0, "lease_lost": 0}
+    assert len(client.attempted_messages) == 1
+
+
+@requires_db
+def test_queue_failure_leaves_unsent_attempt_and_retry_advances_sequence(monkeypatch):
     from hindsight.run_dispatch import dispatch_run_commands
     from hindsight.runs import create_run
 
@@ -411,11 +661,17 @@ def test_queue_failure_leaves_pending_command_for_a_later_sweep(monkeypatch):
         user_input="checkout latency",
     )
 
+    failing_client = RecordingSqs(fail=True)
     failed = dispatch_run_commands(
         run_id=run["id"],
         command="start",
         limit=1,
-        client=RecordingSqs(fail=True),
+        client=failing_client,
+    )
+    failed_body = _assert_delivery_envelope(
+        failing_client.attempted_messages[0]["body"],
+        run=run,
+        sequence=1,
     )
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         pending = conn.execute(
@@ -434,6 +690,12 @@ def test_queue_failure_leaves_pending_command_for_a_later_sweep(monkeypatch):
         limit=1,
         client=succeeding_client,
     )
+    retried_body = _assert_delivery_envelope(
+        succeeding_client.attempted_messages[0]["body"],
+        run=run,
+        sequence=2,
+        dispatch_id=str(failed_body["dispatch_id"]),
+    )
 
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         persisted = conn.execute(
@@ -444,14 +706,28 @@ def test_queue_failure_leaves_pending_command_for_a_later_sweep(monkeypatch):
             """,
             (run["id"],),
         ).fetchone()
+        attempts = conn.execute(
+            """
+                SELECT id, sequence, transport_message_id, sent_at IS NOT NULL
+                FROM agent_run_dispatch_attempts
+                WHERE dispatch_id = %s
+                ORDER BY sequence
+            """,
+            (failed_body["dispatch_id"],),
+        ).fetchall()
 
     assert failed == {"leased": 1, "dispatched": 0, "failed": 1, "lease_lost": 0}
     assert pending[:5] == ("pending", 1, None, None, None)
     assert pending[5]
     assert retried["dispatched"] == 1
     assert succeeding_client.messages
+    assert retried_body["dispatch_attempt_id"] != failed_body["dispatch_attempt_id"]
     assert persisted[0:3] == ("sent", 2, "message-1")
     assert persisted[3] is None
+    assert attempts == [
+        (UUID(str(failed_body["dispatch_attempt_id"])), 1, None, False),
+        (UUID(str(retried_body["dispatch_attempt_id"])), 2, "message-1", True),
+    ]
 
 
 @requires_db
@@ -472,7 +748,14 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
         command="start",
         limit=1,
     )
-    run_dispatch.enqueue_run(dict(leased[0]["payload"]), client=client)
+    first_payload = {
+        **dict(leased[0]["payload"]),
+        "tenant_id": str(leased[0]["tenant_id"]),
+        "dispatch_id": str(leased[0]["id"]),
+        "dispatch_attempt_id": str(leased[0]["dispatch_attempt_id"]),
+        "dispatch_sequence": int(leased[0]["dispatch_sequence"]),
+    }
+    run_dispatch.enqueue_run(first_payload, client=client)
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute(
             """
@@ -484,13 +767,29 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
         )
         conn.commit()
 
-    swept = run_dispatch.dispatch_run_commands(limit=100, client=client)
+    swept = run_dispatch.dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    first_body = _assert_delivery_envelope(client.messages[0]["body"], run=run, sequence=1)
+    second_body = _assert_delivery_envelope(
+        client.messages[1]["body"],
+        run=run,
+        sequence=2,
+        dispatch_id=str(first_body["dispatch_id"]),
+    )
     first_claim = claim_run_attempt(
         run_id=run["id"],
         command="start",
         command_generation=0,
         lease_ttl=timedelta(minutes=5),
         max_attempts=3,
+        dispatch_id=str(second_body["dispatch_id"]),
+        dispatch_attempt_id=str(second_body["dispatch_attempt_id"]),
+        dispatch_sequence=2,
+        worker_message_id="worker-message-2",
     )
     duplicate_claim = claim_run_attempt(
         run_id=run["id"],
@@ -500,13 +799,8 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
         max_attempts=3,
     )
 
-    assert swept["dispatched"] >= 1
-    assert [message["body"] for message in client.messages].count(
-        {
-            **dict(leased[0]["payload"]),
-            "tenant_id": str(leased[0]["tenant_id"]),
-        }
-    ) == 2
+    assert swept == {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+    assert first_body["dispatch_attempt_id"] != second_body["dispatch_attempt_id"]
     assert first_claim.outcome == "claimed"
     assert duplicate_claim.outcome == "busy"
     assert [event["status"] for event in get_run(run_id=run["id"])["events"]].count("triaging") == 1

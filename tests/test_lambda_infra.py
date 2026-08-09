@@ -100,9 +100,12 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert "HINDSIGHT_RUN_MAX_ATTEMPTS" in worker_lambda
     assert "var.validation_mode ? 30 : 180" in stack
     assert "var.validation_mode ? 60 : 300" in stack
-    assert "var.validation_mode ? 180 : 360" in stack
+    assert "var.validation_mode ? 180 : 1080" in stack
     assert re.search(r"run_max_attempts\s*= 3", stack)
     assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' in stack
+    assert stack.count("message_retention_seconds  = 1209600") == 2
+    assert stack.count("batch_size              = 1") == 2
+    assert re.search(r"scaling_config\s*{\s*maximum_concurrency\s*= 2\s*}", stack)
     assert 'resource "aws_cloudwatch_event_rule" "run_dispatcher"' in stack
     assert 'command = "dispatch_run_commands"' in stack
     assert 'resource "aws_lambda_permission" "run_dispatcher"' in stack

@@ -21,6 +21,36 @@ APPROVAL_METADATA = {
 }
 
 
+def test_delivery_identity_validation_fails_before_database_access():
+    from hindsight.runs import claim_run_attempt
+
+    common = {
+        "run_id": str(uuid4()),
+        "command": "start",
+        "command_generation": 0,
+        "lease_ttl": LEASE_TTL,
+        "max_attempts": 3,
+    }
+    with pytest.raises(ValueError, match="complete dispatch delivery identity"):
+        claim_run_attempt(**common, dispatch_id=uuid4())
+    with pytest.raises(ValueError, match="positive integer"):
+        claim_run_attempt(
+            **common,
+            dispatch_id=uuid4(),
+            dispatch_attempt_id=uuid4(),
+            dispatch_sequence=0,
+            worker_message_id="message-1",
+        )
+    with pytest.raises(ValueError, match="must not be blank"):
+        claim_run_attempt(
+            **common,
+            dispatch_id=uuid4(),
+            dispatch_attempt_id=uuid4(),
+            dispatch_sequence=1,
+            worker_message_id=" ",
+        )
+
+
 def _expire_attempt(run_id: str) -> None:
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute(
@@ -381,3 +411,164 @@ def test_exhausted_dlq_finalization_is_atomic_and_idempotent():
             (run["decision_id"],),
         ).fetchone()
     assert decision == ("failed", True)
+
+
+@requires_db
+def test_delivery_acknowledgement_commits_with_first_run_effects_and_wins_send_race():
+    import hindsight.run_dispatch as run_dispatch
+    from hindsight.runs import claim_run_attempt, create_run, get_run
+
+    run, _ = create_run(
+        incident_slug=f"attempt-delivery-{uuid4().hex}",
+        namespace="attempt-delivery",
+        user_input="checkout latency",
+    )
+    delivery = run_dispatch._lease_run_dispatches(
+        db_url=None,
+        run_id=run["id"],
+        command="start",
+        limit=1,
+    )[0]
+
+    claimed = claim_run_attempt(
+        run_id=run["id"],
+        command="start",
+        command_generation=0,
+        lease_ttl=LEASE_TTL,
+        max_attempts=3,
+        dispatch_id=delivery["id"],
+        dispatch_attempt_id=delivery["dispatch_attempt_id"],
+        dispatch_sequence=delivery["dispatch_sequence"],
+        worker_message_id="worker-message-1",
+    )
+
+    assert claimed.outcome == "claimed"
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        before_send_completion = conn.execute(
+            """
+                SELECT status, acknowledged_attempt_id, acknowledged_at IS NOT NULL,
+                       transport_message_id
+                FROM agent_run_dispatches
+                WHERE id = %s
+            """,
+            (delivery["id"],),
+        ).fetchone()
+        attempt = conn.execute(
+            """
+                SELECT sequence, worker_message_id, acknowledged_at IS NOT NULL,
+                       transport_message_id
+                FROM agent_run_dispatch_attempts
+                WHERE id = %s
+            """,
+            (delivery["dispatch_attempt_id"],),
+        ).fetchone()
+
+    assert before_send_completion == (
+        "acknowledged",
+        delivery["dispatch_attempt_id"],
+        True,
+        None,
+    )
+    assert attempt == (delivery["dispatch_sequence"], "worker-message-1", True, None)
+
+    completed = run_dispatch._complete_run_dispatch(
+        dispatch_id=delivery["id"],
+        dispatch_attempt_id=delivery["dispatch_attempt_id"],
+        lease_owner=delivery["lease_owner"],
+        message_id="transport-message-1",
+        db_url=None,
+    )
+
+    assert completed is True
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        after_send_completion = conn.execute(
+            """
+                SELECT status, acknowledged_attempt_id, transport_message_id,
+                       dispatched_at IS NOT NULL
+                FROM agent_run_dispatches
+                WHERE id = %s
+            """,
+            (delivery["id"],),
+        ).fetchone()
+    assert after_send_completion == (
+        "acknowledged",
+        delivery["dispatch_attempt_id"],
+        "transport-message-1",
+        True,
+    )
+    triage_event = get_run(run_id=run["id"])["events"][-1]
+    assert triage_event["metadata"]["dispatch_attempt_id"] == str(delivery["dispatch_attempt_id"])
+    assert triage_event["metadata"]["dispatch_sequence"] == delivery["dispatch_sequence"]
+
+
+@requires_db
+def test_run_effects_and_delivery_acknowledgement_roll_back_together(monkeypatch):
+    import hindsight.run_dispatch as run_dispatch
+    import hindsight.runs as runs
+
+    run, _ = runs.create_run(
+        incident_slug=f"attempt-delivery-rollback-{uuid4().hex}",
+        namespace="attempt-delivery-rollback",
+        user_input="checkout latency",
+    )
+    delivery = run_dispatch._lease_run_dispatches(
+        db_url=None,
+        run_id=run["id"],
+        command="start",
+        limit=1,
+    )[0]
+
+    def fail_event(*_args, **_kwargs):
+        raise RuntimeError("event write failed")
+
+    monkeypatch.setattr(runs, "_append_event_with_cursor", fail_event)
+    with pytest.raises(RuntimeError, match="event write failed"):
+        runs.claim_run_attempt(
+            run_id=run["id"],
+            command="start",
+            command_generation=0,
+            lease_ttl=LEASE_TTL,
+            max_attempts=3,
+            dispatch_id=delivery["id"],
+            dispatch_attempt_id=delivery["dispatch_attempt_id"],
+            dispatch_sequence=delivery["dispatch_sequence"],
+            worker_message_id="worker-message-rollback",
+        )
+
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        persisted_run = conn.execute(
+            """
+                SELECT status, worker_attempt_id
+                FROM agent_runs
+                WHERE id = %s
+            """,
+            (run["id"],),
+        ).fetchone()
+        persisted_dispatch = conn.execute(
+            """
+                SELECT status, acknowledged_attempt_id
+                FROM agent_run_dispatches
+                WHERE id = %s
+            """,
+            (delivery["id"],),
+        ).fetchone()
+        persisted_attempt = conn.execute(
+            """
+                SELECT worker_message_id, acknowledged_at
+                FROM agent_run_dispatch_attempts
+                WHERE id = %s
+            """,
+            (delivery["dispatch_attempt_id"],),
+        ).fetchone()
+        triage_events = conn.execute(
+            """
+                SELECT count(*) FROM agent_run_events
+                WHERE run_id = %s AND phase = 'triaging'
+            """,
+            (run["id"],),
+        ).fetchone()
+
+    assert persisted_run == ("queued", None)
+    assert persisted_dispatch == ("leased", None)
+    assert persisted_attempt == (None, None)
+    assert triage_events == (0,)

@@ -82,7 +82,7 @@ run "complete_demo_graph" {
     condition = (
       aws_lambda_function.worker.timeout == 180 &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) == 300 &&
-      aws_sqs_queue.runs.visibility_timeout_seconds == 360 &&
+      aws_sqs_queue.runs.visibility_timeout_seconds == 1080 &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == 3 &&
       aws_lambda_function.worker.timeout < tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) < aws_sqs_queue.runs.visibility_timeout_seconds &&
@@ -98,10 +98,15 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
+      aws_sqs_queue.runs.message_retention_seconds == 1209600 &&
+      aws_sqs_queue.run_dlq.message_retention_seconds == 1209600 &&
+      aws_lambda_event_source_mapping.worker.batch_size == 1 &&
+      aws_lambda_event_source_mapping.worker_dlq.batch_size == 1 &&
+      aws_lambda_event_source_mapping.worker.scaling_config[0].maximum_concurrency == 2 &&
       toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"]) &&
       toset(aws_lambda_event_source_mapping.worker_dlq.function_response_types) == toset(["ReportBatchItemFailures"])
     )
-    error_message = "Both run queues must use partial batch failure reporting."
+    error_message = "Both queues must retain messages for 14 days and isolate retries, while the source mapping stays within worker concurrency."
   }
 
   assert {
@@ -156,7 +161,7 @@ run "complete_demo_graph" {
   }
 
   assert {
-    condition     = local.operation_poll_seconds == 960
+    condition     = local.operation_poll_seconds == 2400
     error_message = "The deployed UI must wait through the complete production retry budget."
   }
 

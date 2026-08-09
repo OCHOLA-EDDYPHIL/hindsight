@@ -93,6 +93,73 @@ def test_agent_run_call_budget_migration_caps_calls_and_allows_resume_replanning
     assert "agent_run_call_budgets_monotonic" in migration
 
 
+def test_loss_safe_run_delivery_is_staged_and_tenant_fenced():
+    columns_path = MIGRATIONS / "0027_loss_safe_run_delivery_columns.sql"
+    guards_path = MIGRATIONS / "0027a_loss_safe_run_delivery_guards.sql"
+    columns = columns_path.read_text()
+    guards = guards_path.read_text()
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+
+    assert columns_path.name < guards_path.name
+    assert "request_fingerprint STRING" in columns
+    assert "acknowledged_attempt_id UUID" in columns
+    assert "CREATE TABLE IF NOT EXISTS agent_run_dispatch_attempts" in columns
+    for field in (
+        "id UUID PRIMARY KEY",
+        "tenant_id UUID NOT NULL",
+        "dispatch_id UUID NOT NULL",
+        "sequence INT8 NOT NULL",
+        "transport_message_id STRING",
+        "worker_message_id STRING",
+        "acknowledged_at TIMESTAMPTZ",
+    ):
+        assert field in columns
+
+    assert "DROP INDEX IF EXISTS agent_runs@agent_runs_idempotency_key_key CASCADE" in guards
+    assert "ON agent_runs (tenant_id, idempotency_key)" in guards
+    assert "WHERE idempotency_key IS NOT NULL" in guards
+    assert "request_fingerprint ~ '^[0-9a-f]{64}$'" in guards
+    assert "agent_run_dispatch_attempts_dispatch_sequence_key" in guards
+    assert "ON agent_run_dispatch_attempts (dispatch_id, sequence)" in guards
+    assert "sequence >= 1" in guards
+    assert "FOREIGN KEY (tenant_id, dispatch_id)" in guards
+    assert "REFERENCES agent_run_dispatches (tenant_id, id)" in guards
+    assert "FOREIGN KEY (tenant_id, id, acknowledged_attempt_id)" in guards
+    assert "REFERENCES agent_run_dispatch_attempts (tenant_id, dispatch_id, id)" in guards
+    assert "status IN ('pending', 'leased', 'sent', 'acknowledged')" in guards
+    assert "status = 'acknowledged'" in guards
+    assert "agent_run_dispatch_attempts_tenant_permissive" in guards
+    assert "agent_run_dispatch_attempts_tenant_fence" in guards
+    assert "ALTER TABLE agent_run_dispatch_attempts FORCE ROW LEVEL SECURITY" in guards
+    assert "guard_agent_run_dispatch_attempt_identity" in guards
+    assert "(NEW).tenant_id IS DISTINCT FROM (OLD).tenant_id" in guards
+    assert "GRANT SELECT, INSERT, UPDATE ON TABLE agent_run_dispatch_attempts" in guards
+    assert "GRANT SELECT, UPDATE ON TABLE agent_run_dispatch_attempts" in guards
+
+    normalization = guards.split("UPDATE agent_run_dispatches AS dispatch", 1)[1].split(
+        ";", 1
+    )[0]
+    assert "status = 'pending'" in normalization
+    assert "attempt_count = 0" in normalization
+    assert "lease_owner = NULL" in normalization
+    assert "transport_message_id = NULL" in normalization
+    assert "dispatched_at = NULL" in normalization
+
+    agent_select, agent_insert, agent_update = roles.split(
+        "TO hindsight_agent_writer;", 3
+    )[:3]
+    worker_section = roles.split("TO hindsight_agent_writer;", 3)[-1]
+    worker_select, worker_insert, worker_update = worker_section.split(
+        "TO hindsight_memory_worker;", 3
+    )[:3]
+    assert "agent_run_dispatch_attempts" in agent_select
+    assert "agent_run_dispatch_attempts" in agent_insert
+    assert "agent_run_dispatch_attempts" in agent_update
+    assert "agent_run_dispatch_attempts" in worker_select
+    assert "agent_run_dispatch_attempts" not in worker_insert
+    assert "agent_run_dispatch_attempts" in worker_update
+
+
 def test_product_writers_have_only_foreign_key_read_access_to_learning_preparations():
     roles = (ROOT / "infra/db/roles.sql").read_text()
     agent_select, agent_insert, agent_update = roles.split(
