@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useCockpit } from "@/hooks/use-cockpit";
-import type { Snapshot } from "@/types";
+import type { SignatureScenario, Snapshot } from "@/types";
 
 const currentSnapshot: Snapshot = {
   mode: "current",
@@ -18,6 +18,37 @@ const historicalSnapshot: Snapshot = {
   mode: "as_of",
   as_of: currentSnapshot.timeline[0],
 };
+
+function approvalScenario(withIdentity = true): SignatureScenario {
+  return {
+    scenario_id: "scenario-approval",
+    namespace: currentSnapshot.namespace,
+    status: "active",
+    incident: {
+      slug: "incident-approval",
+      title: "Checkout latency",
+      summary: "Processor timeouts increased checkout latency.",
+    },
+    runs: [
+      {
+        id: "run-approval",
+        status: "awaiting_approval",
+        action_trace: withIdentity
+          ? {
+              mode: "recommendation_only",
+              selection: { fingerprint: "b".repeat(64) },
+              recommendation: {
+                id: `recommendation:${"a".repeat(64)}`,
+                summary: "Throttle retry fanout after verifying processor health.",
+              },
+            }
+          : { mode: "recommendation_only" },
+      },
+    ],
+    memories: [],
+    stages: {},
+  };
+}
 
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -167,5 +198,87 @@ describe("cockpit historical snapshot selection", () => {
     });
 
     await waitFor(() => expect(snapshotRequests).toBe(2));
+  });
+
+  it("binds approval to the exact recommendation and memory selection", async () => {
+    window.HINDSIGHT_CONFIG = {
+      apiBase: "/v1",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    const approvalBodies: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/operator/session") {
+          return Promise.resolve(jsonResponse({ operator: true }));
+        }
+        if (url.pathname === "/v1/signature-scenarios") {
+          return Promise.resolve(jsonResponse(approvalScenario()));
+        }
+        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v1/runs/run-approval/approval") {
+          approvalBodies.push(JSON.parse(String(init?.body)));
+          return Promise.resolve(jsonResponse({ status: "resuming" }));
+        }
+        if (url.pathname === "/v1/runs/run-approval") {
+          return Promise.resolve(
+            jsonResponse({ ...approvalScenario().runs[0], status: "completed" }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await act(async () => result.current.decideRun(true));
+
+    expect(approvalBodies).toEqual([
+      {
+        approved: true,
+        recommendation_id: `recommendation:${"a".repeat(64)}`,
+        selection_fingerprint: "b".repeat(64),
+      },
+    ]);
+  });
+
+  it("fails visibly without approval-bound identities and does not post", async () => {
+    window.HINDSIGHT_CONFIG = {
+      apiBase: "/v1",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    let approvalRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/operator/session") {
+          return Promise.resolve(jsonResponse({ operator: true }));
+        }
+        if (url.pathname === "/v1/signature-scenarios") {
+          return Promise.resolve(jsonResponse(approvalScenario(false)));
+        }
+        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname.endsWith("/approval")) approvalRequests += 1;
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await act(async () => result.current.decideRun(false));
+
+    expect(approvalRequests).toBe(0);
+    expect(result.current.notice).toEqual({
+      kind: "error",
+      message: "Approval identity is unavailable. Refresh or rerun the analysis before deciding.",
+    });
   });
 });

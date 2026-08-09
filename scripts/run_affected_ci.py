@@ -110,9 +110,7 @@ def run_main_qualification(env: dict[str, str]) -> None:
     project = f"hindsight_local_main_{token}"[:63]
     compose = [*docker_command(), "compose", "-p", project]
     fresh_url = f"postgresql://root@localhost:26257/hindsight_fresh_{token}?sslmode=disable"
-    populated_url = (
-        f"postgresql://root@localhost:26257/hindsight_populated_{token}?sslmode=disable"
-    )
+    populated_url = f"postgresql://root@localhost:26257/hindsight_populated_{token}?sslmode=disable"
     schema_dir = ROOT / "build" / "schema"
     fresh_manifest = schema_dir / f"fresh-{token}.json"
     populated_manifest = schema_dir / f"populated-{token}.json"
@@ -257,7 +255,9 @@ def main() -> int:
         default="pull_request",
     )
     parser.add_argument("--path", action="append", dest="paths")
-    parser.add_argument("--list", action="store_true", help="print selection without running checks")
+    parser.add_argument(
+        "--list", action="store_true", help="print selection without running checks"
+    )
     args = parser.parse_args()
 
     paths = args.paths or changed_paths(
@@ -272,8 +272,6 @@ def main() -> int:
 
     env = {
         **os.environ,
-        "EMBEDDING_PROVIDER": "deterministic",
-        "LLM_PROVIDER": "deterministic",
         "PYTHON_DOTENV_DISABLED": "1",
     }
     for name in ("GEMINI_API_KEY", "GEMINI_API_KEYS"):

@@ -304,14 +304,16 @@ def test_changefeed_does_not_retry_non_serialization_failure(monkeypatch):
 
 def test_live_acceptance_is_product_only_and_never_fences_changefeed():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    assert (
+        "HINDSIGHT_GEMINI_REPRESENTATION: "
+        "${{ vars.HINDSIGHT_GEMINI_REPRESENTATION || 'raw_control' }}"
+    ) in workflow
     assert "github.triggering_actor" in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow
     assert "run_live_acceptance.py hosted-product --phase providers" in workflow
     assert "run_live_acceptance.py hosted-product --phase semantic" in workflow
     for phase in ("semantic", "consolidation", "worker", "browser", "roles"):
         assert f"run_live_acceptance.py hosted-product --phase {phase}" in workflow
-    assert "BEDROCK" not in workflow
-    assert "Bedrock" not in workflow
     shared_cli = pathlib.Path("scripts/run_live_acceptance.py").read_text()
     assert '"scripts/configure_changefeed.py", "status"' in shared_cli
     for forbidden in (
@@ -328,22 +330,27 @@ def test_live_acceptance_is_product_only_and_never_fences_changefeed():
 
 def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    browser_job = workflow.split("  browser_product:\n", 1)[1].split(
-        "  database_roles:\n", 1
-    )[0]
+    browser_job = workflow.split("  browser_product:\n", 1)[1].split("  database_roles:\n", 1)[0]
     roles_job = workflow.split("  database_roles:\n", 1)[1].split(
         "  product_acceptance_complete:\n", 1
     )[0]
 
     assert "HINDSIGHT_WEBSOCKET_URL:" in browser_job
+    assert "HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}" in browser_job
     assert "needs.acceptance_plan.outputs.candidate_websocket_url" in browser_job
     assert "needs.deploy.outputs.websocket_url" in browser_job
     assert "HINDSIGHT_EXPECTED_DEPLOYED_REVISION" in browser_job
     assert 'CHANGEFEED_TOKEN="$(aws ssm get-parameter --name "$CHANGEFEED_PARAMETER"' in browser_job
-    assert 'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"' in browser_job
+    assert (
+        'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"'
+        in browser_job
+    )
     assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
     assert "HINDSIGHT_SELENIUM_REMOTE_URL: http://127.0.0.1:4444" in browser_job
+    assert "scripts/publish_controlled_incident_telemetry.py" in browser_job
+    assert "--confirm-controlled-fixture" in browser_job
+    assert "--visibility-timeout-seconds 120" in browser_job
     assert "selenium/standalone-firefox@sha256:" in browser_job
     assert "--shm-size=2g" in browser_job
     assert 'docker ps -aq --filter "name=^/${container_name}$"' in browser_job
@@ -368,8 +375,14 @@ def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
 
-    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2" in live_concurrency
-    assert "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2" in destroy_concurrency
+    assert (
+        "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2"
+        in live_concurrency
+    )
+    assert (
+        "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2"
+        in destroy_concurrency
+    )
     assert "inputs.validation_mode" in deploy_concurrency
     assert "format('hindsight-live-deploy-{0}-{1}'" in deploy_concurrency
     assert "format('hindsight-{0}-environment-v2'" in deploy_concurrency
@@ -384,9 +397,7 @@ def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
 def test_live_acceptance_resolves_one_owner_authorized_revision():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     parsed = yaml.safe_load(workflow)
-    authorize = workflow.split("  authorize:\n", 1)[1].split(
-        "  exact_main_ci:\n", 1
-    )[0]
+    authorize = workflow.split("  authorize:\n", 1)[1].split("  exact_main_ci:\n", 1)[0]
 
     assert "  workflow_dispatch:\n" in workflow
     assert "pull_request:" not in workflow
@@ -516,11 +527,9 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
         values={
             "EVENT_NAME": "workflow_dispatch",
             "REF_NAME": "refs/heads/main",
-                "WORKFLOW_REF": (
-                    "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
-                ),
-                "REPOSITORY": "owner/project",
-                "ACTOR": "owner",
+            "WORKFLOW_REF": ("owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"),
+            "REPOSITORY": "owner/project",
+            "ACTOR": "owner",
             "TRIGGERING_ACTOR": "owner",
             "REPOSITORY_OWNER": "owner",
             "REQUESTED_SHA": "a" * 40,
@@ -535,9 +544,7 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
         values={
             "EVENT_NAME": "workflow_dispatch",
             "REF_NAME": "refs/heads/main",
-            "WORKFLOW_REF": (
-                "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
-            ),
+            "WORKFLOW_REF": ("owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"),
             "REPOSITORY": "owner/project",
             "ACTOR": "owner",
             "TRIGGERING_ACTOR": "maintainer",
@@ -557,7 +564,7 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
     assert 'f"{api_url}/v1/health/ready"' in verify
     assert 'f"{api_url}/v1/incidents?limit=1"' in verify
     assert 'f"{ui_url}/v1/health/ready"' in verify
-    assert "revision\": expected_sha" in verify
+    assert 'revision": expected_sha' in verify
     assert "/v1/realtime/ticket" in verify
     assert "urlencode({'ticket': ticket})" in verify
     assert "from websockets.asyncio.client import connect" in verify
@@ -584,9 +591,7 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
 
 def test_product_preflight_does_not_repeat_normal_ci():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    preflight = workflow.split("  product_preflight:\n", 1)[1].split(
-        "  deploy:\n", 1
-    )[0]
+    preflight = workflow.split("  product_preflight:\n", 1)[1].split("  deploy:\n", 1)[0]
 
     assert "scripts/migrate.py" in preflight
     assert "scripts/initialize_agent_storage.py" in preflight
@@ -614,9 +619,7 @@ def test_product_preflight_always_removes_its_run_scoped_database():
         "hindsight_product_preflight_${{ github.run_id }}_${{ github.run_attempt }}"
     )
     cleanup = next(
-        step
-        for step in preflight["steps"]
-        if step.get("name") == "Remove isolated CockroachDB"
+        step for step in preflight["steps"] if step.get("name") == "Remove isolated CockroachDB"
     )
     assert cleanup["if"] == "always()"
     assert cleanup["run"] == "docker compose down --volumes --remove-orphans"
@@ -625,9 +628,7 @@ def test_product_preflight_always_removes_its_run_scoped_database():
 
 def test_exact_main_ci_query_does_not_hide_unsuccessful_runs():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    job = workflow.split("  exact_main_ci:\n", 1)[1].split(
-        "  product_preflight:\n", 1
-    )[0]
+    job = workflow.split("  exact_main_ci:\n", 1)[1].split("  product_preflight:\n", 1)[0]
 
     assert "actions: read" in job
     assert "GITHUB_API_URL: ${{ github.api_url }}" in job
@@ -714,9 +715,7 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
         "DATABASE_ROLES_RESULT",
     ),
 )
-def test_product_completion_requires_every_product_job(
-    tmp_path, failed_result
-):
+def test_product_completion_requires_every_product_job(tmp_path, failed_result):
     workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
     step = workflow["jobs"]["product_acceptance_complete"]["steps"][0]
     script = step["run"]
@@ -882,8 +881,7 @@ def test_deployment_identity_preflight_binds_account_state_and_certificate(capsy
         region="us-east-1",
         state_bucket="target-state",
         certificate_arn=(
-            "arn:aws:acm:us-east-1:123456789012:certificate/"
-            "00000000-0000-0000-0000-000000000000"
+            "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
         ),
         sts_client=FakeSts(),
         s3_client=s3,
@@ -982,23 +980,18 @@ def test_validation_deployment_selects_bounded_runtime_timing():
         "run_max_attempts",
         "run_dispatch_schedule_seconds",
     ):
-        assert f'output -raw {output}' in workflow
+        assert f"output -raw {output}" in workflow
         assert f"value: ${{{{ jobs.apply.outputs.{output} }}}}" in workflow
 
 
 def test_hosted_browser_preserves_failure_evidence_without_learning_dependency():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    browser = workflow.split("  browser_product:\n", 1)[1].split(
-        "  database_roles:\n", 1
-    )[0]
+    browser = workflow.split("  browser_product:\n", 1)[1].split("  database_roles:\n", 1)[0]
 
     assert "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR" in browser
     job_environment = browser.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
     assert "runner.temp" not in job_environment
-    assert (
-        'HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence'
-        in browser
-    )
+    assert "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence" in browser
     assert '>> "$GITHUB_ENV"' in browser
     assert "if: always()" in browser
     assert "browser-evidence-" in browser

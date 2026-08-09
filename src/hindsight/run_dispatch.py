@@ -103,6 +103,13 @@ def _lease_run_dispatches(
                             (status = 'pending' AND available_at <= now())
                             OR (status = 'leased' AND lease_expires_at <= now())
                         )
+                        AND EXISTS (
+                            SELECT 1
+                            FROM agent_runs AS run
+                            WHERE run.id = agent_run_dispatches.run_id
+                                AND run.command_generation =
+                                    agent_run_dispatches.command_generation
+                        )
                         {filter_sql}
                         ORDER BY available_at, created_at, id
                         LIMIT %s

@@ -62,6 +62,81 @@ export interface DecisionTrace {
   lineage_edges?: Array<{ id: Identifier }>;
 }
 
+export interface DiagnosticToolCall {
+  id: Identifier;
+  tool: "aws_cloudwatch_diagnostics";
+  query_key: string;
+  status: "executing" | "completed";
+}
+
+export interface DiagnosticObservation {
+  id: Identifier;
+  tool_call_id: Identifier;
+  schema_version: number;
+  tool: "aws_cloudwatch_diagnostics";
+  query_key: string;
+  account_id?: string;
+  region?: string;
+  metric?: {
+    namespace?: string;
+    name?: string;
+    dimensions?: Array<{ name: string; value: string }>;
+    statistic?: string;
+    period_seconds?: number;
+  };
+  window?: {
+    start?: string;
+    end?: string;
+    seconds?: number;
+  };
+  datapoints?: Array<{ timestamp: string; value: number }>;
+  datapoint_count: number;
+  truncated?: boolean;
+}
+
+export interface RecommendationActionTrace {
+  schema_version?: number;
+  mode?: "recommendation_only";
+  selection?: {
+    fingerprint?: string;
+    memory_ids?: Identifier[];
+    provider?: string | null;
+    model?: string | null;
+  };
+  reasoning_steps?: Array<{
+    turn?: number;
+    provider?: string;
+    model?: string;
+    decision?: Record<string, unknown>;
+  }>;
+  tool_calls?: DiagnosticToolCall[];
+  observations?: DiagnosticObservation[];
+  recommendation?: {
+    id?: Identifier;
+    summary?: string | null;
+    diagnosis?: string | null;
+    rationale?: string | null;
+    rollback?: string | null;
+    verification?: string[];
+    safety_constraints?: string[];
+    status?: string;
+  };
+  approval?: {
+    approved?: boolean;
+    disposition?: string;
+    recommendation_id?: Identifier;
+    selection_fingerprint?: string;
+  };
+  execution?: {
+    status?:
+      | "awaiting_approval"
+      | "recommendation_approved"
+      | "not_executed"
+      | "replan_required";
+    mode?: "recommendation_only";
+  };
+}
+
 export interface Run {
   id: Identifier;
   incident_slug?: string | null;
@@ -79,40 +154,7 @@ export interface Run {
   completed_at?: string | null;
   events?: Array<{ phase: string; created_at?: string }>;
   trace?: DecisionTrace | null;
-  action_trace?: {
-    schema_version?: number;
-    request?: {
-      id?: Identifier;
-      mode?: string;
-      tool?: string;
-      actions?: string[];
-    };
-    execution?: {
-      status?: "awaiting_approval" | "pending" | "executing" | "completed" | "not_executed";
-      tool?: string;
-      allowed_actions?: string[];
-    };
-    initial_observation?: {
-      id?: Identifier;
-      simulator_kind?: string;
-      recovered?: boolean;
-    };
-    observations?: Array<{
-      id?: Identifier;
-      action?: string;
-      unsafe?: boolean;
-      recovered?: boolean;
-      detail?: string;
-    }>;
-    score?: {
-      recovered?: boolean;
-      unsafe_action_count?: number;
-    };
-    approval?: {
-      approved?: boolean;
-      disposition?: string;
-    };
-  } | null;
+  action_trace?: RecommendationActionTrace | null;
 }
 
 export interface MemoryRecord {
@@ -192,6 +234,8 @@ export interface SignatureScenario {
   memories: MemoryRecord[];
   stages: {
     baseline_memory_id?: Identifier | null;
+    compromised_memory_id?: Identifier | null;
+    /** Compatibility alias for replay snapshots created before the role-free scenario contract. */
     poison_memory_id?: Identifier | null;
     influenced_decision_id?: Identifier | null;
     rewind_operation_id?: Identifier | null;

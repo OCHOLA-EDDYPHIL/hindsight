@@ -8,6 +8,20 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stub_runtime_providers(monkeypatch):
+    from tests.fakes import DeterministicEmbeddingProvider, DeterministicReasoningProvider
+
+    monkeypatch.setattr(
+        "hindsight.worker.reasoning_provider_from_env",
+        lambda *_args, **_kwargs: DeterministicReasoningProvider(),
+    )
+    monkeypatch.setattr(
+        "hindsight.worker.embedding_provider_from_env",
+        lambda *_args, **_kwargs: DeterministicEmbeddingProvider(),
+    )
+
+
 def test_scheduled_worker_reaps_expired_memory_operations(monkeypatch):
     import hindsight.worker as worker
 
@@ -68,7 +82,7 @@ def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypat
     monkeypatch.setattr(
         worker,
         "runtime_settings",
-        lambda: SimpleNamespace(provider_env={"EMBEDDING_PROVIDER": "deterministic"}),
+        lambda: SimpleNamespace(provider_env={}),
     )
     monkeypatch.setattr(worker, "embedding_provider_from_env", lambda *_args, **_kwargs: provider)
 
@@ -78,9 +92,7 @@ def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypat
 
     monkeypatch.setattr(worker, "execute_operation", execute)
 
-    result = worker.process_message(
-        {"command": "memory_operation", "operation_id": "operation-1"}
-    )
+    result = worker.process_message({"command": "memory_operation", "operation_id": "operation-1"})
 
     assert result == {"provider": provider}
     assert captured["db_url"] == "postgresql://db"
@@ -112,8 +124,8 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
     environ = {
         runtime.DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
         "AWS_LAMBDA_FUNCTION_NAME": "hindsight-worker",
-        "LLM_PROVIDER": "deterministic",
-        "EMBEDDING_PROVIDER": "deterministic",
+        "LLM_PROVIDER": "gemini",
+        "EMBEDDING_PROVIDER": "gemini",
     }
 
     def resolve_settings():
@@ -129,8 +141,10 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
     monkeypatch.setattr(
         worker,
         "claim_run_attempt",
-        lambda **kwargs: database_calls.append(("claim", kwargs))
-        or SimpleNamespace(outcome="duplicate", run=None, attempt_id=None),
+        lambda **kwargs: (
+            database_calls.append(("claim", kwargs))
+            or SimpleNamespace(outcome="duplicate", run=None, attempt_id=None)
+        ),
     )
     monkeypatch.setattr(
         worker,
@@ -151,6 +165,7 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
             {
                 "run_id": "run-1",
                 "command": command,
+                "command_generation": 0,
                 "lease_ttl": timedelta(seconds=300),
                 "max_attempts": 3,
                 "db_url": "postgresql://hosted/database",
@@ -166,7 +181,6 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
 def test_worker_records_progress_and_awaiting_approval(monkeypatch):
     import hindsight.worker as worker
     from hindsight.agent import IncidentAgentResult
-    from hindsight.reasoning import DeterministicReasoningProvider
 
     run = {
         "id": "run-1",
@@ -176,30 +190,40 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
         "namespace": "demo:payments",
         "service_slug": "payments-api",
         "user_input": "checkout p99 is above SLO",
+        "model_call_count": 1,
+        "cloudwatch_call_count": 1,
     }
     monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "optional_cloudwatch_diagnostics_from_env",
+        lambda: SimpleNamespace(name="aws_cloudwatch_diagnostics", query_keys=()),
+    )
     claim_calls = []
     monkeypatch.setattr(
         worker,
         "claim_run_attempt",
-        lambda **kwargs: claim_calls.append(kwargs)
-        or SimpleNamespace(outcome="claimed", run=run, attempt_id="attempt-1"),
+        lambda **kwargs: (
+            claim_calls.append(kwargs)
+            or SimpleNamespace(outcome="claimed", run=run, attempt_id="attempt-1")
+        ),
     )
     monkeypatch.setattr(
         worker,
         "runtime_settings",
         lambda: SimpleNamespace(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
             reasoning_max_attempts=1,
         ),
     )
+    transitions = []
+    reservations = []
     monkeypatch.setattr(
         worker,
-        "reasoning_provider_from_env",
-        lambda env: DeterministicReasoningProvider(),
+        "reserve_run_budget",
+        lambda **kwargs: reservations.append(kwargs) or 2,
     )
-    transitions = []
     monkeypatch.setattr(
         worker,
         "transition_run_attempt",
@@ -213,6 +237,11 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
 
     def fake_agent(*args, **kwargs):
         assert kwargs["db_url"] == "postgresql://db"
+        assert kwargs["initial_model_call_count"] == 1
+        assert kwargs["initial_diagnostic_call_count"] == 1
+        assert kwargs["model_call_reservation"]() == 2
+        assert kwargs["diagnostic_call_reservation"]() == 2
+        kwargs["progress_callback"]("diagnostic", "planning", {})
         kwargs["progress_callback"](
             "plan",
             "planning",
@@ -247,18 +276,26 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
         {
             "run_id": "run-1",
             "command": "start",
+            "command_generation": 0,
             "lease_ttl": timedelta(seconds=300),
             "max_attempts": 3,
             "db_url": "postgresql://db",
         }
     ]
-    assert [item["status"] for item in transitions] == ["planning", "awaiting_approval"]
+    assert [item["status"] for item in transitions] == [
+        "planning",
+        "planning",
+        "awaiting_approval",
+    ]
+    assert transitions[0]["phase"] == "diagnostic"
+    assert transitions[0]["command"] == "start"
     assert {item["db_url"] for item in transitions} == {"postgresql://db"}
-    assert transitions[0]["fields"]["plan"] == "throttle retries"
-    assert transitions[1]["metadata"]["action_trace"]["execution"]["status"] == (
+    assert transitions[1]["fields"]["plan"] == "throttle retries"
+    assert transitions[2]["metadata"]["action_trace"]["execution"]["status"] == (
         "awaiting_approval"
     )
-    assert "score" not in transitions[1]["metadata"]["action_trace"]
+    assert "score" not in transitions[2]["metadata"]["action_trace"]
+    assert [item["budget"] for item in reservations] == ["model", "cloudwatch"]
     assert result["status"] == "awaiting_approval"
 
 
@@ -288,7 +325,7 @@ def test_provider_setup_failure_uses_durable_attempt_retry_path(monkeypatch):
         "runtime_settings",
         lambda: SimpleNamespace(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
             reasoning_max_attempts=1,
         ),
     )
@@ -311,6 +348,91 @@ def test_provider_setup_failure_uses_durable_attempt_retry_path(monkeypatch):
 
     assert failures[-1]["attempt_id"] == "attempt-1"
     assert failures[-1]["error_type"] == "RuntimeError"
+
+
+def test_resume_attempt_can_replan_and_return_to_approval(monkeypatch):
+    import hindsight.worker as worker
+    from hindsight.agent import IncidentAgentResult
+
+    run = {
+        "id": "run-1",
+        "thread_id": "thread-1",
+        "decision_id": "agent:run-1:plan",
+        "incident_slug": "checkout-latency",
+        "namespace": "demo:payments",
+        "service_slug": "payments-api",
+        "user_input": "checkout p99 is above SLO",
+        "model_call_count": 2,
+        "cloudwatch_call_count": 1,
+    }
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: SimpleNamespace(
+            database_url="postgresql://db",
+            provider_env={},
+            reasoning_max_attempts=1,
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "optional_cloudwatch_diagnostics_from_env",
+        lambda: SimpleNamespace(name="aws_cloudwatch_diagnostics", query_keys=()),
+    )
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **_kwargs: SimpleNamespace(outcome="claimed", run=run, attempt_id="attempt-resume"),
+    )
+    transitions = []
+    monkeypatch.setattr(
+        worker,
+        "transition_run_attempt",
+        lambda **kwargs: transitions.append(kwargs) or kwargs,
+    )
+    monkeypatch.setattr(
+        worker,
+        "finish_run_attempt",
+        lambda **kwargs: transitions.append(kwargs) or kwargs,
+    )
+
+    def fake_resume(**kwargs):
+        assert kwargs["model_call_count"] == 2
+        assert kwargs["diagnostic_call_count"] == 1
+        kwargs["progress_callback"]("plan", "planning", {"action_approved": False})
+        return IncidentAgentResult(
+            thread_id="thread-1",
+            interrupted=True,
+            interrupt={
+                "proposed_action": "review the refreshed recommendation",
+                "action_trace": {
+                    "recommendation": {"id": "recommendation:refreshed"},
+                    "selection": {"fingerprint": "selection:refreshed"},
+                },
+            },
+            state={},
+            plan="refreshed plan",
+        )
+
+    monkeypatch.setattr(worker, "resume_incident_agent", fake_resume)
+
+    result = worker.process_message(
+        {
+            "command": "resume",
+            "run_id": "run-1",
+            "approved": True,
+            "recommendation_id": "recommendation:original",
+            "selection_fingerprint": "selection:original",
+        }
+    )
+
+    assert transitions[0]["status"] == "planning"
+    assert transitions[0]["command"] == "resume"
+    assert transitions[0]["fields"]["action_approved"] is False
+    assert transitions[1]["status"] == "awaiting_approval"
+    assert transitions[1]["command"] == "resume"
+    assert result["status"] == "awaiting_approval"
 
 
 def test_handler_identifies_dlq_records_by_source_arn(monkeypatch):
@@ -411,9 +533,7 @@ def test_exhausted_source_retries_and_dlq_finalizes(monkeypatch):
 
     with pytest.raises(worker.RunAttemptsExhaustedError):
         worker.process_message({"command": "start", "run_id": "run-1"})
-    result = worker.process_message(
-        {"command": "start", "run_id": "run-1"}, dead_letter=True
-    )
+    result = worker.process_message({"command": "start", "run_id": "run-1"}, dead_letter=True)
 
     assert result == {"status": "failed"}
     assert finalized[0]["max_attempts"] == 3

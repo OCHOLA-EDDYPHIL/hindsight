@@ -375,6 +375,10 @@ data "aws_iam_policy_document" "worker" {
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.runs.arn]
   }
+  statement {
+    actions   = ["cloudwatch:GetMetricStatistics"]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "worker" {
@@ -476,6 +480,7 @@ resource "aws_lambda_function" "api" {
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
     }
   }
 }
@@ -518,12 +523,15 @@ resource "aws_lambda_function" "worker" {
       HINDSIGHT_RUN_DLQ_ARN               = aws_sqs_queue.run_dlq.arn
       HINDSIGHT_RUN_MAX_ATTEMPTS          = tostring(local.run_max_attempts)
       HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS = tostring(local.run_attempt_lease_seconds)
+      HINDSIGHT_AWS_ACCOUNT_ID            = data.aws_caller_identity.current.account_id
+      HINDSIGHT_STAGE                     = var.stage
       HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
       HINDSIGHT_WORKER_TENANT_ID          = "00000000-0000-0000-0000-000000000002"
       LLM_PROVIDER                        = var.llm_provider
       EMBEDDING_PROVIDER                  = var.embedding_provider
       GEMINI_MODEL                        = var.gemini_model
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
       REASONING_MAX_ATTEMPTS              = tostring(var.reasoning_max_attempts)
     }
   }

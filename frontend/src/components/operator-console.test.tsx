@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { deriveWalkthroughStep, OperatorConsole } from "@/components/operator-console";
-import type { Snapshot } from "@/types";
+import type { SignatureScenario, Snapshot } from "@/types";
 
 const baselineSnapshot: Snapshot = {
   mode: "current",
@@ -19,9 +19,10 @@ const props = {
   incidentInput: "processor timeout report",
   busy: null,
   rewindAnchor: null,
+  scenario: null,
   snapshot: baselineSnapshot,
   rewindTimestamp: "",
-  rewindReason: "Remove poisoned guidance",
+  rewindReason: "Remove stale guidance",
   rewindPreview: null,
   onIncident: vi.fn(),
   onIncidentInput: vi.fn(),
@@ -87,8 +88,8 @@ describe("operator separation", () => {
     const rail = screen.getByRole("list", { name: "Agent run phases" });
     expect(rail.querySelectorAll("li")).toHaveLength(7);
     expect(screen.getByText("cited proposal")).toBeVisible();
-    expect(screen.getByText("bounded action")).toBeVisible();
-    expect(screen.getByText("observation")).toBeVisible();
+    expect(screen.getByText("recommendation")).toBeVisible();
+    expect(screen.getByText("diagnostics")).toBeVisible();
   });
 
   it("keeps the walkthrough optional and never invokes mutation callbacks", () => {
@@ -116,17 +117,26 @@ describe("operator separation", () => {
   });
 
   it("derives every walkthrough transition from durable product state", () => {
-    const poisonSnapshot: Snapshot = {
+    const compromisedMemoryId = "compromised-guidance";
+    const compromisedScenario = {
+      scenario_id: "scenario-1",
+      namespace: baselineSnapshot.namespace,
+      status: "active",
+      runs: [],
+      memories: [],
+      stages: { compromised_memory_id: compromisedMemoryId },
+    } satisfies SignatureScenario;
+    const compromisedSnapshot: Snapshot = {
       ...baselineSnapshot,
       memories: [
         ...baselineSnapshot.memories,
-        { id: "poison", writer: "demo.poison", status: "current" },
+        { id: compromisedMemoryId, writer: "demo.fixture-import", status: "current" },
       ],
     };
     const rewoundSnapshot: Snapshot = {
-      ...poisonSnapshot,
-      memories: poisonSnapshot.memories.map((memory) =>
-        memory.writer === "demo.poison"
+      ...compromisedSnapshot,
+      memories: compromisedSnapshot.memories.map((memory) =>
+        memory.id === compromisedMemoryId
           ? { ...memory, status: "invalidated", t_invalid: "2026-07-18T00:00:00Z" }
           : memory,
       ),
@@ -135,18 +145,21 @@ describe("operator separation", () => {
     const state = {
       operator: true,
       rewindAnchor: "2026-07-18T00:00:00Z",
-      snapshot: poisonSnapshot,
+      scenario: compromisedScenario,
+      snapshot: compromisedSnapshot,
       run: null,
       rewindPreview: null,
     };
 
     expect(deriveWalkthroughStep({ ...state, operator: false })).toBe("unlock");
     expect(deriveWalkthroughStep({ ...state, rewindAnchor: null })).toBe("reset");
-    expect(deriveWalkthroughStep({ ...state, snapshot: baselineSnapshot })).toBe("poison");
+    expect(deriveWalkthroughStep({ ...state, scenario: null, snapshot: baselineSnapshot })).toBe(
+      "compromise",
+    );
     expect(deriveWalkthroughStep(state)).toBe("analyze");
     expect(
       deriveWalkthroughStep({ ...state, run: { id: "bad", status: "awaiting_approval" } }),
-    ).toBe("reject");
+    ).toBe("review");
     expect(deriveWalkthroughStep({ ...state, run: { id: "bad", status: "rejected" } })).toBe(
       "preview",
     );
@@ -171,5 +184,46 @@ describe("operator separation", () => {
         run: { id: "good", status: "completed" },
       }),
     ).toBe("history");
+  });
+
+  it("blocks approval controls when the recommendation identity is absent", () => {
+    render(
+      <OperatorConsole
+        {...props}
+        operator
+        run={{ id: "run-1", status: "awaiting_approval" }}
+      />,
+    );
+
+    expect(screen.getByText(/Approval identity unavailable/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reject recommendation" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Approve recommendation" })).toBeDisabled();
+  });
+
+  it("enables approval controls only for a recommendation bound to a selection", () => {
+    render(
+      <OperatorConsole
+        {...props}
+        operator
+        run={{
+          id: "run-1",
+          status: "awaiting_approval",
+          action_trace: {
+            mode: "recommendation_only",
+            selection: { fingerprint: "b".repeat(64) },
+            recommendation: {
+              id: `recommendation:${"a".repeat(64)}`,
+              summary: "Throttle retry fanout after verifying processor health.",
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/Throttle retry fanout/)).toBeVisible();
+    const approve = screen.getByRole("button", { name: "Approve recommendation" });
+    expect(approve).toBeEnabled();
+    fireEvent.click(approve);
+    expect(props.onDecision).toHaveBeenCalledWith(true);
   });
 });

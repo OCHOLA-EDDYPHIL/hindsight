@@ -96,7 +96,8 @@ def test_demo_fixture_loads_believable_incident_data(seeded_conn):
 
 @requires_db
 def test_showcase_query_joins_vectors_validity_and_transactional_filters(seeded_conn):
-    from hindsight.embeddings import DeterministicEmbeddingProvider, vector_literal
+    from hindsight.embeddings import vector_literal
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     provider = DeterministicEmbeddingProvider()

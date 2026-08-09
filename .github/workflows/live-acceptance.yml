@@ -34,6 +34,7 @@ env:
   CHANGEFEED_PARAMETER: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
   GEMINI_MODEL: ${{ vars.HINDSIGHT_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
   GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
+  HINDSIGHT_GEMINI_REPRESENTATION: ${{ vars.HINDSIGHT_GEMINI_REPRESENTATION || 'raw_control' }}
 
 jobs:
   authorize:
@@ -182,8 +183,6 @@ jobs:
       GEMINI_EMBEDDING_MODEL: ${{ vars.HINDSIGHT_GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2' }}
       COMPOSE_PROJECT_NAME: hindsight_product_preflight_${{ github.run_id }}_${{ github.run_attempt }}
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_product_${{ github.run_id }}?sslmode=disable
-      EMBEDDING_PROVIDER: deterministic
-      LLM_PROVIDER: deterministic
     steps:
       - uses: actions/checkout@v4
         with:
@@ -439,6 +438,7 @@ jobs:
       id-token: write
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
       GEMINI_PARAMETER: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
       DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
       OPERATOR_PARAMETER: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
@@ -494,6 +494,16 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/hindsight-browser-evidence"
           echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence" >> "$GITHUB_ENV"
+      - name: Publish and verify controlled incident telemetry
+        run: >-
+          uv run python scripts/publish_controlled_incident_telemetry.py
+          --stage "$HINDSIGHT_STAGE"
+          --region "$AWS_REGION"
+          --checkout-latency-ms 842.5
+          --retry-fanout 8
+          --processor-queue-depth 217
+          --visibility-timeout-seconds 120
+          --confirm-controlled-fixture
       - name: Start isolated Firefox service
         shell: bash
         run: |

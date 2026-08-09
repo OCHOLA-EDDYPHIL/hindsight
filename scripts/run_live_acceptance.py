@@ -198,8 +198,8 @@ def _verify_resilience(args: argparse.Namespace) -> None:
     env.update(
         {
             "DATABASE_URL": database_url,
-            "EMBEDDING_PROVIDER": "deterministic",
-            "LLM_PROVIDER": "deterministic",
+            "EMBEDDING_PROVIDER": "gemini",
+            "LLM_PROVIDER": "gemini",
         }
     )
     artifact_dir = _acceptance_artifact_dir("resilience")
@@ -222,17 +222,15 @@ def _run_local_product_full(args: argparse.Namespace) -> None:
         _create_local_database(url)
 
     _verify_product_providers()
-    semantic_env = _product_environment(semantic_url, live=True)
+    semantic_env = _product_environment(semantic_url)
     _initialize_product_database(semantic_env, configure_embeddings=True)
-    _verify_semantic(
-        argparse.Namespace(database_url=semantic_url, database_scope="local")
-    )
+    _verify_semantic(argparse.Namespace(database_url=semantic_url, database_scope="local"))
 
-    resilience_env = _product_environment(resilience_url, live=False)
+    resilience_env = _product_environment(resilience_url)
     _initialize_product_database(resilience_env, configure_embeddings=False)
     _verify_resilience(argparse.Namespace(database_url=resilience_url))
 
-    browser_env = _product_environment(browser_url, live=True)
+    browser_env = _product_environment(browser_url)
     _initialize_product_database(browser_env, configure_embeddings=True)
     _run_local_browser_product(
         database_url=browser_url,
@@ -240,9 +238,7 @@ def _run_local_product_full(args: argparse.Namespace) -> None:
     )
 
 
-def _initialize_product_database(
-    env: dict[str, str], *, configure_embeddings: bool
-) -> None:
+def _initialize_product_database(env: dict[str, str], *, configure_embeddings: bool) -> None:
     _run([sys.executable, "scripts/migrate.py"], env=env)
     _run([sys.executable, "scripts/initialize_agent_storage.py"], env=env)
     if configure_embeddings:
@@ -264,7 +260,7 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
         raise ValueError("local-product-full requires an explicit loopback HTTP port")
     _require_gemini_credentials()
     token = secrets.token_hex(32)
-    env = _product_environment(database_url, live=True)
+    env = _product_environment(database_url)
     for name in (
         "RUN_HOSTED_ACCEPTANCE",
         "HOSTED_API_URL",
@@ -477,9 +473,7 @@ def _verify_changefeed(env: dict[str, str]) -> None:
     _run([sys.executable, "scripts/configure_changefeed.py", "status"], env=env)
 
 
-def _run_hosted_pytest(
-    selectors: tuple[str, ...], *, env: dict[str, str], phase: str
-) -> None:
+def _run_hosted_pytest(selectors: tuple[str, ...], *, env: dict[str, str], phase: str) -> None:
     artifact_dir = _acceptance_artifact_dir(phase)
     env[ACCEPTANCE_ARTIFACT_DIR_ENV] = str(artifact_dir)
     _run_strict_pytest(
@@ -536,9 +530,7 @@ def _run_strict_pytest(
 def _verify_hosted_endpoints() -> None:
     ui_url = _required_https_env("HINDSIGHT_BROWSER_BASE_URL").rstrip("/")
     api_url = _required_https_env("HOSTED_API_URL").rstrip("/")
-    expected_revision = _require_exact_sha(
-        _required_env("HINDSIGHT_EXPECTED_DEPLOYED_REVISION")
-    )
+    expected_revision = _require_exact_sha(_required_env("HINDSIGHT_EXPECTED_DEPLOYED_REVISION"))
     websocket_url = _required_env("HINDSIGHT_WEBSOCKET_URL")
     if not websocket_url.startswith("wss://"):
         raise ValueError("hosted product WebSocket endpoint must use WSS")
@@ -595,9 +587,7 @@ def _validate_local_url(database_url: str):
         or database_name in {"", "defaultdb", "postgres"}
         or query.get("sslmode") != ["disable"]
     ):
-        raise ValueError(
-            "local acceptance requires a named loopback database with sslmode=disable"
-        )
+        raise ValueError("local acceptance requires a named loopback database with sslmode=disable")
     return parts, database_name
 
 
@@ -626,8 +616,7 @@ def _require_hosted_database(database_url: str) -> None:
 
 def _require_gemini_credentials() -> None:
     if not any(
-        (os.environ.get(name) or "").strip()
-        for name in ("GEMINI_API_KEYS", "GEMINI_API_KEY")
+        (os.environ.get(name) or "").strip() for name in ("GEMINI_API_KEYS", "GEMINI_API_KEY")
     ):
         raise ValueError("Gemini credentials must already be loaded into the environment")
 
@@ -668,13 +657,13 @@ def _required_positive_int_env(name: str) -> int:
     return parsed
 
 
-def _product_environment(database_url: str, *, live: bool) -> dict[str, str]:
+def _product_environment(database_url: str) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
         {
             "DATABASE_URL": database_url,
-            "EMBEDDING_PROVIDER": "gemini" if live else "deterministic",
-            "LLM_PROVIDER": "gemini" if live else "deterministic",
+            "EMBEDDING_PROVIDER": "gemini",
+            "LLM_PROVIDER": "gemini",
             "HINDSIGHT_DATABASE_URL_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEY_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEYS_PARAM": "",

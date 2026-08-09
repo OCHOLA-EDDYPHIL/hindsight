@@ -1,6 +1,5 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
-LOCAL_OTEL_ENDPOINT ?= http://localhost:4317
-.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts poison-rewind-demo poison-rewind-demo-local poison-rewind-trace-local product-api-local changefeed-apply changefeed-pause changefeed-status
+.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts product-api-local changefeed-apply changefeed-pause changefeed-status
 
 dev-up:
 	docker compose up -d --wait
@@ -32,15 +31,6 @@ lint:
 
 lambda-artifacts:
 	uv run python scripts/build_lambda_artifacts.py
-
-poison-rewind-demo:
-	uv run python scripts/run_poison_rewind_demo.py all
-
-poison-rewind-demo-local:
-	DATABASE_URL="$(LOCAL_DATABASE_URL)" uv run python scripts/run_poison_rewind_demo.py all
-
-poison-rewind-trace-local:
-	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_OTEL_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT="$(LOCAL_OTEL_ENDPOINT)" OTEL_EXPORTER_OTLP_INSECURE=true uv run python scripts/run_poison_rewind_demo.py all
 
 product-api-local:
 	DATABASE_URL="$(LOCAL_DATABASE_URL)" HINDSIGHT_DATABASE_URL_PARAM="" HINDSIGHT_GEMINI_API_KEY_PARAM="" HINDSIGHT_GEMINI_API_KEYS_PARAM="" HINDSIGHT_INLINE_WORKER=1 HINDSIGHT_SECURE_COOKIES=0 uv run uvicorn hindsight.api:app --reload --host 127.0.0.1 --port 8766

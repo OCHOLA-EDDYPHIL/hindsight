@@ -219,7 +219,14 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
         timeout=scheduler_seconds * 2 + lease_seconds + 180,
     )
     assert awaiting["worker_attempt_count"] == 1
-    prepare_approval(run_id=pending["id"], approved=True, db_url=database_url)
+    action_trace = awaiting["action_trace"]
+    prepare_approval(
+        run_id=pending["id"],
+        approved=True,
+        recommendation_id=action_trace["recommendation"]["id"],
+        selection_fingerprint=action_trace["selection"]["fingerprint"],
+        db_url=database_url,
+    )
     _wait_for_run_status(
         str(pending["id"]),
         expected={"completed"},
@@ -245,6 +252,7 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
     first = claim_run_attempt(
         run_id=reclaimed["id"],
         command="start",
+        command_generation=0,
         lease_ttl=timedelta(seconds=1),
         max_attempts=max_attempts,
         db_url=database_url,
@@ -281,6 +289,7 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
         claim = claim_run_attempt(
             run_id=exhausted["id"],
             command="start",
+            command_generation=0,
             lease_ttl=timedelta(seconds=1),
             max_attempts=max_attempts,
             db_url=database_url,

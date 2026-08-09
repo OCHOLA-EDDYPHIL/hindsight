@@ -14,8 +14,6 @@ jobs:
       COMPOSE_PROJECT_NAME: hindsight_migrations_${{ github.run_id }}_${{ github.run_attempt }}
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EXTENDED_DATABASE_URL: postgresql://root@localhost:26257/migration_extended_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
-      EMBEDDING_PROVIDER: deterministic
-      LLM_PROVIDER: deterministic
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

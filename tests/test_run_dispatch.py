@@ -16,6 +16,14 @@ from psycopg import sql
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
+APPROVAL_RECOMMENDATION_ID = "recommendation:test"
+APPROVAL_SELECTION_FINGERPRINT = "selection:test"
+APPROVAL_METADATA = {
+    "action_trace": {
+        "recommendation": {"id": APPROVAL_RECOMMENDATION_ID},
+        "selection": {"fingerprint": APPROVAL_SELECTION_FINGERPRINT},
+    }
+}
 
 
 class RecordingSqs:
@@ -111,8 +119,14 @@ def test_run_and_approval_transitions_commit_their_dispatches():
         status="awaiting_approval",
         phase="plan",
         summary="Plan awaits approval",
+        metadata=APPROVAL_METADATA,
     )
-    prepared = prepare_approval(run_id=run["id"], approved=True)
+    prepared = prepare_approval(
+        run_id=run["id"],
+        approved=True,
+        recommendation_id=APPROVAL_RECOMMENDATION_ID,
+        selection_fingerprint=APPROVAL_SELECTION_FINGERPRINT,
+    )
 
     assert created is True
     assert prepared["status"] == "resuming"
@@ -132,10 +146,21 @@ def test_run_and_approval_transitions_commit_their_dispatches():
         ).fetchall()
 
     assert dispatches == [
-        ("start", {"command": "start", "run_id": run["id"]}, "pending"),
+        (
+            "start",
+            {"command": "start", "command_generation": 0, "run_id": run["id"]},
+            "pending",
+        ),
         (
             "resume",
-            {"approved": True, "command": "resume", "run_id": run["id"]},
+            {
+                "approved": True,
+                "command": "resume",
+                "command_generation": 1,
+                "recommendation_id": APPROVAL_RECOMMENDATION_ID,
+                "run_id": run["id"],
+                "selection_fingerprint": APPROVAL_SELECTION_FINGERPRINT,
+            },
             "pending",
         ),
     ]
@@ -143,6 +168,135 @@ def test_run_and_approval_transitions_commit_their_dispatches():
         ("queue", "queued"),
         ("plan", "awaiting_approval"),
         ("approval", "resuming"),
+    ]
+
+
+@requires_db
+def test_replanned_run_can_commit_a_second_approval_dispatch(monkeypatch):
+    from hindsight.run_dispatch import dispatch_run_commands
+    from hindsight.runs import (
+        claim_run_attempt,
+        create_run,
+        finish_run_attempt,
+        prepare_approval,
+        transition_run,
+    )
+
+    suffix = uuid4().hex
+    run, _ = create_run(
+        incident_slug=f"dispatch-replan-{suffix}",
+        namespace=f"dispatch-replan-{suffix}",
+        user_input="checkout latency",
+    )
+    transition_run(
+        run_id=run["id"],
+        status="awaiting_approval",
+        phase="plan",
+        summary="First recommendation awaits approval",
+        metadata=APPROVAL_METADATA,
+    )
+    prepare_approval(
+        run_id=run["id"],
+        approved=True,
+        recommendation_id=APPROVAL_RECOMMENDATION_ID,
+        selection_fingerprint=APPROVAL_SELECTION_FINGERPRINT,
+    )
+
+    claimed = claim_run_attempt(
+        run_id=run["id"],
+        command="resume",
+        command_generation=1,
+        lease_ttl=timedelta(minutes=1),
+        max_attempts=3,
+    )
+    assert claimed.outcome == "claimed"
+    assert claimed.attempt_id is not None
+
+    next_recommendation_id = "recommendation:replanned"
+    next_selection_fingerprint = "selection:replanned"
+    finish_run_attempt(
+        run_id=run["id"],
+        attempt_id=claimed.attempt_id,
+        command="resume",
+        status="awaiting_approval",
+        phase="plan",
+        summary="Changed memory requires a new approval",
+        metadata={
+            "action_trace": {
+                "recommendation": {"id": next_recommendation_id},
+                "selection": {"fingerprint": next_selection_fingerprint},
+            }
+        },
+    )
+    prepared = prepare_approval(
+        run_id=run["id"],
+        approved=True,
+        recommendation_id=next_recommendation_id,
+        selection_fingerprint=next_selection_fingerprint,
+    )
+
+    assert prepared["status"] == "resuming"
+    assert prepared["command_generation"] == 2
+    monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
+    client = RecordingSqs()
+    dispatched = dispatch_run_commands(
+        run_id=run["id"],
+        command="resume",
+        limit=1,
+        client=client,
+    )
+    assert dispatched["dispatched"] == 1
+    assert client.messages[0]["body"]["command_generation"] == 2
+    stale = claim_run_attempt(
+        run_id=run["id"],
+        command="resume",
+        command_generation=1,
+        lease_ttl=timedelta(minutes=1),
+        max_attempts=3,
+    )
+    current = claim_run_attempt(
+        run_id=run["id"],
+        command="resume",
+        command_generation=2,
+        lease_ttl=timedelta(minutes=1),
+        max_attempts=3,
+    )
+    assert stale.outcome == "duplicate"
+    assert current.outcome == "claimed"
+    assert current.run["worker_attempt_count"] == 1
+    assert current.run["worker_attempt_generation"] == 2
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        resume_payloads = conn.execute(
+            """
+                SELECT payload
+                FROM agent_run_dispatches
+                WHERE run_id = %s AND command = 'resume'
+                ORDER BY created_at, id
+            """,
+            (run["id"],),
+        ).fetchall()
+
+    assert resume_payloads == [
+        (
+            {
+                "approved": True,
+                "command": "resume",
+                "command_generation": 1,
+                "recommendation_id": APPROVAL_RECOMMENDATION_ID,
+                "run_id": run["id"],
+                "selection_fingerprint": APPROVAL_SELECTION_FINGERPRINT,
+            },
+        ),
+        (
+            {
+                "approved": True,
+                "command": "resume",
+                "command_generation": 2,
+                "recommendation_id": next_recommendation_id,
+                "run_id": run["id"],
+                "selection_fingerprint": next_selection_fingerprint,
+            },
+        ),
     ]
 
 
@@ -207,6 +361,7 @@ def test_approval_rolls_back_when_resume_dispatch_cannot_be_persisted(monkeypatc
         status="awaiting_approval",
         phase="plan",
         summary="Plan awaits approval",
+        metadata=APPROVAL_METADATA,
     )
     monkeypatch.setattr(
         runs,
@@ -215,7 +370,12 @@ def test_approval_rolls_back_when_resume_dispatch_cannot_be_persisted(monkeypatc
     )
 
     with pytest.raises(RuntimeError, match="outbox insert failed"):
-        runs.prepare_approval(run_id=run["id"], approved=True)
+        runs.prepare_approval(
+            run_id=run["id"],
+            approved=True,
+            recommendation_id=APPROVAL_RECOMMENDATION_ID,
+            selection_fingerprint=APPROVAL_SELECTION_FINGERPRINT,
+        )
 
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         persisted = conn.execute(
@@ -328,12 +488,14 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
     first_claim = claim_run_attempt(
         run_id=run["id"],
         command="start",
+        command_generation=0,
         lease_ttl=timedelta(minutes=5),
         max_attempts=3,
     )
     duplicate_claim = claim_run_attempt(
         run_id=run["id"],
         command="start",
+        command_generation=0,
         lease_ttl=timedelta(minutes=5),
         max_attempts=3,
     )
@@ -347,6 +509,4 @@ def test_expired_dispatch_lease_is_reclaimed_and_duplicate_delivery_is_phase_saf
     ) == 2
     assert first_claim.outcome == "claimed"
     assert duplicate_claim.outcome == "busy"
-    assert [
-        event["status"] for event in get_run(run_id=run["id"])["events"]
-    ].count("triaging") == 1
+    assert [event["status"] for event in get_run(run_id=run["id"])["events"]].count("triaging") == 1

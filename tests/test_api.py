@@ -490,15 +490,27 @@ def test_approval_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
     response = client.post(
         "/v1/runs/run-pending/approval",
         headers={"Authorization": "Bearer operator-secret"},
-        json={"approved": True},
+        json={
+            "approved": True,
+            "recommendation_id": f"recommendation:{'a' * 64}",
+            "selection_fingerprint": "b" * 64,
+        },
     )
 
     assert response.status_code == 202
-    assert response.json() == {"run_id": "run-pending", "status": "resuming", "approved": True}
+    assert response.json() == {
+        "run_id": "run-pending",
+        "status": "resuming",
+        "approved": True,
+        "recommendation_id": f"recommendation:{'a' * 64}",
+        "selection_fingerprint": "b" * 64,
+    }
     assert transitions == [
         {
             "run_id": "run-pending",
             "approved": True,
+            "recommendation_id": f"recommendation:{'a' * 64}",
+            "selection_fingerprint": "b" * 64,
             "db_url": "postgresql://resolved/database",
         }
     ]

@@ -245,7 +245,7 @@ def test_provenance_and_decision_read_tracking(memory_store):
 @requires_db
 def test_semantic_write_creates_embedding_row():
     from hindsight.db import connect
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     conn = connect()
@@ -272,8 +272,8 @@ def test_semantic_write_creates_embedding_row():
 
         assert row == (
             memory["namespace"],
-            "deterministic",
-            "stable-hash-v1",
+            "test_deterministic",
+            "test-stable-hash-v1",
             1024,
         )
     finally:
@@ -286,7 +286,7 @@ def test_owned_semantic_write_retries_serialization_with_one_prepared_embedding(
     from psycopg.errors import SerializationFailure
 
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     class CountingProvider(DeterministicEmbeddingProvider):
@@ -345,7 +345,7 @@ def test_serialization_retry_exhaustion_is_owned_and_caller_transactions_propaga
     from psycopg.errors import SerializationFailure
 
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import (
         MAX_OWNED_WRITE_TRANSACTION_ATTEMPTS,
         MemoryStore,
@@ -442,7 +442,7 @@ def test_bad_embedding_provider_does_not_leave_semantic_row():
 @requires_db
 def test_live_document_embedding_is_rejected_inside_caller_transaction():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     class CountingSemanticProvider(DeterministicEmbeddingProvider):
@@ -492,7 +492,7 @@ def test_active_profile_read_closes_owned_implicit_transaction():
     from psycopg.pq import TransactionStatus
 
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
 
     with MemoryStore(
@@ -523,7 +523,8 @@ def test_active_profile_read_preserves_caller_transaction():
 @requires_db
 def test_remember_accepts_precomputed_embedding_inside_caller_transaction():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider, embedding_profile
+    from hindsight.embeddings import embedding_profile
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     provider = DeterministicEmbeddingProvider()
@@ -586,7 +587,7 @@ def test_historical_read_url_prefers_explicit_store_url():
 @requires_db
 def test_direct_semantic_write_supports_tenant_bound_transactions():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     conn = connect(database_url())
@@ -803,7 +804,7 @@ def test_historical_semantic_reads_return_mutable_fields_from_mvcc_snapshot():
 @requires_db
 def test_vector_recall_is_namespace_scoped_current_and_tracked():
     from hindsight.db import connect
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     conn = connect()
@@ -867,7 +868,7 @@ def test_vector_recall_is_namespace_scoped_current_and_tracked():
 @requires_db
 def test_vector_recall_commits_read_tracking_when_store_owns_connection():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     namespace = f"incident-{uuid4()}"
@@ -909,3 +910,186 @@ def test_vector_recall_commits_read_tracking_when_store_owns_connection():
 
     assert [row["id"] for row in recalled] == [memory["id"]]
     assert [row["memory_id"] for row in reads] == [memory["id"]]
+
+
+def test_locked_memory_selection_rejects_namespace_revision_change():
+    from hindsight.memory import MemorySelectionChangedError, MemoryStore
+
+    store = MemoryStore.__new__(MemoryStore)
+    store._fetch_optional = lambda *_args, **_kwargs: {"revision": 4}
+    store._fetch_all = lambda *_args, **_kwargs: pytest.fail(
+        "parents should not be queried after a revision mismatch"
+    )
+
+    with pytest.raises(MemorySelectionChangedError):
+        store._validate_locked_memory_selection(  # noqa: SLF001
+            namespace="incident-checkout",
+            expected_namespace_revision=3,
+            parent_memory_ids=(),
+            require_current_parents=True,
+        )
+
+
+def test_locked_memory_selection_rejects_noncurrent_required_parent():
+    from hindsight.memory import MemorySelectionChangedError, MemoryStore
+
+    store = MemoryStore.__new__(MemoryStore)
+    store._fetch_optional = lambda *_args, **_kwargs: {"revision": 4}
+    store._fetch_all = lambda *_args, **_kwargs: [{"id": "memory-current"}]
+
+    with pytest.raises(MemorySelectionChangedError):
+        store._validate_locked_memory_selection(  # noqa: SLF001
+            namespace="incident-checkout",
+            expected_namespace_revision=4,
+            parent_memory_ids=("memory-current", "memory-invalidated"),
+            require_current_parents=False,
+        )
+
+
+def _reflection_selection(memory_store):
+    from hindsight.memory import Provenance
+
+    namespace = f"reflection-selection-{uuid4()}"
+    decision_id = f"reflection-selection:{uuid4()}"
+    parent = memory_store.write_semantic(
+        namespace=namespace,
+        content="retry fanout saturated the processor",
+        provenance=Provenance(
+            "pytest",
+            "evidence:reflection-selection",
+            "seed approval-bound memory",
+        ),
+    )
+    expected_revision = memory_store.namespace_revision(namespace=namespace)
+    selected = memory_store.current_semantic(
+        namespace=namespace,
+        decision_id=decision_id,
+        reader="agent.recall",
+        purpose="select evidence for an approval-bound recommendation",
+    )
+    assert [row["id"] for row in selected] == [parent["id"]]
+    return namespace, decision_id, parent, expected_revision
+
+
+def _remember_guarded_reflection(
+    memory_store,
+    *,
+    namespace,
+    decision_id,
+    parent_id,
+    expected_revision,
+):
+    from hindsight.memory import Provenance
+
+    return memory_store.remember_agent_reflection(
+        decision_id=decision_id,
+        run_id=str(uuid4()),
+        thread_id=f"thread-{uuid4()}",
+        incident_id=f"incident-{uuid4()}",
+        namespace=namespace,
+        service_slug="payments-api",
+        plan="Inspect processor latency before changing retry policy.",
+        proposed_action="Keep the recommendation read-only.",
+        action_approved=False,
+        content="Approval-bound reflection",
+        metadata={},
+        structured_payload={"schema_version": 1},
+        provenance=Provenance(
+            "agent.reflect",
+            decision_id,
+            "persist the approval-bound reflection",
+        ),
+        parent_memory_ids=[str(parent_id)],
+        expected_namespace_revision=expected_revision,
+        require_current_parents=True,
+    )
+
+
+def _reflection_output_counts(memory_store, *, decision_id):
+    return memory_store._fetch_one(  # noqa: SLF001
+        """
+            SELECT
+                (SELECT count(*) FROM semantic_memories
+                 WHERE producer_decision_id = %s) AS memories,
+                (SELECT count(*) FROM agent_reflections
+                 WHERE decision_id = %s) AS reflections
+        """,
+        (decision_id, decision_id),
+    )
+
+
+@requires_db
+def test_guarded_reflection_writes_against_current_selection(memory_store):
+    namespace, decision_id, parent, expected_revision = _reflection_selection(memory_store)
+
+    reflection = _remember_guarded_reflection(
+        memory_store,
+        namespace=namespace,
+        decision_id=decision_id,
+        parent_id=parent["id"],
+        expected_revision=expected_revision,
+    )
+
+    assert reflection["content_schema"] == "agent_reflection.v1"
+    assert memory_store.namespace_revision(namespace=namespace) == expected_revision + 1
+    assert _reflection_output_counts(memory_store, decision_id=decision_id) == {
+        "memories": 1,
+        "reflections": 1,
+    }
+
+
+@requires_db
+def test_guarded_reflection_rolls_back_when_namespace_revision_changed(memory_store):
+    from hindsight.memory import MemorySelectionChangedError, Provenance
+
+    namespace, decision_id, parent, expected_revision = _reflection_selection(memory_store)
+    memory_store.write_semantic(
+        namespace=namespace,
+        content="new evidence arrived before reflection",
+        provenance=Provenance(
+            "pytest",
+            "evidence:concurrent-selection",
+            "change the approval-bound namespace revision",
+        ),
+    )
+
+    with pytest.raises(MemorySelectionChangedError):
+        _remember_guarded_reflection(
+            memory_store,
+            namespace=namespace,
+            decision_id=decision_id,
+            parent_id=parent["id"],
+            expected_revision=expected_revision,
+        )
+
+    assert _reflection_output_counts(memory_store, decision_id=decision_id) == {
+        "memories": 0,
+        "reflections": 0,
+    }
+
+
+@requires_db
+def test_guarded_reflection_rolls_back_when_parent_is_no_longer_current(memory_store):
+    from hindsight.memory import MemorySelectionChangedError
+
+    namespace, decision_id, parent, _ = _reflection_selection(memory_store)
+    memory_store.invalidate(
+        memory_id=str(parent["id"]),
+        actor="pytest",
+        reason="new evidence invalidated the approval-bound parent",
+    )
+    current_revision = memory_store.namespace_revision(namespace=namespace)
+
+    with pytest.raises(MemorySelectionChangedError):
+        _remember_guarded_reflection(
+            memory_store,
+            namespace=namespace,
+            decision_id=decision_id,
+            parent_id=parent["id"],
+            expected_revision=current_revision,
+        )
+
+    assert _reflection_output_counts(memory_store, decision_id=decision_id) == {
+        "memories": 0,
+        "reflections": 0,
+    }

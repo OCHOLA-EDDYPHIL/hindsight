@@ -73,7 +73,6 @@ DATABASE_SCRIPTS = frozenset(
         "configure_changefeed.py",
         "reembed_memories.py",
         "run_incident_agent.py",
-        "run_poison_rewind_demo.py",
     }
 )
 LAMBDA_SCRIPTS = frozenset(

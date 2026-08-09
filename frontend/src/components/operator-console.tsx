@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { formatTime, humanStatus } from "@/lib/format";
-import type { Incident, RewindPreview, Run, Snapshot } from "@/types";
+import type { Incident, RewindPreview, Run, SignatureScenario, Snapshot } from "@/types";
 
 export function OperatorAccess({
   open,
@@ -50,7 +50,7 @@ export function OperatorAccess({
           execution require a passcode-backed session.
         </DialogDescription>
         <p className="mt-3 text-xs leading-5 text-muted">
-          Unlock first, then use the optional walkthrough to reset, inject poison, analyze,
+          Unlock first, then use the optional walkthrough to reset, import stale guidance, analyze,
           correct the belief state, and inspect history.
         </p>
         <form id="operatorForm" className="mt-6 grid gap-2" onSubmit={submit}>
@@ -81,8 +81,8 @@ const phases = [
   { key: "recall", label: "recall" },
   { key: "plan", label: "cited proposal" },
   { key: "approval", label: "approval" },
-  { key: "action", label: "bounded action" },
-  { key: "observation", label: "observation" },
+  { key: "action", label: "recommendation" },
+  { key: "observation", label: "diagnostics" },
   { key: "reflection", label: "reflection" },
 ];
 
@@ -98,9 +98,9 @@ const walkthroughSteps = [
     detail: "Restore the known-good baseline and create a fresh signature namespace.",
   },
   {
-    id: "poison",
-    label: "Inject poison",
-    detail: "Add traced retry-amplifying guidance that should influence the first decision.",
+    id: "compromise",
+    label: "Import stale guidance",
+    detail: "Import traced retry-amplifying guidance into normal governed memory history.",
   },
   {
     id: "analyze",
@@ -108,9 +108,9 @@ const walkthroughSteps = [
     detail: "Run the agent and inspect which memories shaped the recommendation.",
   },
   {
-    id: "reject",
-    label: "Run the bounded action",
-    detail: "Approve the controlled simulator run, then inspect its independent safety result.",
+    id: "review",
+    label: "Review recommendation",
+    detail: "Approve or reject the recommendation bound to its cited memory selection.",
   },
   {
     id: "preview",
@@ -125,7 +125,7 @@ const walkthroughSteps = [
   {
     id: "reanalyze",
     label: "Re-analyze and approve",
-    detail: "Analyze again, confirm the poison is absent, then approve the corrected plan.",
+    detail: "Analyze again, confirm the stale guidance is absent, then approve the corrected plan.",
   },
   {
     id: "history",
@@ -139,12 +139,14 @@ type WalkthroughStep = (typeof walkthroughSteps)[number]["id"];
 export function deriveWalkthroughStep({
   operator,
   rewindAnchor,
+  scenario,
   snapshot,
   run,
   rewindPreview,
 }: {
   operator: boolean;
   rewindAnchor: string | null;
+  scenario: SignatureScenario | null;
   snapshot: Snapshot | null;
   run: Run | null;
   rewindPreview: RewindPreview | null;
@@ -156,18 +158,20 @@ export function deriveWalkthroughStep({
       (operation) => operation.operation_type === "rewind" && operation.status === "completed",
     ),
   );
-  const activePoison = Boolean(
-    snapshot?.memories.some(
-      (memory) =>
-        memory.writer === "demo.poison" &&
-        memory.status !== "invalidated" &&
-        !memory.t_invalid,
-    ),
+  const compromisedMemoryId = scenario?.stages.compromised_memory_id;
+  const activeCompromisedGuidance = Boolean(
+    compromisedMemoryId &&
+      snapshot?.memories.some(
+        (memory) =>
+          memory.id === compromisedMemoryId &&
+          memory.status !== "invalidated" &&
+          !memory.t_invalid,
+      ),
   );
-  if (!activePoison && !completedRewind) return "poison";
+  if (!activeCompromisedGuidance && !completedRewind) return "compromise";
   if (!completedRewind) {
     if (rewindPreview) return "execute";
-    if (run?.status === "awaiting_approval") return "reject";
+    if (run?.status === "awaiting_approval") return "review";
     if (run?.status === "rejected") return "preview";
     return "analyze";
   }
@@ -183,6 +187,7 @@ export function OperatorConsole({
   incidentInput,
   busy,
   rewindAnchor,
+  scenario,
   snapshot,
   rewindTimestamp,
   rewindReason,
@@ -206,6 +211,7 @@ export function OperatorConsole({
   incidentInput: string;
   busy: string | null;
   rewindAnchor: string | null;
+  scenario: SignatureScenario | null;
   snapshot: Snapshot | null;
   rewindTimestamp: string;
   rewindReason: string;
@@ -228,11 +234,15 @@ export function OperatorConsole({
   const walkthroughStep = deriveWalkthroughStep({
     operator,
     rewindAnchor,
+    scenario,
     snapshot,
     run,
     rewindPreview,
   });
   const walkthroughIndex = walkthroughSteps.findIndex((step) => step.id === walkthroughStep);
+  const recommendationId = run?.action_trace?.recommendation?.id;
+  const selectionFingerprint = run?.action_trace?.selection?.fingerprint;
+  const approvalIdentityReady = Boolean(recommendationId && selectionFingerprint);
   const describedBy = walkthroughOpen ? "walkthroughCurrent" : undefined;
   const currentControl = (step: WalkthroughStep) =>
     walkthroughOpen && walkthroughStep === step
@@ -341,9 +351,9 @@ export function OperatorConsole({
             data-operator
             disabled={!operator || busy === "poison"}
             onClick={onPoison}
-            {...currentControl("poison")}
+            {...currentControl("compromise")}
           >
-            {busy === "poison" ? "Injecting" : "Inject poison"}
+            {busy === "poison" ? "Importing" : "Import stale guidance"}
           </Button>
           <Button
             id="startRun"
@@ -380,28 +390,32 @@ export function OperatorConsole({
       <div id="approvalActions" className="approval-actions" hidden={run?.status !== "awaiting_approval"}>
         <div>
           <strong>Decision awaits operator review</strong>
-          <span>{run?.decision_id || "identity pending"}</span>
+          <span>
+            {approvalIdentityReady
+              ? run?.action_trace?.recommendation?.summary || "Recommendation identity verified"
+              : "Approval identity unavailable. Refresh or rerun the analysis."}
+          </span>
         </div>
         <Button
           id="rejectRun"
           type="button"
           variant="danger"
           data-operator
-          disabled={!operator || busy === "reject"}
+          disabled={!operator || !approvalIdentityReady || busy === "reject"}
           onClick={() => onDecision(false)}
         >
-          Reject without running
+          Reject recommendation
         </Button>
         <Button
           id="approveRun"
           type="button"
           variant="primary"
           data-operator
-          disabled={!operator || busy === "approve"}
+          disabled={!operator || !approvalIdentityReady || busy === "approve"}
           onClick={() => onDecision(true)}
-          {...currentControl(walkthroughStep === "reject" ? "reject" : "reanalyze")}
+          {...currentControl(walkthroughStep === "review" ? "review" : "reanalyze")}
         >
-          Approve &amp; run
+          Approve recommendation
         </Button>
       </div>
 

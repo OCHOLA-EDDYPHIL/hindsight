@@ -21,6 +21,7 @@ from hindsight.agent import (
     resume_incident_agent,
     run_incident_agent,
 )
+from hindsight.cloudwatch_diagnostics import cloudwatch_diagnostics_from_env
 from hindsight.embeddings import embedding_provider_from_env
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
 from hindsight.security import safe_error_detail
@@ -110,7 +111,9 @@ def handle_request(
     except ValueError as exc:
         return _error_response(400, str(exc), started, cold_start, route)
     except Exception as exc:
-        return _error_response(500, "incident agent request failed", started, cold_start, route, exc)
+        return _error_response(
+            500, "incident agent request failed", started, cold_start, route, exc
+        )
 
 
 def function_auth_token(
@@ -168,11 +171,10 @@ def runtime_settings(
         "LLM_PROVIDER": env.get("LLM_PROVIDER", "gemini"),
         "GEMINI_MODEL": env.get("GEMINI_MODEL", ""),
         "GEMINI_EMBEDDING_MODEL": env.get("GEMINI_EMBEDDING_MODEL", ""),
-        "EMBEDDING_PROVIDER": env.get(
-            "EMBEDDING_PROVIDER", env.get("LLM_PROVIDER", "gemini")
+        "EMBEDDING_PROVIDER": env.get("EMBEDDING_PROVIDER", env.get("LLM_PROVIDER", "gemini")),
+        "HINDSIGHT_GEMINI_REPRESENTATION": env.get(
+            "HINDSIGHT_GEMINI_REPRESENTATION", "raw_control"
         ),
-        "BEDROCK_MODEL": env.get("BEDROCK_MODEL", ""),
-        "BEDROCK_EMBEDDING_MODEL": env.get("BEDROCK_EMBEDDING_MODEL", ""),
         "AWS_REGION": env.get("AWS_REGION", ""),
         "AWS_DEFAULT_REGION": env.get("AWS_DEFAULT_REGION", ""),
     }
@@ -239,6 +241,7 @@ def _start(
         db_url=resolved_settings.database_url,
         reasoning_provider=provider,
         embedding_provider=embedding_provider_from_env(resolved_settings.provider_env),
+        diagnostic_tool=cloudwatch_diagnostics_from_env(),
     )
 
 
@@ -252,10 +255,17 @@ def _resume(
     thread_id = _required_limited_str(payload, "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
     return resume_incident_agent(
         thread_id=thread_id,
-        approved=_optional_bool(payload, "approved", default=True),
+        approved=_optional_bool(payload, "approved", default=False),
+        recommendation_id=_required_limited_str(
+            payload, "recommendation_id", max_chars=80
+        ),
+        selection_fingerprint=_required_limited_str(
+            payload, "selection_fingerprint", max_chars=64
+        ),
         db_url=resolved_settings.database_url,
         reasoning_provider=provider,
         embedding_provider=embedding_provider_from_env(resolved_settings.provider_env),
+        diagnostic_tool=cloudwatch_diagnostics_from_env(),
     )
 
 
@@ -276,6 +286,12 @@ def _success_response(
         "provider": reasoning.get("provider"),
         "model": reasoning.get("model"),
         "usage": reasoning.get("usage", {}),
+        "plan_payload": result.state.get("plan_payload") or {},
+        "reasoning_steps": result.state.get("reasoning_steps") or [],
+        "tool_calls": result.state.get("tool_calls") or [],
+        "observations": result.state.get("observations") or [],
+        "safety": (result.state.get("plan_payload") or {}).get("safety_constraints", []),
+        "embedding_profile": result.state.get("embedding_profile") or {},
         "elapsed_ms": elapsed_ms,
         "cold_start": cold_start,
     }
@@ -457,7 +473,9 @@ def _metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _validate_payload(route: str, payload: Mapping[str, Any]) -> None:
     if route == "/incident/resume":
         _required_limited_str(payload, "thread_id", max_chars=MAX_IDENTIFIER_CHARS)
-        _optional_bool(payload, "approved", default=True)
+        _optional_bool(payload, "approved", default=False)
+        _required_limited_str(payload, "recommendation_id", max_chars=80)
+        _required_limited_str(payload, "selection_fingerprint", max_chars=64)
         return
     _required_limited_str(
         payload,

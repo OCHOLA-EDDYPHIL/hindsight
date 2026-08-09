@@ -211,6 +211,12 @@ class RunCreate(BaseModel):
 
 class ApprovalRequest(BaseModel):
     approved: bool
+    recommendation_id: str = Field(
+        min_length=79,
+        max_length=79,
+        pattern=r"^recommendation:[a-f0-9]{64}$",
+    )
+    selection_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
 
 
 class IncidentResolutionRequest(BaseModel):
@@ -534,6 +540,8 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
         prepare_approval(
             run_id=run_id,
             approved=payload.approved,
+            recommendation_id=payload.recommendation_id,
+            selection_fingerprint=payload.selection_fingerprint,
             db_url=db_url,
         )
     except RunNotFoundError as exc:
@@ -546,7 +554,13 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
         command="resume",
         limit=1,
     )
-    return {"run_id": run_id, "status": "resuming", "approved": payload.approved}
+    return {
+        "run_id": run_id,
+        "status": "resuming",
+        "approved": payload.approved,
+        "recommendation_id": payload.recommendation_id,
+        "selection_fingerprint": payload.selection_fingerprint,
+    }
 
 
 @app.get(f"{API_PREFIX}/namespaces/{{namespace}}/beliefs", tags=["memory"])

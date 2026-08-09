@@ -18,7 +18,7 @@ def test_writes_after_build_snapshot_are_enqueued_before_activation(monkeypatch)
         activate_profile,
         begin_profile_build,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     class RotationProvider(DeterministicEmbeddingProvider):
@@ -139,7 +139,8 @@ def test_retrieval_remains_explicit_and_complete_across_profile_rotation():
         activate_profile,
         begin_profile_build,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider, embedding_profile
+    from hindsight.embeddings import embedding_profile
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     class RotationProvider(DeterministicEmbeddingProvider):
@@ -248,7 +249,8 @@ def test_build_fence_blocks_overlapping_write_until_snapshot_commits(monkeypatch
         begin_profile_build,
         lock_embedding_index_write_fence,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider, embedding_profile
+    from hindsight.embeddings import embedding_profile
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     class OverlapProvider(DeterministicEmbeddingProvider):

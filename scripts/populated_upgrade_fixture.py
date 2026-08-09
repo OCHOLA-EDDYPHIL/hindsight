@@ -43,7 +43,7 @@ def seed(url: str) -> None:
                     provider, model, code_sha
                 ) VALUES (
                     %s, 'ci_smoke', 'running', %s, 'ci-upgrade-manifest',
-                    'deterministic', 'deterministic', 'ci-upgrade'
+                    'ci-fixture', 'ci-upgrade-v1', 'ci-upgrade'
                 )
             """,
             (EXPERIMENT_ID, Jsonb({"fixture": "terminal-upgrade"})),
@@ -102,6 +102,20 @@ def _expect_immutable(conn: psycopg.Connection, statement: str, params: tuple[ob
 
 def verify(url: str) -> None:
     with psycopg.connect(url, autocommit=True) as conn:
+        run_budget_columns = {
+            row[0]
+            for row in conn.execute(
+                """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'agent_runs'
+                      AND column_name IN ('model_call_count', 'cloudwatch_call_count')
+                """
+            ).fetchall()
+        }
+        if run_budget_columns != {"model_call_count", "cloudwatch_call_count"}:
+            raise RuntimeError("agent run call-budget columns are missing after upgrade")
         experiment = conn.execute(
             """
                 SELECT tenant_id, status, experiment_kind, manifest_sha256,

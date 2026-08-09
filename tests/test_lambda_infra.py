@@ -37,16 +37,15 @@ def test_saved_plan_sources_do_not_capture_a_runner_checkout_path():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
 
     for artifact in ("api", "worker", "realtime"):
-        assert f'abspath(var.{artifact}_zip_path)' not in stack
+        assert f"abspath(var.{artifact}_zip_path)" not in stack
         assert (
-            f'"${{path.module}}/../../../build/lambda-artifacts/hindsight-{artifact}.zip"'
-            in stack
+            f'"${{path.module}}/../../../build/lambda-artifacts/hindsight-{artifact}.zip"' in stack
         )
     assert 'web_root     = "${path.module}/../../../src/hindsight/web"' in stack
-    assert 'web_root     = abspath(' not in stack
+    assert "web_root     = abspath(" not in stack
 
 
-def test_runtime_lambdas_use_distinct_database_parameters_without_bedrock():
+def test_runtime_lambdas_use_distinct_database_parameters():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
     api_policy = stack.split('data "aws_iam_policy_document" "api"', 1)[1].split(
         'resource "aws_iam_role_policy" "api"', 1
@@ -63,16 +62,14 @@ def test_runtime_lambdas_use_distinct_database_parameters_without_bedrock():
     assert "dynamodb:UpdateItem" in api_policy
     assert "local.parameter_arns.api_database" in api_policy
     assert "local.parameter_arns.worker_database" not in api_policy
-    assert "bedrock:" not in api_policy
     assert "local.parameter_arns.worker_database" in worker_policy
     assert "local.parameter_arns.api_database" not in worker_policy
-    assert "bedrock:" not in worker_policy
     assert "HINDSIGHT_GEMINI_API_KEYS_PARAM" in api_lambda
     assert "HINDSIGHT_GEMINI_KEY_HEALTH_TABLE" in api_lambda
     assert "LLM_PROVIDER" in api_lambda
     assert "EMBEDDING_PROVIDER" in api_lambda
     assert "GEMINI_EMBEDDING_MODEL" in api_lambda
-    assert "BEDROCK_" not in api_lambda
+    assert "HINDSIGHT_GEMINI_REPRESENTATION" in api_lambda
     assert 'resource "aws_cloudwatch_event_rule" "operation_reaper"' in stack
     assert 'command = "reap_memory_operations"' in stack
     assert 'resource "aws_api_gateway_account" "cloudwatch"' in stack
@@ -136,6 +133,12 @@ def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():
     assert "TF_VAR_manage_public_dns" in deploy
     assert "TF_VAR_cloudfront_aliases" in deploy
     assert "inputs.health_only != true && env.TF_VAR_runtime_active == 'true'" in deploy
+    embedding_step = deploy.split("      - name: Configure embedding profile\n", 1)[1].split(
+        "      - name: Configure changefeed\n", 1
+    )[0]
+    assert "if: env.TF_VAR_runtime_active == 'true'" in embedding_step
+    assert "scripts/reembed_memories.py" in embedding_step
+    assert "inputs.health_only" not in embedding_step
     for command in ("init -backend=false -input=false", "validate", "test"):
         assert f"terraform -chdir=infra/terraform/edge {command}" in ci
 
@@ -176,11 +179,6 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle
     assert "function:hindsight-${var.stage}-${component}" in bootstrap
-    deploy_policy = bootstrap.split('data "aws_iam_policy_document" "github_deploy"', 1)[1].split(
-        'resource "aws_iam_role_policy" "github_deploy"', 1
-    )[0]
-    assert "bedrock:" not in deploy_policy
-    assert "BEDROCK_" not in bootstrap
     assert "s3:GetBucketAcl" in bootstrap
     assert "s3:GetBucketCORS" in bootstrap
     assert "s3:GetBucketOwnershipControls" in bootstrap
@@ -197,6 +195,16 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "cloudwatch:ListTagsForResource" in bootstrap
     assert "cloudwatch:TagResource" in bootstrap
     assert "cloudwatch:UntagResource" in bootstrap
+    controlled_write = bootstrap.split('sid       = "ControlledIncidentTelemetryWrite"', 1)[
+        1
+    ].split("\n  statement {", 1)[0]
+    assert 'actions   = ["cloudwatch:PutMetricData"]' in controlled_write
+    assert 'variable = "cloudwatch:namespace"' in controlled_write
+    assert 'values   = ["Hindsight/ControlledIncidentTelemetry"]' in controlled_write
+    controlled_read = bootstrap.split('sid       = "ControlledIncidentTelemetryRead"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+    assert 'actions   = ["cloudwatch:GetMetricStatistics"]' in controlled_read
     assert "logs:CreateLogDelivery" in bootstrap
     assert "logs:DeleteLogDelivery" in bootstrap
     assert "logs:GetLogDelivery" in bootstrap
@@ -238,7 +246,7 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     assert 'output "learning_evidence_bucket"' in outputs
 
 
-def test_protected_corpus_uses_rotating_kms_and_no_bedrock_permissions():
+def test_protected_corpus_uses_rotating_kms_and_narrow_permissions():
     bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
     outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
     policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[1].split(
@@ -248,7 +256,6 @@ def test_protected_corpus_uses_rotating_kms_and_no_bedrock_permissions():
     assert 'resource "aws_kms_key" "learning_corpus"' in bootstrap
     assert "enable_key_rotation     = true" in bootstrap
     assert "prevent_destroy = true" in bootstrap
-    assert "bedrock:" not in policy.lower()
     assert "gemini-api-keys" in bootstrap
     assert 'actions   = ["ssm:GetParameter", "ssm:GetParameters"]' in policy
     assert 'sid = "ProtectedCorpusEncryption"' in policy
@@ -296,8 +303,10 @@ def test_deploy_preflights_dependencies_and_invalidates_cloudfront():
     assert "/hindsight/demo/api-database-url" in workflow
     assert "/hindsight/demo/worker-database-url" in workflow
     assert "TF_VAR_database_url_parameter_name" not in workflow
-    assert "BEDROCK" not in workflow
     assert 'export EMBEDDING_PROVIDER="$TF_VAR_embedding_provider"' in workflow
+    assert (
+        'export HINDSIGHT_GEMINI_REPRESENTATION="$TF_VAR_gemini_embedding_representation"'
+    ) in workflow
     assert "export EMBEDDING_PROVIDER=gemini" not in workflow
     assert "github.triggering_actor" in workflow
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in workflow

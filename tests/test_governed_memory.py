@@ -12,7 +12,7 @@ requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DAT
 @requires_db
 def test_positive_guidance_retrieval_filters_governance_before_vector_ranking():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import (
         APPROVED_POSITIVE_GUIDANCE,
         MemoryGovernance,
@@ -92,7 +92,7 @@ def test_positive_guidance_retrieval_filters_governance_before_vector_ranking():
 @requires_db
 def test_explicit_text_miss_stays_empty_and_strict_retrieval_is_audited():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     namespace = f"governed-retrieval-{uuid4()}"
@@ -140,7 +140,7 @@ def test_degraded_retrieval_returns_and_persists_its_fallback_reason(
     monkeypatch, vector_failure, query, expected_strategy, expected_reason
 ):
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     namespace = f"retrieval-fallback-reason-{uuid4()}"
@@ -189,7 +189,7 @@ def test_degraded_retrieval_returns_and_persists_its_fallback_reason(
 @requires_db
 def test_strict_semantic_miss_returns_no_fallback_or_unrelated_rows(monkeypatch):
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     namespace = f"strict-empty-retrieval-{uuid4()}"
@@ -226,7 +226,7 @@ def test_strict_semantic_miss_returns_no_fallback_or_unrelated_rows(monkeypatch)
 @requires_db
 def test_exact_rewind_reasserts_target_version_without_rewriting_history():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 
@@ -292,7 +292,7 @@ def test_exact_rewind_reasserts_target_version_without_rewriting_history():
 @requires_db
 def test_exact_rewind_reasserts_a_target_version_invalidated_after_the_target():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 
@@ -461,7 +461,7 @@ def test_memory_payload_and_provenance_fields_are_database_immutable():
     from psycopg import errors
 
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     with MemoryStore(
@@ -565,7 +565,7 @@ def test_lineage_edge_producer_must_own_the_child_memory(memory_kind):
     from psycopg import errors
 
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     namespace = f"lineage-child-owner-{memory_kind}-{uuid4()}"
@@ -639,7 +639,7 @@ def test_lineage_edge_producer_must_own_the_child_memory(memory_kind):
 @requires_db
 def test_evolution_supersession_quarantines_cross_namespace_descendants_for_review():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import (
         enqueue_operation,
@@ -738,7 +738,7 @@ def test_evolution_supersession_quarantines_cross_namespace_descendants_for_revi
 @requires_db
 def test_review_retraction_resolves_every_closed_descendant_item():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import (
         enqueue_operation,
@@ -848,7 +848,7 @@ def test_review_retraction_resolves_every_closed_descendant_item():
 @requires_db
 def test_review_retraction_rejects_an_already_closed_reviewed_memory():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import (
         OperationConflictError,
@@ -939,7 +939,7 @@ def test_review_retraction_rejects_an_already_closed_reviewed_memory():
 @requires_db
 def test_correction_supersession_requires_all_namespaces_and_retracts_descendants():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import (
         OperationAuthorizationError,
@@ -1020,7 +1020,7 @@ def test_correction_supersession_requires_all_namespaces_and_retracts_descendant
 @requires_db
 def test_stale_operation_preview_conflicts_without_partial_mutation():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, execute_operation, preview_retraction
 
@@ -1068,7 +1068,7 @@ def test_stale_operation_preview_conflicts_without_partial_mutation():
 @requires_db
 def test_empty_rewind_preview_locks_the_first_namespace_revision():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
 
@@ -1116,7 +1116,7 @@ def test_empty_rewind_preview_locks_the_first_namespace_revision():
 @requires_db
 def test_cross_namespace_descendant_after_preview_conflicts_via_parent_revision():
     from hindsight.db import database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.operations import enqueue_operation, execute_operation, preview_retraction
 
@@ -1207,7 +1207,7 @@ def test_embedding_profile_rotation_refuses_partial_coverage_and_switches_atomic
         begin_profile_build,
         run_backfill_batch,
     )
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     class AlternateSemanticProvider(DeterministicEmbeddingProvider):
@@ -1271,7 +1271,7 @@ def test_embedding_profile_rotation_refuses_partial_coverage_and_switches_atomic
 @requires_db
 def test_missing_active_profile_with_trusted_memories_requires_backfill():
     from hindsight.db import connect, database_url
-    from hindsight.embeddings import DeterministicEmbeddingProvider
+    from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
 
     provider = DeterministicEmbeddingProvider()

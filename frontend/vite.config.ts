@@ -10,7 +10,22 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   root,
   publicDir: path.resolve(root, "public"),
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    {
+      name: "strip-built-asset-trailing-whitespace",
+      generateBundle(_options, bundle) {
+        for (const output of Object.values(bundle)) {
+          if (output.type === "chunk") {
+            output.code = output.code.replace(/[ \t]+$/gm, "");
+          } else if (typeof output.source === "string") {
+            output.source = output.source.replace(/[ \t]+$/gm, "");
+          }
+        }
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@": path.resolve(root, "src"),

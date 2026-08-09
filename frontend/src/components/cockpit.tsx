@@ -107,7 +107,7 @@ export function ConnectionState({ state }: { state: string }) {
 
 const STAGE_META = [
   { key: "baseline_memory_id", label: "Baseline", kind: "memory" },
-  { key: "poison_memory_id", label: "Poisoned memory", kind: "memory" },
+  { key: "compromised_memory_id", label: "Compromised guidance", kind: "memory" },
   { key: "influenced_decision_id", label: "Influenced decision", kind: "decision" },
   { key: "rewind_operation_id", label: "Audited rewind", kind: "operation" },
   { key: "corrected_decision_id", label: "Corrected decision", kind: "decision" },
@@ -183,12 +183,12 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
 
 function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "current" }) {
   const historical = mode === "historical";
-  const score = run?.action_trace?.score;
-  const request = run?.action_trace?.request;
-  const actions = request?.actions || [];
-  const execution = run?.action_trace?.execution;
-  const observations = run?.action_trace?.observations || [];
-  const latestObservation = observations.at(-1);
+  const actionTrace = run?.action_trace;
+  const recommendation = actionTrace?.recommendation;
+  const execution = actionTrace?.execution;
+  const selection = actionTrace?.selection;
+  const latestToolCall = actionTrace?.tool_calls?.at(-1);
+  const latestObservation = actionTrace?.observations?.at(-1);
   const reads = run?.trace?.reads || [];
   return (
     <article className={cn("outcome", historical ? "outcome-historical" : "outcome-current")}>
@@ -202,38 +202,26 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
       <PlanSections run={run} primary={!historical} />
-      {request ? (
+      {recommendation ? (
         <div
           className="action-execution"
           data-execution-status={execution?.status || "awaiting_approval"}
         >
-          <span>Bounded action</span>
+          <span>Recommendation</span>
           <strong>{humanStatus(execution?.status || "awaiting_approval")}</strong>
           <span>
-            {request.tool || execution?.tool || "tool identity pending"} ·{" "}
-            {actions.join(" → ") || "action pending"}
+            {selection?.provider || "provider pending"} / {selection?.model || "model pending"}
           </span>
         </div>
       ) : null}
-      {score ? (
-        <div
-          className={cn("action-score", score.recovered ? "recovered" : "not-recovered")}
-          data-recovered={String(Boolean(score.recovered))}
-          data-unsafe-action-count={score.unsafe_action_count || 0}
-        >
-          <span>External score</span>
-          <strong>{score.recovered ? "Recovered" : "Not recovered"}</strong>
-          <span>
-            {score.unsafe_action_count || 0} unsafe · {actions.join(" → ") || "No action"}
-          </span>
-        </div>
-      ) : null}
-      {latestObservation ? (
+      {latestToolCall || latestObservation ? (
         <div className="action-observation">
-          <span>Observed result</span>
-          <strong>{latestObservation.detail || "Observation recorded"}</strong>
+          <span>Diagnostic evidence</span>
+          <strong>{latestObservation?.query_key || latestToolCall?.query_key}</strong>
           <span>
-            {latestObservation.action || "initial state"} · {latestObservation.recovered ? "recovered" : "not recovered"}
+            {latestObservation?.metric?.namespace || "metric namespace pending"} /{" "}
+            {latestObservation?.metric?.name || "metric pending"} /{" "}
+            {latestObservation?.datapoint_count ?? 0} datapoints
           </span>
         </div>
       ) : null}
@@ -535,7 +523,7 @@ export function StoryHeader({
         <h1 id="incidentHeading">{incident?.title || "Governed memory, inspected end to end"}</h1>
         <p id="incidentSummary">
           {incident?.summary ||
-            "Follow a poisoned belief through decision influence, rewind, and a corrected outcome."}
+            "Follow compromised guidance through decision influence, rewind, and a corrected outcome."}
         </p>
       </div>
       <dl className="story-facts">

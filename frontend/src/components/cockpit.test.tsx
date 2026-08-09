@@ -32,30 +32,48 @@ const scenario: SignatureScenario = {
       trace: {
         reads: [
           {
-            id: "read-poison",
-            memory_id: "memory-poison",
-            writer: "demo.poison",
-            source_ref: "demo:simulated-memory-poisoning",
+            id: "read-compromised",
+            memory_id: "memory-compromised",
+            writer: "demo.fixture-import",
+            source_ref: "demo:stale-runbook-import",
             justification: "Previously approved retry guidance is stale for this incident.",
-            outgoing_lineage_edge_ids: ["edge-poison-reflection"],
+            outgoing_lineage_edge_ids: ["edge-compromised-reflection"],
           },
         ],
       },
       action_trace: {
-        request: { id: "action-rejected", actions: ["scale_workers"] },
-        execution: {
-          status: "completed",
-          tool: "deterministic_incident_simulator",
+        schema_version: 2,
+        mode: "recommendation_only",
+        selection: {
+          fingerprint: "b".repeat(64),
+          provider: "gemini",
+          model: "gemini-2.5-flash",
         },
-        observations: [
+        recommendation: {
+          id: `recommendation:${"a".repeat(64)}`,
+          summary: "Scale payment workers while retry fanout remains elevated.",
+          status: "awaiting_approval",
+        },
+        execution: { status: "not_executed", mode: "recommendation_only" },
+        tool_calls: [
           {
-            action: "scale_workers",
-            unsafe: true,
-            recovered: false,
-            detail: "scale_workers amplified unresolved upstream pressure",
+            id: "diagnostic-rejected",
+            tool: "aws_cloudwatch_diagnostics",
+            query_key: "payments.retry_fanout",
+            status: "completed",
           },
         ],
-        score: { recovered: false, unsafe_action_count: 1 },
+        observations: [
+          {
+            id: "observation-rejected",
+            tool_call_id: "diagnostic-rejected",
+            schema_version: 1,
+            tool: "aws_cloudwatch_diagnostics",
+            query_key: "payments.retry_fanout",
+            metric: { namespace: "Hindsight/ControlledIncidentTelemetry", name: "RetryFanout" },
+            datapoint_count: 12,
+          },
+        ],
       },
     },
     {
@@ -77,23 +95,41 @@ const scenario: SignatureScenario = {
         ],
       },
       action_trace: {
-        request: {
-          id: "action-corrected",
-          actions: ["inspect_dependency", "throttle_retries"],
+        schema_version: 2,
+        mode: "recommendation_only",
+        selection: {
+          fingerprint: "d".repeat(64),
+          provider: "gemini",
+          model: "gemini-2.5-flash",
         },
-        execution: {
-          status: "completed",
-          tool: "deterministic_incident_simulator",
+        recommendation: {
+          id: `recommendation:${"c".repeat(64)}`,
+          summary: "Throttle retry fanout while processor health recovers.",
+          status: "awaiting_approval",
         },
-        observations: [
+        execution: { status: "recommendation_approved", mode: "recommendation_only" },
+        tool_calls: [
           {
-            action: "throttle_retries",
-            unsafe: false,
-            recovered: true,
-            detail: "retry fanout throttled; downstream pressure recovered",
+            id: "diagnostic-corrected",
+            tool: "aws_cloudwatch_diagnostics",
+            query_key: "payments.processor_queue_depth",
+            status: "completed",
           },
         ],
-        score: { recovered: true, unsafe_action_count: 0 },
+        observations: [
+          {
+            id: "observation-corrected",
+            tool_call_id: "diagnostic-corrected",
+            schema_version: 1,
+            tool: "aws_cloudwatch_diagnostics",
+            query_key: "payments.processor_queue_depth",
+            metric: {
+              namespace: "Hindsight/ControlledIncidentTelemetry",
+              name: "ProcessorQueueDepth",
+            },
+            datapoint_count: 10,
+          },
+        ],
       },
     },
   ],
@@ -105,7 +141,7 @@ const scenario: SignatureScenario = {
   memories: [],
   stages: {
     baseline_memory_id: "memory-baseline",
-    poison_memory_id: "memory-poison",
+    compromised_memory_id: "memory-compromised",
     influenced_decision_id: "decision-rejected",
     rewind_operation_id: "operation-rewind",
     corrected_decision_id: "decision-corrected",
@@ -126,9 +162,9 @@ const snapshot: Snapshot = {
       status: "current",
     },
     {
-      id: "memory-poison",
-      content: "Poisoned memory recommends scaling workers into retry pressure.",
-      writer: "demo.poison",
+      id: "memory-compromised",
+      content: "Stale guidance recommends scaling workers into retry pressure.",
+      writer: "demo.fixture-import",
       status: "invalidated",
       t_invalid: "2026-07-17T11:00:00Z",
     },
@@ -138,8 +174,8 @@ const snapshot: Snapshot = {
       id: "operation-rewind",
       operation_type: "rewind",
       status: "completed",
-      reason: "Remove poisoned guidance",
-      invalidated_memory_ids: ["memory-poison"],
+      reason: "Remove stale guidance",
+      invalidated_memory_ids: ["memory-compromised"],
       restored_memory_ids: [],
     },
   ],
@@ -168,23 +204,21 @@ describe("guided replay cockpit", () => {
     expect(screen.getAllByText("Checks")).toHaveLength(2);
     expect(screen.getAllByText("Action")).toHaveLength(2);
     expect(screen.getAllByText("Safety")).toHaveLength(2);
-    expect(screen.getByText("Not recovered")).toBeVisible();
-    expect(screen.getByText("Recovered")).toBeVisible();
-    expect(screen.getByText(/1 unsafe · scale_workers/)).toBeVisible();
-    expect(screen.getByText(/0 unsafe · inspect_dependency → throttle_retries/)).toBeVisible();
-    expect(screen.getAllByText(/deterministic_incident_simulator/)).toHaveLength(2);
-    expect(screen.getByText(/deterministic_incident_simulator · scale_workers/)).toBeVisible();
-    expect(screen.getByText(/amplified unresolved upstream pressure/)).toBeVisible();
-    expect(screen.getByText(/downstream pressure recovered/)).toBeVisible();
+    expect(screen.getByText("not executed")).toBeVisible();
+    expect(screen.getByText("recommendation approved")).toBeVisible();
+    expect(screen.getAllByText(/gemini \/ gemini-2.5-flash/)).toHaveLength(2);
+    expect(screen.getByText("payments.retry_fanout")).toBeVisible();
+    expect(screen.getByText(/Hindsight\/ControlledIncidentTelemetry \/ RetryFanout \/ 12 datapoints/)).toBeVisible();
+    expect(screen.getByText("payments.processor_queue_depth")).toBeVisible();
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
-    expect(screen.getByText("demo.poison")).toBeVisible();
-    expect(screen.getByText("demo:simulated-memory-poisoning")).toBeVisible();
+    expect(screen.getByText("demo.fixture-import")).toBeVisible();
+    expect(screen.getByText("demo:stale-runbook-import")).toBeVisible();
     expect(screen.getByText(/Previously approved retry guidance is stale/)).toBeVisible();
     expect(screen.getByText("demo.seed")).toBeVisible();
     expect(screen.getAllByText("1 downstream lineage edge")).toHaveLength(2);
     expect(screen.getByLabelText(/Copy historical cited memory/)).toHaveAttribute(
       "title",
-      "memory-poison",
+      "memory-compromised",
     );
     expect(screen.getByLabelText(/Copy current cited memory/)).toHaveAttribute(
       "title",
@@ -192,7 +226,7 @@ describe("guided replay cockpit", () => {
     );
   });
 
-  it("shows the bounded action request before execution is approved", () => {
+  it("shows the recommendation identity before approval", () => {
     const { container } = render(
       <OutcomeComparison
         scenario={null}
@@ -200,11 +234,17 @@ describe("guided replay cockpit", () => {
           id: "run-awaiting-approval",
           status: "awaiting_approval",
           action_trace: {
-            request: {
-              id: "action-awaiting-approval",
-              tool: "deterministic_incident_simulator",
-              actions: ["scale_workers"],
+            mode: "recommendation_only",
+            selection: {
+              fingerprint: "b".repeat(64),
+              provider: "gemini",
+              model: "gemini-2.5-flash",
             },
+            recommendation: {
+              id: `recommendation:${"a".repeat(64)}`,
+              summary: "Inspect processor health before changing retry capacity.",
+            },
+            execution: { status: "awaiting_approval", mode: "recommendation_only" },
           },
         }}
       />,
@@ -212,7 +252,7 @@ describe("guided replay cockpit", () => {
 
     const request = container.querySelector(".action-execution");
     expect(request).toHaveAttribute("data-execution-status", "awaiting_approval");
-    expect(request).toHaveTextContent("deterministic_incident_simulator · scale_workers");
+    expect(request).toHaveTextContent("gemini / gemini-2.5-flash");
   });
 
   it("renders model Markdown without exposing syntax as the primary presentation", () => {

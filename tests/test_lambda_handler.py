@@ -7,6 +7,33 @@ from types import SimpleNamespace
 import pytest
 
 AUTH_TOKEN = "test-token"
+RECOMMENDATION_ID = f"recommendation:{'a' * 64}"
+SELECTION_FINGERPRINT = "b" * 64
+
+
+@pytest.fixture(autouse=True)
+def _stub_agent_dependencies(monkeypatch):
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        DeterministicReasoningProvider,
+        FakeCloudWatchDiagnostics,
+    )
+
+    reasoning_provider = DeterministicReasoningProvider()
+    embedding_provider = DeterministicEmbeddingProvider()
+    diagnostic_tool = FakeCloudWatchDiagnostics({})
+    monkeypatch.setattr(
+        "hindsight.lambda_handler.reasoning_provider_from_env",
+        lambda *_args, **_kwargs: reasoning_provider,
+    )
+    monkeypatch.setattr(
+        "hindsight.lambda_handler.embedding_provider_from_env",
+        lambda *_args, **_kwargs: embedding_provider,
+    )
+    monkeypatch.setattr(
+        "hindsight.lambda_handler.cloudwatch_diagnostics_from_env",
+        lambda: diagnostic_tool,
+    )
 
 
 def _event(path: str, body: dict, *, method: str = "POST", token: str | None = AUTH_TOKEN):
@@ -30,8 +57,8 @@ def _result(*, thread_id="thread-1", interrupted=False):
         interrupt={"proposed_action": "approve"} if interrupted else None,
         state={
             "reasoning": {
-                "provider": "deterministic",
-                "model": "deterministic-v1",
+                "provider": "test_deterministic",
+                "model": "test-scripted-v1",
                 "usage": {"prompt_characters": 12, "attempts": 1},
             }
         },
@@ -65,7 +92,7 @@ def test_handle_request_starts_incident(monkeypatch):
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -73,7 +100,7 @@ def test_handle_request_starts_incident(monkeypatch):
     body = json.loads(response["body"])
     assert response["statusCode"] == 200
     assert body["thread_id"] == "thread-1"
-    assert body["provider"] == "deterministic"
+    assert body["provider"] == "test_deterministic"
     assert calls[0][0].incident_id == "incident-1"
     assert calls[0][1]["db_url"] == "postgresql://db"
 
@@ -90,11 +117,19 @@ def test_handle_request_resumes_incident(monkeypatch):
     monkeypatch.setattr("hindsight.lambda_handler.resume_incident_agent", fake_resume)
 
     response = handle_request(
-        _event("/incident/resume", {"thread_id": "thread-2", "approved": False}),
+        _event(
+            "/incident/resume",
+            {
+                "thread_id": "thread-2",
+                "approved": False,
+                "recommendation_id": RECOMMENDATION_ID,
+                "selection_fingerprint": SELECTION_FINGERPRINT,
+            },
+        ),
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -103,6 +138,8 @@ def test_handle_request_resumes_incident(monkeypatch):
     assert response["statusCode"] == 200
     assert body["thread_id"] == "thread-2"
     assert calls[0]["approved"] is False
+    assert calls[0]["recommendation_id"] == RECOMMENDATION_ID
+    assert calls[0]["selection_fingerprint"] == SELECTION_FINGERPRINT
 
 
 def test_handle_request_rejects_bad_start_request():
@@ -113,7 +150,7 @@ def test_handle_request_rejects_bad_start_request():
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -208,7 +245,7 @@ def test_handle_request_rejects_string_boolean_for_pause():
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -241,7 +278,7 @@ def test_handle_request_accepts_boolean_false_for_pause(monkeypatch):
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -258,7 +295,7 @@ def test_handle_request_rejects_string_boolean_for_resume():
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -279,7 +316,7 @@ def test_handle_request_rejects_invalid_base64_body():
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -302,7 +339,7 @@ def test_handle_request_rejects_oversized_user_input():
         context=SimpleNamespace(),
         settings=RuntimeSettings(
             database_url="postgresql://db",
-            provider_env={"LLM_PROVIDER": "deterministic"},
+            provider_env={},
         ),
         auth_token=AUTH_TOKEN,
     )
@@ -351,6 +388,7 @@ def test_runtime_settings_reads_secrets_from_ssm():
             GEMINI_API_KEY_PARAM_ENV: "/hindsight/test/gemini-key",
             "LLM_PROVIDER": "gemini",
             "GEMINI_MODEL": "gemini-test",
+            "HINDSIGHT_GEMINI_REPRESENTATION": "applicability_instruction",
             "REASONING_MAX_ATTEMPTS": "3",
         },
         ssm_client=FakeSsm(),
@@ -360,6 +398,7 @@ def test_runtime_settings_reads_secrets_from_ssm():
     assert settings.database_url == "postgresql://db"
     assert settings.provider_env["GEMINI_API_KEY"] == "secret-key"
     assert settings.provider_env["GEMINI_MODEL"] == "gemini-test"
+    assert settings.provider_env["HINDSIGHT_GEMINI_REPRESENTATION"] == ("applicability_instruction")
     assert settings.reasoning_max_attempts == 3
 
 
@@ -390,32 +429,6 @@ def test_runtime_settings_uses_local_fallbacks_without_ssm_client():
     assert settings.provider_env["GEMINI_API_KEY"] == "local-key"
 
 
-def test_runtime_settings_skips_gemini_secret_for_deterministic_provider():
-    from hindsight.lambda_handler import (
-        DATABASE_URL_PARAM_ENV,
-        GEMINI_API_KEY_PARAM_ENV,
-        runtime_settings,
-    )
-
-    class FakeSsm:
-        def get_parameter(self, *, Name, WithDecryption):
-            assert Name == "/hindsight/test/database-url"
-            return {"Parameter": {"Value": "postgresql://db"}}
-
-    settings = runtime_settings(
-        environ={
-            DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
-            GEMINI_API_KEY_PARAM_ENV: "/hindsight/test/missing-gemini-key",
-            "LLM_PROVIDER": "deterministic",
-        },
-        ssm_client=FakeSsm(),
-        use_cache=False,
-    )
-
-    assert settings.database_url == "postgresql://db"
-    assert "GEMINI_API_KEY" not in settings.provider_env
-
-
 def test_runtime_settings_adds_certifi_root_for_verify_full_database_url():
     import certifi
 
@@ -425,17 +438,14 @@ def test_runtime_settings_adds_certifi_root_for_verify_full_database_url():
         def get_parameter(self, *, Name, WithDecryption):
             return {
                 "Parameter": {
-                    "Value": (
-                        "postgresql://user:pass@example.com:26257/db"
-                        "?sslmode=verify-full"
-                    )
+                    "Value": ("postgresql://user:pass@example.com:26257/db?sslmode=verify-full")
                 }
             }
 
     settings = runtime_settings(
         environ={
             DATABASE_URL_PARAM_ENV: "/hindsight/test/database-url",
-            "LLM_PROVIDER": "deterministic",
+            "LLM_PROVIDER": "gemini",
         },
         ssm_client=FakeSsm(),
         use_cache=False,

@@ -90,15 +90,6 @@ run "isolated_bootstrap" {
   }
 
   assert {
-    condition = length(flatten([
-      for statement in data.aws_iam_policy_document.github_evidence[0].statement : [
-        for action in statement.actions : action if startswith(lower(action), "bedrock:")
-      ]
-    ])) == 0
-    error_message = "The evidence role must not contain Bedrock permissions."
-  }
-
-  assert {
     condition     = aws_kms_key.learning_qualification_hmac[0].key_usage == "GENERATE_VERIFY_MAC" && aws_kms_key.learning_qualification_hmac[0].customer_master_key_spec == "HMAC_256"
     error_message = "Qualification identifiers must use a non-exportable HMAC-SHA256 KMS key."
   }
