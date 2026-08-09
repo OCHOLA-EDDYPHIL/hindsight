@@ -80,7 +80,6 @@ def test_configure_demo_secrets_dry_run_never_prints_values(monkeypatch, capsys)
     monkeypatch.setattr(configure.boto3, "Session", lambda **kwargs: FakeSession())
     monkeypatch.setattr(configure, "load_dotenv", lambda: None)
     monkeypatch.setenv("DATABASE_URL", "postgresql://secret-database")
-    monkeypatch.setenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", "secret-operator")
     monkeypatch.setenv("HINDSIGHT_CHANGEFEED_AUTH_TOKEN", "secret-changefeed")
     for index in range(5):
         name = "GEMINI_API_KEY" if index == 0 else f"GEMINI_API_KEY_{index}"
@@ -94,7 +93,9 @@ def test_configure_demo_secrets_dry_run_never_prints_values(monkeypatch, capsys)
     assert "secret-" not in output
 
 
-def test_configure_demo_secrets_preserves_generated_tokens_on_overwrite(monkeypatch, capsys):
+def test_configure_demo_secrets_preserves_generated_changefeed_token_on_overwrite(
+    monkeypatch, capsys
+):
     configure = _configure_module()
 
     writes = []
@@ -113,7 +114,6 @@ def test_configure_demo_secrets_preserves_generated_tokens_on_overwrite(monkeypa
     monkeypatch.setattr(configure.boto3, "Session", lambda **kwargs: FakeSession())
     monkeypatch.setattr(configure, "load_dotenv", lambda: None)
     monkeypatch.setenv("DATABASE_URL", "postgresql://database")
-    monkeypatch.delenv("HINDSIGHT_FUNCTION_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("HINDSIGHT_CHANGEFEED_AUTH_TOKEN", raising=False)
     for index in range(5):
         name = "GEMINI_API_KEY" if index == 0 else f"GEMINI_API_KEY_{index}"
@@ -126,7 +126,7 @@ def test_configure_demo_secrets_preserves_generated_tokens_on_overwrite(monkeypa
         "/hindsight/demo/database-url",
         "/hindsight/demo/gemini-api-keys",
     }
-    assert "operator-token" in capsys.readouterr().out
+    assert "changefeed-token" in capsys.readouterr().out
 
 
 def test_changefeed_wait_observes_requested_database_state(monkeypatch):
@@ -344,9 +344,11 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert "aws lambda get-function-configuration" in browser_job
     assert "HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE" in browser_job
     assert (
-        'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$OPERATOR_TOKEN" "$CHANGEFEED_TOKEN"'
+        'for value in "$DATABASE_URL" "$GEMINI_MATERIAL" "$HINDSIGHT_OPERATOR_USERNAME" '
+        '"$HINDSIGHT_OPERATOR_PASSWORD" "$CHANGEFEED_TOKEN"'
         in browser_job
     )
+    assert "HINDSIGHT_BROWSER_OPERATOR_TOKEN" not in browser_job
     assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
     assert "HINDSIGHT_SELENIUM_REMOTE_URL: http://127.0.0.1:4444" in browser_job

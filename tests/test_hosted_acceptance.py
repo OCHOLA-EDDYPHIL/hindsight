@@ -32,7 +32,7 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
     from hindsight.runtime import runtime_settings
 
     api_url = _required_env("HOSTED_API_URL").rstrip("/")
-    operator_token = _required_env("HINDSIGHT_BROWSER_OPERATOR_TOKEN")
+    operator_token = _required_env("HINDSIGHT_PRODUCT_ACCESS_TOKEN")
     settings = runtime_settings(use_cache=False)
     pool = gemini_pool_from_env(settings.provider_env)
     embeddings = embedding_provider_from_env(settings.provider_env, gemini_pool=pool)

@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 
 from hindsight.aws import aws_client_config
 from hindsight.queueing import enqueue_run
-from hindsight.realtime_ticket import verify_realtime_ticket
+from hindsight.realtime_ticket import TICKET_TABLE_ENV, consume_realtime_ticket
 from hindsight.security import safe_error_detail
 
 CONNECTION_TABLE_ENV = "HINDSIGHT_WEBSOCKET_CONNECTION_TABLE"
@@ -30,7 +30,6 @@ EVENT_LEASE_SECONDS_ENV = "HINDSIGHT_CHANGEFEED_LEASE_SECONDS"
 MANAGEMENT_ENDPOINT_ENV = "HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT"
 CHANGEFEED_TOKEN_ENV = "HINDSIGHT_CHANGEFEED_AUTH_TOKEN"
 CHANGEFEED_TOKEN_PARAM_ENV = "HINDSIGHT_CHANGEFEED_AUTH_TOKEN_PARAM"
-TICKET_SECRET_PARAM_ENV = "HINDSIGHT_REALTIME_TICKET_SECRET_PARAM"
 CONNECTION_TTL_SECONDS = 24 * 60 * 60
 EVENT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_EVENT_LEASE_SECONDS = 60
@@ -38,7 +37,6 @@ EVENT_VERSION = 2
 LEGACY_EVENT_VERSION = 1
 _HLC_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 _CHANGEFEED_TOKEN_CACHE: str | None = None
-_TICKET_SECRET_CACHE: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,17 +77,32 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         if route == "$connect":
             ticket = str((event.get("queryStringParameters") or {}).get("ticket") or "")
+            ticket_table_name = os.environ.get(TICKET_TABLE_ENV)
+            if not ticket_table_name:
+                return _response(503, {"error": "realtime ticket registry is not configured"})
             try:
-                tenant_id = verify_realtime_ticket(ticket, secret=_ticket_secret())
+                claims = consume_realtime_ticket(
+                    ticket,
+                    table=dynamodb.Table(ticket_table_name),
+                )
             except ValueError as exc:
                 return _response(401, {"error": str(exc)})
+            connected_at = int(time.time())
+            expires_at = min(
+                claims.session_expires_at,
+                connected_at + CONNECTION_TTL_SECONDS,
+            )
+            if expires_at <= connected_at:
+                return _response(401, {"error": "realtime ticket is invalid or expired"})
             table.put_item(
                 Item={
                     "connection_id": connection_id,
                     "namespace": "",
                     "run_id": "",
-                    "tenant_id": tenant_id,
-                    "expires_at": int(time.time()) + CONNECTION_TTL_SECONDS,
+                    "tenant_id": claims.tenant_id,
+                    "access_class": claims.access_class,
+                    "principal_id": claims.principal_id or "",
+                    "expires_at": expires_at,
                 }
             )
             return _response(200, {"connected": True})
@@ -97,6 +110,25 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _delete_subscriptions(subscriptions, connection_id)
             table.delete_item(Key={"connection_id": connection_id})
             return _response(200, {"connected": False})
+
+        connection = table.get_item(
+            Key={"connection_id": connection_id},
+            ConsistentRead=True,
+        ).get("Item")
+        if not connection:
+            return _response(404, {"error": "connection is not registered"})
+        tenant_id = str(connection.get("tenant_id") or "")
+        if not tenant_id:
+            return _response(403, {"error": "connection tenant is unavailable"})
+        current_time = int(time.time())
+        try:
+            expires_at = int(connection.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        if expires_at <= current_time:
+            _delete_subscriptions(subscriptions, connection_id)
+            table.delete_item(Key={"connection_id": connection_id})
+            return _response(401, {"error": "connection session has expired"})
 
         payload = _event_body(event)
         message_type = str(payload.get("type") or "").strip().lower()
@@ -109,17 +141,7 @@ def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if message_type == "unsubscribe":
             namespace = ""
             run_id = ""
-        connection = table.get_item(
-            Key={"connection_id": connection_id},
-            ConsistentRead=True,
-        ).get("Item")
-        if not connection:
-            return _response(404, {"error": "connection is not registered"})
-        tenant_id = str(connection.get("tenant_id") or "")
-        if not tenant_id:
-            return _response(403, {"error": "connection tenant is unavailable"})
         _delete_subscriptions(subscriptions, connection_id)
-        expires_at = int(time.time()) + CONNECTION_TTL_SECONDS
         if message_type == "subscribe":
             topic_keys = []
             if namespace:
@@ -477,22 +499,6 @@ def _changefeed_token() -> str | None:
     response = client.get_parameter(Name=parameter, WithDecryption=True)
     _CHANGEFEED_TOKEN_CACHE = str(response["Parameter"]["Value"])
     return _CHANGEFEED_TOKEN_CACHE
-
-
-def _ticket_secret() -> str:
-    global _TICKET_SECRET_CACHE
-    if _TICKET_SECRET_CACHE is not None:
-        return _TICKET_SECRET_CACHE
-    parameter = os.environ.get(TICKET_SECRET_PARAM_ENV)
-    if not parameter:
-        raise ValueError("realtime ticket verification is not configured")
-    response = boto3.client(
-        "ssm",
-        region_name=os.environ.get("AWS_REGION"),
-        config=aws_client_config(read_timeout=10),
-    ).get_parameter(Name=parameter, WithDecryption=True)
-    _TICKET_SECRET_CACHE = str(response["Parameter"]["Value"])
-    return _TICKET_SECRET_CACHE
 
 
 def _connection_table() -> Any:

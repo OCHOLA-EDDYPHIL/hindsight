@@ -16,7 +16,13 @@ from psycopg.types.json import Jsonb
 from hindsight.db import connect, database_url
 from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider
-from hindsight.memory import APPROVED_POSITIVE_GUIDANCE, MemoryStore, Provenance
+from hindsight.memory import (
+    APPROVED_POSITIVE_GUIDANCE,
+    MemoryGovernance,
+    MemoryStore,
+    Provenance,
+)
+from hindsight.prompt_safety import PROMPT_SAFETY_METADATA_KEYS
 from hindsight.security import safe_error_detail
 
 OperationType = Literal["rewind", "retraction", "supersession", "review_resolution"]
@@ -947,6 +953,8 @@ def _apply_rewind(
             reader=operation["actor"],
             purpose="Reassert exact target logical belief",
         )
+        source_metadata = dict(source.get("metadata") or {})
+        source_governance = _governance_from_metadata(source_metadata)
         created = store.write_semantic(
             namespace=source["namespace"],
             content=source["content"],
@@ -955,7 +963,8 @@ def _apply_rewind(
                 source_ref=f"memory:{source['id']}",
                 justification=operation["reason"],
             ),
-            metadata=dict(source.get("metadata") or {}),
+            metadata=_without_governance(source_metadata),
+            governance=source_governance,
             content_schema=source["content_schema"],
             structured_payload=dict(source["structured_payload"]),
             producer_decision_id=decision_id,
@@ -963,6 +972,7 @@ def _apply_rewind(
             belief_id=str(source["belief_id"]),
             previous_version_id=item["previous_version_id"],
             transition_kind="rewind_reassertion",
+            trust_status=source["trust_status"],
             created_by_operation_id=str(operation["id"]),
             precomputed_embedding=embeddings[str(source["id"])],
         )
@@ -1310,14 +1320,31 @@ def _review_resolutions(
 
 
 def _without_governance(metadata: dict[str, Any]) -> dict[str, Any]:
-    for key in (
-        "operator_disposition",
-        "safety_status",
-        "contradiction_status",
-        "usage_instruction",
-    ):
+    for key in (*_GOVERNANCE_METADATA_KEYS, *PROMPT_SAFETY_METADATA_KEYS):
         metadata.pop(key, None)
     return metadata
+
+
+_GOVERNANCE_METADATA_KEYS = (
+    "operator_disposition",
+    "safety_status",
+    "contradiction_status",
+    "usage_instruction",
+)
+
+
+def _governance_from_metadata(metadata: dict[str, Any]) -> MemoryGovernance | None:
+    present = {key for key in _GOVERNANCE_METADATA_KEYS if key in metadata}
+    if not present:
+        return None
+    if present != set(_GOVERNANCE_METADATA_KEYS):
+        raise OperationConflictError("rewind source has incomplete governance metadata")
+    return MemoryGovernance(
+        operator_disposition=metadata["operator_disposition"],
+        safety_status=metadata["safety_status"],
+        contradiction_status=metadata["contradiction_status"],
+        usage_instruction=metadata["usage_instruction"],
+    )
 
 
 def _effect_namespaces(cur: Any, effect: dict[str, Any]) -> set[str]:

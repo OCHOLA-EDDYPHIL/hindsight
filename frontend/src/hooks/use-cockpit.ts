@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ApiError, requestJson, snapshotUrl } from "@/lib/api";
+import {
+  ApiError,
+  publicSnapshotUrl,
+  requestProductJson,
+  requestPublicJson,
+} from "@/lib/api";
+import { createHostedUiAuthAdapter, type AuthAdapter } from "@/lib/auth";
 import { isoToLocalInput, localInputToIso } from "@/lib/format";
 import { BoundedRealtimeTracker, parseRealtimeEnvelopeV2 } from "@/lib/realtime";
 import type {
+  AuthStatus,
+  EffectiveIdentity,
   Incident,
   InfluenceItem,
   MemoryOperation,
@@ -46,6 +54,64 @@ interface RewindAccepted {
   status?: string;
 }
 
+export interface UseCockpitOptions {
+  authAdapter?: AuthAdapter | null;
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`Identity response has an invalid ${field}.`);
+  }
+  return value;
+}
+
+export function parseEffectiveIdentity(value: unknown): EffectiveIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Identity response is invalid.");
+  }
+  const payload = value as Record<string, unknown>;
+  const roles = [payload.token_role, payload.mapped_role, payload.effective_role];
+  if (roles.some((role) => role !== "viewer" && role !== "operator")) {
+    throw new Error("Identity response has an invalid role.");
+  }
+  if (
+    !Array.isArray(payload.scopes) ||
+    payload.scopes.some((scope) => typeof scope !== "string" || !scope.trim())
+  ) {
+    throw new Error("Identity response has invalid scopes.");
+  }
+  const scopes = [...new Set(payload.scopes as string[])];
+  const expectedRole =
+    payload.token_role === "operator" && payload.mapped_role === "operator"
+      ? "operator"
+      : "viewer";
+  if (
+    payload.effective_role !== expectedRole ||
+    !scopes.includes("read") ||
+    !scopes.includes("realtime") ||
+    scopes.includes("write") !== (expectedRole === "operator")
+  ) {
+    throw new Error("Identity response contains conflicting effective access.");
+  }
+  if (
+    typeof payload.expires_at !== "number" ||
+    !Number.isSafeInteger(payload.expires_at) ||
+    payload.expires_at <= Math.floor(Date.now() / 1000)
+  ) {
+    throw new Error("Identity response is expired or invalid.");
+  }
+  return {
+    principal_id: requiredString(payload.principal_id, "principal ID"),
+    tenant_id: requiredString(payload.tenant_id, "tenant ID"),
+    tenant_slug: requiredString(payload.tenant_slug, "tenant slug"),
+    token_role: payload.token_role as EffectiveIdentity["token_role"],
+    mapped_role: payload.mapped_role as EffectiveIdentity["mapped_role"],
+    effective_role: payload.effective_role as EffectiveIdentity["effective_role"],
+    scopes,
+    expires_at: payload.expires_at,
+  };
+}
+
 function initialNamespace(config: RuntimeConfig): string {
   return (
     new URLSearchParams(window.location.search).get("namespace") ||
@@ -54,8 +120,22 @@ function initialNamespace(config: RuntimeConfig): string {
   );
 }
 
-export function useCockpit() {
+export function useCockpit(options: UseCockpitOptions = {}) {
   const config = useRef<RuntimeConfig>(window.HINDSIGHT_CONFIG || {}).current;
+  const authSelection = useRef<{ adapter: AuthAdapter | null; error: string | null }>();
+  if (!authSelection.current) {
+    try {
+      authSelection.current = {
+        adapter: Object.prototype.hasOwnProperty.call(options, "authAdapter")
+          ? options.authAdapter || null
+          : createHostedUiAuthAdapter(config.auth),
+        error: null,
+      };
+    } catch (error) {
+      authSelection.current = { adapter: null, error: (error as Error).message };
+    }
+  }
+  const authAdapter = authSelection.current.adapter;
   const params = useRef(new URLSearchParams(window.location.search)).current;
   const explicitNamespace = params.has("namespace");
 
@@ -72,7 +152,11 @@ export function useCockpit() {
   const [run, setRun] = useState<Run | null>(null);
   const runRef = useRef<Run | null>(null);
   const [influence, setInfluence] = useState<InfluenceItem[]>([]);
-  const [operator, setOperator] = useState(false);
+  const [authStatus, setAuthStatus] = useState<AuthStatus>("initializing");
+  const authStatusRef = useRef<AuthStatus>("initializing");
+  const [identity, setIdentity] = useState<EffectiveIdentity | null>(null);
+  const identityRef = useRef<EffectiveIdentity | null>(null);
+  const [authEpoch, setAuthEpoch] = useState(0);
   const [notice, setNotice] = useState<Notice | null>(null);
   const noticeTimer = useRef<number>();
   const snapshotRefreshTimer = useRef<number>();
@@ -110,6 +194,69 @@ export function useCockpit() {
     noticeTimer.current = window.setTimeout(() => setNotice(null), 6000);
   }, []);
 
+  const moveToPublicSurface = useCallback(() => {
+    identityRef.current = null;
+    authStatusRef.current = "public";
+    setIdentity(null);
+    setAuthStatus("public");
+    setAuthEpoch((value) => value + 1);
+  }, []);
+
+  const readJson = useCallback(
+    async <T,>(path: string, options: RequestInit = {}): Promise<T> => {
+      if (authStatusRef.current === "authenticated") {
+        const token = authAdapter?.accessToken() || null;
+        if (token) {
+          try {
+            return await requestProductJson<T>(config, path, token, options);
+          } catch (error) {
+            if (!(error instanceof ApiError && error.status === 401)) throw error;
+            authAdapter?.clear();
+            moveToPublicSurface();
+            announce("Your sign-in expired. The public read-only replay is still available.", "error");
+          }
+        } else {
+          authAdapter?.clear();
+          moveToPublicSurface();
+          announce("Your sign-in expired. The public read-only replay is still available.", "error");
+        }
+      }
+      return requestPublicJson<T>(config, path, options);
+    },
+    [announce, authAdapter, config, moveToPublicSurface],
+  );
+
+  const requireWriteAccess = useCallback((): string | null => {
+    const authorized =
+      authStatusRef.current === "authenticated" &&
+      identityRef.current?.effective_role === "operator" &&
+      identityRef.current.scopes.includes("write");
+    const token = authorized ? authAdapter?.accessToken() || null : null;
+    if (authorized && token) return token;
+    if (authorized && !token) {
+      authAdapter?.clear();
+      moveToPublicSurface();
+    }
+    announce("Operator authorization with write scope is required.", "error");
+    return null;
+  }, [announce, authAdapter, moveToPublicSurface]);
+
+  const productWriteJson = useCallback(
+    async <T,>(path: string, token: string, options: RequestInit = {}): Promise<T> => {
+      try {
+        return await requestProductJson<T>(config, path, token, options);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          authAdapter?.clear();
+          moveToPublicSurface();
+          announce("Your sign-in expired. The public read-only replay is still available.", "error");
+        }
+        throw error;
+      }
+    },
+    [announce, authAdapter, config, moveToPublicSurface],
+  );
+
   const applySnapshot = useCallback((value: Snapshot) => {
     snapshotRef.current = value;
     setSnapshot(value);
@@ -122,11 +269,20 @@ export function useCockpit() {
       const requestId = ++snapshotRequest.current;
       const requestedNamespace = targetNamespace || namespaceRef.current;
       try {
-        const response = await fetch(snapshotUrl(config, requestedNamespace, asOf), {
-          credentials: "include",
-        });
-        if (!response.ok) throw new Error(await response.text());
-        const next = (await response.json()) as Snapshot;
+        let next: Snapshot;
+        if (authStatusRef.current === "authenticated" || !config.snapshotBase) {
+          const query = asOf ? `?as_of=${encodeURIComponent(asOf)}` : "";
+          next = await readJson<Snapshot>(
+            `/namespaces/${encodeURIComponent(requestedNamespace)}/beliefs${query}`,
+          );
+        } else {
+          const response = await fetch(publicSnapshotUrl(config, requestedNamespace, asOf), {
+            credentials: "omit",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) throw new Error(await response.text());
+          next = (await response.json()) as Snapshot;
+        }
         if (requestId !== snapshotRequest.current || requestedNamespace !== namespaceRef.current) {
           return;
         }
@@ -140,7 +296,7 @@ export function useCockpit() {
         throw error;
       }
     },
-    [applySnapshot, config],
+    [applySnapshot, config, readJson],
   );
 
   const scheduleSnapshotRefresh = useCallback(
@@ -167,8 +323,7 @@ export function useCockpit() {
     async (decisionId: string, expectedRunId?: string) => {
       const requestId = ++influenceRequest.current;
       try {
-        const payload = await requestJson<{ memories?: InfluenceItem[] }>(
-          config,
+        const payload = await readJson<{ memories?: InfluenceItem[] }>(
           `/decisions/${encodeURIComponent(decisionId)}/influence`,
         );
         if (requestId !== influenceRequest.current) return;
@@ -180,7 +335,7 @@ export function useCockpit() {
         announce(`Decision influence could not be loaded: ${(error as Error).message}`, "error");
       }
     },
-    [announce, config],
+    [announce, readJson],
   );
 
   const loadRun = useCallback(
@@ -188,7 +343,7 @@ export function useCockpit() {
       if (activeRunId.current && runId !== activeRunId.current) return;
       const requestId = ++runRequest.current;
       try {
-        const next = await requestJson<Run>(config, `/runs/${encodeURIComponent(runId)}`);
+        const next = await readJson<Run>(`/runs/${encodeURIComponent(runId)}`);
         if (requestId !== runRequest.current || runId !== activeRunId.current) return;
         runRef.current = next;
         setRun(next);
@@ -203,7 +358,7 @@ export function useCockpit() {
         announce(`Run status could not be loaded: ${(error as Error).message}`, "error");
       }
     },
-    [announce, config, loadInfluence, loadSnapshot],
+    [announce, loadInfluence, loadSnapshot, readJson],
   );
 
   const selectIncident = useCallback(
@@ -212,14 +367,13 @@ export function useCockpit() {
       const requestId = ++incidentRequest.current;
       activeRunId.current = null;
       try {
-        const nextIncident = await requestJson<Incident>(
-          config,
+        const nextIncident = await readJson<Incident>(
           `/incidents/${encodeURIComponent(slug)}`,
         );
         if (requestId !== incidentRequest.current) return;
         const latest = nextIncident.runs?.[0];
         const nextRun = latest
-          ? await requestJson<Run>(config, `/runs/${encodeURIComponent(latest.id)}`)
+          ? await readJson<Run>(`/runs/${encodeURIComponent(latest.id)}`)
           : null;
         if (requestId !== incidentRequest.current) return;
         setIncident(nextIncident);
@@ -236,13 +390,13 @@ export function useCockpit() {
         announce(`Incident could not be loaded: ${(error as Error).message}`, "error");
       }
     },
-    [announce, config, loadInfluence, loadSnapshot, updateNamespace],
+    [announce, loadInfluence, loadSnapshot, readJson, updateNamespace],
   );
 
   const loadIncidents = useCallback(
     async (preferredSlug?: string | null, select = true) => {
       try {
-        const payload = await requestJson<IncidentListResponse>(config, "/incidents");
+        const payload = await readJson<IncidentListResponse>("/incidents");
         const items = payload.items || [];
         setIncidents(items);
         if (!select) return;
@@ -260,7 +414,7 @@ export function useCockpit() {
         setIncidents([]);
       }
     },
-    [config, selectIncident],
+    [readJson, selectIncident],
   );
 
   const loadScenario = useCallback(
@@ -269,10 +423,7 @@ export function useCockpit() {
       if (selector?.namespace) query.set("namespace", selector.namespace);
       if (selector?.decisionId) query.set("decision_id", selector.decisionId);
       const suffix = query.size ? `?${query}` : "";
-      const next = await requestJson<SignatureScenario>(
-        config,
-        `/signature-scenarios${suffix}`,
-      );
+      const next = await readJson<SignatureScenario>(`/signature-scenarios${suffix}`);
       setScenario(next);
       setIncident(next.incident || null);
       const preferredRun = [...next.runs].reverse().find((item) => item.status === "completed") ||
@@ -303,36 +454,48 @@ export function useCockpit() {
       setLoadState("ready");
       return next;
     },
-    [config, loadSnapshot, updateNamespace],
+    [loadSnapshot, readJson, updateNamespace],
   );
 
-  const establishOperatorSession = useCallback(async () => {
-    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-    const fragmentToken = hash.get("operator");
-    if (fragmentToken) {
-      try {
-        await requestJson(config, "/operator/session", {
-          method: "POST",
-          body: JSON.stringify({ token: fragmentToken }),
-        });
-        window.history.replaceState(null, "", `${location.pathname}${location.search}`);
-      } catch (error) {
-        announce(`Operator unlock failed: ${(error as Error).message}`, "error");
-      }
+  const initializeAuth = useCallback(async () => {
+    if (authSelection.current?.error) {
+      moveToPublicSurface();
+      announce(`Sign-in configuration is invalid: ${authSelection.current.error}`, "error");
+      return;
+    }
+    if (!authAdapter) {
+      moveToPublicSurface();
+      return;
     }
     try {
-      const session = await requestJson<{ operator: boolean }>(config, "/operator/session");
-      setOperator(Boolean(session.operator));
-    } catch {
-      setOperator(false);
+      const session = await authAdapter.initialize();
+      if (!session) {
+        moveToPublicSurface();
+        return;
+      }
+      const payload = await requestProductJson<unknown>(config, "/me", session.accessToken);
+      const resolvedIdentity = parseEffectiveIdentity(payload);
+      identityRef.current = resolvedIdentity;
+      authStatusRef.current = "authenticated";
+      setIdentity(resolvedIdentity);
+      setAuthStatus("authenticated");
+      setAuthEpoch((value) => value + 1);
+    } catch (error) {
+      authAdapter.clear();
+      moveToPublicSurface();
+      announce(`Sign-in could not be established: ${(error as Error).message}`, "error");
     }
-  }, [announce, config]);
+  }, [announce, authAdapter, config, moveToPublicSurface]);
 
   const retryInitialLoad = useCallback(async () => {
     setLoadState("loading");
     setLoadError("");
     try {
-      if (config.snapshotBase && !explicitNamespace) {
+      if (
+        authStatusRef.current !== "authenticated" &&
+        config.snapshotBase &&
+        !explicitNamespace
+      ) {
         await loadSnapshot(params.get("as_of"), namespaceRef.current);
         await loadIncidents(null, false);
         setLoadState("ready");
@@ -366,10 +529,10 @@ export function useCockpit() {
     if (initialized.current) return;
     initialized.current = true;
     void (async () => {
-      await establishOperatorSession();
+      await initializeAuth();
       await retryInitialLoad();
     })();
-  }, [establishOperatorSession, retryInitialLoad]);
+  }, [initializeAuth, retryInitialLoad]);
 
   const handleLiveEvent = useCallback(
     (payload: unknown) => {
@@ -448,7 +611,7 @@ export function useCockpit() {
   }, []);
 
   useEffect(() => {
-    if (!initialized.current) return;
+    if (!initialized.current || authStatus === "initializing") return;
     let disposed = false;
     let reconnectTimer: number | undefined;
     let interval: number | undefined;
@@ -457,7 +620,7 @@ export function useCockpit() {
       const connect = async () => {
         if (disposed) return;
         try {
-          const ticket = await requestJson<{ ticket: string }>(config, "/realtime/ticket", {
+          const ticket = await readJson<{ ticket: string }>("/realtime/ticket", {
             method: "POST",
           });
           if (disposed) return;
@@ -523,43 +686,69 @@ export function useCockpit() {
     };
   }, [
     announce,
+    authEpoch,
+    authStatus,
     config,
     handleLiveEvent,
     loadRun,
     loadSnapshot,
     namespace,
+    readJson,
     scheduleSnapshotRefresh,
     subscribeSocket,
   ]);
 
-  const unlockOperator = useCallback(
-    async (token: string) => {
-      try {
-        await requestJson(config, "/operator/session", {
-          method: "POST",
-          body: JSON.stringify({ token }),
-        });
-        setOperator(true);
-        announce("Operator controls unlocked for this session.");
-        return true;
-      } catch (error) {
-        announce(`Operator unlock failed: ${(error as Error).message}`, "error");
-        return false;
-      }
-    },
-    [announce, config],
-  );
+  const signIn = useCallback(async () => {
+    if (!authAdapter) {
+      announce("Hosted sign-in is not configured for this deployment.", "error");
+      return;
+    }
+    try {
+      await authAdapter.signIn(
+        `${window.location.pathname}${window.location.search}${window.location.hash}`,
+      );
+    } catch (error) {
+      announce(`Sign-in could not start: ${(error as Error).message}`, "error");
+    }
+  }, [announce, authAdapter]);
 
-  const lockOperator = useCallback(async () => {
-    await requestJson(config, "/operator/session", { method: "DELETE" }).catch(() => undefined);
-    setOperator(false);
-    announce("Returned to the public read-only replay.");
-  }, [announce, config]);
+  const signOut = useCallback(() => {
+    snapshotRequest.current += 1;
+    incidentRequest.current += 1;
+    runRequest.current += 1;
+    influenceRequest.current += 1;
+    activeRunId.current = null;
+    realtimeTracker.current = new BoundedRealtimeTracker();
+    if (socketRef.current) {
+      const socket = socketRef.current;
+      socketRef.current = null;
+      socket.close();
+    }
+    setScenario(null);
+    setIncidents([]);
+    setIncident(null);
+    setRun(null);
+    runRef.current = null;
+    setInfluence([]);
+    applySnapshot({
+      mode: "current",
+      namespace: namespaceRef.current,
+      memories: [],
+      operations: [],
+      timeline: [],
+    });
+    moveToPublicSurface();
+    authAdapter?.signOut();
+    announce("Signed out. The public read-only replay remains available.");
+    void retryInitialLoad();
+  }, [announce, applySnapshot, authAdapter, moveToPublicSurface, retryInitialLoad]);
 
   const resetDemo = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token) return;
     setBusy("reset");
     try {
-      const payload = await requestJson<ResetResponse>(config, "/demo/poison-rewind/reset", {
+      const payload = await productWriteJson<ResetResponse>("/demo/poison-rewind/reset", token, {
         method: "POST",
         body: JSON.stringify({ namespace: namespaceRef.current }),
       });
@@ -577,16 +766,26 @@ export function useCockpit() {
     } finally {
       setBusy(null);
     }
-  }, [announce, config, loadIncidents, loadScenario, subscribeSocket, updateNamespace]);
+  }, [
+    announce,
+    loadIncidents,
+    loadScenario,
+    productWriteJson,
+    requireWriteAccess,
+    subscribeSocket,
+    updateNamespace,
+  ]);
 
   const poisonDemo = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token) return;
     if (!rewindAnchor) {
       announce("Reset the replay before importing stale guidance.", "error");
       return;
     }
     setBusy("poison");
     try {
-      await requestJson(config, "/demo/poison-rewind/poison", {
+      await productWriteJson("/demo/poison-rewind/poison", token, {
         method: "POST",
         body: JSON.stringify({ namespace: namespaceRef.current }),
       });
@@ -597,18 +796,20 @@ export function useCockpit() {
     } finally {
       setBusy(null);
     }
-  }, [announce, config, loadScenario, rewindAnchor]);
+  }, [announce, loadScenario, productWriteJson, requireWriteAccess, rewindAnchor]);
 
   const startRun = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token) return;
     if (!incident) {
       announce("Choose or reset a signature incident first.", "error");
       return;
     }
     setBusy("run");
     try {
-      const result = await requestJson<RunStartResponse>(
-        config,
+      const result = await productWriteJson<RunStartResponse>(
         `/incidents/${encodeURIComponent(incident.slug)}/runs`,
+        token,
         {
           method: "POST",
           headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -626,10 +827,12 @@ export function useCockpit() {
     } finally {
       setBusy(null);
     }
-  }, [announce, config, incident, incidentInput, loadRun]);
+  }, [announce, incident, incidentInput, loadRun, productWriteJson, requireWriteAccess]);
 
   const decideRun = useCallback(
     async (approved: boolean) => {
+      const token = requireWriteAccess();
+      if (!token) return;
       const current = runRef.current;
       if (!current) return;
       const recommendationId = current.action_trace?.recommendation?.id?.trim();
@@ -643,7 +846,7 @@ export function useCockpit() {
       }
       setBusy(approved ? "approve" : "reject");
       try {
-        await requestJson(config, `/runs/${encodeURIComponent(current.id)}/approval`, {
+        await productWriteJson(`/runs/${encodeURIComponent(current.id)}/approval`, token, {
           method: "POST",
           body: JSON.stringify({
             approved,
@@ -663,12 +866,14 @@ export function useCockpit() {
         setBusy(null);
       }
     },
-    [announce, config, loadRun],
+    [announce, loadRun, productWriteJson, requireWriteAccess],
   );
 
   const invalidatePreview = useCallback(() => setRewindPreview(null), []);
 
   const previewRewind = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token) return;
     const target = rewindAnchor || localInputToIso(rewindTimestamp);
     if (!target) {
       announce("Choose a valid rewind timestamp.", "error");
@@ -676,9 +881,9 @@ export function useCockpit() {
     }
     setBusy("preview");
     try {
-      const preview = await requestJson<RewindPreview>(
-        config,
+      const preview = await productWriteJson<RewindPreview>(
         `/namespaces/${encodeURIComponent(namespaceRef.current)}/rewinds/preview`,
+        token,
         {
           method: "POST",
           body: JSON.stringify({
@@ -694,7 +899,14 @@ export function useCockpit() {
     } finally {
       setBusy(null);
     }
-  }, [announce, config, rewindAnchor, rewindReason, rewindTimestamp]);
+  }, [
+    announce,
+    productWriteJson,
+    requireWriteAccess,
+    rewindAnchor,
+    rewindReason,
+    rewindTimestamp,
+  ]);
 
   const waitForOperation = useCallback(
     async (operationId: string) => {
@@ -702,8 +914,7 @@ export function useCockpit() {
       const deadline = Date.now() + pollSeconds * 1000;
       let lastOperation: MemoryOperation | null = null;
       while (Date.now() < deadline) {
-        const operation = await requestJson<MemoryOperation>(
-          config,
+        const operation = await readJson<MemoryOperation>(
           `/memory/operations/${encodeURIComponent(operationId)}`,
         );
         lastOperation = operation;
@@ -723,16 +934,18 @@ export function useCockpit() {
         `operation did not reach a terminal state; last status ${lastOperation?.status || "unknown"}${detail}`,
       );
     },
-    [applySnapshot, config],
+    [applySnapshot, config.operationPollSeconds, readJson],
   );
 
   const executeRewind = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token) return;
     if (!rewindPreview) return;
     setBusy("execute");
     try {
-      const accepted = await requestJson<RewindAccepted>(
-        config,
+      const accepted = await productWriteJson<RewindAccepted>(
         `/namespaces/${encodeURIComponent(namespaceRef.current)}/rewinds`,
+        token,
         {
           method: "POST",
           headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -773,8 +986,9 @@ export function useCockpit() {
   }, [
     announce,
     applySnapshot,
-    config,
     loadSnapshot,
+    productWriteJson,
+    requireWriteAccess,
     rewindPreview,
     rewindReason,
     waitForOperation,
@@ -791,8 +1005,17 @@ export function useCockpit() {
     [announce, loadSnapshot],
   );
 
+  const canWrite =
+    authStatus === "authenticated" &&
+    identity?.effective_role === "operator" &&
+    identity.scopes.includes("write");
+
   return {
     config,
+    authConfigured: Boolean(authAdapter),
+    authStatus,
+    identity,
+    canWrite,
     explicitNamespace,
     loadState,
     loadError,
@@ -804,7 +1027,6 @@ export function useCockpit() {
     incident,
     run,
     influence,
-    operator,
     notice,
     incidentInput,
     rewindAnchor,
@@ -813,8 +1035,8 @@ export function useCockpit() {
     rewindPreview,
     busy,
     retryInitialLoad,
-    unlockOperator,
-    lockOperator,
+    signIn,
+    signOut,
     selectIncident,
     setIncidentInput,
     resetDemo,

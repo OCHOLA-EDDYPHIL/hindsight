@@ -9,6 +9,7 @@ const styles = fs.readFileSync(path.join(root, "src/styles.css"), "utf8");
 const visibleSources = [
   "src/App.tsx",
   "src/components/cockpit.tsx",
+  "src/components/identity-access.tsx",
   "src/components/operator-console.tsx",
   "src/components/safe-markdown.tsx",
 ].map((file) => fs.readFileSync(path.join(root, file), "utf8"));

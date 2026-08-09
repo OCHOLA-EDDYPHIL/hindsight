@@ -28,6 +28,7 @@ GRANT USAGE ON SCHEMA public TO
 
 GRANT SELECT ON TABLE
     tenants,
+    product_principal_roles,
     episodic_memories,
     semantic_memories,
     current_episodic_memories,

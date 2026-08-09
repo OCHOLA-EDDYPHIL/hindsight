@@ -34,23 +34,14 @@ const props = {
   onRewindReason: vi.fn(),
   onPreview: vi.fn(),
   onExecute: vi.fn(),
-  onLock: vi.fn(),
+  onSignOut: vi.fn(),
 };
 
-describe("operator separation", () => {
-  it("keeps mutation controls inert and outside the visible public replay", () => {
-    render(<OperatorConsole {...props} operator={false} />);
-
-    expect(screen.getByRole("region", { hidden: true })).toHaveAttribute("aria-hidden", "true");
-    expect(screen.getByRole("button", { name: "Analyze incident", hidden: true })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Execute rewind", hidden: true })).toBeDisabled();
-  });
-
+describe("operator console", () => {
   it("labels preview and execution as distinct operator states", () => {
     render(
       <OperatorConsole
         {...props}
-        operator
         rewindPreview={{
           id: "preview-1",
           fingerprint: "fingerprint-1",
@@ -68,7 +59,6 @@ describe("operator separation", () => {
     render(
       <OperatorConsole
         {...props}
-        operator
         run={{
           id: "run-1",
           status: "reflecting",
@@ -93,7 +83,7 @@ describe("operator separation", () => {
   });
 
   it("keeps the walkthrough optional and never invokes mutation callbacks", () => {
-    render(<OperatorConsole {...props} operator />);
+    render(<OperatorConsole {...props} />);
 
     expect(screen.getByRole("complementary", { hidden: true })).not.toBeVisible();
     const toggle = screen.getByRole("button", { name: "Walkthrough" });
@@ -143,7 +133,6 @@ describe("operator separation", () => {
       operations: [{ id: "rewind", operation_type: "rewind", status: "completed" }],
     };
     const state = {
-      operator: true,
       rewindAnchor: "2026-07-18T00:00:00Z",
       scenario: compromisedScenario,
       snapshot: compromisedSnapshot,
@@ -151,7 +140,6 @@ describe("operator separation", () => {
       rewindPreview: null,
     };
 
-    expect(deriveWalkthroughStep({ ...state, operator: false })).toBe("unlock");
     expect(deriveWalkthroughStep({ ...state, rewindAnchor: null })).toBe("reset");
     expect(deriveWalkthroughStep({ ...state, scenario: null, snapshot: baselineSnapshot })).toBe(
       "compromise",
@@ -190,7 +178,6 @@ describe("operator separation", () => {
     render(
       <OperatorConsole
         {...props}
-        operator
         run={{ id: "run-1", status: "awaiting_approval" }}
       />,
     );
@@ -204,7 +191,6 @@ describe("operator separation", () => {
     render(
       <OperatorConsole
         {...props}
-        operator
         run={{
           id: "run-1",
           status: "awaiting_approval",

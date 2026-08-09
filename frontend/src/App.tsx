@@ -14,12 +14,13 @@ import {
   StoryHeader,
   Timeline,
 } from "@/components/cockpit";
-import { OperatorAccess, OperatorConsole } from "@/components/operator-console";
+import { IdentityAccess } from "@/components/identity-access";
+import { OperatorConsole } from "@/components/operator-console";
 import { useCockpit } from "@/hooks/use-cockpit";
 
 export default function App() {
   const cockpit = useCockpit();
-  const [operatorOpen, setOperatorOpen] = useState(false);
+  const [identityOpen, setIdentityOpen] = useState(false);
   const showReplay = cockpit.loadState === "ready";
 
   return (
@@ -37,11 +38,14 @@ export default function App() {
         </a>
         <div className="header-actions">
           <ConnectionState state={cockpit.connection} />
-          <OperatorAccess
-            open={operatorOpen}
-            onOpenChange={setOperatorOpen}
-            operator={cockpit.operator}
-            onUnlock={cockpit.unlockOperator}
+          <IdentityAccess
+            open={identityOpen}
+            onOpenChange={setIdentityOpen}
+            authConfigured={cockpit.authConfigured}
+            authStatus={cockpit.authStatus}
+            identity={cockpit.identity}
+            onSignIn={cockpit.signIn}
+            onSignOut={cockpit.signOut}
           />
         </div>
       </header>
@@ -49,7 +53,7 @@ export default function App() {
       <main id="main">
         {cockpit.loadState === "loading" ? <LoadingSurface /> : null}
         {cockpit.loadState === "empty" ? (
-          <EmptySurface onOperator={() => setOperatorOpen(true)} />
+          <EmptySurface onSignIn={() => setIdentityOpen(true)} />
         ) : null}
         {cockpit.loadState === "error" ? (
           <ErrorSurface message={cockpit.loadError} onRetry={cockpit.retryInitialLoad} />
@@ -72,31 +76,32 @@ export default function App() {
           </>
         ) : null}
 
-        <OperatorConsole
-          operator={cockpit.operator}
-          incidents={cockpit.incidents}
-          incident={cockpit.incident}
-          run={cockpit.run}
-          incidentInput={cockpit.incidentInput}
-          busy={cockpit.busy}
-          rewindAnchor={cockpit.rewindAnchor}
-          scenario={cockpit.scenario}
-          snapshot={cockpit.snapshot}
-          rewindTimestamp={cockpit.rewindTimestamp}
-          rewindReason={cockpit.rewindReason}
-          rewindPreview={cockpit.rewindPreview}
-          onIncident={cockpit.selectIncident}
-          onIncidentInput={cockpit.setIncidentInput}
-          onReset={cockpit.resetDemo}
-          onPoison={cockpit.poisonDemo}
-          onRun={cockpit.startRun}
-          onDecision={cockpit.decideRun}
-          onRewindTimestamp={cockpit.setRewindTimestamp}
-          onRewindReason={cockpit.setRewindReason}
-          onPreview={cockpit.previewRewind}
-          onExecute={cockpit.executeRewind}
-          onLock={cockpit.lockOperator}
-        />
+        {cockpit.canWrite ? (
+          <OperatorConsole
+            incidents={cockpit.incidents}
+            incident={cockpit.incident}
+            run={cockpit.run}
+            incidentInput={cockpit.incidentInput}
+            busy={cockpit.busy}
+            rewindAnchor={cockpit.rewindAnchor}
+            scenario={cockpit.scenario}
+            snapshot={cockpit.snapshot}
+            rewindTimestamp={cockpit.rewindTimestamp}
+            rewindReason={cockpit.rewindReason}
+            rewindPreview={cockpit.rewindPreview}
+            onIncident={cockpit.selectIncident}
+            onIncidentInput={cockpit.setIncidentInput}
+            onReset={cockpit.resetDemo}
+            onPoison={cockpit.poisonDemo}
+            onRun={cockpit.startRun}
+            onDecision={cockpit.decideRun}
+            onRewindTimestamp={cockpit.setRewindTimestamp}
+            onRewindReason={cockpit.setRewindReason}
+            onPreview={cockpit.previewRewind}
+            onExecute={cockpit.executeRewind}
+            onSignOut={cockpit.signOut}
+          />
+        ) : null}
 
         <div
           id="notice"

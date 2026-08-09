@@ -27,7 +27,7 @@ export function DialogContent({
         {children}
         <DialogPrimitive.Close
           className="absolute right-4 top-4 grid size-9 place-items-center border border-transparent text-muted transition-colors hover:border-line-strong hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-          aria-label="Close operator access"
+          aria-label="Close dialog"
         >
           <X aria-hidden="true" size={18} weight="bold" />
         </DialogPrimitive.Close>

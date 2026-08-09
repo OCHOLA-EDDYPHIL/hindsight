@@ -28,7 +28,6 @@ def main() -> None:
     parser.add_argument("--api-database-parameter", required=True)
     parser.add_argument("--worker-database-parameter", required=True)
     parser.add_argument("--gemini-parameter")
-    parser.add_argument("--operator-parameter", required=True)
     parser.add_argument("--changefeed-parameter", required=True)
     parser.add_argument(
         "--llm-provider",
@@ -47,7 +46,6 @@ def main() -> None:
         args.deploy_database_parameter,
         args.api_database_parameter,
         args.worker_database_parameter,
-        args.operator_parameter,
         args.changefeed_parameter,
     ]
     needs_gemini = "gemini" in {args.llm_provider, args.embedding_provider}

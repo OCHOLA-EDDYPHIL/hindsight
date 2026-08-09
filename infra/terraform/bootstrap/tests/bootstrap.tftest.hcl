@@ -156,6 +156,40 @@ run "isolated_bootstrap" {
     ]).resources) == toset(local.lambda_function_arns)
     error_message = "The LambdaVersionRefresh statement must use only the four scoped function ARNs."
   }
+
+  assert {
+    condition = toset([
+      for action in one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "ApplicationLifecycle"
+      ]).actions : action if startswith(action, "cognito-idp:Admin")
+      ]) == toset([
+      "cognito-idp:AdminAddUserToGroup",
+      "cognito-idp:AdminCreateUser",
+      "cognito-idp:AdminGetUser",
+      "cognito-idp:AdminInitiateAuth",
+      "cognito-idp:AdminListGroupsForUser",
+      "cognito-idp:AdminRemoveUserFromGroup",
+      "cognito-idp:AdminSetUserPassword",
+    ])
+    error_message = "The deployment role must expose only the admin identity operations used for provisioning and hosted token acquisition."
+  }
+
+  assert {
+    condition = alltrue([
+      for action in [
+        "cognito-idp:CreateUserPool",
+        "cognito-idp:CreateUserPoolClient",
+        "cognito-idp:CreateUserPoolDomain",
+        "wafv2:CreateWebACL",
+        "wafv2:UpdateWebACL",
+        ] : contains(one([
+          for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+          if statement.sid == "ApplicationLifecycle"
+      ]).actions, action)
+    ])
+    error_message = "The deployment role must be able to materialize the optional identity and edge-protection resources."
+  }
 }
 
 run "product_only_bootstrap" {

@@ -72,6 +72,7 @@ def test_reasoning_prompt_uses_typed_governance_envelopes():
                     "content_schema": "semantic.v1",
                     "transition_kind": "supersession",
                     "trust_status": "active",
+                    "prompt_safety_status": "clear",
                     "writer": "operator",
                     "source_ref": "incident:resolved",
                     "justification": "Resolved incident evidence",

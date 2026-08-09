@@ -33,8 +33,8 @@ env:
   TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
   TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
   TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-  TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
   TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+  TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}
   TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
   TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
   TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
@@ -58,8 +58,8 @@ jobs:
       TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
       TF_VAR_gemini_api_keys_parameter_name: ${{ vars.HINDSIGHT_GEMINI_API_KEYS_PARAM || '/hindsight/demo/gemini-api-keys' }}
-      TF_VAR_operator_token_parameter_name: ${{ vars.HINDSIGHT_OPERATOR_TOKEN_PARAM || '/hindsight/demo/operator-token' }}
       TF_VAR_changefeed_token_parameter_name: ${{ vars.HINDSIGHT_CHANGEFEED_TOKEN_PARAM || '/hindsight/demo/changefeed-token' }}
+      TF_VAR_enable_waf: ${{ vars.HINDSIGHT_ENABLE_WAF || 'false' }}
       TF_VAR_domain_name: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
       TF_VAR_public_origin: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
       TF_VAR_cloudfront_aliases: ${{ vars.HINDSIGHT_CLOUDFRONT_ALIASES || format('["{0}"]', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}

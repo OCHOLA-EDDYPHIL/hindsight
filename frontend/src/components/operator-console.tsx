@@ -1,80 +1,9 @@
-import { ListChecks, LockKey, SignOut, Warning } from "@phosphor-icons/react";
-import { FormEvent, useEffect, useState } from "react";
+import { ListChecks, SignOut, Warning } from "@phosphor-icons/react";
+import { useState } from "react";
 
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { formatTime, humanStatus } from "@/lib/format";
+import { formatTime } from "@/lib/format";
 import type { Incident, RewindPreview, Run, SignatureScenario, Snapshot } from "@/types";
-
-export function OperatorAccess({
-  open,
-  onOpenChange,
-  operator,
-  onUnlock,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  operator: boolean;
-  onUnlock: (token: string) => Promise<boolean>;
-}) {
-  const [token, setToken] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    setSubmitting(true);
-    const unlocked = await onUnlock(token);
-    setSubmitting(false);
-    if (unlocked) {
-      setToken("");
-      onOpenChange(false);
-    }
-  };
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger asChild>
-        <Button id="operatorButton" type="button" variant={operator ? "primary" : "quiet"}>
-          <LockKey aria-hidden="true" size={15} weight="bold" />
-          <span id="operatorLabel">{operator ? "Operator" : "Operator access"}</span>
-        </Button>
-      </DialogTrigger>
-      <DialogContent id="operatorPanel" aria-label="Operator access">
-        <DialogTitle className="text-xl font-semibold text-text">Unlock mutation controls</DialogTitle>
-        <DialogDescription className="mt-2 max-w-[52ch] text-sm leading-6 text-muted">
-          Public replay is credential free. Model calls, memory injection, approvals, and rewind
-          execution require a passcode-backed session.
-        </DialogDescription>
-        <p className="mt-3 text-xs leading-5 text-muted">
-          Unlock first, then use the optional walkthrough to reset, import stale guidance, analyze,
-          correct the belief state, and inspect history.
-        </p>
-        <form id="operatorForm" className="mt-6 grid gap-2" onSubmit={submit}>
-          <label className="text-sm font-semibold text-text" htmlFor="operatorToken">
-            Operator passcode
-          </label>
-          <input
-            id="operatorToken"
-            name="token"
-            type="password"
-            autoComplete="current-password"
-            value={token}
-            onChange={(event) => setToken(event.target.value)}
-            required
-          />
-          <p className="form-help">The passcode is exchanged for a secure, same-origin session.</p>
-          <Button className="mt-3 w-full" type="submit" variant="primary" disabled={submitting}>
-            {submitting ? "Verifying" : "Unlock controls"}
-          </Button>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
-}
 
 const phases = [
   { key: "triage", label: "triage" },
@@ -87,11 +16,6 @@ const phases = [
 ];
 
 const walkthroughSteps = [
-  {
-    id: "unlock",
-    label: "Unlock controls",
-    detail: "Use Operator access to exchange the passcode for a protected session.",
-  },
   {
     id: "reset",
     label: "Reset the replay",
@@ -137,21 +61,18 @@ const walkthroughSteps = [
 type WalkthroughStep = (typeof walkthroughSteps)[number]["id"];
 
 export function deriveWalkthroughStep({
-  operator,
   rewindAnchor,
   scenario,
   snapshot,
   run,
   rewindPreview,
 }: {
-  operator: boolean;
   rewindAnchor: string | null;
   scenario: SignatureScenario | null;
   snapshot: Snapshot | null;
   run: Run | null;
   rewindPreview: RewindPreview | null;
 }): WalkthroughStep {
-  if (!operator) return "unlock";
   if (!rewindAnchor) return "reset";
   const completedRewind = Boolean(
     snapshot?.operations.some(
@@ -180,7 +101,6 @@ export function deriveWalkthroughStep({
 }
 
 export function OperatorConsole({
-  operator,
   incidents,
   incident,
   run,
@@ -202,9 +122,8 @@ export function OperatorConsole({
   onRewindReason,
   onPreview,
   onExecute,
-  onLock,
+  onSignOut,
 }: {
-  operator: boolean;
   incidents: Incident[];
   incident: Incident | null;
   run: Run | null;
@@ -226,13 +145,12 @@ export function OperatorConsole({
   onRewindReason: (value: string) => void;
   onPreview: () => void;
   onExecute: () => void;
-  onLock: () => void;
+  onSignOut: () => void;
 }) {
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
   const eventPhases = new Set((run?.events || []).map((event) => event.phase));
   const currentPhase = run?.events?.at(-1)?.phase;
   const walkthroughStep = deriveWalkthroughStep({
-    operator,
     rewindAnchor,
     scenario,
     snapshot,
@@ -248,16 +166,8 @@ export function OperatorConsole({
     walkthroughOpen && walkthroughStep === step
       ? { "aria-describedby": describedBy, "data-walkthrough-current": "true" }
       : {};
-  useEffect(() => {
-    if (!operator) setWalkthroughOpen(false);
-  }, [operator]);
   return (
-    <section
-      className="operator-console"
-      hidden={!operator}
-      aria-label="Protected operator controls"
-      aria-hidden={!operator}
-    >
+    <section className="operator-console" aria-label="Protected operator controls">
       <header>
         <div>
           <p className="section-kicker">Protected surface</p>
@@ -276,9 +186,9 @@ export function OperatorConsole({
             <ListChecks aria-hidden="true" size={14} />
             {walkthroughOpen ? "Hide walkthrough" : "Walkthrough"}
           </Button>
-          <Button id="lockButton" type="button" variant="ghost" size="compact" onClick={onLock}>
+          <Button id="signOutButton" type="button" variant="ghost" size="compact" onClick={onSignOut}>
             <SignOut aria-hidden="true" size={14} />
-            Return to read-only
+            Sign out
           </Button>
         </div>
       </header>
@@ -338,7 +248,7 @@ export function OperatorConsole({
             id="resetDemo"
             type="button"
             data-operator
-            disabled={!operator || busy === "reset"}
+            disabled={busy === "reset"}
             onClick={onReset}
             {...currentControl("reset")}
           >
@@ -349,7 +259,7 @@ export function OperatorConsole({
             type="button"
             variant="danger"
             data-operator
-            disabled={!operator || busy === "poison"}
+            disabled={busy === "poison"}
             onClick={onPoison}
             {...currentControl("compromise")}
           >
@@ -360,7 +270,7 @@ export function OperatorConsole({
             type="button"
             variant="primary"
             data-operator
-            disabled={!operator || busy === "run"}
+            disabled={busy === "run"}
             onClick={onRun}
             {...currentControl(walkthroughStep === "reanalyze" ? "reanalyze" : "analyze")}
           >
@@ -401,7 +311,7 @@ export function OperatorConsole({
           type="button"
           variant="danger"
           data-operator
-          disabled={!operator || !approvalIdentityReady || busy === "reject"}
+          disabled={!approvalIdentityReady || busy === "reject"}
           onClick={() => onDecision(false)}
         >
           Reject recommendation
@@ -411,7 +321,7 @@ export function OperatorConsole({
           type="button"
           variant="primary"
           data-operator
-          disabled={!operator || !approvalIdentityReady || busy === "approve"}
+          disabled={!approvalIdentityReady || busy === "approve"}
           onClick={() => onDecision(true)}
           {...currentControl(walkthroughStep === "review" ? "review" : "reanalyze")}
         >
@@ -447,7 +357,7 @@ export function OperatorConsole({
             id="previewRewind"
             type="button"
             data-operator
-            disabled={!operator || busy === "preview"}
+            disabled={busy === "preview"}
             onClick={onPreview}
             {...currentControl("preview")}
           >
@@ -458,7 +368,7 @@ export function OperatorConsole({
             type="button"
             variant="danger"
             data-operator
-            disabled={!operator || !rewindPreview || busy === "execute"}
+            disabled={!rewindPreview || busy === "execute"}
             onClick={onExecute}
             {...currentControl("execute")}
           >

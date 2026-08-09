@@ -32,6 +32,10 @@ from hindsight.embeddings import (
     embedding_profile,
     vector_literal,
 )
+from hindsight.prompt_safety import (
+    PROMPT_SAFETY_METADATA_KEYS,
+    assess_prompt_safety,
+)
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
 
 MemoryKind = Literal["episodic", "semantic"]
@@ -1055,7 +1059,27 @@ class MemoryStore:
             ):
                 raise ValueError("expected_namespace_revision must be a non-negative integer")
             resolved_parent_memory_ids = tuple(str(value) for value in (parent_memory_ids or ()))
-            resolved_metadata = _governed_metadata(metadata, governance)
+            caller_metadata = {
+                key: value
+                for key, value in (metadata or {}).items()
+                if key not in PROMPT_SAFETY_METADATA_KEYS
+            }
+            resolved_metadata = _governed_metadata(caller_metadata, governance)
+            prompt_safety = assess_prompt_safety(
+                content=content,
+                metadata=resolved_metadata,
+                structured_payload=structured_payload,
+                provenance={
+                    "writer": provenance.writer,
+                    "source_ref": provenance.source_ref,
+                    "justification": provenance.justification,
+                },
+            )
+            resolved_metadata.update(prompt_safety.metadata())
+            resolved_trust_status = trust_status
+            if prompt_safety.status == "suspected":
+                resolved_trust_status = "review_required"
+                resolved_metadata["usage_instruction"] = "audit_only"
             memory_id = uuid4()
             resolved_belief_id = belief_id or str(uuid4())
             producer_id = producer_decision_id or f"memory:write:{memory_id}"
@@ -1101,13 +1125,14 @@ class MemoryStore:
                     writer, source_ref, justification, producer_decision_id,
                     transition_kind, content_schema, structured_payload,
                     payload_digest, lineage_status, trust_status,
-                    created_by_operation_id
+                    created_by_operation_id, prompt_safety_status,
+                    prompt_safety_scanner_version, prompt_safety_reason_codes
                 )
                 VALUES (
                     %s, %s,
                     COALESCE((SELECT max(version_number) + 1 FROM semantic_memories WHERE belief_id = %s), 1),
                     %s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s,
-                    %s, %s, %s, %s, %s, 'complete', %s, %s
+                    %s, %s, %s, %s, %s, 'complete', %s, %s, %s, %s, %s
                 )
                 RETURNING *
             """
@@ -1128,8 +1153,11 @@ class MemoryStore:
                 content_schema,
                 Jsonb(payload),
                 digest,
-                trust_status,
+                resolved_trust_status,
                 created_by_operation_id,
+                prompt_safety.status,
+                prompt_safety.scanner_version,
+                Jsonb(list(prompt_safety.reason_codes)),
             )
 
             def write_row() -> dict[str, Any]:
@@ -2464,7 +2492,11 @@ def _governed_metadata(
 def positive_guidance_eligible(memory: dict[str, Any]) -> bool:
     """Return the same fail-closed eligibility used by semantic retrieval SQL."""
 
-    if memory.get("t_invalid") is not None or memory.get("trust_status") != "active":
+    if (
+        memory.get("t_invalid") is not None
+        or memory.get("trust_status") != "active"
+        or memory.get("prompt_safety_status") != "clear"
+    ):
         return False
     metadata = memory.get("metadata")
     if not isinstance(metadata, dict):
@@ -2488,9 +2520,13 @@ def _semantic_eligibility_sql(alias: str, positive_guidance_only: bool) -> str:
         raise ValueError("unsupported semantic-memory SQL alias")
     prefix = f"{alias}."
     if not positive_guidance_only:
-        return f"AND {prefix}trust_status = 'active'"
+        return (
+            f"AND {prefix}trust_status = 'active' "
+            f"AND {prefix}prompt_safety_status = 'clear'"
+        )
     return f"""
         AND {prefix}trust_status = 'active'
+        AND {prefix}prompt_safety_status = 'clear'
         AND {prefix}metadata->>'operator_disposition' = 'approved'
         AND {prefix}metadata->>'safety_status' = 'safe'
         AND {prefix}metadata->>'contradiction_status' = 'supported'

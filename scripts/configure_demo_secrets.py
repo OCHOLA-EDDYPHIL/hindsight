@@ -54,9 +54,6 @@ def main() -> None:
             },
             separators=(",", ":"),
         ),
-        f"{prefix}/operator-token": (
-            os.environ.get("HINDSIGHT_FUNCTION_AUTH_TOKEN") or secrets.token_urlsafe(32)
-        ),
         f"{prefix}/changefeed-token": (
             os.environ.get("HINDSIGHT_CHANGEFEED_AUTH_TOKEN") or secrets.token_urlsafe(32)
         ),
@@ -64,10 +61,8 @@ def main() -> None:
 
     for name, value in desired.items():
         exists = _parameter_exists(ssm, name)
-        is_generated_token = name.endswith(("operator-token", "changefeed-token")) and not (
-            os.environ.get("HINDSIGHT_FUNCTION_AUTH_TOKEN")
-            if name.endswith("operator-token")
-            else os.environ.get("HINDSIGHT_CHANGEFEED_AUTH_TOKEN")
+        is_generated_token = name.endswith("changefeed-token") and not os.environ.get(
+            "HINDSIGHT_CHANGEFEED_AUTH_TOKEN"
         )
         if exists and (not args.overwrite or is_generated_token):
             print(f"secure parameter preserved: {name}")

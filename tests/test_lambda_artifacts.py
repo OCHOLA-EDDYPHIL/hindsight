@@ -61,6 +61,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     assert any(dependency.startswith("google-genai") for dependency in api["dependencies"])
     assert "embedding_index.py" in api["modules"]
     assert "operations.py" in api["modules"]
+    assert "prompt_safety.py" in api["modules"]
     assert "run_dispatch.py" in api["modules"]
     assert "snapshots.py" in api["modules"]
     assert "trace_contract.py" in api["modules"]
@@ -76,6 +77,7 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
     assert not any("fastapi" in dependency for dependency in worker["dependencies"])
     assert {
         "operations.py",
+        "prompt_safety.py",
         "consolidation.py",
         "embedding_index.py",
         "queueing.py",

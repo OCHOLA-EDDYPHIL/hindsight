@@ -1,12 +1,37 @@
 export type Identifier = string;
 
+export interface HostedUiAuthConfig {
+  hostedUiBaseUrl: string;
+  clientId: string;
+  redirectUri: string;
+  logoutUri: string;
+  scopes: string[];
+}
+
 export interface RuntimeConfig {
-  apiBase?: string;
+  publicApiBase?: string;
+  productApiBase?: string;
+  protectedApiBase?: string;
+  auth?: HostedUiAuthConfig | null;
   snapshotBase?: string | null;
   websocketUrl?: string | null;
   defaultNamespace?: string;
   pollIntervalMs?: number;
   operationPollSeconds?: number;
+}
+
+export type ProductRole = "viewer" | "operator";
+export type AuthStatus = "initializing" | "public" | "authenticated";
+
+export interface EffectiveIdentity {
+  principal_id: Identifier;
+  tenant_id: Identifier;
+  tenant_slug: string;
+  token_role: ProductRole;
+  mapped_role: ProductRole;
+  effective_role: ProductRole;
+  scopes: string[];
+  expires_at: number;
 }
 
 export type RealtimeEventType = "memory" | "operation" | "run" | "run_event";

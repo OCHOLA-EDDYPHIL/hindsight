@@ -39,6 +39,10 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "aws" {
+  alias = "us_east_1"
+}
+
 mock_provider "cloudflare" {}
 
 run "complete_demo_graph" {
@@ -75,7 +79,7 @@ run "complete_demo_graph" {
 
   assert {
     condition     = aws_lambda_function.api.environment[0].variables.HINDSIGHT_ALLOWED_ORIGINS == "https://hindsight.example.com"
-    error_message = "The API must authorize cookie sessions from the configured CloudFront product origin."
+    error_message = "The API must authorize browser requests from the configured CloudFront product origin."
   }
 
   assert {
@@ -153,12 +157,95 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
-      aws_apigatewayv2_route.api_v2_root.route_key == "ANY /v2" &&
-      aws_apigatewayv2_route.api_v2_proxy.route_key == "ANY /v2/{proxy+}" &&
+      aws_apigatewayv2_route.product_v2_root.route_key == "ANY /v2" &&
+      aws_apigatewayv2_route.product_v2_root.authorization_type == "JWT" &&
+      aws_apigatewayv2_route.product_v2_proxy.route_key == "ANY /v2/{proxy+}" &&
+      aws_apigatewayv2_route.product_v2_proxy.authorization_type == "JWT" &&
       aws_lambda_function.api.environment[0].variables.HINDSIGHT_REQUIRE_TENANT_CONTEXT == "1" &&
       aws_lambda_function.worker.environment[0].variables.HINDSIGHT_REQUIRE_TENANT_CONTEXT == "1"
     )
-    error_message = "Both API versions and workers must reach tenant-bound runtime paths."
+    error_message = "The product API must require the Cognito authorizer before reaching tenant-bound runtime paths."
+  }
+
+  assert {
+    condition = (
+      aws_apigatewayv2_authorizer.product.authorizer_type == "JWT" &&
+      toset(aws_apigatewayv2_authorizer.product.identity_sources) == toset(["$request.header.Authorization"]) &&
+      aws_apigatewayv2_route.public_v1_root_get.route_key == "GET /v1" &&
+      aws_apigatewayv2_route.public_v1_proxy_get.route_key == "GET /v1/{proxy+}" &&
+      aws_apigatewayv2_route.public_v1_ticket_post.route_key == "POST /v1/realtime/ticket" &&
+      aws_apigatewayv2_route.public_v1_root_options.authorization_type == "NONE" &&
+      aws_apigatewayv2_route.public_v1_proxy_options.authorization_type == "NONE" &&
+      aws_apigatewayv2_route.product_v2_root_options.authorization_type == "NONE" &&
+      aws_apigatewayv2_route.product_v2_proxy_options.authorization_type == "NONE"
+    )
+    error_message = "Public v1 routes and unauthenticated preflight routes must remain explicit around the JWT-protected v2 boundary."
+  }
+
+  assert {
+    condition = (
+      aws_cognito_user_pool.product.user_pool_tier == "LITE" &&
+      aws_cognito_user_pool.product.admin_create_user_config[0].allow_admin_create_user_only &&
+      aws_cognito_user_pool.product.username_configuration[0].case_sensitive == false &&
+      one(aws_cognito_user_pool.product.account_recovery_setting[0].recovery_mechanism).name == "admin_only" &&
+      aws_cognito_user_pool.product.password_policy[0].minimum_length == 14 &&
+      aws_cognito_user_pool_client.product.generate_secret == false &&
+      toset(aws_cognito_user_pool_client.product.allowed_oauth_flows) == toset(["code"]) &&
+      toset(aws_cognito_user_pool_client.product.allowed_oauth_scopes) == toset(["openid"]) &&
+      aws_cognito_user_pool_client.product.access_token_validity == 15 &&
+      contains(aws_cognito_user_pool_client.product.explicit_auth_flows, "ALLOW_ADMIN_USER_PASSWORD_AUTH") &&
+      !contains(aws_cognito_user_pool_client.product.explicit_auth_flows, "ALLOW_USER_PASSWORD_AUTH") &&
+      !contains(aws_cognito_user_pool_client.product.explicit_auth_flows, "ALLOW_USER_SRP_AUTH") &&
+      !contains(aws_cognito_user_pool_client.product.explicit_auth_flows, "ALLOW_REFRESH_TOKEN_AUTH") &&
+      aws_cognito_user_group.viewer.name == "viewer" &&
+      aws_cognito_user_group.operator.name == "operator"
+    )
+    error_message = "Cognito must be a low-cost, admin-provisioned PKCE identity boundary without a browser password grant."
+  }
+
+  assert {
+    condition = (
+      aws_dynamodb_table.realtime_tickets.hash_key == "ticket_digest" &&
+      aws_dynamodb_table.realtime_tickets.billing_mode == "PAY_PER_REQUEST" &&
+      aws_dynamodb_table.realtime_tickets.ttl[0].enabled &&
+      aws_dynamodb_table.realtime_tickets.ttl[0].attribute_name == "expires_at" &&
+      aws_dynamodb_table.realtime_tickets.server_side_encryption[0].enabled &&
+      anytrue([
+        for index in aws_dynamodb_table.realtime_tickets.global_secondary_index :
+        index.hash_key == "tenant_id" && index.name == "tenant-id-index"
+      ]) &&
+      aws_lambda_function.api.environment[0].variables.HINDSIGHT_REALTIME_TICKET_TABLE == aws_dynamodb_table.realtime_tickets.name &&
+      aws_lambda_function.websocket.environment[0].variables.HINDSIGHT_REALTIME_TICKET_TABLE == aws_dynamodb_table.realtime_tickets.name
+    )
+    error_message = "Realtime tickets must use encrypted expiring digest records with a tenant cleanup index."
+  }
+
+  assert {
+    condition = (
+      length([
+        for statement in data.aws_iam_policy_document.api.statement : statement
+        if statement.sid == "RealtimeTicketIssue"
+        ]) == 1 && toset(one([
+          for statement in data.aws_iam_policy_document.api.statement : statement
+          if statement.sid == "RealtimeTicketIssue"
+      ]).actions) == toset(["dynamodb:PutItem"]) &&
+      length([
+        for statement in data.aws_iam_policy_document.websocket.statement : statement
+        if statement.sid == "RealtimeTicketRedeem"
+        ]) == 1 && toset(one([
+          for statement in data.aws_iam_policy_document.websocket.statement : statement
+          if statement.sid == "RealtimeTicketRedeem"
+      ]).actions) == toset(["dynamodb:DeleteItem"])
+    )
+    error_message = "The API may only issue ticket rows and the WebSocket runtime may only atomically redeem them."
+  }
+
+  assert {
+    condition = (
+      length(aws_wafv2_web_acl.ui) == 0 &&
+      aws_cloudfront_distribution.ui.web_acl_id == null
+    )
+    error_message = "The default deployment must incur no Web ACL resources or attachment."
   }
 
   assert {
@@ -188,6 +275,34 @@ run "complete_demo_graph" {
       endswith(aws_iam_role_policy_attachment.apigateway_cloudwatch.policy_arn, "AmazonAPIGatewayPushToCloudWatchLogs")
     )
     error_message = "API Gateway access logs require the Terraform-owned account role and managed policy."
+  }
+}
+
+run "waf_enabled" {
+  command = plan
+
+  variables {
+    enable_waf        = true
+    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  assert {
+    condition = (
+      length(aws_wafv2_web_acl.ui) == 1 &&
+      aws_wafv2_web_acl.ui[0].scope == "CLOUDFRONT" &&
+      length(aws_wafv2_web_acl.ui[0].rule) == 2 &&
+      anytrue([
+        for rule in aws_wafv2_web_acl.ui[0].rule :
+        rule.name == "ip-rate-limit"
+      ]) &&
+      anytrue([
+        for rule in aws_wafv2_web_acl.ui[0].rule :
+        rule.name == "aws-managed-common"
+      ])
+    )
+    error_message = "Opting into WAF must attach CloudFront rate limiting and the AWS managed common protections."
   }
 }
 

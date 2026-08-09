@@ -16,13 +16,10 @@ from hindsight.db import database_url_with_tls_roots
 DATABASE_URL_PARAM_ENV = "HINDSIGHT_DATABASE_URL_PARAM"
 GEMINI_API_KEY_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEY_PARAM"
 GEMINI_API_KEYS_PARAM_ENV = "HINDSIGHT_GEMINI_API_KEYS_PARAM"
-FUNCTION_AUTH_TOKEN_PARAM_ENV = "HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM"
-FUNCTION_AUTH_TOKEN_ENV = "HINDSIGHT_FUNCTION_AUTH_TOKEN"
 REASONING_MAX_ATTEMPTS_ENV = "REASONING_MAX_ATTEMPTS"
 SETTINGS_CACHE_TTL_ENV = "HINDSIGHT_SETTINGS_CACHE_TTL_SECONDS"
 _SETTINGS_CACHE: RuntimeSettings | None = None
 _SETTINGS_CACHE_AT: float | None = None
-_AUTH_TOKEN_CACHE: str | None = None
 
 
 @dataclass(frozen=True)
@@ -30,30 +27,6 @@ class RuntimeSettings:
     database_url: str
     provider_env: dict[str, str]
     reasoning_max_attempts: int = 2
-
-
-def function_auth_token(
-    *,
-    environ: Mapping[str, str] | None = None,
-    ssm_client: Any | None = None,
-    use_cache: bool = True,
-) -> str:
-    global _AUTH_TOKEN_CACHE
-    env = os.environ if environ is None else environ
-    if use_cache and environ is None and ssm_client is None and _AUTH_TOKEN_CACHE is not None:
-        return _AUTH_TOKEN_CACHE
-    client = ssm_client
-    if client is None and env.get(FUNCTION_AUTH_TOKEN_PARAM_ENV):
-        client = _ssm_client(env)
-    token = _secret_value(
-        env=env,
-        client=client,
-        param_env=FUNCTION_AUTH_TOKEN_PARAM_ENV,
-        fallback_env=FUNCTION_AUTH_TOKEN_ENV,
-    )
-    if use_cache and environ is None and ssm_client is None:
-        _AUTH_TOKEN_CACHE = token
-    return token
 
 
 def runtime_settings(
