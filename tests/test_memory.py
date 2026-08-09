@@ -272,8 +272,8 @@ def test_semantic_write_creates_embedding_row():
 
         assert row == (
             memory["namespace"],
-            "deterministic",
-            "stable-hash-v1",
+            "test_deterministic",
+            "test-stable-hash-v1",
             1024,
         )
     finally:

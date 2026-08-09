@@ -6,10 +6,12 @@
 DROP INDEX IF EXISTS
     agent_run_dispatches@agent_run_dispatches_run_id_command_key CASCADE;
 
+CREATE UNIQUE INDEX IF NOT EXISTS
+    agent_run_dispatches_run_command_generation_key
+    ON agent_run_dispatches (run_id, command, command_generation);
+
 ALTER TABLE agent_run_dispatches
-    ADD CONSTRAINT agent_run_dispatches_run_command_generation_key
-    UNIQUE (run_id, command, command_generation),
-    ADD CONSTRAINT agent_run_dispatches_command_generation CHECK (
+    ADD CONSTRAINT IF NOT EXISTS agent_run_dispatches_command_generation CHECK (
         command_generation >= 0
         AND COALESCE((payload->>'command_generation')::INT8, 0) = command_generation
     );
@@ -19,13 +21,17 @@ SET worker_attempt_generation = command_generation
 WHERE worker_attempt_id IS NOT NULL AND worker_attempt_generation IS NULL;
 
 ALTER TABLE agent_runs
-    ADD CONSTRAINT agent_runs_model_call_budget CHECK (
+    ADD CONSTRAINT IF NOT EXISTS agent_runs_model_call_budget CHECK (
         model_call_count BETWEEN 0 AND 4
-    ),
-    ADD CONSTRAINT agent_runs_cloudwatch_call_budget CHECK (
+    );
+
+ALTER TABLE agent_runs
+    ADD CONSTRAINT IF NOT EXISTS agent_runs_cloudwatch_call_budget CHECK (
         cloudwatch_call_count BETWEEN 0 AND 3
-    ),
-    ADD CONSTRAINT agent_runs_command_generation CHECK (
+    );
+
+ALTER TABLE agent_runs
+    ADD CONSTRAINT IF NOT EXISTS agent_runs_command_generation CHECK (
         command_generation >= 0
     );
 
@@ -61,6 +67,8 @@ ALTER TABLE agent_runs
         )
     );
 
+DROP TRIGGER IF EXISTS agent_run_call_budgets_monotonic ON agent_runs;
+
 CREATE OR REPLACE FUNCTION guard_agent_run_call_budgets()
 RETURNS TRIGGER
 LANGUAGE PLpgSQL
@@ -79,11 +87,16 @@ BEGIN
 END
 $$;
 
-DROP TRIGGER IF EXISTS agent_run_call_budgets_monotonic ON agent_runs;
 CREATE TRIGGER agent_run_call_budgets_monotonic
 BEFORE UPDATE ON agent_runs
 FOR EACH ROW
 EXECUTE FUNCTION guard_agent_run_call_budgets();
+
+-- The prior migration installed this trigger. CockroachDB cannot replace its
+-- function while the trigger remains active, so rebuild the trigger around
+-- the expanded identity guard.
+DROP TRIGGER IF EXISTS agent_run_dispatch_identity_immutable
+ON agent_run_dispatches;
 
 CREATE OR REPLACE FUNCTION guard_agent_run_dispatch_identity()
 RETURNS TRIGGER
@@ -103,3 +116,8 @@ BEGIN
     RETURN NEW;
 END
 $$;
+
+CREATE TRIGGER agent_run_dispatch_identity_immutable
+BEFORE UPDATE ON agent_run_dispatches
+FOR EACH ROW
+EXECUTE FUNCTION guard_agent_run_dispatch_identity();

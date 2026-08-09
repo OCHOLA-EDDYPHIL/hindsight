@@ -172,7 +172,7 @@ def test_run_and_approval_transitions_commit_their_dispatches():
 
 
 @requires_db
-def test_replanned_run_can_commit_a_second_approval_dispatch():
+def test_replanned_run_can_commit_a_second_approval_dispatch(monkeypatch):
     from hindsight.run_dispatch import dispatch_run_commands
     from hindsight.runs import (
         claim_run_attempt,
@@ -237,6 +237,7 @@ def test_replanned_run_can_commit_a_second_approval_dispatch():
 
     assert prepared["status"] == "resuming"
     assert prepared["command_generation"] == 2
+    monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
     client = RecordingSqs()
     dispatched = dispatch_run_commands(
         run_id=run["id"],

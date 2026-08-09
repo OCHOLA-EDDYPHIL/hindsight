@@ -71,7 +71,7 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
     assert trace["decision"]["id"] == decision_id
     assert str(trace["retrievals"][0]["id"]) == retrieval.retrieval_id
     assert trace["retrievals"][0]["embedding_profile_id"]
-    assert trace["retrievals"][0]["embedding_provider"] == "deterministic"
+    assert trace["retrievals"][0]["embedding_provider"] == "test_deterministic"
     read = trace["reads"][0]
     assert str(read["memory_id"]) == str(source["id"])
     assert read["belief_id"] == source["belief_id"]
