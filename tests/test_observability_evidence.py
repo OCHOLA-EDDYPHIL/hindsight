@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,9 @@ SOURCE_REVISION = "a" * 40
 
 
 def _script(name: str):
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
     spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -114,6 +119,293 @@ def test_alert_exercise_records_only_acknowledgement_and_revision():
     )
     assert evidence["message_id"] == "message-1"
     assert evidence["source_revision"] == SOURCE_REVISION
+    assert evidence["account_id"] == "123456789012"
+    assert evidence["region"] == "us-east-1"
+
+
+def _acceptance_documents():
+    started = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+    run = {
+        "id": 123,
+        "run_attempt": 2,
+        "head_sha": SOURCE_REVISION,
+        "head_branch": "main",
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/live-acceptance.yml",
+        "conclusion": "success",
+        "run_started_at": started.isoformat(),
+        "updated_at": (started + timedelta(minutes=30)).isoformat(),
+        "repository": {"full_name": "owner/hindsight"},
+        "actor": {"login": "owner"},
+        "triggering_actor": {"login": "owner"},
+    }
+    provenance = {
+        "repository": "owner/hindsight",
+        "run_id": "123",
+        "run_attempt": "2",
+        "head_sha": SOURCE_REVISION,
+        "acceptance_mode": "full",
+        "deployment_environment": "demo",
+        "bounded_observability_enabled": True,
+    }
+    return run, provenance
+
+
+def test_observability_provenance_requires_successful_bounded_full_acceptance():
+    module = _script("collect_observability_evidence")
+    run, provenance = _acceptance_documents()
+    start, end = module.validate_provenance(
+        run,
+        provenance,
+        repository="owner/hindsight",
+        source_revision=SOURCE_REVISION,
+        acceptance_run_id="123",
+        acceptance_run_attempt="2",
+        deployment_environment="demo",
+    )
+    assert (end - start).total_seconds() == 40 * 60
+
+    provenance["bounded_observability_enabled"] = False
+    with pytest.raises(ValueError, match="did not enable bounded observability"):
+        module.validate_provenance(
+            run,
+            provenance,
+            repository="owner/hindsight",
+            source_revision=SOURCE_REVISION,
+            acceptance_run_id="123",
+            acceptance_run_attempt="2",
+            deployment_environment="demo",
+        )
+
+
+def test_observability_log_query_is_bounded_and_rejects_secret_fields():
+    module = _script("collect_observability_evidence")
+    groups = module.expected_log_groups("demo")
+
+    class Logs:
+        def __init__(self, message):
+            self.message = message
+            self.started = None
+
+        def start_query(self, **kwargs):
+            self.started = kwargs
+            return {"queryId": "query-1"}
+
+        def get_query_results(self, **kwargs):
+            assert kwargs == {"queryId": "query-1"}
+            return {
+                "status": "Complete",
+                "statistics": {"bytesScanned": 100, "recordsScanned": 4, "recordsMatched": 1},
+                "results": [
+                    [
+                        {"field": "@timestamp", "value": "2026-08-10 10:00:00.000"},
+                        {"field": "@log", "value": f"123456789012:{groups[0]}"},
+                        {
+                            "field": "@message",
+                            "value": (
+                                "2026-08-10T10:00:00.000Z request-id INFO "
+                                + json.dumps(
+                                    self.message,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                            ),
+                        },
+                    ]
+                ],
+            }
+
+    safe = {
+        "event": "api_request",
+        "status": "202",
+        "tenant_id": "tenant-1",
+        "trace_id": "a" * 32,
+        "span_id": "b" * 16,
+    }
+    client = Logs(safe)
+    events, statistics = module.collect_logs(
+        client,
+        log_groups=groups,
+        start=datetime.now(UTC) - timedelta(minutes=1),
+        end=datetime.now(UTC),
+    )
+    assert events[0]["event"] == "api_request"
+    assert statistics["bytes_scanned"] == 100
+    assert client.started["limit"] == module.MAX_LOG_EVENTS
+    assert client.started["logGroupNames"] == groups
+    assert 'filter @message like /"event":' in client.started["queryString"]
+
+    client = Logs({**safe, "api_key": "never"})
+    with pytest.raises(RuntimeError, match="unexpected field"):
+        module.collect_logs(
+            client,
+            log_groups=groups,
+            start=datetime.now(UTC) - timedelta(minutes=1),
+            end=datetime.now(UTC),
+        )
+
+    with pytest.raises(RuntimeError, match="compact structured event"):
+        module._extract_structured_event(json.dumps(safe))
+
+
+def test_observability_browser_evidence_binds_completed_product_run(tmp_path):
+    module = _script("collect_observability_evidence")
+    operation = tmp_path / "operation.json"
+    operation.write_text(
+        json.dumps(
+            {"signature": {"corrected": {"run_id": "run-1", "status": "completed"}}}
+        )
+    )
+    run_id, digest = module.validate_browser_evidence(operation)
+    assert run_id == "run-1"
+    assert digest == module.hashlib.sha256(operation.read_bytes()).hexdigest()
+
+    operation.write_text(
+        json.dumps(
+            {"signature": {"corrected": {"run_id": "run-1", "status": "failed"}}}
+        )
+    )
+    with pytest.raises(ValueError, match="did not complete"):
+        module.validate_browser_evidence(operation)
+
+
+def test_observability_correlation_requires_all_product_boundaries():
+    module = _script("collect_observability_evidence")
+    trace_id = "a" * 32
+    common = {
+        "tenant_id": "tenant-1",
+        "run_id": "run-1",
+        "dispatch_id": "dispatch-1",
+        "dispatch_attempt_id": "dispatch-attempt-1",
+        "trace_id": trace_id,
+        "span_id": "b" * 16,
+    }
+    logs = [
+        {"event": "api_request", "status": "202", "tenant_id": "tenant-1", "trace_id": trace_id},
+        {"event": "run_dispatch", "status": "sent", "message_id": "message-1", **common},
+        {"event": "worker_record", "status": "completed", "message_id": "message-1", **common},
+        {
+            "event": "realtime_changefeed",
+            "status": "delivered",
+            "tenant_id": "tenant-1",
+            "run_id": "run-1",
+            "trace_id": "c" * 32,
+        },
+    ]
+    traces = {
+        trace_id: {
+            "xray_trace_id": "1-aaaaaaaa-aaaaaaaaaaaaaaaaaaaaaaaa",
+            "nodes": [
+                {"name": "hindsight.api.request"},
+                {"name": "hindsight.worker.message"},
+            ],
+        }
+    }
+    result = module.correlate(logs, traces, product_run_id="run-1")
+    assert result["run_id"] == "run-1"
+    assert result["dispatch"]["message_id"] == result["worker"]["message_id"]
+    assert module.candidate_trace_ids(logs, product_run_id="run-1") == [trace_id]
+
+    with pytest.raises(RuntimeError, match="complete correlation candidate"):
+        module.candidate_trace_ids(logs, product_run_id="run-other")
+
+    with pytest.raises(RuntimeError, match="no complete"):
+        module.correlate(logs[:-1], traces, product_run_id="run-1")
+
+
+def test_observability_fetches_only_log_derived_trace_ids():
+    module = _script("collect_observability_evidence")
+    trace_id = "a" * 32
+
+    class Xray:
+        def __init__(self):
+            self.calls = []
+
+        def batch_get_traces(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "Traces": [
+                    {
+                        "Id": "1-aaaaaaaa-aaaaaaaaaaaaaaaaaaaaaaaa",
+                        "Duration": 1,
+                        "Segments": [
+                            {"Document": json.dumps({"name": "hindsight.api.request"})}
+                        ],
+                    }
+                ]
+            }
+
+    client = Xray()
+    traces = module.collect_traces(client, trace_ids=[trace_id])
+    assert client.calls == [{"TraceIds": ["1-aaaaaaaa-aaaaaaaaaaaaaaaaaaaaaaaa"]}]
+    assert list(traces) == [trace_id]
+
+
+def test_observability_retries_only_trace_collection(monkeypatch):
+    module = _script("collect_observability_evidence")
+    calls = {"logs": 0, "traces": 0}
+
+    def logs(*args, **kwargs):
+        calls["logs"] += 1
+        return ([{"event": "worker_record"}], {"bytes_scanned": 10})
+
+    def candidates(events, *, product_run_id):
+        assert product_run_id == "run-1"
+        return ["a" * 32]
+
+    def traces(*args, **kwargs):
+        calls["traces"] += 1
+        if calls["traces"] == 1:
+            raise RuntimeError("trace not indexed yet")
+        return {"a" * 32: {"nodes": []}}
+
+    def correlation(events, fetched, *, product_run_id):
+        return {"run_id": product_run_id, "trace_id": next(iter(fetched))}
+
+    monkeypatch.setattr(module, "collect_logs", logs)
+    monkeypatch.setattr(module, "candidate_trace_ids", candidates)
+    monkeypatch.setattr(module, "collect_traces", traces)
+    monkeypatch.setattr(module, "correlate", correlation)
+    result = module.collect_correlation_evidence(
+        object(),
+        object(),
+        log_groups=["group"],
+        start=datetime.now(UTC) - timedelta(minutes=1),
+        end=datetime.now(UTC),
+        product_run_id="run-1",
+        sleep=lambda _: None,
+    )
+    assert calls == {"logs": 1, "traces": 2}
+    assert result[0]["run_id"] == "run-1"
+    assert result[-1] == 2
+
+
+def test_observability_report_has_verifiable_payload_digest():
+    module = _script("collect_observability_evidence")
+    report = module.build_report(
+        source_revision=SOURCE_REVISION,
+        repository="owner/hindsight",
+        acceptance_run_id="123",
+        acceptance_run_attempt="2",
+        product_run_id="run-1",
+        browser_evidence_sha256="c" * 64,
+        deployment_environment="demo",
+        identity={"account_id": "123456789012", "caller_arn": "arn:aws:iam::123:role/test", "region": "us-east-1"},
+        start=datetime.now(UTC) - timedelta(minutes=1),
+        end=datetime.now(UTC),
+        log_groups=module.expected_log_groups("demo"),
+        correlation={"trace_id": "a" * 32},
+        log_statistics={"bytes_scanned": 1},
+        trace_ids_requested=1,
+        traces_returned=1,
+        trace_collection_attempt=1,
+        alert={"message_id": "message-1"},
+    )
+    assert module.validate_report_digest(report)
+    assert report["method"]["log_query_attempts"] == 1
+    assert report["acceptance"]["product_run_id"] == "run-1"
+    report["source_revision"] = "b" * 40
+    assert not module.validate_report_digest(report)
 
 
 def test_correlation_fields_drop_arbitrary_values_and_include_trace_ids():
@@ -150,3 +442,12 @@ def test_worker_record_keeps_all_correlation_identities(caplog):
         )
     event = json.loads(caplog.records[-1].message)
     assert {key: event[key] for key in message} == message
+
+
+def test_lambda_structured_event_loggers_emit_info_without_root_configuration():
+    import logging
+
+    from hindsight import api, realtime, run_dispatch, worker
+
+    for module in (api, realtime, run_dispatch, worker):
+        assert module.LOGGER.level == logging.INFO

@@ -646,6 +646,9 @@ jobs:
           CI_RUN_ATTEMPT: ${{ needs.exact_main_ci.outputs.ci_run_attempt }}
           CI_RUN_URL: ${{ needs.exact_main_ci.outputs.ci_run_url }}
           CI_WORKFLOW_PATH: ${{ needs.exact_main_ci.outputs.ci_workflow_path }}
+          ACCEPTANCE_MODE: ${{ needs.authorize.outputs.acceptance_mode }}
+          DEPLOYMENT_ENVIRONMENT: ${{ needs.authorize.outputs.deployment_environment }}
+          BOUNDED_OBSERVABILITY_ENABLED: ${{ inputs.enable_bounded_observability }}
         run: |
           python - <<'PY'
           import json
@@ -661,6 +664,9 @@ jobs:
               "ci_run_attempt": os.environ["CI_RUN_ATTEMPT"],
               "ci_run_url": os.environ["CI_RUN_URL"],
               "ci_workflow_path": os.environ["CI_WORKFLOW_PATH"],
+              "acceptance_mode": os.environ["ACCEPTANCE_MODE"],
+              "deployment_environment": os.environ["DEPLOYMENT_ENVIRONMENT"],
+              "bounded_observability_enabled": os.environ["BOUNDED_OBSERVABILITY_ENABLED"] == "true",
               "ui_url": os.environ["UI_URL"],
               "api_url": os.environ["API_URL"],
               "websocket_url": os.environ["WEBSOCKET_URL"],

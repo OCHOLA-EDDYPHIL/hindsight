@@ -473,6 +473,12 @@ resource "aws_iam_role" "github_deploy" {
   max_session_duration = 3600
 }
 
+resource "aws_iam_role" "github_observability_evidence" {
+  name                 = "hindsight-github-observability-evidence"
+  assume_role_policy   = data.aws_iam_policy_document.github_assume.json
+  max_session_duration = 3600
+}
+
 resource "aws_iam_role" "github_evidence" {
   count = var.enable_learning_infrastructure ? 1 : 0
 
@@ -1047,6 +1053,44 @@ resource "aws_iam_policy" "github_deploy_observability" {
 resource "aws_iam_role_policy_attachment" "github_deploy_observability" {
   role       = aws_iam_role.github_deploy.name
   policy_arn = aws_iam_policy.github_deploy_observability.arn
+}
+
+data "aws_iam_policy_document" "github_observability_evidence" {
+  statement {
+    sid       = "CallerIdentity"
+    actions   = ["sts:GetCallerIdentity"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "BoundedLogQuery"
+    actions   = ["logs:StartQuery"]
+    resources = local.observability_metric_log_group_arns
+  }
+
+  statement {
+    sid       = "BoundedLogQueryResults"
+    actions   = ["logs:GetQueryResults", "logs:StopQuery"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "BoundedTraceRead"
+    actions   = ["xray:BatchGetTraces"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "StageAlertPublish"
+    actions   = ["sns:Publish"]
+    resources = [local.observability_alert_topic_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "github_observability_evidence" {
+  name   = "hindsight-github-observability-evidence"
+  role   = aws_iam_role.github_observability_evidence.id
+  policy = data.aws_iam_policy_document.github_observability_evidence.json
 }
 
 data "aws_iam_policy_document" "github_evidence" {

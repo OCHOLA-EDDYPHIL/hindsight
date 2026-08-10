@@ -596,3 +596,51 @@ def test_deploy_maps_opt_in_observability_from_protected_configuration():
         in deploy_call
     )
     assert "adot_python_layer_arn:" not in deploy_call
+
+
+def test_observability_evidence_is_owner_authorized_and_exact_main():
+    workflow = pathlib.Path(".github/workflows/observability-evidence.yml").read_text()
+    authorization = workflow.split("      - id: authorization\n", 1)[1].split(
+        "  collect:\n", 1
+    )[0]
+    assert '"$REF_NAME" == "refs/heads/main"' in authorization
+    assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorization
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorization
+    assert "collect_observability_evidence.py" in workflow
+    assert "Collect bounded observability evidence" in workflow
+    assert "run-id: ${{ needs.authorize.outputs.acceptance_run_id }}" in workflow
+    assert (
+        "role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/"
+        "hindsight-github-observability-evidence" in workflow
+    )
+    assert "browser-evidence-${{ needs.authorize.outputs.source_revision }}" in workflow
+    assert "--browser-evidence build/observability-browser/operation.json" in workflow
+    assert "timeout-minutes: 15" in workflow
+    assert "observability-evidence.sha256" in workflow
+
+
+def test_observability_evidence_iam_is_read_only_except_stage_alert_publish():
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_observability_evidence" {', 1
+    )[1].split('data "aws_iam_policy_document" "github_evidence"', 1)[0]
+    assert 'resource "aws_iam_role" "github_observability_evidence"' in bootstrap
+    assert 'name                 = "hindsight-github-observability-evidence"' in bootstrap
+    assert '"sts:GetCallerIdentity"' in policy
+    assert '"xray:BatchGetTraces"' in policy
+    assert '"xray:GetTraceSummaries"' not in policy
+    assert '"logs:StartQuery"' in policy
+    assert '"logs:GetQueryResults"' in policy
+    assert '"logs:StopQuery"' in policy
+    alert = policy.split('sid       = "StageAlertPublish"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
+    assert 'actions   = ["sns:Publish"]' in alert
+    assert "resources = [local.observability_alert_topic_arn]" in alert
+    deploy_policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_deploy_observability" {', 1
+    )[1].split('resource "aws_iam_policy" "github_deploy_observability"', 1)[0]
+    assert '"xray:BatchGetTraces"' not in deploy_policy
+    assert '"logs:StartQuery"' not in deploy_policy
+    outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
+    assert 'output "github_observability_evidence_role_arn"' in outputs

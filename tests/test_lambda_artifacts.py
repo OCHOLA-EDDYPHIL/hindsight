@@ -47,6 +47,7 @@ def test_realtime_artifact_bundles_only_required_tracing_dependencies():
     assert builder.ARTIFACTS["realtime"]["modules"] == [
         "__init__.py",
         "aws.py",
+        "observability.py",
         "queueing.py",
         "realtime.py",
         "realtime_ticket.py",

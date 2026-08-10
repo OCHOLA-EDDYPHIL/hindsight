@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -20,6 +21,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 from hindsight.aws import aws_client_config
+from hindsight.observability import structured_event
 from hindsight.queueing import enqueue_run
 from hindsight.realtime_ticket import TICKET_TABLE_ENV, consume_realtime_ticket
 from hindsight.security import safe_error_detail
@@ -39,6 +41,8 @@ EVENT_VERSION = 2
 LEGACY_EVENT_VERSION = 1
 _HLC_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 _CHANGEFEED_TOKEN_CACHE: str | None = None
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 
 
 def _otel_enabled() -> bool:
@@ -285,6 +289,17 @@ def _changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     row_accepted = 1
                     row_delivered = result["delivered"]
                     row_stale = result["stale"]
+                    LOGGER.info(
+                        structured_event(
+                            "realtime_changefeed",
+                            {
+                                "tenant_id": envelope.get("tenant_id"),
+                                "run_id": envelope.get("run_id"),
+                                "message_id": envelope.get("event_id"),
+                                "status": "delivered",
+                            },
+                        )
+                    )
                 if event_id is not None and claim is not None:
                     if claim.owner is None or not _complete_outbox_event(event_id, claim.owner):
                         raise OutboxEventLeaseLost(
