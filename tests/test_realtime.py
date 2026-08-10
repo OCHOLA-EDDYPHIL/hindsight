@@ -5,11 +5,48 @@ import re
 import time
 from types import SimpleNamespace
 
+import pytest
 from botocore.exceptions import ClientError
 
 
 class FakeConditionalCheckFailed(Exception):
     pass
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "wss://socket.execute-api.us-east-1.amazonaws.com/demo",
+        "https://socket.execute-api.us-east-1.amazonaws.com",
+        "not-an-endpoint",
+    ],
+)
+def test_management_client_rejects_non_https_stage_endpoints(monkeypatch, endpoint):
+    from hindsight import realtime
+
+    monkeypatch.setenv(realtime.MANAGEMENT_ENDPOINT_ENV, endpoint)
+
+    with pytest.raises(RuntimeError, match="must be an HTTPS stage endpoint"):
+        realtime._management_client()
+
+
+def test_management_client_uses_validated_https_stage_endpoint(monkeypatch):
+    from hindsight import realtime
+
+    endpoint = "https://socket.execute-api.us-east-1.amazonaws.com/demo"
+    sentinel = object()
+    captured = {}
+    monkeypatch.setenv(realtime.MANAGEMENT_ENDPOINT_ENV, endpoint)
+
+    def fake_client(service_name, **kwargs):
+        captured.update(service_name=service_name, **kwargs)
+        return sentinel
+
+    monkeypatch.setattr(realtime.boto3, "client", fake_client)
+
+    assert realtime._management_client() is sentinel
+    assert captured["service_name"] == "apigatewaymanagementapi"
+    assert captured["endpoint_url"] == endpoint
 
 
 class FakeLeaseTable:

@@ -200,8 +200,11 @@ run "complete_demo_graph" {
       aws_apigatewayv2_authorizer.product.authorizer_type == "JWT" &&
       toset(aws_apigatewayv2_authorizer.product.identity_sources) == toset(["$request.header.Authorization"]) &&
       aws_apigatewayv2_route.public_v1_root_get.route_key == "GET /v1" &&
+      aws_apigatewayv2_route.public_v1_root_get.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_proxy_get.route_key == "GET /v1/{proxy+}" &&
+      aws_apigatewayv2_route.public_v1_proxy_get.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_ticket_post.route_key == "POST /v1/realtime/ticket" &&
+      aws_apigatewayv2_route.public_v1_ticket_post.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_root_options.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_proxy_options.authorization_type == "NONE" &&
       aws_apigatewayv2_route.product_v2_root_options.authorization_type == "NONE" &&
@@ -363,6 +366,39 @@ run "alert_email_subscribes_operational_and_budget_topics" {
       ])
     )
     error_message = "The protected alert email must subscribe to both notification topics and receive every budget alert."
+  }
+}
+
+run "websocket_endpoints_use_consumer_protocols" {
+  command = plan
+
+  variables {
+    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  override_resource {
+    target          = aws_apigatewayv2_api.websocket
+    override_during = plan
+    values = {
+      api_endpoint  = "wss://websocket.execute-api.us-east-1.amazonaws.com"
+      execution_arn = "arn:aws:execute-api:us-east-1:123456789012:websocket"
+    }
+  }
+
+  assert {
+    condition = (
+      local.websocket_management_endpoint == "https://websocket.execute-api.us-east-1.amazonaws.com/demo" &&
+      aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT == local.websocket_management_endpoint &&
+      output.websocket_management_endpoint == local.websocket_management_endpoint
+    )
+    error_message = "Changefeed fan-out must use the HTTPS API Gateway Management API endpoint for the deployed stage."
+  }
+
+  assert {
+    condition     = output.websocket_url == "wss://websocket.execute-api.us-east-1.amazonaws.com/demo"
+    error_message = "Browser WebSocket clients must retain the WSS stage endpoint."
   }
 }
 
