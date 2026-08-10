@@ -479,7 +479,7 @@ def test_deploy_maps_opt_in_observability_from_protected_configuration():
         assert 'default: ""' in layer
 
     assert "HINDSIGHT_ALERT_RECIPIENT:" in reusable
-    assert "Confirmed email recipient for operational alerts" in reusable
+    assert "Optional confirmed email recipient for operational and budget alerts" in reusable
     assert (
         "TF_VAR_enable_bounded_observability: "
         "${{ inputs.enable_bounded_observability && 'true' || 'false' }}"
@@ -491,6 +491,7 @@ def test_deploy_maps_opt_in_observability_from_protected_configuration():
     assert deploy.count('echo "::add-mask::$ALERT_RECIPIENT"') == 2
     assert deploy.count('echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"') == 2
     assert deploy.count('echo "TF_VAR_alert_email=$ALERT_RECIPIENT"') == 2
+    assert deploy.count('if [[ -n "$ALERT_RECIPIENT" ]]; then') == 2
     assert "TF_VAR_adot_python_layer_arn:" not in deploy
     assert "TF_VAR_alert_email:" not in deploy
 

@@ -77,7 +77,7 @@ on:
         default: demo
     secrets:
       HINDSIGHT_ALERT_RECIPIENT:
-        description: Confirmed email recipient for operational alerts
+        description: Optional confirmed email recipient for operational and budget alerts
         required: false
     outputs:
       ui_url:
@@ -302,15 +302,15 @@ jobs:
             echo "Bounded observability requires a confirmed ADOT Python layer ARN in $AWS_REGION." >&2
             exit 1
           }
-          [[ "$ALERT_RECIPIENT" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
-            echo "Bounded observability requires a confirmed alert recipient." >&2
-            exit 1
-          }
-          echo "::add-mask::$ALERT_RECIPIENT"
-          {
-            echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"
-            echo "TF_VAR_alert_email=$ALERT_RECIPIENT"
-          } >> "$GITHUB_ENV"
+          echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN" >> "$GITHUB_ENV"
+          if [[ -n "$ALERT_RECIPIENT" ]]; then
+            [[ "$ALERT_RECIPIENT" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
+              echo "The configured alert recipient is not a valid email address." >&2
+              exit 1
+            }
+            echo "::add-mask::$ALERT_RECIPIENT"
+            echo "TF_VAR_alert_email=$ALERT_RECIPIENT" >> "$GITHUB_ENV"
+          fi
       - run: uv sync --frozen
       - name: Verify deployment account and state identity
         run: >-
@@ -431,15 +431,15 @@ jobs:
             echo "Bounded observability requires a confirmed ADOT Python layer ARN in $AWS_REGION." >&2
             exit 1
           }
-          [[ "$ALERT_RECIPIENT" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
-            echo "Bounded observability requires a confirmed alert recipient." >&2
-            exit 1
-          }
-          echo "::add-mask::$ALERT_RECIPIENT"
-          {
-            echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"
-            echo "TF_VAR_alert_email=$ALERT_RECIPIENT"
-          } >> "$GITHUB_ENV"
+          echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN" >> "$GITHUB_ENV"
+          if [[ -n "$ALERT_RECIPIENT" ]]; then
+            [[ "$ALERT_RECIPIENT" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
+              echo "The configured alert recipient is not a valid email address." >&2
+              exit 1
+            }
+            echo "::add-mask::$ALERT_RECIPIENT"
+            echo "TF_VAR_alert_email=$ALERT_RECIPIENT" >> "$GITHUB_ENV"
+          fi
       - run: uv sync --frozen
       - name: Verify deployment account and state identity
         run: >-

@@ -439,11 +439,17 @@ run "isolated_bootstrap" {
     condition = (
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityAlertSubscription"
-      ]).resources) == toset(local.observability_alert_subscription_arns) &&
+        if statement.sid == "ObservabilitySubscriptions"
+      ]).resources) == toset(local.observability_subscription_arns) &&
+      toset(local.observability_subscription_arns) == toset([
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts:*",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts:*",
+      ]) &&
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityAlertSubscription"
+        if statement.sid == "ObservabilitySubscriptions"
         ]).actions) == toset([
         "sns:GetSubscriptionAttributes",
         "sns:ListSubscriptionsByTopic",
@@ -459,7 +465,7 @@ run "isolated_bootstrap" {
         if statement.sid == "ObservabilityAlertExercise"
       ]).actions) == toset(["sns:Publish"])
     )
-    error_message = "Alert subscription and exercise permissions must not extend to the budget topic or unrelated SNS resources."
+    error_message = "Alert subscription permissions must stay on the two stage topics, and publish must stay on the operational topic."
   }
 
   assert {

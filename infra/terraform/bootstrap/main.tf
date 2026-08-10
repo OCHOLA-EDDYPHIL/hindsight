@@ -67,10 +67,12 @@ locals {
     local.observability_alert_topic_arn,
     local.observability_budget_topic_arn,
   ]
-  observability_alert_subscription_arns = [
-    local.observability_alert_topic_arn,
-    "${local.observability_alert_topic_arn}:*",
-  ]
+  observability_subscription_arns = flatten([
+    for topic_arn in local.observability_topic_arns : [
+      topic_arn,
+      "${topic_arn}:*",
+    ]
+  ])
   observability_budget_arn        = "arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:budget/hindsight-${var.stage}-monthly-five-usd"
   observability_sampling_rule_arn = "arn:${data.aws_partition.current.partition}:xray:${var.aws_region}:${data.aws_caller_identity.current.account_id}:sampling-rule/hindsight-${var.stage}-bounded"
   observability_metric_log_group_arns = [
@@ -908,14 +910,14 @@ data "aws_iam_policy_document" "github_deploy_observability" {
   }
 
   statement {
-    sid = "ObservabilityAlertSubscription"
+    sid = "ObservabilitySubscriptions"
     actions = [
       "sns:GetSubscriptionAttributes",
       "sns:ListSubscriptionsByTopic",
       "sns:Subscribe",
       "sns:Unsubscribe",
     ]
-    resources = local.observability_alert_subscription_arns
+    resources = local.observability_subscription_arns
   }
 
   statement {
