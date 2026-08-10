@@ -19,6 +19,11 @@ on:
         options:
           - demo
           - demo-candidate
+      enable_bounded_observability:
+        description: Enable the opt-in cost-bounded ADOT/X-Ray profile
+        required: true
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -267,6 +272,8 @@ jobs:
       apply: true
       validation_mode: true
       embedding_max_distance: "0.35"
+      enable_bounded_observability: ${{ inputs.enable_bounded_observability }}
+      adot_python_layer_arn: ${{ inputs.enable_bounded_observability && vars.HINDSIGHT_ADOT_PYTHON_LAYER_ARN || '' }}
       source_sha: ${{ needs.authorize.outputs.product_sha }}
       deployment_environment: ${{ needs.authorize.outputs.deployment_environment }}
 

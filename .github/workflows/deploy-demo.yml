@@ -16,6 +16,16 @@ on:
         required: true
         type: boolean
         default: true
+      enable_bounded_observability:
+        description: Enable the opt-in cost-bounded ADOT/X-Ray profile
+        required: true
+        type: boolean
+        default: false
+      adot_python_layer_arn:
+        description: Confirmed region-matched ADOT Python Lambda layer ARN
+        required: false
+        type: string
+        default: ""
       deployment_environment:
         description: Protected GitHub environment containing one AWS account configuration
         required: true
@@ -46,6 +56,16 @@ on:
         required: false
         type: boolean
         default: false
+      enable_bounded_observability:
+        description: Enable the opt-in cost-bounded ADOT/X-Ray profile
+        required: false
+        type: boolean
+        default: false
+      adot_python_layer_arn:
+        description: Confirmed region-matched ADOT Python Lambda layer ARN
+        required: false
+        type: string
+        default: ""
       source_sha:
         description: Exact caller-authorized revision to deploy
         required: true
@@ -55,6 +75,10 @@ on:
         required: false
         type: string
         default: demo
+    secrets:
+      HINDSIGHT_ALERT_RECIPIENT:
+        description: Confirmed email recipient for operational alerts
+        required: false
     outputs:
       ui_url:
         description: Deployed CloudFront/custom-domain URL
@@ -101,6 +125,7 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_VAR_validation_mode: ${{ inputs.validation_mode && 'true' || 'false' }}
+  TF_VAR_enable_bounded_observability: ${{ inputs.enable_bounded_observability && 'true' || 'false' }}
   DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
   TF_VAR_api_database_url_parameter_name: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
   TF_VAR_worker_database_url_parameter_name: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
@@ -265,6 +290,27 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - name: Configure bounded observability inputs
+        if: inputs.enable_bounded_observability == true
+        env:
+          ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn }}
+          ALERT_RECIPIENT: ${{ secrets.HINDSIGHT_ALERT_RECIPIENT }}
+        shell: bash
+        run: |
+          layer_pattern="^arn:(aws|aws-us-gov|aws-cn):lambda:${AWS_REGION}:[0-9]{12}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*$"
+          [[ "$ADOT_PYTHON_LAYER_ARN" =~ $layer_pattern ]] || {
+            echo "Bounded observability requires a confirmed ADOT Python layer ARN in $AWS_REGION." >&2
+            exit 1
+          }
+          [[ "$ALERT_RECIPIENT" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
+            echo "Bounded observability requires a confirmed alert recipient." >&2
+            exit 1
+          }
+          echo "::add-mask::$ALERT_RECIPIENT"
+          {
+            echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"
+            echo "TF_VAR_alert_email=$ALERT_RECIPIENT"
+          } >> "$GITHUB_ENV"
       - run: uv sync --frozen
       - name: Verify deployment account and state identity
         run: >-
@@ -373,6 +419,27 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - name: Configure bounded observability inputs
+        if: inputs.enable_bounded_observability == true
+        env:
+          ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn }}
+          ALERT_RECIPIENT: ${{ secrets.HINDSIGHT_ALERT_RECIPIENT }}
+        shell: bash
+        run: |
+          layer_pattern="^arn:(aws|aws-us-gov|aws-cn):lambda:${AWS_REGION}:[0-9]{12}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*$"
+          [[ "$ADOT_PYTHON_LAYER_ARN" =~ $layer_pattern ]] || {
+            echo "Bounded observability requires a confirmed ADOT Python layer ARN in $AWS_REGION." >&2
+            exit 1
+          }
+          [[ "$ALERT_RECIPIENT" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
+            echo "Bounded observability requires a confirmed alert recipient." >&2
+            exit 1
+          }
+          echo "::add-mask::$ALERT_RECIPIENT"
+          {
+            echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"
+            echo "TF_VAR_alert_email=$ALERT_RECIPIENT"
+          } >> "$GITHUB_ENV"
       - run: uv sync --frozen
       - name: Verify deployment account and state identity
         run: >-

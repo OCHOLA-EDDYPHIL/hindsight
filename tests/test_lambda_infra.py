@@ -457,3 +457,54 @@ def test_deploy_uses_the_caller_authorized_source_revision():
     assert "DEPLOYED_SHA: ${{ needs.authorize.outputs.source_sha }}" in workflow
     assert "${DEPLOYMENT_ENVIRONMENT}-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}" in workflow
     assert "github.event.pull_request.head.sha || github.sha" not in workflow
+
+
+def test_deploy_maps_opt_in_observability_from_protected_configuration():
+    deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+    live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+
+    dispatch = deploy.split("  workflow_dispatch:\n", 1)[1].split("  workflow_call:\n", 1)[0]
+    reusable = deploy.split("  workflow_call:\n", 1)[1].split("    outputs:\n", 1)[0]
+    for trigger in (dispatch, reusable):
+        enabled = trigger.split("      enable_bounded_observability:\n", 1)[1].split(
+            "      adot_python_layer_arn:\n", 1
+        )[0]
+        layer = trigger.split("      adot_python_layer_arn:\n", 1)[1].split(
+            "      source_sha:\n" if trigger is reusable else "      deployment_environment:\n",
+            1,
+        )[0]
+        assert "type: boolean" in enabled
+        assert "default: false" in enabled
+        assert "type: string" in layer
+        assert 'default: ""' in layer
+
+    assert "HINDSIGHT_ALERT_RECIPIENT:" in reusable
+    assert "Confirmed email recipient for operational alerts" in reusable
+    assert (
+        "TF_VAR_enable_bounded_observability: "
+        "${{ inputs.enable_bounded_observability && 'true' || 'false' }}"
+    ) in deploy
+    assert deploy.count("Configure bounded observability inputs") == 2
+    assert deploy.count("if: inputs.enable_bounded_observability == true") == 2
+    assert deploy.count("ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn }}") == 2
+    assert deploy.count("ALERT_RECIPIENT: ${{ secrets.HINDSIGHT_ALERT_RECIPIENT }}") == 2
+    assert deploy.count('echo "::add-mask::$ALERT_RECIPIENT"') == 2
+    assert deploy.count('echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"') == 2
+    assert deploy.count('echo "TF_VAR_alert_email=$ALERT_RECIPIENT"') == 2
+    assert "TF_VAR_adot_python_layer_arn:" not in deploy
+    assert "TF_VAR_alert_email:" not in deploy
+
+    live_dispatch = live.split("  workflow_dispatch:\n", 1)[1].split("permissions:", 1)[0]
+    assert "      enable_bounded_observability:" in live_dispatch
+    assert "        default: false" in live_dispatch
+    deploy_call = live.split("  deploy:\n", 1)[1].split("  semantic_product:\n", 1)[0]
+    assert "secrets: inherit" in deploy_call
+    assert (
+        "enable_bounded_observability: ${{ inputs.enable_bounded_observability }}"
+        in deploy_call
+    )
+    assert (
+        "adot_python_layer_arn: ${{ inputs.enable_bounded_observability && "
+        "vars.HINDSIGHT_ADOT_PYTHON_LAYER_ARN || '' }}"
+        in deploy_call
+    )
