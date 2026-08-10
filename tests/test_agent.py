@@ -132,6 +132,54 @@ def test_diagnostic_action_is_selected_only_by_structured_model_output():
     assert "role" not in provider.requests[0].prompt
 
 
+def test_context_invalid_recommendation_repairs_to_required_diagnostic():
+    from hindsight.agent import _generate_agent_decision
+    from tests.fakes import (
+        SequencedReasoningProvider,
+        diagnostic_decision,
+        recommendation_decision,
+    )
+
+    invalid_recommendation = recommendation_decision(
+        "Inspect the worker before collecting current telemetry."
+    )
+    provider = SequencedReasoningProvider(
+        [
+            invalid_recommendation,
+            diagnostic_decision("payments.checkout_latency_ms"),
+        ]
+    )
+    state = {
+        "run_id": "run-repair",
+        "decision_id": "decision-repair",
+        "namespace": "worker-recovery",
+        "incident_id": "worker-recovery",
+        "user_input": "A scheduled command remains pending beyond its dispatch window",
+        "recalled_memories": [],
+        "observations": [],
+        "model_turn_count": 0,
+        "diagnostic_call_count": 0,
+    }
+
+    decision, _, turns = _generate_agent_decision(
+        state,
+        provider=provider,
+        allowed_query_keys={"payments.checkout_latency_ms"},
+    )
+
+    assert decision.next_step_kind == "diagnostic_tool"
+    assert turns == 2
+    assert len(provider.requests) == 2
+    assert (
+        "Stable repair reason: current_diagnostic_observation_required."
+        in provider.requests[1].prompt
+    )
+    assert invalid_recommendation not in provider.requests[1].prompt
+    assert provider.requests[1].response_json_schema["properties"]["next_step_kind"]["enum"] == [
+        "diagnostic_tool"
+    ]
+
+
 def test_review_required_memory_cannot_claim_positive_guidance():
     from hindsight.agent import _governed_guidance_envelope
 

@@ -5,8 +5,11 @@ import json
 import pytest
 
 from hindsight.agent_decision import (
+    AGENT_DECISION_JSON_SCHEMA,
+    MAX_MODEL_TURNS,
     AgentDecisionError,
     AgentDecisionV1,
+    agent_decision_provider_schema,
     memory_selection_fingerprint,
     parse_agent_decision,
     recommendation_id,
@@ -54,6 +57,93 @@ def test_recommendation_contract_is_strict_and_content_addressed():
         selection_fingerprint="selection-1",
     )
     assert first.startswith("recommendation:")
+
+
+def test_unobserved_provider_schema_requires_exact_diagnostic_and_empty_citations():
+    schema = agent_decision_provider_schema(
+        recalled_memory_ids=set(),
+        allowed_query_keys={"payments.retry_fanout", "payments.checkout_latency_ms"},
+        diagnostic_calls_used=0,
+        diagnostic_observation_available=False,
+        model_turn=1,
+    )
+
+    assert schema["properties"]["next_step_kind"]["enum"] == ["diagnostic_tool"]
+    assert schema["properties"]["tool_call"] == {"$ref": "#/$defs/DiagnosticToolCall"}
+    assert schema["properties"]["recommendation"] == {"type": "null"}
+    assert schema["properties"]["recalled_memory_citations"]["maxItems"] == 0
+    assert schema["$defs"]["DiagnosticToolCall"]["properties"]["query_key"]["enum"] == [
+        "payments.checkout_latency_ms",
+        "payments.retry_fanout",
+    ]
+    assert AGENT_DECISION_JSON_SCHEMA["properties"]["next_step_kind"]["enum"] == [
+        "diagnostic_tool",
+        "recommendation",
+    ]
+
+
+def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
+    schema = agent_decision_provider_schema(
+        recalled_memory_ids={"memory-2", "memory-1"},
+        allowed_query_keys={"payments.checkout_latency_ms"},
+        diagnostic_calls_used=1,
+        diagnostic_observation_available=True,
+        model_turn=2,
+    )
+
+    assert schema["properties"]["next_step_kind"]["enum"] == [
+        "diagnostic_tool",
+        "recommendation",
+    ]
+    assert schema["anyOf"] == [
+        {
+            "properties": {
+                "next_step_kind": {"const": "diagnostic_tool"},
+                "tool_call": {"$ref": "#/$defs/DiagnosticToolCall"},
+                "recommendation": {"type": "null"},
+            }
+        },
+        {
+            "properties": {
+                "next_step_kind": {"const": "recommendation"},
+                "tool_call": {"type": "null"},
+                "recommendation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4_000,
+                },
+            }
+        },
+    ]
+    assert schema["properties"]["recalled_memory_citations"]["maxItems"] == 2
+    assert schema["$defs"]["MemoryCitation"]["properties"]["memory_id"]["enum"] == [
+        "memory-1",
+        "memory-2",
+    ]
+
+
+def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
+    schema = agent_decision_provider_schema(
+        recalled_memory_ids=set(),
+        allowed_query_keys={"payments.checkout_latency_ms"},
+        diagnostic_calls_used=0,
+        diagnostic_observation_available=False,
+        model_turn=MAX_MODEL_TURNS,
+    )
+
+    assert schema["properties"]["next_step_kind"]["enum"] == ["recommendation"]
+    assert schema["properties"]["tool_call"] == {"type": "null"}
+    assert schema["properties"]["recommendation"]["type"] == "string"
+
+    with pytest.raises(AgentDecisionError, match="current diagnostic observation"):
+        parse_agent_decision(
+            json.dumps(_payload(recalled_memory_citations=[])),
+            recalled_memory_ids=set(),
+            allowed_query_keys={"payments.checkout_latency_ms"},
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=MAX_MODEL_TURNS,
+        )
 
 
 @pytest.mark.parametrize(

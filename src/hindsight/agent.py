@@ -24,11 +24,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from hindsight.db import TenantConnection, connect, database_url, database_url_with_tls_roots
 from hindsight.agent_decision import (
-    AGENT_DECISION_JSON_SCHEMA,
     MAX_DIAGNOSTIC_CALLS,
     MAX_MODEL_TURNS,
     AgentDecisionError,
     AgentDecisionV1,
+    agent_decision_provider_schema,
     memory_selection_fingerprint,
     parse_agent_decision,
     recommendation_id,
@@ -1151,6 +1151,20 @@ def _generate_agent_decision(
     if starting_turn >= MAX_MODEL_TURNS:
         raise AgentDecisionError("model turn budget is exhausted")
     prompt = _decision_prompt(state, allowed_query_keys=allowed_query_keys)
+    recalled_memory_ids = {
+        str(memory.get("memory_id") or memory.get("id"))
+        for memory in state.get("recalled_memories", [])
+        if memory.get("memory_id") or memory.get("id")
+    }
+    recalled_memory_text = {
+        str(memory.get("memory_id") or memory.get("id")): str(
+            memory.get("memory_content") or memory.get("content") or ""
+        )
+        for memory in state.get("recalled_memories", [])
+        if memory.get("memory_id") or memory.get("id")
+    }
+    diagnostic_calls_used = int(state.get("diagnostic_call_count") or 0)
+    diagnostic_observation_available = _has_current_diagnostic_observation(state)
     attempts = 0
     last_error: AgentDecisionError | None = None
     while attempts < 2 and starting_turn + attempts < MAX_MODEL_TURNS:
@@ -1160,12 +1174,22 @@ def _generate_agent_decision(
         )
         if not starting_turn < logical_turn <= MAX_MODEL_TURNS:
             raise RuntimeError("model call reservation returned an invalid count")
+        response_schema = agent_decision_provider_schema(
+            recalled_memory_ids=recalled_memory_ids,
+            allowed_query_keys=allowed_query_keys,
+            diagnostic_calls_used=diagnostic_calls_used,
+            diagnostic_observation_available=diagnostic_observation_available,
+            model_turn=logical_turn,
+        )
         request_prompt = prompt
         if attempts == 2:
+            assert last_error is not None
             request_prompt = (
                 f"{prompt}\n\n"
-                "The prior response failed AgentDecisionV1 validation. Return only one "
-                "JSON object matching the supplied schema. Do not add markdown or commentary."
+                "The prior response failed a server-enforced AgentDecisionV1 constraint. "
+                f"Stable repair reason: {_decision_repair_reason(last_error)}. "
+                "Return only one JSON object matching the supplied schema for this turn. "
+                "Do not add markdown or commentary."
             )
         response = provider.generate(
             ReasoningRequest(
@@ -1182,27 +1206,17 @@ def _generate_agent_decision(
                 temperature=0,
                 max_output_tokens=1_024,
                 routing_key=f"{state['decision_id']}:turn:{logical_turn}",
-                response_json_schema=AGENT_DECISION_JSON_SCHEMA,
+                response_json_schema=response_schema,
             )
         )
         try:
             decision = parse_agent_decision(
                 response.text,
-                recalled_memory_ids={
-                    str(memory.get("memory_id") or memory.get("id"))
-                    for memory in state.get("recalled_memories", [])
-                    if memory.get("memory_id") or memory.get("id")
-                },
-                recalled_memory_text={
-                    str(memory.get("memory_id") or memory.get("id")): str(
-                        memory.get("memory_content") or memory.get("content") or ""
-                    )
-                    for memory in state.get("recalled_memories", [])
-                    if memory.get("memory_id") or memory.get("id")
-                },
+                recalled_memory_ids=recalled_memory_ids,
+                recalled_memory_text=recalled_memory_text,
                 allowed_query_keys=allowed_query_keys,
-                diagnostic_calls_used=int(state.get("diagnostic_call_count") or 0),
-                diagnostic_observation_available=_has_current_diagnostic_observation(state),
+                diagnostic_calls_used=diagnostic_calls_used,
+                diagnostic_observation_available=diagnostic_observation_available,
                 model_turn=logical_turn,
             )
         except AgentDecisionError as exc:
@@ -1218,6 +1232,24 @@ def _generate_agent_decision(
         )
         return decision, normalized_response, logical_turn
     raise AgentDecisionError("model did not produce a valid bounded decision") from last_error
+
+
+_DECISION_REPAIR_REASONS = {
+    "model response did not satisfy AgentDecisionV1": "agent_decision_schema_mismatch",
+    "a recalled memory may be cited only once per decision": "duplicate_memory_citation",
+    "model cited memory that was not recalled": "unrecalled_memory_citation",
+    "model citation is not a quote from recalled memory": "non_verbatim_memory_citation",
+    "final model turn must produce a recommendation": "final_turn_requires_recommendation",
+    "diagnostic call budget is exhausted": "diagnostic_call_budget_exhausted",
+    "model selected a diagnostic query outside the allowlist": "diagnostic_query_not_allowed",
+    "a current diagnostic observation is required before recommendation": (
+        "current_diagnostic_observation_required"
+    ),
+}
+
+
+def _decision_repair_reason(error: AgentDecisionError) -> str:
+    return _DECISION_REPAIR_REASONS.get(str(error), "agent_decision_constraint_violation")
 
 
 def _validate_initial_call_count(value: int, *, limit: int, name: str) -> None:
