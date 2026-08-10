@@ -351,7 +351,7 @@ def test_recovery_workflow_is_owner_main_only_and_uses_ephemeral_local_storage()
 
     job = workflow["jobs"]["recovery_drill"]
     assert job["needs"] == "authorize"
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
     assert "github.run_id" in job["env"]["COMPOSE_PROJECT_NAME"]
     assert "github.run_attempt" in job["env"]["COMPOSE_PROJECT_NAME"]
     assert job["env"]["COCKROACH_IMAGE"] == "cockroachdb/cockroach:v25.4.5"
