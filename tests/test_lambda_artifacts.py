@@ -36,10 +36,14 @@ def _smoke():
     return module
 
 
-def test_realtime_artifact_has_no_third_party_dependency_bundle():
+def test_realtime_artifact_bundles_only_required_tracing_dependencies():
     builder = _builder()
 
-    assert builder.ARTIFACTS["realtime"]["dependencies"] == []
+    assert builder.ARTIFACTS["realtime"]["dependencies"] == [
+        "opentelemetry-api>=1.43.0",
+        "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+        "opentelemetry-sdk>=1.43.0",
+    ]
     assert builder.ARTIFACTS["realtime"]["modules"] == [
         "__init__.py",
         "aws.py",

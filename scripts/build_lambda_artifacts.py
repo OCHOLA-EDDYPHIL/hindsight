@@ -103,7 +103,11 @@ ARTIFACTS = {
         ],
     },
     "realtime": {
-        "dependencies": [],
+        "dependencies": [
+            "opentelemetry-api>=1.43.0",
+            "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+            "opentelemetry-sdk>=1.43.0",
+        ],
         "modules": [
             "__init__.py",
             "aws.py",
