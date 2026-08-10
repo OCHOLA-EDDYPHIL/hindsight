@@ -1355,63 +1355,13 @@ resource "aws_iam_role_policy_attachment" "xray" {
 }
 
 resource "aws_sns_topic" "alerts" {
-  name              = "${local.name}-alerts"
-  kms_master_key_id = var.aws_region == "us-east-1" ? aws_kms_key.budget_alerts.arn : aws_kms_key.alerts[0].arn
+  name = "${local.name}-alerts"
 }
 
 resource "aws_sns_topic" "budget_alerts" {
   provider = aws.us_east_1
 
-  name              = "${local.name}-budget-alerts"
-  kms_master_key_id = aws_kms_key.budget_alerts.arn
-}
-
-data "aws_iam_policy_document" "notification_key" {
-  statement {
-    sid       = "EnableAccountAdministration"
-    actions   = ["kms:*"]
-    resources = ["*"]
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
-    }
-  }
-
-  statement {
-    sid = "AllowNotificationServices"
-    actions = [
-      "kms:Decrypt",
-      "kms:GenerateDataKey*"
-    ]
-    resources = ["*"]
-    principals {
-      type        = "Service"
-      identifiers = ["budgets.amazonaws.com", "cloudwatch.amazonaws.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceAccount"
-      values   = [data.aws_caller_identity.current.account_id]
-    }
-  }
-}
-
-resource "aws_kms_key" "budget_alerts" {
-  provider = aws.us_east_1
-
-  description             = "Encrypt Hindsight budget and us-east-1 operational notifications"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-  policy                  = data.aws_iam_policy_document.notification_key.json
-}
-
-resource "aws_kms_key" "alerts" {
-  count = var.aws_region == "us-east-1" ? 0 : 1
-
-  description             = "Encrypt Hindsight operational notifications"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-  policy                  = data.aws_iam_policy_document.notification_key.json
+  name = "${local.name}-budget-alerts"
 }
 
 data "aws_iam_policy_document" "alerts" {

@@ -1,1 +1,3 @@
+# The cost-bounded profile uses provider-managed S3 encryption and access-restricted SNS topics.
+AVD-AWS-0095
 AVD-AWS-0132

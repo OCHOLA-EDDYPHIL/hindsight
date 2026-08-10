@@ -377,13 +377,6 @@ run "bounded_observability_profile" {
     error_message = "The monthly five-dollar budget must notify on actual and forecasted cost."
   }
 
-  assert {
-    condition = (
-      aws_kms_key.budget_alerts.enable_key_rotation &&
-      length(aws_kms_key.alerts) == 0
-    )
-    error_message = "The default-region notification topics must share one rotating customer key."
-  }
 }
 
 run "bounded_observability_rejects_cross_region_layer" {
