@@ -1,0 +1,10 @@
+misconfigurations:
+  - id: AVD-AWS-0095
+    paths:
+      - app/main.tf
+    statement: Notification topics are access-restricted and left unencrypted to avoid a paid customer key.
+  - id: AVD-AWS-0132
+    paths:
+      - app/main.tf
+      - bootstrap/main.tf
+    statement: Cost-bounded buckets use provider-managed S3 encryption instead of paid customer keys.
