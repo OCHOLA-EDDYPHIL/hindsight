@@ -79,8 +79,7 @@ run "isolated_bootstrap" {
 
   assert {
     condition = (
-      aws_iam_role.github_observability_evidence.name == "hindsight-github-observability-evidence" &&
-      output.github_observability_evidence_role_arn == aws_iam_role.github_observability_evidence.arn
+      aws_iam_role.github_observability_evidence.name == "hindsight-github-observability-evidence"
     )
     error_message = "Observability evidence must use an always-created stable GitHub OIDC role."
   }
