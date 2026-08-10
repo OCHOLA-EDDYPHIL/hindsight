@@ -439,6 +439,8 @@ def test_approved_model_selected_retraction_executes_governed_operation(monkeypa
         "metadata": {"usage_instruction": "positive_guidance"},
     }
     operation_calls = []
+    operation_id = uuid4()
+    event_id = uuid4()
     monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
     monkeypatch.setattr(
         agent,
@@ -462,14 +464,14 @@ def test_approved_model_selected_retraction_executes_governed_operation(monkeypa
 
     def fake_enqueue(**kwargs):
         operation_calls.append(("enqueue", kwargs))
-        return {"id": "operation-action"}, True
+        return {"id": operation_id}, True
 
     def fake_execute(**kwargs):
         operation_calls.append(("execute", kwargs))
         return {
-            "id": "operation-action",
+            "id": operation_id,
             "status": "completed",
-            "events": [{"sequence": 1, "status": "completed"}],
+            "events": [{"id": event_id, "sequence": 1, "status": "completed"}],
             "effects": [
                 {
                     "sequence": 1,
@@ -553,11 +555,12 @@ def test_approved_model_selected_retraction_executes_governed_operation(monkeypa
     assert trace["preview"]["effect_count"] == 1
     assert trace["execution"]["status"] == "completed"
     assert trace["execution"]["events"][0]["status"] == "completed"
+    assert trace["execution"]["events"][0]["id"] == str(event_id)
     assert trace["execution"]["effects"][0]["source_memory_id"] == "memory-unsafe"
     assert completed.get("reflected_memory") is None
     assert operation_calls[0][1]["actor"] == "product:operator:test"
     assert operation_calls[0][1]["idempotency_key"].startswith("agent-remediation:")
-    assert operation_calls[1][1]["operation_id"] == "operation-action"
+    assert operation_calls[1][1]["operation_id"] == str(operation_id)
 
 
 def test_retraction_allows_one_stale_replan_then_fails_closed(monkeypatch):

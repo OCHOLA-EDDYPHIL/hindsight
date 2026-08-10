@@ -10,7 +10,7 @@ from functools import partial
 from collections.abc import Callable, Collection
 import json
 from typing import Any, NotRequired, Protocol, TypedDict
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage, messages_to_dict
 from langchain_cockroachdb import CockroachDBChatMessageHistory, CockroachDBSaver
@@ -1852,10 +1852,16 @@ def _jsonable_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _jsonable_row(row: dict[str, Any]) -> dict[str, Any]:
-    converted = {}
-    for key, value in row.items():
-        if hasattr(value, "isoformat"):
-            converted[key] = value.isoformat()
-        else:
-            converted[key] = value
-    return converted
+    return {key: _jsonable_value(value) for key, value in row.items()}
+
+
+def _jsonable_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _jsonable_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_value(item) for item in value]
+    if isinstance(value, UUID):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
