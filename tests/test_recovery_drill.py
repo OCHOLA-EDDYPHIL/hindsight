@@ -145,6 +145,33 @@ def test_manifest_summary_and_difference_are_section_scoped_and_bounded():
     }
 
 
+def test_manifest_difference_bounds_items_and_distinguishes_missing_from_null():
+    drill = _module()
+    long_definition = "x" * 200
+
+    differences = drill._manifest_difference_sample(
+        {"missing_from_restored": None, "functions": [long_definition]},
+        {"missing_from_source": None, "functions": ["changed"]},
+        max_item_chars=80,
+    )
+
+    assert differences["missing_from_restored"] == {
+        "source_only_count": 1,
+        "restored_only_count": 0,
+        "source_only_sample": ["null"],
+        "restored_only_sample": [],
+    }
+    assert differences["missing_from_source"] == {
+        "source_only_count": 0,
+        "restored_only_count": 1,
+        "source_only_sample": [],
+        "restored_only_sample": ["null"],
+    }
+    source_sample = differences["functions"]["source_only_sample"][0]
+    assert len(source_sample) == 80
+    assert source_sample.endswith("...<truncated; original chars=202>")
+
+
 def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch):
     drill = _module()
     calls = []

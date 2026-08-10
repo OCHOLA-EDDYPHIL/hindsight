@@ -38,6 +38,7 @@ MAX_TIMEOUT_SECONDS = 1800
 CONNECT_TIMEOUT_SECONDS = 5
 CLEANUP_TIMEOUT_SECONDS = 120
 SCHEMA_MANIFEST_MAX_READS = 3
+SCHEMA_DIAGNOSTIC_ITEM_MAX_CHARS = 1000
 PRE_BACKUP_MARKER_KEY = "recovery_drill_pre_backup"
 POST_BACKUP_MARKER_KEY = "recovery_drill_post_backup"
 SCHEMA_VERSION = "hindsight.recovery_drill.v1"
@@ -250,8 +251,7 @@ def _schema_manifest(database_url: str, deadline: Deadline) -> dict[str, Any]:
                 return value
             previous = value
     raise RuntimeError(
-        "schema manifest did not converge across "
-        f"{SCHEMA_MANIFEST_MAX_READS} consecutive reads"
+        f"schema manifest did not converge across {SCHEMA_MANIFEST_MAX_READS} consecutive reads"
     )
 
 
@@ -351,25 +351,45 @@ def _manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
             key: len(value) if isinstance(value, (dict, list)) else 1
             for key, value in sorted(manifest.items())
         },
-        "section_sha256": {
-            key: _sha256(value) for key, value in sorted(manifest.items())
-        },
+        "section_sha256": {key: _sha256(value) for key, value in sorted(manifest.items())},
     }
 
 
 def _manifest_difference_sample(
-    source: dict[str, Any], restored: dict[str, Any], *, limit: int = 5
+    source: dict[str, Any],
+    restored: dict[str, Any],
+    *,
+    limit: int = 5,
+    max_item_chars: int = SCHEMA_DIAGNOSTIC_ITEM_MAX_CHARS,
 ) -> dict[str, Any]:
     """Return bounded schema-only diagnostics for non-identical manifests."""
 
+    def bounded_item(value: str) -> str:
+        if len(value) <= max_item_chars:
+            return value
+        suffix = f"...<truncated; original chars={len(value)}>"
+        if len(suffix) >= max_item_chars:
+            return suffix[:max_item_chars]
+        return value[: max_item_chars - len(suffix)] + suffix
+
     differences: dict[str, Any] = {}
     for section in sorted(set(source).union(restored)):
+        source_present = section in source
+        restored_present = section in restored
         source_value = source.get(section)
         restored_value = restored.get(section)
-        if source_value == restored_value:
+        if source_present == restored_present and source_value == restored_value:
             continue
-        source_items = source_value if isinstance(source_value, list) else [source_value]
-        restored_items = restored_value if isinstance(restored_value, list) else [restored_value]
+        source_items = (
+            (source_value if isinstance(source_value, list) else [source_value])
+            if source_present
+            else []
+        )
+        restored_items = (
+            (restored_value if isinstance(restored_value, list) else [restored_value])
+            if restored_present
+            else []
+        )
         source_counter = Counter(_canonical_json(item) for item in source_items)
         restored_counter = Counter(_canonical_json(item) for item in restored_items)
         source_only = list((source_counter - restored_counter).elements())
@@ -377,8 +397,8 @@ def _manifest_difference_sample(
         differences[section] = {
             "source_only_count": len(source_only),
             "restored_only_count": len(restored_only),
-            "source_only_sample": source_only[:limit],
-            "restored_only_sample": restored_only[:limit],
+            "source_only_sample": [bounded_item(item) for item in source_only[:limit]],
+            "restored_only_sample": [bounded_item(item) for item in restored_only[:limit]],
         }
     return differences
 
@@ -653,7 +673,9 @@ def run_drill(
         schema_matches = restored_manifest == source_manifest
         data_matches = restored_data == source_data
         manifest_differences = (
-            {} if schema_matches else _manifest_difference_sample(source_manifest, restored_manifest)
+            {}
+            if schema_matches
+            else _manifest_difference_sample(source_manifest, restored_manifest)
         )
         evidence["validation"] = {
             "markers": {
