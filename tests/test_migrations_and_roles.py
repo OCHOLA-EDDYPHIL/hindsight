@@ -991,3 +991,277 @@ def test_populated_prompt_safety_upgrade_is_fail_closed_and_principal_lookup_is_
                     sql.Identifier(database_name)
                 )
             )
+
+
+def _seed_tenant_vector_fixture(conn: psycopg.Connection) -> tuple[str, str, str, str]:
+    from hindsight.embeddings import EMBEDDING_DIMENSIONS, vector_literal
+
+    tenant_id = "00000000-0000-0000-0000-000000000001"
+    other_tenant_id = "00000000-0000-0000-0000-000000000279"
+    namespace = "vector-qualification-target"
+    profile_id = "vector-qualification-profile"
+    target_memory_id = str(uuid4())
+    target_vector = vector_literal([1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))])
+    distractor_vector = vector_literal([0.0, 1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 2))])
+
+    conn.execute(
+        """
+            INSERT INTO tenants (id, slug, tenant_kind)
+            VALUES (%s, 'vector-qualification-distractor', 'diagnostic')
+            ON CONFLICT (id) DO NOTHING
+        """,
+        (other_tenant_id,),
+    )
+    conn.execute(
+        """
+            INSERT INTO embedding_profiles (
+                id, provider, model, dimensions, capability, encoder_revision,
+                status, activated_at
+            ) VALUES
+                (%s, 'pytest', 'target', 1024, 'semantic', 'v1', 'active', now()),
+                ('vector-qualification-other-profile', 'pytest', 'other', 1024,
+                 'semantic', 'v1', 'active', now())
+            ON CONFLICT (id) DO NOTHING
+        """,
+        (profile_id,),
+    )
+    conn.execute("SET experimental_enable_temp_tables = 'on'")
+    conn.execute(
+        """
+            CREATE TEMP TABLE vector_qualification_fixture (
+                memory_id UUID PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                namespace STRING NOT NULL,
+                profile_id STRING NOT NULL,
+                embedding VECTOR(1024) NOT NULL,
+                fixture_kind STRING NOT NULL
+            )
+        """
+    )
+    rows = [
+        (target_memory_id, tenant_id, namespace, profile_id, target_vector, "target"),
+        *(
+            (
+                str(uuid4()),
+                tenant_id,
+                namespace,
+                profile_id,
+                distractor_vector,
+                "same-prefix-distractor",
+            )
+            for _ in range(999)
+        ),
+        (
+            str(uuid4()),
+            other_tenant_id,
+            namespace,
+            profile_id,
+            target_vector,
+            "tenant-distractor",
+        ),
+        (
+            str(uuid4()),
+            tenant_id,
+            "vector-qualification-other-namespace",
+            profile_id,
+            target_vector,
+            "namespace-distractor",
+        ),
+        (
+            str(uuid4()),
+            tenant_id,
+            namespace,
+            "vector-qualification-other-profile",
+            target_vector,
+            "profile-distractor",
+        ),
+    ]
+    with conn.cursor().copy(
+        "COPY vector_qualification_fixture "
+        "(memory_id, tenant_id, namespace, profile_id, embedding, fixture_kind) FROM STDIN"
+    ) as copy:
+        for row in rows:
+            copy.write_row(row)
+
+    conn.execute(
+        """
+            INSERT INTO memory_namespaces (tenant_id, namespace)
+            SELECT DISTINCT tenant_id, namespace
+            FROM vector_qualification_fixture
+            ON CONFLICT (namespace) DO NOTHING
+        """
+    )
+    conn.execute(
+        """
+            INSERT INTO memory_decisions (
+                id, tenant_id, actor, decision_kind, purpose, namespace,
+                status
+            )
+            SELECT 'vector-qualification:' || memory_id::STRING, tenant_id,
+                   'pytest', 'semantic_write', 'qualify vector index', namespace,
+                   'open'
+            FROM vector_qualification_fixture
+        """
+    )
+    conn.execute(
+        """
+            INSERT INTO semantic_beliefs (id, tenant_id, namespace)
+            SELECT memory_id, tenant_id, namespace
+            FROM vector_qualification_fixture
+        """
+    )
+    conn.execute(
+        """
+            INSERT INTO semantic_memories (
+                id, tenant_id, belief_id, version_number, namespace, content,
+                writer, source_ref, justification, producer_decision_id,
+                transition_kind, content_schema, structured_payload,
+                payload_digest, lineage_status, trust_status,
+                prompt_safety_status, prompt_safety_scanner_version,
+                prompt_safety_reason_codes
+            )
+            SELECT memory_id, tenant_id, memory_id, 1, namespace, fixture_kind,
+                   'pytest', 'vector-qualification', 'qualify vector index',
+                   'vector-qualification:' || memory_id::STRING, 'assertion',
+                   'semantic.v1', '{}'::JSONB, memory_id::STRING, 'complete',
+                   'active', 'clear', 'pytest.v1', '[]'::JSONB
+            FROM vector_qualification_fixture
+        """
+    )
+    conn.execute(
+        """
+            INSERT INTO semantic_memory_vectors (
+                tenant_id, memory_id, profile_id, namespace, content_digest, embedding
+            )
+            SELECT tenant_id, memory_id, profile_id, namespace,
+                   memory_id::STRING, embedding
+            FROM vector_qualification_fixture
+        """
+    )
+    conn.execute(
+        """
+            UPDATE memory_decisions
+            SET status = 'sealed', sealed_at = now()
+            WHERE id IN (
+                SELECT 'vector-qualification:' || memory_id::STRING
+                FROM vector_qualification_fixture
+            )
+        """
+    )
+    conn.execute("ANALYZE semantic_memory_vectors")
+    return tenant_id, namespace, profile_id, target_memory_id
+
+
+def _assert_tenant_vector_qualification(conn: psycopg.Connection) -> None:
+    from hindsight.embeddings import EMBEDDING_DIMENSIONS, vector_literal
+    from hindsight.vector_index_qualification import (
+        TENANT_VECTOR_INDEX,
+        explain_semantic_vector_search,
+        qualify_semantic_vector_plan,
+    )
+
+    tenant_id, namespace, profile_id, target_memory_id = _seed_tenant_vector_fixture(conn)
+    index_names = {row[1] for row in conn.execute("SHOW INDEXES FROM semantic_memory_vectors")}
+    assert "semantic_memory_vectors_embedding_idx" in index_names
+    assert TENANT_VECTOR_INDEX in index_names
+
+    query_vector = [1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))]
+    plan = explain_semantic_vector_search(
+        conn,
+        tenant_id=tenant_id,
+        namespace=namespace,
+        profile_id=profile_id,
+        query_vector=query_vector,
+        limit=5,
+    )
+    assert qualify_semantic_vector_plan(plan)
+    rows = conn.execute(
+        f"""
+            SELECT memory_id
+            FROM semantic_memory_vectors
+            WHERE tenant_id = %s::UUID
+                AND namespace = %s
+                AND profile_id = %s
+            ORDER BY embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+            LIMIT 5
+        """,
+        (tenant_id, namespace, profile_id, vector_literal(query_vector)),
+    ).fetchall()
+    assert str(rows[0][0]) == target_memory_id
+
+
+@requires_db
+@pytest.mark.migration_acceptance
+def test_tenant_vector_index_fresh_and_populated_upgrade_qualification():
+    from scripts.migrate import apply_migrations
+    from hindsight.vector_index_qualification import TENANT_VECTOR_INDEX
+
+    database_names = (
+        f"hindsight_vector_fresh_{uuid4().hex}",
+        f"hindsight_vector_populated_{uuid4().hex}",
+    )
+    admin_url = _database_url("defaultdb")
+    try:
+        fresh_url = _database_url(database_names[0])
+        apply_migrations(fresh_url)
+        with psycopg.connect(fresh_url, autocommit=True) as conn:
+            _assert_tenant_vector_qualification(conn)
+
+        populated_url = _database_url(database_names[1])
+        apply_migrations(populated_url, through="0029e_product_credential_locators.sql")
+        with psycopg.connect(populated_url, autocommit=True) as conn:
+            fixture = _seed_tenant_vector_fixture(conn)
+            index_names = {
+                row[1] for row in conn.execute("SHOW INDEXES FROM semantic_memory_vectors")
+            }
+            assert "semantic_memory_vectors_embedding_idx" in index_names
+            assert TENANT_VECTOR_INDEX not in index_names
+        apply_migrations(populated_url)
+        with psycopg.connect(populated_url, autocommit=True) as conn:
+            tenant_id, namespace, profile_id, target_memory_id = fixture
+            index_names = {
+                row[1] for row in conn.execute("SHOW INDEXES FROM semantic_memory_vectors")
+            }
+            assert "semantic_memory_vectors_embedding_idx" in index_names
+            assert TENANT_VECTOR_INDEX in index_names
+            from hindsight.embeddings import EMBEDDING_DIMENSIONS, vector_literal
+            from hindsight.vector_index_qualification import (
+                explain_semantic_vector_search,
+                qualify_semantic_vector_plan,
+            )
+
+            plan = explain_semantic_vector_search(
+                conn,
+                tenant_id=tenant_id,
+                namespace=namespace,
+                profile_id=profile_id,
+                query_vector=[1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))],
+                limit=5,
+            )
+            assert qualify_semantic_vector_plan(plan)
+            rows = conn.execute(
+                f"""
+                    SELECT memory_id
+                    FROM semantic_memory_vectors
+                    WHERE tenant_id = %s::UUID
+                        AND namespace = %s
+                        AND profile_id = %s
+                    ORDER BY embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
+                    LIMIT 5
+                """,
+                (
+                    tenant_id,
+                    namespace,
+                    profile_id,
+                    vector_literal([1.0, *([0.0] * (EMBEDDING_DIMENSIONS - 1))]),
+                ),
+            ).fetchall()
+            assert str(rows[0][0]) == target_memory_id
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            for database_name in database_names:
+                admin.execute(
+                    sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(
+                        sql.Identifier(database_name)
+                    )
+                )

@@ -8,6 +8,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER_EXPRESSION = "${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}"
+COCKROACH_IMAGE = "cockroachdb/cockroach:v25.4.5"
 RUNNER_ROUTED_WORKFLOWS = (
     "ci.yml",
     "deploy-demo.yml",
@@ -66,6 +67,7 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
         "prompt_safety_upgrade",
         "dispatch_upgrade",
         "qualification_authority",
+        "tenant_vector_index",
     }
 
 
@@ -88,12 +90,17 @@ def test_reusable_deploy_workflow_preserves_hosted_runner_default():
     assert "runs-on: ubuntu-latest" not in workflow
 
 
-def test_historical_migration_qualification_uses_durable_hosted_runner():
+def test_normal_ci_and_migration_qualification_pin_supported_cockroach_version():
+    compose = (ROOT / "docker-compose.yml").read_text()
+    assert f"${{COCKROACH_IMAGE:-{COCKROACH_IMAGE}}}" in compose
+
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
     )
 
-    assert workflow["jobs"]["migration_compatibility"]["runs-on"] == "ubuntu-latest"
+    job = workflow["jobs"]["migration_compatibility"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["env"]["COCKROACH_IMAGE"] == COCKROACH_IMAGE
 
 
 def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
