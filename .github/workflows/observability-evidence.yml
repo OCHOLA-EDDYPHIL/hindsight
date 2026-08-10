@@ -108,6 +108,13 @@ jobs:
           path: build/observability-input
           run-id: ${{ needs.authorize.outputs.acceptance_run_id }}
           github-token: ${{ github.token }}
+      - name: Download exact browser evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: browser-evidence-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_attempt }}
+          path: build/observability-browser
+          run-id: ${{ needs.authorize.outputs.acceptance_run_id }}
+          github-token: ${{ github.token }}
       - name: Fetch exact acceptance attempt metadata
         env:
           GH_TOKEN: ${{ github.token }}
@@ -120,7 +127,7 @@ jobs:
           > build/observability-input/acceptance-run.json
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-observability-evidence
           aws-region: ${{ env.AWS_REGION }}
       - name: Collect bounded observability evidence
         run: >-
@@ -131,6 +138,7 @@ jobs:
           --acceptance-run-attempt "${{ needs.authorize.outputs.acceptance_run_attempt }}"
           --acceptance-run build/observability-input/acceptance-run.json
           --acceptance-provenance build/observability-input/product-provenance.json
+          --browser-evidence build/observability-browser/operation.json
           --deployment-environment "${{ needs.authorize.outputs.deployment_environment }}"
           --stage "$HINDSIGHT_STAGE"
           --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID"
@@ -144,5 +152,6 @@ jobs:
             build/observability-evidence.json
             build/observability-evidence.sha256
             build/observability-input/product-provenance.json
+            build/observability-browser/operation.json
           if-no-files-found: error
           retention-days: 90

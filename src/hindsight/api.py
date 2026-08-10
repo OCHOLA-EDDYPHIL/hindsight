@@ -97,6 +97,7 @@ TENANT_SELECTOR_HEADERS = frozenset(
 )
 TENANT_SELECTOR_QUERY_KEYS = frozenset({"tenant", "tenant_id"})
 LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 
 
 def _normalize_origin(value: str) -> str | None:

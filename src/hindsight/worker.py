@@ -47,6 +47,7 @@ RUN_MAX_ATTEMPTS_ENV = "HINDSIGHT_RUN_MAX_ATTEMPTS"
 RUN_ATTEMPT_LEASE_SECONDS_ENV = "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS"
 RUN_DLQ_ARN_ENV = "HINDSIGHT_RUN_DLQ_ARN"
 LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 _RECORD_OBSERVER: ContextVar[Callable[[Exception | None], None] | None] = ContextVar(
     "worker_record_observer", default=None
 )

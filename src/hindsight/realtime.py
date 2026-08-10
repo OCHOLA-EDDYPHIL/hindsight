@@ -42,6 +42,7 @@ LEGACY_EVENT_VERSION = 1
 _HLC_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 _CHANGEFEED_TOKEN_CACHE: str | None = None
 LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 
 
 def _otel_enabled() -> bool:

@@ -89,6 +89,23 @@ def _load_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def validate_browser_evidence(path: Path) -> tuple[str, str]:
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("browser operation evidence must be a JSON object")
+    signature = value.get("signature")
+    corrected = signature.get("corrected") if isinstance(signature, dict) else None
+    if not isinstance(corrected, dict):
+        raise ValueError("browser operation evidence is missing the corrected signature")
+    run_id = str(corrected.get("run_id") or "")
+    if not run_id or len(run_id) > 256 or SECRET_VALUE.search(run_id):
+        raise ValueError("browser operation evidence has an invalid corrected run ID")
+    if corrected.get("status") != "completed":
+        raise ValueError("browser operation evidence did not complete the corrected run")
+    return run_id, hashlib.sha256(raw).hexdigest()
+
+
 def validate_provenance(
     run: dict[str, Any],
     provenance: dict[str, Any],
@@ -199,9 +216,9 @@ def collect_logs(
         endTime=int(end.timestamp()),
         queryString=(
             "fields @timestamp, @log, @message "
-            "| filter event = 'api_request' or event = 'run_dispatch' "
-            "or (event = 'worker_record' and status = 'completed') "
-            "or event = 'realtime_changefeed' "
+            '| filter @message like /"event":"(api_request|run_dispatch|realtime_changefeed)"/ '
+            'or (@message like /"event":"worker_record"/ '
+            'and @message like /"status":"completed"/) '
             "| sort @timestamp asc "
             f"| limit {MAX_LOG_EVENTS}"
         ),
@@ -233,9 +250,7 @@ def collect_logs(
         log_group = fields.get("@log", "").split(":", 1)[-1]
         if log_group not in log_groups:
             raise RuntimeError("CloudWatch Logs returned an unexpected log group")
-        message = json.loads(fields.get("@message") or "{}")
-        if not isinstance(message, dict):
-            raise RuntimeError("structured log observation is not an object")
+        message = _extract_structured_event(fields.get("@message", ""))
         event = _validate_log_event(message)
         observations.append(
             {
@@ -250,6 +265,31 @@ def collect_logs(
         "records_scanned": float(statistics.get("recordsScanned") or 0),
         "records_matched": float(statistics.get("recordsMatched") or 0),
     }
+
+
+def _extract_structured_event(raw_message: str) -> dict[str, Any]:
+    messages = [raw_message.strip()]
+    try:
+        outer = json.loads(messages[0])
+    except json.JSONDecodeError:
+        outer = None
+    if isinstance(outer, dict) and isinstance(outer.get("message"), str):
+        messages.insert(0, outer["message"].strip())
+    for message in messages:
+        for index, character in enumerate(message):
+            if character != "{":
+                continue
+            candidate = message[index:]
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            compact = json.dumps(value, sort_keys=True, separators=(",", ":"))
+            if candidate == compact:
+                return value
+    raise RuntimeError("Lambda log message does not end with a compact structured event")
 
 
 def _validate_log_event(message: dict[str, Any]) -> dict[str, str]:
@@ -328,13 +368,17 @@ def _trace_nodes(document: Any, nodes: list[dict[str, Any]]) -> None:
 
 
 def correlate(
-    logs: list[dict[str, str]], traces: dict[str, dict[str, Any]]
+    logs: list[dict[str, str]],
+    traces: dict[str, dict[str, Any]],
+    *,
+    product_run_id: str,
 ) -> dict[str, Any]:
     workers = [
         event
         for event in logs
         if event.get("event") == "worker_record"
         and event.get("status") == "completed"
+        and event.get("run_id") == product_run_id
         and all(
             event.get(key)
             for key in ("tenant_id", "run_id", "dispatch_id", "dispatch_attempt_id", "trace_id")
@@ -402,10 +446,12 @@ def correlate(
     raise RuntimeError("no complete API-to-queue-to-worker and realtime correlation was found")
 
 
-def candidate_trace_ids(logs: list[dict[str, str]]) -> list[str]:
+def candidate_trace_ids(logs: list[dict[str, str]], *, product_run_id: str) -> list[str]:
     candidates: list[str] = []
     for worker in logs:
         if worker.get("event") != "worker_record" or worker.get("status") != "completed":
+            continue
+        if worker.get("run_id") != product_run_id:
             continue
         if not all(
             worker.get(key)
@@ -455,12 +501,51 @@ def candidate_trace_ids(logs: list[dict[str, str]]) -> list[str]:
     return candidates
 
 
+def collect_correlation_evidence(
+    logs_client: Any,
+    xray_client: Any,
+    *,
+    log_groups: list[str],
+    start: datetime,
+    end: datetime,
+    product_run_id: str,
+    sleep: Any = time.sleep,
+) -> tuple[dict[str, Any], dict[str, Any], int, int, int]:
+    logs, log_statistics = collect_logs(
+        logs_client,
+        log_groups=log_groups,
+        start=start,
+        end=end,
+        sleep=sleep,
+    )
+    candidate_ids = candidate_trace_ids(logs, product_run_id=product_run_id)
+    last_error: Exception | None = None
+    for attempt in range(1, COLLECTION_ATTEMPTS + 1):
+        try:
+            traces = collect_traces(xray_client, trace_ids=candidate_ids)
+            correlation = correlate(logs, traces, product_run_id=product_run_id)
+            return (
+                correlation,
+                log_statistics,
+                len(candidate_ids),
+                len(traces),
+                attempt,
+            )
+        except (BotoCoreError, ClientError, RuntimeError) as exc:
+            last_error = exc
+            if attempt < COLLECTION_ATTEMPTS:
+                sleep(COLLECTION_DELAY_SECONDS)
+    raise RuntimeError("bounded trace correlation attempts were exhausted") from last_error
+
+
 def build_report(
     *,
     source_revision: str,
     repository: str,
     acceptance_run_id: str,
     acceptance_run_attempt: str,
+    product_run_id: str,
+    browser_evidence_sha256: str,
     deployment_environment: str,
     identity: dict[str, str],
     start: datetime,
@@ -470,7 +555,7 @@ def build_report(
     log_statistics: dict[str, Any],
     trace_ids_requested: int,
     traces_returned: int,
-    collection_attempt: int,
+    trace_collection_attempt: int,
     alert: dict[str, Any],
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
@@ -484,6 +569,8 @@ def build_report(
             "run_attempt": acceptance_run_attempt,
             "mode": "full",
             "bounded_observability_enabled": True,
+            "product_run_id": product_run_id,
+            "browser_operation_sha256": browser_evidence_sha256,
         },
         "environment": {
             "deployment_environment": deployment_environment,
@@ -493,8 +580,9 @@ def build_report(
         "method": {
             "window_start": start.isoformat(),
             "window_end": end.isoformat(),
-            "collection_attempt": collection_attempt,
-            "maximum_collection_attempts": COLLECTION_ATTEMPTS,
+            "log_query_attempts": 1,
+            "trace_collection_attempt": trace_collection_attempt,
+            "maximum_trace_collection_attempts": COLLECTION_ATTEMPTS,
             "maximum_log_events": MAX_LOG_EVENTS,
             "maximum_candidate_traces": MAX_CANDIDATE_TRACES,
             "maximum_scan_bytes_per_query": MAX_SCAN_BYTES,
@@ -542,6 +630,7 @@ def main() -> int:
     parser.add_argument("--acceptance-run-attempt", required=True)
     parser.add_argument("--acceptance-run", type=Path, required=True)
     parser.add_argument("--acceptance-provenance", type=Path, required=True)
+    parser.add_argument("--browser-evidence", type=Path, required=True)
     parser.add_argument("--deployment-environment", choices=("demo", "demo-candidate"), required=True)
     parser.add_argument("--stage", choices=("demo", "demo-candidate"), required=True)
     parser.add_argument("--expected-account-id", required=True)
@@ -553,6 +642,9 @@ def main() -> int:
     try:
         run = _load_object(args.acceptance_run, "acceptance run")
         provenance = _load_object(args.acceptance_provenance, "acceptance provenance")
+        product_run_id, browser_evidence_sha256 = validate_browser_evidence(
+            args.browser_evidence
+        )
         if args.stage != args.deployment_environment:
             raise ValueError("stage must match the protected deployment environment")
         start, end = validate_provenance(
@@ -573,32 +665,20 @@ def main() -> int:
         )
         logs_client = session.client("logs", region_name=args.region, config=CLIENT_CONFIG)
         xray_client = session.client("xray", region_name=args.region, config=CLIENT_CONFIG)
-        correlation = None
-        log_statistics: dict[str, Any] = {}
-        trace_ids_requested = 0
-        traces_returned = 0
-        attempt = 0
-        last_error: Exception | None = None
-        for attempt in range(1, COLLECTION_ATTEMPTS + 1):
-            try:
-                logs, log_statistics = collect_logs(
-                    logs_client,
-                    log_groups=groups,
-                    start=start,
-                    end=end,
-                )
-                candidate_ids = candidate_trace_ids(logs)
-                trace_ids_requested = len(candidate_ids)
-                traces = collect_traces(xray_client, trace_ids=candidate_ids)
-                traces_returned = len(traces)
-                correlation = correlate(logs, traces)
-                break
-            except RuntimeError as exc:
-                last_error = exc
-                if attempt < COLLECTION_ATTEMPTS:
-                    time.sleep(COLLECTION_DELAY_SECONDS)
-        if correlation is None:
-            raise RuntimeError("bounded correlation attempts were exhausted") from last_error
+        (
+            correlation,
+            log_statistics,
+            trace_ids_requested,
+            traces_returned,
+            attempt,
+        ) = collect_correlation_evidence(
+            logs_client,
+            xray_client,
+            log_groups=groups,
+            start=start,
+            end=end,
+            product_run_id=product_run_id,
+        )
         topic_arn = (
             f"arn:aws:sns:{args.region}:{args.expected_account_id}:"
             f"hindsight-{args.stage}-alerts"
@@ -614,6 +694,8 @@ def main() -> int:
             repository=args.repository,
             acceptance_run_id=args.acceptance_run_id,
             acceptance_run_attempt=args.acceptance_run_attempt,
+            product_run_id=product_run_id,
+            browser_evidence_sha256=browser_evidence_sha256,
             deployment_environment=args.deployment_environment,
             identity=identity,
             start=start,
@@ -623,7 +705,7 @@ def main() -> int:
             log_statistics=log_statistics,
             trace_ids_requested=trace_ids_requested,
             traces_returned=traces_returned,
-            collection_attempt=attempt,
+            trace_collection_attempt=attempt,
             alert=alert,
         )
         _write_report(report, args.output, args.checksum_output)

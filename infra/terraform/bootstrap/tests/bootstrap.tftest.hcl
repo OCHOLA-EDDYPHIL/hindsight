@@ -78,6 +78,14 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition = (
+      aws_iam_role.github_observability_evidence.name == "hindsight-github-observability-evidence" &&
+      output.github_observability_evidence_role_arn == aws_iam_role.github_observability_evidence.arn
+    )
+    error_message = "Observability evidence must use an always-created stable GitHub OIDC role."
+  }
+
+  assert {
     condition     = aws_iam_role.github_evidence[0].name == "hindsight-github-evidence"
     error_message = "The evidence writer must use its dedicated GitHub OIDC role."
   }
@@ -543,7 +551,6 @@ run "isolated_bootstrap" {
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
         if statement.sid == "ObservabilitySamplingRuleRead"
         ]).actions) == toset([
-        "xray:BatchGetTraces",
         "xray:GetSamplingRules",
         "xray:GetSamplingTargets",
       ]) &&
@@ -572,24 +579,26 @@ run "isolated_bootstrap" {
 
   assert {
     condition = (
+      toset(flatten([
+        for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement.actions
+        ])) == toset([
+        "sts:GetCallerIdentity",
+        "logs:StartQuery",
+        "logs:GetQueryResults",
+        "logs:StopQuery",
+        "xray:BatchGetTraces",
+        "sns:Publish",
+      ]) &&
       toset(one([
-        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityEvidenceLogQuery"
-      ]).actions) == toset(["logs:StartQuery"]) &&
-      toset(one([
-        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityEvidenceLogQuery"
+        for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement
+        if statement.sid == "BoundedLogQuery"
       ]).resources) == toset(local.observability_metric_log_group_arns) &&
       toset(one([
-        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityEvidenceLogQueryResults"
-      ]).actions) == toset(["logs:GetQueryResults", "logs:StopQuery"]) &&
-      toset(one([
-        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityEvidenceLogQueryResults"
-      ]).resources) == toset(["*"])
+        for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement
+        if statement.sid == "StageAlertPublish"
+      ]).resources) == toset([local.observability_alert_topic_arn])
     )
-    error_message = "Evidence log queries must start only on bounded-profile groups and poll by query ID."
+    error_message = "The dedicated evidence role must contain only bounded reads and stage alert publication."
   }
 
   assert {

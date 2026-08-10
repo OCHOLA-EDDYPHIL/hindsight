@@ -111,6 +111,7 @@ ARTIFACTS = {
         "modules": [
             "__init__.py",
             "aws.py",
+            "observability.py",
             "queueing.py",
             "realtime.py",
             "realtime_ticket.py",

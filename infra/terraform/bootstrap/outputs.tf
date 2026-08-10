@@ -6,6 +6,10 @@ output "github_deploy_role_arn" {
   value = aws_iam_role.github_deploy.arn
 }
 
+output "github_observability_evidence_role_arn" {
+  value = aws_iam_role.github_observability_evidence.arn
+}
+
 output "github_evidence_role_arn" {
   value = try(aws_iam_role.github_evidence[0].arn, null)
 }

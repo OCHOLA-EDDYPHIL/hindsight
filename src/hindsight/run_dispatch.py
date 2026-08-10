@@ -18,6 +18,7 @@ RUN_DISPATCH_LEASE_TTL = timedelta(seconds=30)
 RUN_DISPATCH_ACK_TTL = timedelta(minutes=5)
 RUN_DISPATCH_BATCH_LIMIT = 25
 LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 
 
 def dispatch_run_commands(
