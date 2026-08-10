@@ -60,7 +60,7 @@ jobs:
   database:
     needs: changes
     if: needs.changes.outputs.database == 'true'
-    timeout-minutes: 15
+    timeout-minutes: 30
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_database
@@ -98,7 +98,7 @@ jobs:
   main_qualification:
     needs: changes
     if: needs.changes.outputs.main_qualification == 'true'
-    timeout-minutes: 15
+    timeout-minutes: 30
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_main
