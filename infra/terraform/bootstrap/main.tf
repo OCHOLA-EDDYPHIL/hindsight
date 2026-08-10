@@ -87,6 +87,7 @@ locals {
   observability_adot_layer_arns = [
     "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-*:*",
   ]
+  github_deploy_observability_policy_name = "hindsight-github-deploy-observability"
   application_resource_tags = {
     Project     = "hindsight"
     Environment = var.stage
@@ -926,6 +927,13 @@ data "aws_iam_policy_document" "github_deploy" {
 resource "aws_iam_role_policy" "github_deploy" {
   role   = aws_iam_role.github_deploy.id
   policy = data.aws_iam_policy_document.github_deploy.json
+
+  lifecycle {
+    precondition {
+      condition     = length(regexall("\\S", data.aws_iam_policy_document.github_deploy.json)) <= 10240
+      error_message = "The primary GitHub deploy inline policy exceeds the 10,240-character per-role inline policy limit."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "github_deploy_observability" {
@@ -1016,9 +1024,28 @@ data "aws_iam_policy_document" "github_deploy_observability" {
   }
 }
 
-resource "aws_iam_role_policy" "github_deploy_observability" {
-  role   = aws_iam_role.github_deploy.id
-  policy = data.aws_iam_policy_document.github_deploy_observability.json
+resource "aws_iam_policy" "github_deploy_observability" {
+  name        = local.github_deploy_observability_policy_name
+  description = "Stage-scoped deployment access for bounded observability resources."
+  policy      = data.aws_iam_policy_document.github_deploy_observability.json
+
+  tags = {
+    Project     = "hindsight"
+    Environment = var.stage
+    ManagedBy   = "terraform-bootstrap"
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(regexall("\\S", data.aws_iam_policy_document.github_deploy_observability.json)) <= 6144
+      error_message = "The GitHub deploy observability policy exceeds the 6,144-character customer-managed IAM policy limit."
+    }
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "github_deploy_observability" {
+  role       = aws_iam_role.github_deploy.name
+  policy_arn = aws_iam_policy.github_deploy_observability.arn
 }
 
 data "aws_iam_policy_document" "github_evidence" {

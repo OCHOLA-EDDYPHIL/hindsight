@@ -41,6 +41,14 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_iam_policy" {
+    override_during = plan
+
+    defaults = {
+      arn = "arn:aws:iam::123456789012:policy/hindsight-github-deploy-observability"
+    }
+  }
+
 }
 
 mock_provider "aws" {
@@ -439,6 +447,17 @@ run "isolated_bootstrap" {
 
   assert {
     condition = (
+      aws_iam_policy.github_deploy_observability.name == local.github_deploy_observability_policy_name &&
+      local.github_deploy_observability_policy_name == "hindsight-github-deploy-observability" &&
+      aws_iam_policy.github_deploy_observability.arn == "arn:aws:iam::123456789012:policy/hindsight-github-deploy-observability" &&
+      aws_iam_policy.github_deploy_observability.policy == data.aws_iam_policy_document.github_deploy_observability.json &&
+      aws_iam_policy.github_deploy_observability.tags == tomap({
+        Project     = "hindsight"
+        Environment = "demo"
+        ManagedBy   = "terraform-bootstrap"
+      }) &&
+      aws_iam_role_policy_attachment.github_deploy_observability.role == aws_iam_role.github_deploy.name &&
+      aws_iam_role_policy_attachment.github_deploy_observability.policy_arn == aws_iam_policy.github_deploy_observability.arn &&
       toset(local.observability_topic_arns) == toset([
         "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts",
         "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts",
@@ -460,7 +479,7 @@ run "isolated_bootstrap" {
         "sns:UntagResource",
       ])
     )
-    error_message = "Observability topic management must remain limited to the two stage-owned topics."
+    error_message = "Observability access must use the attached size-bounded managed policy with stable identity and stage ownership tags."
   }
 
   assert {
