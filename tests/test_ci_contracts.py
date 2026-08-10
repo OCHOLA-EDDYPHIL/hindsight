@@ -207,12 +207,21 @@ def test_fast_product_checks_use_exactly_one_server_and_database():
 def test_main_schema_builds_share_one_server_and_isolate_required_databases():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     main_job = workflow["jobs"]["main_qualification"]
+    role_step = next(
+        step
+        for step in main_job["steps"]
+        if step.get("name") == "Establish shared migration roles"
+    )
     schema_step = next(
         step
         for step in main_job["steps"]
         if step.get("name") == "Verify populated upgrade and schema parity"
     )
 
+    assert main_job["steps"].index(role_step) < main_job["steps"].index(schema_step)
+    assert role_step["run"].count(
+        "CREATE ROLE IF NOT EXISTS hindsight_lifecycle NOLOGIN"
+    ) == 1
     assert "fresh_pid=$!" in schema_step["run"]
     assert "populated_pid=$!" in schema_step["run"]
     assert 'wait "$fresh_pid"' in schema_step["run"]
