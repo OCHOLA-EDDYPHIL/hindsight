@@ -303,7 +303,12 @@ def enqueue_operation(
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT * FROM memory_operations WHERE idempotency_key = %s",
+                    """
+                        SELECT *
+                        FROM memory_operations
+                        WHERE tenant_id = current_hindsight_tenant_id()
+                            AND idempotency_key = %s
+                    """,
                     (idempotency_key,),
                 )
                 existing = cur.fetchone()
@@ -316,7 +321,12 @@ def enqueue_operation(
                         )
                     return dict(existing), False
                 cur.execute(
-                    "SELECT * FROM memory_operation_previews WHERE id = %s",
+                    """
+                        SELECT *
+                        FROM memory_operation_previews
+                        WHERE tenant_id = current_hindsight_tenant_id()
+                            AND id = %s
+                    """,
                     (preview_id,),
                 )
                 preview = cur.fetchone()
@@ -331,14 +341,16 @@ def enqueue_operation(
                 cur.execute(
                     """
                         INSERT INTO memory_operations (
-                            id, operation_type, actor, reason, target_timestamp,
-                            namespace, idempotency_key, status, preview_id,
+                            id, tenant_id, operation_type, actor, reason,
+                            target_timestamp, namespace, idempotency_key, status, preview_id,
                             preview_fingerprint, root_memory_kind, root_memory_id,
                             expected_revisions, request_payload, attempt_count
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s,
-                                %s, %s, %s, %s, %s, 0)
-                        ON CONFLICT (idempotency_key) DO NOTHING
+                        VALUES (%s, current_hindsight_tenant_id(), %s, %s, %s, %s, %s,
+                                %s, 'queued', %s, %s, %s, %s, %s, %s, 0)
+                        ON CONFLICT (tenant_id, idempotency_key)
+                            WHERE idempotency_key IS NOT NULL
+                            DO NOTHING
                         RETURNING *
                     """,
                     (
@@ -360,7 +372,12 @@ def enqueue_operation(
                 inserted = cur.fetchone()
                 if inserted is None:
                     cur.execute(
-                        "SELECT * FROM memory_operations WHERE idempotency_key = %s",
+                        """
+                            SELECT *
+                            FROM memory_operations
+                            WHERE tenant_id = current_hindsight_tenant_id()
+                                AND idempotency_key = %s
+                        """,
                         (idempotency_key,),
                     )
                     raced = cur.fetchone()

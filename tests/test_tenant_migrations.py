@@ -24,6 +24,23 @@ def test_future_tenant_natural_key_migration_is_restart_safe():
         assert f"CREATE UNIQUE INDEX IF NOT EXISTS {index}" in migration
 
 
+def test_governed_operation_idempotency_is_tenant_scoped_and_restart_safe():
+    migration = (ROOT / "migrations" / "0031_tenant_memory_operation_idempotency.sql").read_text()
+    source = (ROOT / "src" / "hindsight" / "operations.py").read_text()
+
+    assert (
+        "DROP INDEX IF EXISTS memory_operations@memory_operations_idempotency_idx CASCADE"
+        in migration
+    )
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_tenant_idempotency_idx" in migration
+    assert "ON memory_operations (tenant_id, idempotency_key)" in migration
+    assert "WHERE idempotency_key IS NOT NULL" in migration
+    assert source.count("tenant_id = current_hindsight_tenant_id()") >= 3
+    assert "id, tenant_id, operation_type" in source
+    assert "VALUES (%s, current_hindsight_tenant_id()" in source
+    assert "ON CONFLICT (tenant_id, idempotency_key)" in source
+
+
 TENANT_TABLES = {
     "episodic_memories",
     "semantic_memories",

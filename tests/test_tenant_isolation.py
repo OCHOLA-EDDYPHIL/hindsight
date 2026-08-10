@@ -9,8 +9,10 @@ from uuid import uuid4
 import psycopg
 import pytest
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from hindsight.db import TenantConnection
+from hindsight.tenant import tenant_scope
 from hindsight.lifecycle import (
     begin_export,
     begin_purge,
@@ -136,6 +138,153 @@ def _purge_test_tenants(url: str, tenant_ids: tuple[object, ...]) -> None:
                         sql.Identifier(session_user)
                     )
                 )
+
+
+@requires_db
+def test_governed_operation_idempotency_replays_within_tenant_and_isolates_tenants():
+    from hindsight.operations import OperationConflictError, enqueue_operation
+
+    target_url = os.environ["DATABASE_URL"]
+    first_tenant = uuid4()
+    second_tenant = uuid4()
+    first_preview = uuid4()
+    mismatched_preview = uuid4()
+    second_preview = uuid4()
+    suffix = uuid4().hex
+    idempotency_key = f"tenant-operation:{suffix}"
+    first_fingerprint = f"first:{suffix}"
+    mismatched_fingerprint = f"mismatched:{suffix}"
+    second_fingerprint = f"second:{suffix}"
+
+    try:
+        with psycopg.connect(target_url, autocommit=True) as admin:
+            _apply_schema(admin)
+            admin.execute(
+                """
+                    INSERT INTO tenants (id, slug, tenant_kind) VALUES
+                        (%s, %s, 'diagnostic'),
+                        (%s, %s, 'diagnostic')
+                """,
+                (
+                    first_tenant,
+                    f"operation-a-{suffix}",
+                    second_tenant,
+                    f"operation-b-{suffix}",
+                ),
+            )
+            admin.execute(
+                """
+                    INSERT INTO memory_operation_previews (
+                        id, tenant_id, operation_type, actor, request_payload,
+                        effect_payload, expected_revisions, fingerprint, expires_at
+                    ) VALUES
+                        (%s, %s, 'rewind', 'pytest.operator', %s, %s, %s, %s,
+                         now() + INTERVAL '1 hour'),
+                        (%s, %s, 'rewind', 'pytest.operator', %s, %s, %s, %s,
+                         now() + INTERVAL '1 hour'),
+                        (%s, %s, 'rewind', 'pytest.operator', %s, %s, %s, %s,
+                         now() + INTERVAL '1 hour')
+                """,
+                (
+                    first_preview,
+                    first_tenant,
+                    Jsonb({"namespace": f"operation-a-{suffix}", "reason": "first request"}),
+                    Jsonb({}),
+                    Jsonb({}),
+                    first_fingerprint,
+                    mismatched_preview,
+                    first_tenant,
+                    Jsonb(
+                        {
+                            "namespace": f"operation-a-{suffix}",
+                            "reason": "mismatched request",
+                        }
+                    ),
+                    Jsonb({}),
+                    Jsonb({}),
+                    mismatched_fingerprint,
+                    second_preview,
+                    second_tenant,
+                    Jsonb({"namespace": f"operation-b-{suffix}", "reason": "second request"}),
+                    Jsonb({}),
+                    Jsonb({}),
+                    second_fingerprint,
+                ),
+            )
+
+        with tenant_scope(first_tenant):
+            first, first_created = enqueue_operation(
+                preview_id=str(first_preview),
+                fingerprint=first_fingerprint,
+                idempotency_key=idempotency_key,
+                db_url=target_url,
+            )
+            replay, replay_created = enqueue_operation(
+                preview_id=str(first_preview),
+                fingerprint=first_fingerprint,
+                idempotency_key=idempotency_key,
+                db_url=target_url,
+            )
+            with pytest.raises(
+                OperationConflictError,
+                match="idempotency key is already bound to another approved preview",
+            ):
+                enqueue_operation(
+                    preview_id=str(mismatched_preview),
+                    fingerprint=mismatched_fingerprint,
+                    idempotency_key=idempotency_key,
+                    db_url=target_url,
+                )
+
+        with tenant_scope(second_tenant):
+            second, second_created = enqueue_operation(
+                preview_id=str(second_preview),
+                fingerprint=second_fingerprint,
+                idempotency_key=idempotency_key,
+                db_url=target_url,
+            )
+
+        assert first_created is True
+        assert replay_created is False
+        assert replay["id"] == first["id"]
+        assert second_created is True
+        assert second["id"] != first["id"]
+
+        connection = _runtime_connection(target_url, tenant_id=str(first_tenant))
+        try:
+            assert connection.execute(
+                """
+                    SELECT id, tenant_id
+                    FROM memory_operations
+                    WHERE idempotency_key = %s
+                """,
+                (idempotency_key,),
+            ).fetchall() == [(first["id"], first_tenant)]
+            assert (
+                connection.execute(
+                    """
+                    SELECT id
+                    FROM memory_operations
+                    WHERE tenant_id = %s AND idempotency_key = %s
+                """,
+                    (second_tenant, idempotency_key),
+                ).fetchall()
+                == []
+            )
+            connection.commit()
+            connection.bind_tenant(str(second_tenant))
+            assert connection.execute(
+                """
+                    SELECT id, tenant_id
+                    FROM memory_operations
+                    WHERE idempotency_key = %s
+                """,
+                (idempotency_key,),
+            ).fetchall() == [(second["id"], second_tenant)]
+        finally:
+            connection.close()
+    finally:
+        _purge_test_tenants(target_url, (first_tenant, second_tenant))
 
 
 @requires_db
