@@ -230,7 +230,7 @@ def test_recovery_workflow_is_owner_main_only_and_uses_ephemeral_local_storage()
     assert "github.run_attempt" in job["env"]["COMPOSE_PROJECT_NAME"]
     assert job["env"]["COCKROACH_IMAGE"] == "cockroachdb/cockroach:v25.4.5"
     compose = (ROOT / "docker-compose.yml").read_text()
-    assert "${COCKROACH_IMAGE:-cockroachdb/cockroach:latest-v25.2}" in compose
+    assert "${COCKROACH_IMAGE:-cockroachdb/cockroach:v25.4.5}" in compose
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "docker compose up -d crdb" in commands
     assert "scripts/run_recovery_drill.py" in commands
