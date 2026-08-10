@@ -192,6 +192,7 @@ GRANT INSERT ON TABLE
     agent_reflections,
     agent_runs,
     agent_run_events,
+    agent_run_dispatch_attempts,
     incident_semantic_memories,
     incident_semantic_beliefs,
     incident_events,
