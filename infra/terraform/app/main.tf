@@ -10,7 +10,7 @@ locals {
   operation_poll_seconds        = (local.run_max_attempts - 1) * local.run_queue_visibility_seconds + local.worker_timeout_seconds + 60
   changefeed_timeout_seconds    = 30
   changefeed_lease_seconds      = 60
-  websocket_management_endpoint = "${aws_apigatewayv2_api.websocket.api_endpoint}/${var.stage}"
+  websocket_management_endpoint = "${replace(aws_apigatewayv2_api.websocket.api_endpoint, "wss://", "https://")}/${aws_apigatewayv2_stage.websocket.name}"
 
   api_zip      = var.api_zip_path != null ? var.api_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-api.zip"
   worker_zip   = var.worker_zip_path != null ? var.worker_zip_path : "${path.module}/../../../build/lambda-artifacts/hindsight-worker.zip"

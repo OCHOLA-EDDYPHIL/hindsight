@@ -369,6 +369,39 @@ run "alert_email_subscribes_operational_and_budget_topics" {
   }
 }
 
+run "websocket_endpoints_use_consumer_protocols" {
+  command = plan
+
+  variables {
+    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  override_resource {
+    target          = aws_apigatewayv2_api.websocket
+    override_during = plan
+    values = {
+      api_endpoint  = "wss://websocket.execute-api.us-east-1.amazonaws.com"
+      execution_arn = "arn:aws:execute-api:us-east-1:123456789012:websocket"
+    }
+  }
+
+  assert {
+    condition = (
+      local.websocket_management_endpoint == "https://websocket.execute-api.us-east-1.amazonaws.com/demo" &&
+      aws_lambda_function.changefeed.environment[0].variables.HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT == local.websocket_management_endpoint &&
+      output.websocket_management_endpoint == local.websocket_management_endpoint
+    )
+    error_message = "Changefeed fan-out must use the HTTPS API Gateway Management API endpoint for the deployed stage."
+  }
+
+  assert {
+    condition     = output.websocket_url == "wss://websocket.execute-api.us-east-1.amazonaws.com/demo"
+    error_message = "Browser WebSocket clients must retain the WSS stage endpoint."
+  }
+}
+
 run "waf_enabled" {
   command = plan
 
