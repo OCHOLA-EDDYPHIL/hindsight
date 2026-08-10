@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -73,6 +74,80 @@ class AgentDecisionV1(BaseModel):
 
 
 AGENT_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV1.model_json_schema()
+
+
+def agent_decision_provider_schema(
+    *,
+    recalled_memory_ids: set[str],
+    allowed_query_keys: set[str],
+    diagnostic_calls_used: int,
+    diagnostic_observation_available: bool,
+    model_turn: int,
+) -> dict[str, Any]:
+    """Narrow the provider schema to the decision branch allowed for this turn."""
+
+    if type(model_turn) is not int or not 1 <= model_turn <= MAX_MODEL_TURNS:
+        raise ValueError(f"model_turn must be between one and {MAX_MODEL_TURNS}")
+    if (
+        type(diagnostic_calls_used) is not int
+        or not 0 <= diagnostic_calls_used <= MAX_DIAGNOSTIC_CALLS
+    ):
+        raise ValueError(f"diagnostic_calls_used must be between zero and {MAX_DIAGNOSTIC_CALLS}")
+
+    schema = deepcopy(AGENT_DECISION_JSON_SCHEMA)
+    properties = schema["properties"]
+    definitions = schema["$defs"]
+
+    recalled_ids = sorted(recalled_memory_ids)
+    citations = properties["recalled_memory_citations"]
+    if recalled_ids:
+        citations["maxItems"] = min(int(citations["maxItems"]), len(recalled_ids))
+        definitions["MemoryCitation"]["properties"]["memory_id"]["enum"] = recalled_ids
+    else:
+        citations["maxItems"] = 0
+
+    query_keys = sorted(allowed_query_keys)
+    if query_keys:
+        definitions["DiagnosticToolCall"]["properties"]["query_key"]["enum"] = query_keys
+    diagnostic_available = (
+        bool(query_keys)
+        and diagnostic_calls_used < MAX_DIAGNOSTIC_CALLS
+        and model_turn < MAX_MODEL_TURNS
+    )
+    if diagnostic_available and not diagnostic_observation_available:
+        properties["next_step_kind"]["enum"] = ["diagnostic_tool"]
+        properties["tool_call"] = {"$ref": "#/$defs/DiagnosticToolCall"}
+        properties["recommendation"] = {"type": "null"}
+    elif diagnostic_available and diagnostic_observation_available:
+        schema["anyOf"] = [
+            {
+                "properties": {
+                    "next_step_kind": {"const": "diagnostic_tool"},
+                    "tool_call": {"$ref": "#/$defs/DiagnosticToolCall"},
+                    "recommendation": {"type": "null"},
+                }
+            },
+            {
+                "properties": {
+                    "next_step_kind": {"const": "recommendation"},
+                    "tool_call": {"type": "null"},
+                    "recommendation": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4_000,
+                    },
+                }
+            },
+        ]
+    else:
+        properties["next_step_kind"]["enum"] = ["recommendation"]
+        properties["tool_call"] = {"type": "null"}
+        properties["recommendation"] = {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4_000,
+        }
+    return schema
 
 
 def parse_agent_decision(
