@@ -82,14 +82,20 @@ def signature_scenario_trace(
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                    SELECT incident.*
+                    SELECT incident.*, service.slug AS service_slug
                     FROM incidents AS incident
-                    JOIN agent_runs AS run ON run.incident_id = incident.id
-                    WHERE run.namespace = %s
-                    ORDER BY run.created_at
+                    LEFT JOIN incident_services AS binding
+                      ON binding.tenant_id = incident.tenant_id
+                     AND binding.incident_id = incident.id
+                    LEFT JOIN services AS service
+                      ON service.tenant_id = binding.tenant_id
+                     AND service.id = binding.service_id
+                    WHERE incident.tenant_id = %s
+                      AND incident.id = %s
+                    ORDER BY service.slug NULLS LAST
                     LIMIT 1
                 """,
-                (session["namespace"],),
+                (session["tenant_id"], session["incident_id"]),
             )
             incident = cur.fetchone()
             cur.execute(
@@ -99,10 +105,10 @@ def signature_scenario_trace(
                            action_approved, provider, model, reflected_memory_id,
                            failure_code, created_at, started_at, updated_at, completed_at
                     FROM agent_runs
-                    WHERE namespace = %s
+                    WHERE tenant_id = %s AND namespace = %s
                     ORDER BY created_at
                 """,
-                (session["namespace"],),
+                (session["tenant_id"], session["namespace"]),
             )
             runs = [dict(row) for row in cur.fetchall()]
             run_events: dict[str, list[dict[str, Any]]] = {}
@@ -125,11 +131,13 @@ def signature_scenario_trace(
                            status, attempt_count, created_at, completed_at,
                            failure_code
                     FROM memory_operations
-                    WHERE namespace = %s AND operation_type = 'rewind'
+                    WHERE tenant_id = %s
+                      AND namespace = %s
+                      AND operation_type = 'rewind'
                     ORDER BY created_at DESC
                     LIMIT 1
                 """,
-                (session["namespace"],),
+                (session["tenant_id"], session["namespace"]),
             )
             operation = cur.fetchone()
             events: list[dict[str, Any]] = []
@@ -164,10 +172,10 @@ def signature_scenario_trace(
                            created_by_operation_id, writer, t_valid, t_invalid,
                            written_at, invalidated_at, metadata
                     FROM semantic_memories
-                    WHERE namespace = %s
+                    WHERE tenant_id = %s AND namespace = %s
                     ORDER BY t_valid, written_at
                 """,
-                (session["namespace"],),
+                (session["tenant_id"], session["namespace"]),
             )
             memories = [dict(row) for row in cur.fetchall()]
 
@@ -186,8 +194,27 @@ def signature_scenario_trace(
 
         rejected = next((run for run in runs if run["status"] == "rejected"), None)
         corrected = next(
-            (run for run in reversed(runs) if run["status"] == "completed"),
+            (run for run in reversed(runs) if _is_proven_recovery(run=run, operation=operation)),
             None,
+        )
+        story_completed = bool(
+            rejected
+            and _run_precedes_operation(rejected, operation)
+            and operation is not None
+            and operation["status"] == "completed"
+            and corrected
+        )
+        completed_at_candidates = [
+            value
+            for value in (
+                rejected.get("completed_at") if rejected else None,
+                operation.get("completed_at") if operation is not None else None,
+                corrected.get("completed_at") if corrected else None,
+            )
+            if value is not None
+        ]
+        completed_at = (
+            max(completed_at_candidates) if story_completed and completed_at_candidates else None
         )
         seed = next((row for row in memories if row["writer"] == "demo.seed"), None)
         compromised = next(
@@ -213,8 +240,17 @@ def signature_scenario_trace(
         return {
             "scenario_id": session["id"],
             "namespace": session["namespace"],
-            "status": session["status"],
+            "status": (
+                "completed"
+                if story_completed
+                else "archived"
+                if session["status"] == "archived"
+                else "active"
+            ),
+            "session_status": session["status"],
             "created_at": session["created_at"],
+            "completed_at": completed_at,
+            "rewind_anchor": session["rewind_anchor"],
             "incident": dict(incident) if incident is not None else None,
             "runs": runs,
             "operation": dict(operation) if operation is not None else None,
@@ -223,6 +259,44 @@ def signature_scenario_trace(
             "memories": memories,
             "stages": stages,
         }
+
+
+def _run_precedes_operation(run: dict[str, Any], operation: Any | None) -> bool:
+    if operation is None or operation.get("completed_at") is None:
+        return False
+    completed_at = run.get("completed_at")
+    return bool(completed_at is not None and completed_at < operation["completed_at"])
+
+
+def _is_proven_recovery(*, run: dict[str, Any], operation: Any | None) -> bool:
+    if (
+        operation is None
+        or operation.get("status") != "completed"
+        or operation.get("completed_at") is None
+    ):
+        return False
+    action_trace = run.get("action_trace")
+    approval = action_trace.get("approval") if isinstance(action_trace, dict) else None
+    execution = action_trace.get("execution") if isinstance(action_trace, dict) else None
+    trace = run.get("trace")
+    reads = trace.get("reads") if isinstance(trace, dict) else None
+    observed = [run.get("created_at"), run.get("started_at")]
+    invalidated = {str(value) for value in operation.get("invalidated_memory_ids") or []}
+    return bool(
+        run.get("status") == "completed"
+        and run.get("action_approved") is True
+        and any(
+            timestamp is not None and timestamp > operation["completed_at"]
+            for timestamp in observed
+        )
+        and isinstance(approval, dict)
+        and approval.get("approved") is True
+        and isinstance(execution, dict)
+        and execution.get("status") == "recommendation_approved"
+        and isinstance(reads, list)
+        and reads
+        and all(str(read.get("memory_id")) not in invalidated for read in reads)
+    )
 
 
 def _signature_session(
@@ -240,7 +314,8 @@ def _signature_session(
                 return None
             cur.execute(
                 """
-                    SELECT id, namespace, status, created_at
+                    SELECT id, tenant_id, namespace, status, incident_id,
+                           rewind_anchor, created_at
                     FROM demo_sessions
                     WHERE id = %s
                       AND demo_kind IN ('compromised_guidance_rewind', 'poison_rewind')
@@ -250,10 +325,13 @@ def _signature_session(
         elif decision_id:
             cur.execute(
                 """
-                    SELECT session.id, session.namespace, session.status,
-                           session.created_at
+                    SELECT session.id, session.tenant_id, session.namespace,
+                           session.status, session.incident_id,
+                           session.rewind_anchor, session.created_at
                     FROM agent_runs AS run
-                    JOIN demo_sessions AS session ON session.namespace = run.namespace
+                    JOIN demo_sessions AS session
+                      ON session.tenant_id = run.tenant_id
+                     AND session.namespace = run.namespace
                     WHERE run.decision_id = %s
                       AND session.demo_kind IN (
                           'compromised_guidance_rewind',
@@ -265,7 +343,8 @@ def _signature_session(
         elif namespace:
             cur.execute(
                 """
-                    SELECT id, namespace, status, created_at
+                    SELECT id, tenant_id, namespace, status, incident_id,
+                           rewind_anchor, created_at
                     FROM demo_sessions
                     WHERE namespace = %s
                       AND demo_kind IN ('compromised_guidance_rewind', 'poison_rewind')
@@ -275,8 +354,9 @@ def _signature_session(
         else:
             cur.execute(
                 """
-                    SELECT session.id, session.namespace, session.status,
-                           session.created_at
+                    SELECT session.id, session.tenant_id, session.namespace,
+                           session.status, session.incident_id,
+                           session.rewind_anchor, session.created_at
                     FROM demo_sessions AS session
                     WHERE session.demo_kind IN (
                         'compromised_guidance_rewind',
@@ -285,20 +365,71 @@ def _signature_session(
                       AND session.created_by = 'dashboard.operator'
                       AND session.namespace LIKE %s
                       AND EXISTS (
-                          SELECT 1 FROM agent_runs AS run
-                          WHERE run.namespace = session.namespace
-                            AND run.status = 'rejected'
-                      )
-                      AND EXISTS (
-                          SELECT 1 FROM agent_runs AS run
-                          WHERE run.namespace = session.namespace
-                            AND run.status = 'completed'
-                      )
-                      AND EXISTS (
-                          SELECT 1 FROM memory_operations AS operation
-                          WHERE operation.namespace = session.namespace
+                          SELECT 1
+                          FROM memory_operations AS operation
+                          WHERE operation.tenant_id = session.tenant_id
+                            AND operation.namespace = session.namespace
                             AND operation.operation_type = 'rewind'
                             AND operation.status = 'completed'
+                            AND operation.completed_at IS NOT NULL
+                            AND operation.id = (
+                                SELECT latest_operation.id
+                                FROM memory_operations AS latest_operation
+                                WHERE latest_operation.tenant_id = session.tenant_id
+                                  AND latest_operation.namespace = session.namespace
+                                  AND latest_operation.operation_type = 'rewind'
+                                ORDER BY latest_operation.created_at DESC
+                                LIMIT 1
+                            )
+                            AND EXISTS (
+                                SELECT 1
+                                FROM agent_runs AS rejected_run
+                                WHERE rejected_run.tenant_id = session.tenant_id
+                                  AND rejected_run.namespace = session.namespace
+                                  AND rejected_run.status = 'rejected'
+                                  AND rejected_run.completed_at < operation.completed_at
+                            )
+                            AND EXISTS (
+                                SELECT 1
+                                FROM agent_runs AS recovered_run
+                                WHERE recovered_run.tenant_id = session.tenant_id
+                                  AND recovered_run.namespace = session.namespace
+                                  AND recovered_run.status = 'completed'
+                                  AND recovered_run.action_approved IS TRUE
+                                  AND (
+                                      recovered_run.created_at > operation.completed_at
+                                      OR recovered_run.started_at > operation.completed_at
+                                  )
+                                  AND EXISTS (
+                                      SELECT 1
+                                      FROM agent_run_events AS recovered_event
+                                      WHERE recovered_event.tenant_id =
+                                              recovered_run.tenant_id
+                                        AND recovered_event.run_id = recovered_run.id
+                                        AND recovered_event.metadata @>
+                                            '{"action_trace":{"approval":{"approved":true},"execution":{"status":"recommendation_approved"}}}'::JSONB
+                                  )
+                                  AND EXISTS (
+                                      SELECT 1
+                                      FROM memory_reads AS recovered_read
+                                      WHERE recovered_read.tenant_id =
+                                              recovered_run.tenant_id
+                                        AND recovered_read.decision_id =
+                                              recovered_run.decision_id
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                      FROM memory_reads AS invalidated_read
+                                      WHERE invalidated_read.tenant_id =
+                                              recovered_run.tenant_id
+                                        AND invalidated_read.decision_id =
+                                              recovered_run.decision_id
+                                        AND operation.invalidated_memory_ids @>
+                                            jsonb_build_array(
+                                                invalidated_read.memory_id::STRING
+                                            )
+                                  )
+                            )
                       )
                     ORDER BY session.created_at DESC
                     LIMIT 1

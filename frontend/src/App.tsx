@@ -22,6 +22,9 @@ export default function App() {
   const cockpit = useCockpit();
   const [identityOpen, setIdentityOpen] = useState(false);
   const showReplay = cockpit.loadState === "ready";
+  const brandHref = typeof window === "undefined"
+    ? "/"
+    : `${window.location.pathname}${window.location.search}`;
 
   return (
     <>
@@ -29,7 +32,7 @@ export default function App() {
         Skip to replay
       </a>
       <header className="site-header">
-        <a className="brand" href="/" aria-label="Hindsight governed memory replay">
+        <a className="brand" href={brandHref} aria-label="Hindsight governed memory replay">
           <span className="brand-mark" aria-hidden="true">H</span>
           <span>
             <strong>Hindsight</strong>
@@ -64,13 +67,22 @@ export default function App() {
               incident={cockpit.incident}
               namespace={cockpit.namespace}
               run={cockpit.run}
+              scenario={cockpit.scenario}
             />
-            <CausalRail scenario={cockpit.scenario} />
+            <CausalRail
+              scenario={cockpit.scenario}
+              snapshot={cockpit.snapshot}
+              activeRun={cockpit.run}
+            />
             <OutcomeComparison scenario={cockpit.scenario} activeRun={cockpit.run} />
             <Timeline snapshot={cockpit.snapshot} onSelect={cockpit.selectHistorical} />
             <div className="evidence-grid">
               <BeliefLedger snapshot={cockpit.snapshot} />
-              <InfluenceLedger influence={cockpit.influence} />
+              <InfluenceLedger
+                influence={cockpit.influence}
+                state={cockpit.influenceState}
+                error={cockpit.influenceError}
+              />
             </div>
             <OperationLedger operations={cockpit.snapshot?.operations || []} />
           </>

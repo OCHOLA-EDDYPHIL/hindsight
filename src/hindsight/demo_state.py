@@ -43,13 +43,15 @@ def reset_poison_rewind_state(
     *,
     namespace: str = DEMO_NAMESPACE,
     session_id: UUID | None = None,
+    incident_id: UUID | None = None,
     db_url: str | None = None,
 ) -> str:
     """Archive only the supplied session and return a fresh session namespace."""
 
     resolved_db_url = db_url or database_url()
     base_namespace = namespace.split(":session:", 1)[0]
-    session_namespace = f"{base_namespace}:session:{(session_id or uuid4()).hex}"
+    resolved_session_id = session_id or uuid4()
+    session_namespace = f"{base_namespace}:session:{resolved_session_id.hex}"
     with connect(resolved_db_url) as conn:
         conn.execute(
             """
@@ -61,13 +63,48 @@ def reset_poison_rewind_state(
         )
         conn.execute(
             """
-                INSERT INTO demo_sessions (demo_kind, namespace, created_by)
-                VALUES ('compromised_guidance_rewind', %s, 'dashboard.operator')
+                INSERT INTO demo_sessions (
+                    id, demo_kind, namespace, created_by,
+                    incident_tenant_id, incident_id
+                )
+                VALUES (
+                    %s, 'compromised_guidance_rewind', %s,
+                    'dashboard.operator',
+                    (SELECT tenant_id FROM incidents WHERE id = %s), %s
+                )
             """,
-            (session_namespace,),
+            (
+                resolved_session_id,
+                session_namespace,
+                incident_id,
+                incident_id,
+            ),
         )
         conn.commit()
     return session_namespace
+
+
+def record_poison_rewind_anchor(
+    *,
+    namespace: str,
+    db_url: str | None = None,
+) -> datetime:
+    """Persist and return the database timestamp that bounds a scenario rewind."""
+
+    with connect(db_url or database_url()) as conn:
+        row = conn.execute(
+            """
+                UPDATE demo_sessions
+                SET rewind_anchor = now()
+                WHERE namespace = %s AND status = 'active'
+                RETURNING rewind_anchor
+            """,
+            (namespace,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        raise LookupError("active demo session not found")
+    return row[0]
 
 
 def seed_good_demo_memory(
@@ -200,4 +237,5 @@ def ensure_poison_rewind_incident(
             "title": incident[2],
             "severity": incident[3],
             "status": incident[4],
+            "service_slug": DEMO_SERVICE_SLUG,
         }

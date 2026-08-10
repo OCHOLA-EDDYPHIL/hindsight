@@ -96,8 +96,9 @@ export function deriveWalkthroughStep({
     if (run?.status === "rejected") return "preview";
     return "analyze";
   }
-  if (run?.status !== "completed") return "reanalyze";
-  return "history";
+  if (run?.status === "awaiting_approval") return "review";
+  if (scenario?.status === "completed" && (!run || run.status === "completed")) return "history";
+  return "reanalyze";
 }
 
 export function OperatorConsole({
@@ -148,8 +149,10 @@ export function OperatorConsole({
   onSignOut: () => void;
 }) {
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
+  const eventTraceAvailable = Array.isArray(run?.events);
   const eventPhases = new Set((run?.events || []).map((event) => event.phase));
   const currentPhase = run?.events?.at(-1)?.phase;
+  const terminalRun = Boolean(run?.status.match(/completed|rejected|failed|cancelled/));
   const walkthroughStep = deriveWalkthroughStep({
     rewindAnchor,
     scenario,
@@ -279,19 +282,48 @@ export function OperatorConsole({
         </div>
       </div>
 
+      {!eventTraceAvailable ? (
+        <p className="phase-trace-unavailable">Phase trace unavailable</p>
+      ) : null}
       <ol id="phaseRail" className="phase-rail" aria-label="Agent run phases">
         {phases.map((phase) => {
-          const complete = eventPhases.has(phase.key) && phase.key !== currentPhase;
-          const active =
-            phase.key === currentPhase && !run?.status.match(/completed|rejected|failed/);
+          const observed = eventPhases.has(phase.key);
+          const failed = run?.status === "failed" && phase.key === currentPhase;
+          const complete = observed && !failed && (terminalRun || phase.key !== currentPhase);
+          const active = phase.key === currentPhase && !terminalRun;
+          const state = !eventTraceAvailable
+            ? "unavailable"
+            : failed
+              ? "failed"
+              : complete
+                ? "complete"
+                : active
+                  ? "active"
+                  : terminalRun
+                    ? "not-observed"
+                    : "pending";
           return (
             <li
               key={phase.key}
               data-phase={phase.key}
-              className={complete ? "complete" : active ? "active" : ""}
+              data-phase-state={state}
+              className={
+                ["pending", "unavailable", "not-observed"].includes(state) ? "" : state
+              }
+              aria-current={active ? "step" : undefined}
+              title={
+                state === "unavailable"
+                  ? "Phase state unavailable"
+                  : state === "not-observed"
+                    ? "Phase not observed"
+                    : undefined
+              }
             >
               <span aria-hidden="true" />
               {phase.label}
+              <span className="sr-only">
+                {`, ${state}`}
+              </span>
             </li>
           );
         })}
@@ -379,11 +411,15 @@ export function OperatorConsole({
           {rewindPreview ? (
             <>
               <strong>
-                {(rewindPreview.effect_payload?.close_memory_ids || []).length} versions will close.
+                {rewindPreview.effect_payload?.close_memory_ids
+                  ? `${rewindPreview.effect_payload.close_memory_ids.length} versions will close.`
+                  : "Close count unavailable."}
               </strong>
               <span>
-                {(rewindPreview.effect_payload?.reassertions || []).length} historical beliefs will
-                be reasserted as audited versions. Preview expires {formatTime(rewindPreview.expires_at)}.
+                {rewindPreview.effect_payload?.reassertions
+                  ? `${rewindPreview.effect_payload.reassertions.length} historical beliefs will be reasserted as audited versions.`
+                  : "Reassertion count unavailable."}{" "}
+                Preview expires {formatTime(rewindPreview.expires_at)}.
               </span>
             </>
           ) : (

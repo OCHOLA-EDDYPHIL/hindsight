@@ -33,9 +33,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from hindsight.db import connect
 from hindsight.demo_state import (
     DEMO_NAMESPACE,
-    current_database_timestamp,
     ensure_poison_rewind_incident,
     poison_demo_memory,
+    record_poison_rewind_anchor,
     reset_poison_rewind_state,
     seed_good_demo_memory,
 )
@@ -890,13 +890,14 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
     settings = _api_runtime_settings()
     embedding_provider = embedding_provider_from_env(settings.provider_env)
     fixture_id = uuid4()
+    incident = ensure_poison_rewind_incident(
+        fixture_id=fixture_id,
+        db_url=settings.database_url,
+    )
     session_namespace = reset_poison_rewind_state(
         namespace=payload.namespace,
         session_id=fixture_id,
-        db_url=settings.database_url,
-    )
-    incident = ensure_poison_rewind_incident(
-        fixture_id=fixture_id,
+        incident_id=fixture_id,
         db_url=settings.database_url,
     )
     memory = seed_good_demo_memory(
@@ -904,8 +905,12 @@ def demo_reset(payload: DemoResetRequest) -> dict[str, Any]:
         db_url=settings.database_url,
         embedding_provider=embedding_provider,
     )
-    rewind_anchor = current_database_timestamp(db_url=settings.database_url)
+    rewind_anchor = record_poison_rewind_anchor(
+        namespace=session_namespace,
+        db_url=settings.database_url,
+    )
     return {
+        "scenario_id": str(fixture_id),
         "namespace": session_namespace,
         "incident": incident,
         "seed_memory": _jsonable(memory),

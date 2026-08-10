@@ -25,6 +25,9 @@ function approvalScenario(withIdentity = true): SignatureScenario {
     scenario_id: "scenario-approval",
     namespace: currentSnapshot.namespace,
     status: "active",
+    session_status: "active",
+    rewind_anchor: null,
+    completed_at: null,
     incident: {
       slug: "incident-approval",
       title: "Checkout latency",
@@ -613,5 +616,399 @@ describe("cockpit historical snapshot selection", () => {
       kind: "error",
       message: "Approval identity is unavailable. Refresh or rerun the analysis before deciding.",
     });
+  });
+
+  it("rehydrates an exact scenario deep link and selects the newest active run", async () => {
+    const asOf = "2026-07-17T10:00:00Z";
+    window.history.replaceState(
+      {},
+      "",
+      `/?scenario_id=scenario-deep&namespace=stale&as_of=${encodeURIComponent(asOf)}`,
+    );
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      defaultNamespace: "fallback",
+      pollIntervalMs: 60_000,
+    };
+    const scenario: SignatureScenario = {
+      scenario_id: "scenario-deep",
+      namespace: "tenant:payments:replay",
+      status: "active",
+      session_status: "active",
+      rewind_anchor: "2026-07-17T09:55:00Z",
+      completed_at: null,
+      incident: { slug: "incident-deep", title: "Checkout latency" },
+      runs: [
+        {
+          id: "run-completed-old",
+          status: "completed",
+          created_at: "2026-07-17T10:00:00Z",
+        },
+        {
+          id: "run-active-new",
+          status: "running",
+          created_at: "2026-07-17T11:00:00Z",
+        },
+      ],
+      memories: [],
+      stages: {},
+    };
+    const requested: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        requested.push(`${url.pathname}${url.search}`);
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-deep") {
+          return Promise.resolve(jsonResponse(scenario));
+        }
+        if (url.pathname === "/v1/namespaces/tenant%3Apayments%3Areplay/beliefs") {
+          return Promise.resolve(
+            jsonResponse({
+              ...historicalSnapshot,
+              namespace: scenario.namespace,
+              as_of: asOf,
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+
+    expect(result.current.scenario?.scenario_id).toBe("scenario-deep");
+    expect(result.current.run?.id).toBe("run-active-new");
+    expect(result.current.rewindAnchor).toBe("2026-07-17T09:55:00Z");
+    expect(result.current.connection).toBe("historical");
+    expect(result.current.influenceState).toBe("empty");
+    expect(requested).toContain("/v1/signature-scenarios/scenario-deep");
+    expect(window.location.search).toContain("scenario_id=scenario-deep");
+    expect(window.location.search).toContain("namespace=tenant%3Apayments%3Areplay");
+    expect(new URLSearchParams(window.location.search).get("as_of")).toBe(asOf);
+  });
+
+  it("rehydrates replay identity on browser history navigation", async () => {
+    window.history.replaceState({}, "", "/?scenario_id=scenario-a&namespace=tenant%3Aa");
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      defaultNamespace: "fallback",
+      pollIntervalMs: 60_000,
+    };
+    const scenario = (id: string, namespace: string): SignatureScenario => ({
+      scenario_id: id,
+      namespace,
+      status: "active",
+      session_status: "active",
+      rewind_anchor: null,
+      completed_at: null,
+      incident: { slug: `incident-${id}`, title: `Incident ${id}` },
+      runs: [{ id: `run-${id}`, status: "queued" }],
+      memories: [],
+      stages: {},
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-a") {
+          return Promise.resolve(jsonResponse(scenario("scenario-a", "tenant:a")));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-b") {
+          return Promise.resolve(jsonResponse(scenario("scenario-b", "tenant:b")));
+        }
+        if (url.pathname.startsWith("/v1/namespaces/") && url.pathname.endsWith("/beliefs")) {
+          const namespace = url.pathname.includes("tenant%3Ab") ? "tenant:b" : "tenant:a";
+          return Promise.resolve(jsonResponse({ ...currentSnapshot, namespace }));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.scenario?.scenario_id).toBe("scenario-a"));
+
+    act(() => {
+      window.history.pushState(
+        {},
+        "",
+        "/?scenario_id=scenario-b&namespace=tenant%3Ab",
+      );
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+
+    await waitFor(() => expect(result.current.scenario?.scenario_id).toBe("scenario-b"));
+    expect(result.current.namespace).toBe("tenant:b");
+    expect(result.current.run?.id).toBe("run-scenario-b");
+  });
+
+  it("clears stale replay identity when an ordinary incident is selected", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/signature-scenarios") {
+          return Promise.resolve(jsonResponse(approvalScenario()));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(
+            jsonResponse({ items: [{ slug: "ordinary", title: "Ordinary incident" }] }),
+          );
+        }
+        if (url.pathname === "/v1/incidents/ordinary") {
+          return Promise.resolve(
+            jsonResponse({
+              slug: "ordinary",
+              title: "Ordinary incident",
+              runs: [{ id: "run-ordinary", status: "running" }],
+            }),
+          );
+        }
+        if (url.pathname === "/v1/runs/run-ordinary") {
+          return Promise.resolve(
+            jsonResponse({
+              id: "run-ordinary",
+              status: "running",
+              namespace: "tenant:ordinary",
+            }),
+          );
+        }
+        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v1/namespaces/tenant%3Aordinary/beliefs") {
+          return Promise.resolve(
+            jsonResponse({ ...currentSnapshot, namespace: "tenant:ordinary" }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.scenario?.scenario_id).toBe("scenario-approval"));
+    expect(new URLSearchParams(window.location.search).get("scenario_id")).toBe(
+      "scenario-approval",
+    );
+
+    await act(async () => result.current.selectIncident("ordinary"));
+
+    expect(result.current.scenario).toBeNull();
+    expect(result.current.run?.id).toBe("run-ordinary");
+    expect(result.current.namespace).toBe("tenant:ordinary");
+    expect(new URLSearchParams(window.location.search).has("scenario_id")).toBe(false);
+    expect(new URLSearchParams(window.location.search).has("as_of")).toBe(false);
+  });
+
+  it("distinguishes loading and failed influence reads from an empty ledger", async () => {
+    window.history.replaceState({}, "", "/?namespace=tenant%3Aordinary");
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      defaultNamespace: "tenant:ordinary",
+      pollIntervalMs: 60_000,
+    };
+    let resolveInfluence: (response: Response) => void = () => undefined;
+    const pendingInfluence = new Promise<Response>((resolve) => {
+      resolveInfluence = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/signature-scenarios") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ detail: "not found" }), {
+              status: 404,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/incidents/ordinary") {
+          return Promise.resolve(
+            jsonResponse({
+              slug: "ordinary",
+              title: "Ordinary incident",
+              runs: [{ id: "run-ordinary", status: "completed" }],
+            }),
+          );
+        }
+        if (url.pathname === "/v1/runs/run-ordinary") {
+          return Promise.resolve(
+            jsonResponse({
+              id: "run-ordinary",
+              status: "completed",
+              namespace: "tenant:ordinary",
+              decision_id: "decision-ordinary",
+            }),
+          );
+        }
+        if (url.pathname === "/v1/decisions/decision-ordinary/influence") {
+          return pendingInfluence;
+        }
+        if (url.pathname === "/v1/namespaces/tenant%3Aordinary/beliefs") {
+          return Promise.resolve(
+            jsonResponse({ ...currentSnapshot, namespace: "tenant:ordinary" }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await act(async () => result.current.selectIncident("ordinary"));
+    expect(result.current.influenceState).toBe("loading");
+    expect(result.current.influence).toEqual([]);
+
+    await act(async () => {
+      resolveInfluence(
+        new Response(JSON.stringify({ detail: "trace projection unavailable" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      await pendingInfluence;
+    });
+    await waitFor(() => expect(result.current.influenceState).toBe("error"));
+    expect(result.current.influenceError).toBe("trace projection unavailable");
+    expect(result.current.influence).toEqual([]);
+  });
+
+  it("refreshes the scenario projection after a realtime operation event", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      websocketUrl: "wss://socket.example.test/demo",
+      defaultNamespace: currentSnapshot.namespace,
+    };
+    let projectedScenario: SignatureScenario = {
+      ...approvalScenario(),
+      scenario_id: "scenario-live",
+      status: "active",
+      runs: [{ id: "run-live", status: "running" }],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (
+          url.pathname === "/v1/signature-scenarios" ||
+          url.pathname === "/v1/signature-scenarios/scenario-live"
+        ) {
+          return Promise.resolve(jsonResponse(projectedScenario));
+        }
+        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v1/realtime/ticket") {
+          return Promise.resolve(jsonResponse({ ticket: "signed-ticket" }));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.scenario?.scenario_id).toBe("scenario-live"));
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+    const socket = fakeSocketInstances[0];
+    act(() => socket.open());
+
+    projectedScenario = {
+      ...projectedScenario,
+      status: "completed",
+      completed_at: "2026-07-17T12:05:00Z",
+      runs: [{ id: "run-live", status: "completed" }],
+    };
+    act(() => {
+      socket.message(
+        realtimeReference("operation-completed", "70.0", "operation"),
+      );
+    });
+
+    await waitFor(() => expect(result.current.scenario?.status).toBe("completed"));
+    expect(result.current.run?.status).toBe("completed");
+  });
+
+  it("uses reset scenario identity and its durable rewind anchor", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    const resetScenario: SignatureScenario = {
+      ...approvalScenario(),
+      scenario_id: "scenario-reset",
+      namespace: "tenant:reset",
+      rewind_anchor: "2026-07-17T12:00:00.123456Z",
+    };
+    const requested: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        requested.push(url.pathname);
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity()));
+        }
+        if (url.pathname === "/v2/signature-scenarios") {
+          return Promise.resolve(jsonResponse(approvalScenario()));
+        }
+        if (url.pathname === "/v2/demo/poison-rewind/reset" && init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse({
+              scenario_id: "scenario-reset",
+              namespace: "tenant:reset",
+              rewind_anchor: "2026-07-17T12:00:00.123456Z",
+              incident: resetScenario.incident,
+            }),
+          );
+        }
+        if (url.pathname === "/v2/signature-scenarios/scenario-reset") {
+          return Promise.resolve(jsonResponse(resetScenario));
+        }
+        if (url.pathname === "/v2/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v2/namespaces/tenant%3Areset/beliefs") {
+          return Promise.resolve(
+            jsonResponse({ ...currentSnapshot, namespace: "tenant:reset" }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit({ authAdapter: signedInAdapter() }));
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await act(async () => result.current.resetDemo());
+
+    expect(requested).toContain("/v2/signature-scenarios/scenario-reset");
+    expect(result.current.scenario?.scenario_id).toBe("scenario-reset");
+    expect(result.current.rewindAnchor).toBe("2026-07-17T12:00:00.123456Z");
+    expect(new URLSearchParams(window.location.search).get("scenario_id")).toBe(
+      "scenario-reset",
+    );
   });
 });

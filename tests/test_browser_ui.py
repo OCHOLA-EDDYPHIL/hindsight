@@ -22,18 +22,21 @@ requires_browser = pytest.mark.skipif(
 )
 
 
-def test_reset_resubscribes_before_loading_the_fresh_namespace():
+def test_reset_installs_exact_replay_identity_before_loading_fresh_state():
     source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     reset = source.split("const resetDemo = useCallback", 1)[1].split(
         "const poisonDemo = useCallback", 1
     )[0]
 
-    assert "updateNamespace(payload.namespace);" in reset
+    assert "updateNamespace(payload.namespace, false);" in reset
     assert "subscribeSocket(payload.namespace);" in reset
-    assert reset.index("updateNamespace(payload.namespace);") < reset.index(
+    assert "scenarioId: payload.scenario_id" in reset
+    assert 'historyMode: "push"' in reset
+    assert reset.index("updateNamespace(payload.namespace, false);") < reset.index(
         "subscribeSocket(payload.namespace);"
     )
     assert reset.index("subscribeSocket(payload.namespace);") < reset.index("await loadIncidents(")
+    assert reset.index("await loadIncidents(") < reset.index("await loadScenario(")
 
 
 def test_live_events_from_a_previous_namespace_are_ignored():
@@ -51,18 +54,25 @@ def test_live_events_from_a_previous_namespace_are_ignored():
     )
 
 
-def test_explicit_namespace_renders_before_incident_defaults_are_loaded():
+def test_explicit_replay_identity_renders_before_incident_defaults_are_loaded():
     source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     startup = source.split("const retryInitialLoad = useCallback", 1)[1].split(
         "useEffect(() =>", 1
     )[0]
 
-    explicit_namespace = startup.split("} else if (explicitNamespace) {", 1)[1].split(
+    exact_scenario = startup.split(
+        "} else if (hasScenario && location.scenarioId) {", 1
+    )[1].split("} else if (hasNamespace) {", 1)[0]
+    explicit_namespace = startup.split("} else if (hasNamespace) {", 1)[1].split(
         "} else {", 1
     )[0]
-    assert explicit_namespace.index("await loadSnapshot(") < explicit_namespace.index(
-        "await loadIncidents(null, false);"
-    )
+
+    assert "scenarioId: location.scenarioId" in exact_scenario
+    assert "void loadIncidents(null, false);" in exact_scenario
+    assert "namespace: location.namespace" in explicit_namespace
+    assert "void loadIncidents(null, false);" in explicit_namespace
+    assert "await loadSnapshot(location.asOf, location.namespace);" in explicit_namespace
+    assert "explicitNamespace" not in startup
 
 
 def test_operation_polling_uses_deployed_retry_budget_and_preserves_last_status():

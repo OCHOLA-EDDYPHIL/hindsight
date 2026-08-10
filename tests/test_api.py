@@ -696,7 +696,7 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
     )
     monkeypatch.setattr(
         api,
-        "current_database_timestamp",
+        "record_poison_rewind_anchor",
         lambda **kwargs: calls.append(("anchor", kwargs)) or "2026-07-17T12:00:00.123456+00:00",
     )
     monkeypatch.setattr(
@@ -708,22 +708,24 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
     reset = api.demo_reset(api.DemoResetRequest(namespace="demo:hosted"))
     poison = api.demo_poison(api.DemoPoisonRequest(namespace=reset["namespace"]))
 
+    assert reset["scenario_id"] == str(fixture_id)
     assert reset["seed_memory"] == {"id": "seed-1"}
     assert reset["rewind_anchor"] == "2026-07-17T12:00:00.123456+00:00"
     assert poison == {"id": "poison-1"}
     assert calls == [
         ("provider", settings.provider_env),
         (
+            "incident",
+            {"fixture_id": fixture_id, "db_url": settings.database_url},
+        ),
+        (
             "reset",
             {
                 "namespace": "demo:hosted",
                 "session_id": fixture_id,
+                "incident_id": fixture_id,
                 "db_url": settings.database_url,
             },
-        ),
-        (
-            "incident",
-            {"fixture_id": fixture_id, "db_url": settings.database_url},
         ),
         (
             "seed",
@@ -733,7 +735,13 @@ def test_demo_writes_use_runtime_database_and_embedding_provider(monkeypatch):
                 "embedding_provider": provider,
             },
         ),
-        ("anchor", {"db_url": settings.database_url}),
+        (
+            "anchor",
+            {
+                "namespace": "demo:session:hosted",
+                "db_url": settings.database_url,
+            },
+        ),
         ("provider", settings.provider_env),
         (
             "poison",

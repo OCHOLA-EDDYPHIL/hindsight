@@ -13,26 +13,13 @@ def test_browser_demo_reset_isolates_sessions_and_incidents():
     from hindsight.db import database_url
     from hindsight.demo_state import (
         ensure_poison_rewind_incident,
+        record_poison_rewind_anchor,
         reset_poison_rewind_state,
     )
     from hindsight.db import connect
 
     first_fixture = uuid4()
     second_fixture = uuid4()
-    first = reset_poison_rewind_state(
-        namespace=f"browser-reset:{uuid4()}",
-        session_id=first_fixture,
-        db_url=database_url(),
-    )
-    second = reset_poison_rewind_state(
-        namespace=f"browser-reset:{uuid4()}",
-        session_id=second_fixture,
-        db_url=database_url(),
-    )
-    replacement = reset_poison_rewind_state(
-        namespace=first,
-        db_url=database_url(),
-    )
     first_incident = ensure_poison_rewind_incident(
         fixture_id=first_fixture,
         db_url=database_url(),
@@ -41,7 +28,26 @@ def test_browser_demo_reset_isolates_sessions_and_incidents():
         fixture_id=second_fixture,
         db_url=database_url(),
     )
-
+    first = reset_poison_rewind_state(
+        namespace=f"browser-reset:{uuid4()}",
+        session_id=first_fixture,
+        incident_id=first_fixture,
+        db_url=database_url(),
+    )
+    rewind_anchor = record_poison_rewind_anchor(
+        namespace=first,
+        db_url=database_url(),
+    )
+    second = reset_poison_rewind_state(
+        namespace=f"browser-reset:{uuid4()}",
+        session_id=second_fixture,
+        incident_id=second_fixture,
+        db_url=database_url(),
+    )
+    replacement = reset_poison_rewind_state(
+        namespace=first,
+        db_url=database_url(),
+    )
     with connect(database_url()) as conn:
         statuses = dict(
             conn.execute(
@@ -49,8 +55,34 @@ def test_browser_demo_reset_isolates_sessions_and_incidents():
                 (first, second, replacement),
             ).fetchall()
         )
+        replay_identity = conn.execute(
+            """
+                SELECT id, incident_tenant_id, incident_id, rewind_anchor
+                FROM demo_sessions
+                WHERE namespace = %s
+            """,
+            (first,),
+        ).fetchone()
+        session_tenant_id = replay_identity[1]
+        conn.execute("DELETE FROM incidents WHERE id = %s", (second_fixture,))
+        detached_identity = conn.execute(
+            """
+                SELECT tenant_id, incident_tenant_id, incident_id, status
+                FROM demo_sessions
+                WHERE namespace = %s
+            """,
+            (second,),
+        ).fetchone()
+        conn.commit()
 
     assert statuses == {first: "archived", second: "active", replacement: "active"}
+    assert replay_identity == (
+        first_fixture,
+        session_tenant_id,
+        first_fixture,
+        rewind_anchor,
+    )
+    assert detached_identity == (session_tenant_id, None, None, "active")
     assert first_incident["id"] != second_incident["id"]
     assert first_incident["slug"] != second_incident["slug"]
 

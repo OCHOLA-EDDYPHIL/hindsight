@@ -21,16 +21,30 @@ Throttle retries before scaling.`,
     expect(plan.cause).toContain("**Retry fanout**");
     expect(plan.checks).toContain("- Inspect `queue_depth`");
     expect(plan.action).toBe("Throttle retries before scaling.");
+    expect(plan.recordedPlan).toBeNull();
   });
 
-  it("does not mistake emphasis markers for list prefixes in fallback text", () => {
+  it("keeps an unstructured plan recorded without inventing cause, checks, or action", () => {
     const plan = structurePlan({
       id: "run-2",
       status: "completed",
       plan: "**Retry fanout** is high; inspect the queue; throttle retries.",
     });
 
-    expect(plan.cause).toBe("**Retry fanout** is high");
-    expect(plan.checks).toContain("- inspect the queue");
+    expect(plan.recordedPlan).toBe(
+      "**Retry fanout** is high; inspect the queue; throttle retries.",
+    );
+    expect(plan.cause).toBeNull();
+    expect(plan.checks).toBeNull();
+    expect(plan.action).toBeNull();
+  });
+
+  it("returns null evidence fields when no plan was recorded", () => {
+    expect(structurePlan(null)).toEqual({
+      cause: null,
+      checks: null,
+      action: null,
+      recordedPlan: null,
+    });
   });
 });

@@ -38,8 +38,10 @@ export function IdentifierValue({
   quiet?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
+  if (!value) {
+    return <span className="identifier-unavailable">Unavailable</span>;
+  }
   const copy = async () => {
-    if (!value) return;
     await navigator.clipboard.writeText(value);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1200);
@@ -52,9 +54,8 @@ export function IdentifierValue({
         quiet ? "text-muted" : "text-text",
       )}
       onClick={copy}
-      disabled={!value}
-      title={value || `${label} pending`}
-      aria-label={value ? `Copy ${label}: ${value}` : `${label} pending`}
+      title={value}
+      aria-label={`Copy ${label}: ${value}`}
     >
       <span className="truncate">{shortId(value)}</span>
       {copied ? (
@@ -105,48 +106,259 @@ export function ConnectionState({ state }: { state: string }) {
   );
 }
 
-const STAGE_META = [
-  { key: "baseline_memory_id", label: "Baseline", kind: "memory" },
-  { key: "compromised_memory_id", label: "Compromised guidance", kind: "memory" },
-  { key: "influenced_decision_id", label: "Influenced decision", kind: "decision" },
-  { key: "rewind_operation_id", label: "Audited rewind", kind: "operation" },
-  { key: "corrected_decision_id", label: "Corrected decision", kind: "decision" },
-] as const;
+function rejectedRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
+  const stageId = scenario?.stages.influenced_decision_id;
+  return (
+    scenario?.runs.find((item) => stageId && item.decision_id === stageId) ||
+    scenario?.runs.find((item) => item.status === "rejected") ||
+    (activeRun?.status === "rejected" ? activeRun : null)
+  );
+}
 
-export function CausalRail({ scenario }: { scenario: SignatureScenario | null }) {
+function recoveredRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
+  const stageId = scenario?.stages.corrected_decision_id;
+  return (
+    scenario?.runs.find((item) => stageId && item.decision_id === stageId) ||
+    activeRun ||
+    scenario?.runs.at(-1) ||
+    null
+  );
+}
+
+function recommendationText(run?: Run | null) {
+  return (
+    run?.proposed_action?.trim() ||
+    run?.action_trace?.recommendation?.summary?.trim() ||
+    run?.plan?.trim() ||
+    null
+  );
+}
+
+function runApproval(run?: Run | null): boolean | null {
+  if (typeof run?.action_approved === "boolean") return run.action_approved;
+  const approved = run?.action_trace?.approval?.approved;
+  return typeof approved === "boolean" ? approved : null;
+}
+
+function decisionDisposition(
+  run: Run | null | undefined,
+  mode: "rejected" | "recovered",
+  recoveryConfirmed = false,
+) {
+  if (!run) return "Unavailable";
+  const approved = runApproval(run);
+  if (mode === "rejected") {
+    if (approved === false) return "Rejected by operator";
+    if (approved === true) return "Approved; run later rejected";
+    return run.status === "rejected"
+      ? "Run rejected; approval unavailable"
+      : humanStatus(run.status);
+  }
+  if (approved === true && recoveryConfirmed) return "Approved and recovered";
+  if (approved === true) return "Approved by operator";
+  if (approved === false) return "Rejected by operator";
+  return run.status === "completed"
+    ? "Run completed; approval unavailable"
+    : humanStatus(run.status);
+}
+
+function findCitedRead(run: Run | null | undefined, memoryId?: string | null) {
+  if (!memoryId) return null;
+  return run?.trace?.reads?.find((read) => read.memory_id === memoryId) || null;
+}
+
+function findMemory(
+  memoryId: string | null | undefined,
+  scenario: SignatureScenario | null,
+  snapshot: Snapshot | null,
+) {
+  if (!memoryId) return null;
+  return (
+    snapshot?.memories.find((memory) => memory.id === memoryId) ||
+    scenario?.memories.find((memory) => memory.id === memoryId) ||
+    null
+  );
+}
+
+function CausalCard({
+  step,
+  kind,
+  dataStage,
+  title,
+  status,
+  content,
+  identity,
+  identityLabel,
+  details,
+  last = false,
+}: {
+  step: string;
+  kind: string;
+  dataStage: string;
+  title: string;
+  status: string;
+  content?: string | null;
+  identity?: string | null;
+  identityLabel: string;
+  details: Array<{ label: string; value?: string | number | null }>;
+  last?: boolean;
+}) {
+  return (
+    <li className={cn(identity && "resolved")} data-stage={dataStage}>
+      <div className="causal-card-heading">
+        <span>{step} / {kind}</span>
+        <strong>{status}</strong>
+      </div>
+      <h3>{title}</h3>
+      <div className="causal-recorded">
+        <span>Recorded evidence</span>
+        {content ? <SafeMarkdown>{content}</SafeMarkdown> : <p>Unavailable</p>}
+      </div>
+      <dl>
+        {details.map((detail) => (
+          <div key={detail.label}>
+            <dt>{detail.label}</dt>
+            <dd>
+              {detail.value === null || detail.value === undefined || detail.value === ""
+                ? "Unavailable"
+                : detail.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <footer>
+        <span>Recorded identity</span>
+        <IdentifierValue value={identity} label={identityLabel} quiet />
+      </footer>
+      {!last ? <ArrowRight className="stage-arrow" aria-hidden="true" size={18} /> : null}
+    </li>
+  );
+}
+
+export function CausalRail({
+  scenario,
+  snapshot,
+  activeRun,
+}: {
+  scenario: SignatureScenario | null;
+  snapshot: Snapshot | null;
+  activeRun: Run | null;
+}) {
+  const rejected = rejectedRun(scenario, activeRun);
+  const latestRun = recoveredRun(scenario, activeRun);
+  const compromisedId =
+    scenario?.stages.compromised_memory_id || scenario?.stages.poison_memory_id;
+  const compromised = findMemory(compromisedId, scenario, snapshot);
+  const citedRead = findCitedRead(rejected, compromisedId);
+  const operation =
+    scenario?.operation ||
+    snapshot?.operations.find((item) => item.id === scenario?.stages.rewind_operation_id) ||
+    null;
+  const correctedStageId = scenario?.stages.corrected_decision_id;
+  const recovered = correctedStageId
+    ? latestRun
+    : operation?.status === "completed" &&
+        latestRun?.decision_id &&
+        latestRun.decision_id !== scenario?.stages.influenced_decision_id
+      ? latestRun
+      : null;
+  const correctionCounts = operation
+    ? [
+        operation.invalidated_memory_ids
+          ? `${operation.invalidated_memory_ids.length} version${operation.invalidated_memory_ids.length === 1 ? "" : "s"} closed`
+          : null,
+        operation.restored_memory_ids
+          ? `${operation.restored_memory_ids.length} version${operation.restored_memory_ids.length === 1 ? "" : "s"} restored`
+          : null,
+      ].filter(Boolean).join(" · ") || null
+    : null;
   return (
     <section className="causal-rail" aria-labelledby="causalHeading">
       <div className="rail-heading">
         <div>
-          <p className="section-kicker">Causal chain</p>
-          <h2 id="causalHeading">One incident. Every durable identity.</h2>
+          <p className="section-kicker">Before → correction → after</p>
+          <h2 id="causalHeading">
+            The memory read changed the decision. The rewind changed the next run.
+          </h2>
         </div>
         <IdentifierValue value={scenario?.scenario_id} label="scenario identity" quiet />
       </div>
       <ol aria-label="Signature replay chronology">
-        {STAGE_META.map((stage, index) => {
-          const value = scenario?.stages[stage.key];
-          return (
-            <li
-              key={stage.key}
-              data-stage={stage.key}
-              className={cn(value && "resolved")}
-              style={{ "--stage-index": index } as React.CSSProperties}
-            >
-              <span className="stage-index" aria-hidden="true">
-                {String(index + 1).padStart(2, "0")}
-              </span>
-              <span className="stage-copy">
-                <strong>{stage.label}</strong>
-                <span>{stage.kind}</span>
-              </span>
-              <IdentifierValue value={value} label={`${stage.label} identity`} quiet />
-              {index < STAGE_META.length - 1 ? (
-                <ArrowRight className="stage-arrow" aria-hidden="true" size={16} />
-              ) : null}
-            </li>
-          );
-        })}
+        <CausalCard
+          step="01"
+          kind="memory read"
+          dataStage="compromised_memory_id"
+          title="Cited belief"
+          status={
+            citedRead
+              ? compromised?.t_invalid || compromised?.status === "invalidated"
+                ? "Read; now invalidated"
+                : "Read by agent"
+              : compromised
+                ? "Belief recorded; read unavailable"
+                : "Unavailable"
+          }
+          content={compromised?.content || citedRead?.justification}
+          identity={compromisedId}
+          identityLabel="cited belief identity"
+          details={[
+            { label: "Writer", value: citedRead?.writer || compromised?.writer },
+            { label: "Source", value: citedRead?.source_ref || compromised?.source_ref },
+          ]}
+        />
+        <CausalCard
+          step="02"
+          kind="decision"
+          dataStage="influenced_decision_id"
+          title="Rejected recommendation"
+          status={decisionDisposition(rejected, "rejected")}
+          content={recommendationText(rejected)}
+          identity={scenario?.stages.influenced_decision_id || rejected?.decision_id}
+          identityLabel="rejected decision identity"
+          details={[
+            {
+              label: "Provider",
+              value: rejected?.provider || rejected?.action_trace?.selection?.provider,
+            },
+            { label: "Model", value: rejected?.model || rejected?.action_trace?.selection?.model },
+          ]}
+        />
+        <CausalCard
+          step="03"
+          kind="correction"
+          dataStage="rewind_operation_id"
+          title="Audited rewind"
+          status={operation ? humanStatus(operation.status) : "Unavailable"}
+          content={operation?.reason}
+          identity={scenario?.stages.rewind_operation_id || operation?.id}
+          identityLabel="rewind operation identity"
+          details={[
+            { label: "Effect", value: correctionCounts },
+            { label: "Completed", value: operation?.completed_at ? formatTime(operation.completed_at) : null },
+          ]}
+        />
+        <CausalCard
+          step="04"
+          kind="rerun"
+          dataStage="corrected_decision_id"
+          title={
+            scenario?.status === "completed"
+              ? "Recovered recommendation"
+              : "Rerun recommendation"
+          }
+          status={decisionDisposition(recovered, "recovered", scenario?.status === "completed")}
+          content={recommendationText(recovered)}
+          identity={scenario?.stages.corrected_decision_id || recovered?.decision_id}
+          identityLabel="recovered decision identity"
+          details={[
+            {
+              label: "Provider",
+              value: recovered?.provider || recovered?.action_trace?.selection?.provider,
+            },
+            { label: "Model", value: recovered?.model || recovered?.action_trace?.selection?.model },
+          ]}
+          last
+        />
       </ol>
     </section>
   );
@@ -154,28 +366,35 @@ export function CausalRail({ scenario }: { scenario: SignatureScenario | null })
 
 function PlanSections({ run, primary = false }: { run?: Run | null; primary?: boolean }) {
   const plan = structurePlan(run);
+  const approval = run
+    ? decisionDisposition(run, run.status === "rejected" ? "rejected" : "recovered")
+    : "Unavailable";
+  const fields = [
+    { label: "Recorded plan", value: plan.recordedPlan },
+    { label: "Cause", value: plan.cause },
+    { label: "Checks", value: plan.checks },
+    { label: "Action", value: plan.action, id: primary ? "proposedAction" : undefined },
+  ];
   return (
     <div id={primary ? "planText" : undefined} className="plan-sections">
+      {fields.map((field) => (
+        <div key={field.label}>
+          <span className="plan-label">{field.label}</span>
+          {field.value ? (
+            <SafeMarkdown
+              id={field.id}
+              className={field.label === "Action" ? "proposed-action" : undefined}
+            >
+              {field.value}
+            </SafeMarkdown>
+          ) : (
+            <p id={field.id} className="unavailable-value">Unavailable</p>
+          )}
+        </div>
+      ))}
       <div>
-        <span className="plan-label">Cause</span>
-        <SafeMarkdown>{plan.cause}</SafeMarkdown>
-      </div>
-      <div>
-        <span className="plan-label">Checks</span>
-        <SafeMarkdown>{plan.checks}</SafeMarkdown>
-      </div>
-      <div>
-        <span className="plan-label">Action</span>
-        <SafeMarkdown
-          id={primary ? "proposedAction" : undefined}
-          className="proposed-action"
-        >
-          {plan.action}
-        </SafeMarkdown>
-      </div>
-      <div>
-        <span className="plan-label">Safety</span>
-        <p>{plan.safety}</p>
+        <span className="plan-label">Approval outcome</span>
+        <p>{approval}</p>
       </div>
     </div>
   );
@@ -189,6 +408,7 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
   const selection = actionTrace?.selection;
   const latestToolCall = actionTrace?.tool_calls?.at(-1);
   const latestObservation = actionTrace?.observations?.at(-1);
+  const readsAvailable = Array.isArray(run?.trace?.reads);
   const reads = run?.trace?.reads || [];
   return (
     <article className={cn("outcome", historical ? "outcome-historical" : "outcome-current")}>
@@ -197,7 +417,15 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
           <Badge tone={historical ? "historical" : "current"}>
             {historical ? "Historical outcome" : "Current outcome"}
           </Badge>
-          <h3>{historical ? "Rejected recommendation" : "Corrected recommendation"}</h3>
+          <h3>
+            {run
+              ? historical
+                ? "Rejected recommendation"
+                : run.status === "completed"
+                  ? "Recovered recommendation"
+                  : "Current recommendation"
+              : "Recommendation unavailable"}
+          </h3>
         </div>
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
@@ -210,18 +438,21 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
           <span>Recommendation</span>
           <strong>{humanStatus(execution?.status || "awaiting_approval")}</strong>
           <span>
-            {selection?.provider || "provider pending"} / {selection?.model || "model pending"}
+            {selection?.provider || run?.provider || "Unavailable"} /{" "}
+            {selection?.model || run?.model || "Unavailable"}
           </span>
         </div>
       ) : null}
       {latestToolCall || latestObservation ? (
         <div className="action-observation">
           <span>Diagnostic evidence</span>
-          <strong>{latestObservation?.query_key || latestToolCall?.query_key}</strong>
+          <strong>{latestObservation?.query_key || latestToolCall?.query_key || "Unavailable"}</strong>
           <span>
-            {latestObservation?.metric?.namespace || "metric namespace pending"} /{" "}
-            {latestObservation?.metric?.name || "metric pending"} /{" "}
-            {latestObservation?.datapoint_count ?? 0} datapoints
+            {latestObservation?.metric?.namespace || "Unavailable"} /{" "}
+            {latestObservation?.metric?.name || "Unavailable"} /{" "}
+            {typeof latestObservation?.datapoint_count === "number"
+              ? `${latestObservation.datapoint_count} datapoints`
+              : "Unavailable"}
           </span>
         </div>
       ) : null}
@@ -233,19 +464,33 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
             return (
               <div className="decision-citation" key={read.id}>
                 <div>
-                  <strong>{read.writer || "writer unavailable"}</strong>
-                  <span>{read.source_ref || "source unavailable"}</span>
+                  <strong>{read.writer || "Unavailable"}</strong>
+                  <span>{read.source_ref || "Unavailable"}</span>
                 </div>
                 <IdentifierValue value={read.memory_id} label={`${mode} cited memory`} quiet />
-                <p>{read.justification || "No provenance justification recorded."}</p>
+                <p>{read.justification || "Unavailable"}</p>
                 <span>
-                  {dependencyCount} downstream lineage {dependencyCount === 1 ? "edge" : "edges"}
+                  {read.outgoing_lineage_edge_ids
+                    ? `${dependencyCount} downstream lineage ${dependencyCount === 1 ? "edge" : "edges"}`
+                    : "Lineage count unavailable"}
                 </span>
               </div>
             );
           })}
         </div>
-      ) : null}
+      ) : (
+        <div className="empty-inline compact outcome-empty">
+          <Fingerprint aria-hidden="true" size={18} />
+          <div>
+            <strong>{readsAvailable ? "No recorded memory reads" : "Decision reads unavailable"}</strong>
+            <p>
+              {readsAvailable
+                ? "This decision has no cited read in the trace."
+                : "The trace did not include decision-read data."}
+            </p>
+          </div>
+        </div>
+      )}
       <footer>
         <span>decision</span>
         <IdentifierValue value={run?.decision_id} label={`${mode} decision`} />
@@ -262,18 +507,14 @@ export function OutcomeComparison({
   scenario: SignatureScenario | null;
   activeRun: Run | null;
 }) {
-  const rejected = scenario?.runs.find((item) => item.status === "rejected") ||
-    (activeRun?.status === "rejected" ? activeRun : null);
-  const corrected = [...(scenario?.runs || [])]
-    .reverse()
-    .find((item) => item.status === "completed") ||
-    (activeRun?.status !== "rejected" ? activeRun : null);
+  const rejected = rejectedRun(scenario, activeRun);
+  const corrected = recoveredRun(scenario, activeRun);
   return (
     <section className="comparison" aria-labelledby="comparisonHeading">
       <div className="comparison-heading">
         <div>
-          <p className="section-kicker">Decision delta</p>
-          <h2 id="comparisonHeading">The memory changed. The plan changed.</h2>
+          <p className="section-kicker">Recorded decision delta</p>
+          <h2 id="comparisonHeading">Compare the rejected run with the recovered run.</h2>
         </div>
         <div className="delta-key" aria-label="Outcome chronology">
           <ClockCounterClockwise aria-hidden="true" size={16} />
@@ -298,18 +539,18 @@ function MemoryRow({ memory }: { memory: MemoryRecord }) {
     <article
       className={cn("memory", invalid && "invalidated")}
       data-memory-id={memory.id}
-      title={memory.content || `Memory ${memory.id}`}
+      title={memory.content || "Unavailable"}
     >
       <span className="memory-state" aria-hidden="true" />
       <span className="memory-body">
         <strong className="memory-content">
-          {memory.content || `${memory.content_schema || "governed memory"} / ${shortId(memory.id)}`}
+          {memory.content || "Unavailable"}
         </strong>
         <span className="memory-meta">
           <span className="memory-status">
             {invalid ? "invalidated" : review ? "review required" : "current"}
           </span>
-          <span>{memory.writer || "writer unavailable"}</span>
+          <span>{memory.writer || "Unavailable"}</span>
           <span>{formatTime(memory.written_at || memory.t_valid)}</span>
         </span>
       </span>
@@ -332,7 +573,7 @@ export function BeliefLedger({ snapshot }: { snapshot: Snapshot | null }) {
           <h2 id="beliefTitle">{snapshot?.as_of ? "Beliefs As Of" : "Current Beliefs"}</h2>
         </div>
         <span id="memoryCount" className="metric">
-          {current.length} live · {invalid} invalid
+          {snapshot ? `${current.length} live · ${invalid} invalid` : "Unavailable"}
         </span>
       </header>
       <div id="memories" className="memory-list" aria-live="polite">
@@ -342,8 +583,12 @@ export function BeliefLedger({ snapshot }: { snapshot: Snapshot | null }) {
           <div className="empty-inline">
             <Fingerprint aria-hidden="true" size={22} />
             <div>
-              <strong>No beliefs in this state</strong>
-              <p>A signature replay will populate durable versions and provenance here.</p>
+              <strong>{snapshot ? "No beliefs in this state" : "Belief state unavailable"}</strong>
+              <p>
+                {snapshot
+                  ? "No durable belief versions were returned for this state."
+                  : "The replay did not include a belief snapshot."}
+              </p>
             </div>
           </div>
         )}
@@ -352,7 +597,63 @@ export function BeliefLedger({ snapshot }: { snapshot: Snapshot | null }) {
   );
 }
 
-export function InfluenceLedger({ influence }: { influence: InfluenceItem[] }) {
+export function InfluenceLedger({
+  influence,
+  state = "ready",
+  error = "",
+}: {
+  influence: InfluenceItem[];
+  state?: "loading" | "ready" | "empty" | "error";
+  error?: string;
+}) {
+  const body = state === "loading" ? (
+    <div className="empty-inline compact" role="status" aria-live="polite">
+      <Pulse aria-hidden="true" size={20} />
+      <div>
+        <strong>Loading decision evidence</strong>
+        <p>Resolving the recorded reads for this decision.</p>
+      </div>
+    </div>
+  ) : state === "error" ? (
+    <div className="empty-inline compact inline-error" role="alert">
+      <Warning aria-hidden="true" size={20} />
+      <div>
+        <strong>Decision evidence unavailable</strong>
+        <p>{error || "Unavailable"}</p>
+      </div>
+    </div>
+  ) : influence.length ? (
+    influence.map((item, index) => {
+      const memory = item.memory;
+      const rank = item.read?.rank;
+      return (
+        <article key={item.read?.id || memory?.id || `influence-${index}`}>
+          <div
+            className="influence-rank"
+            aria-label={typeof rank === "number" ? `Rank ${rank}` : "Rank unavailable"}
+          >
+            {typeof rank === "number" ? String(rank).padStart(2, "0") : "Unavailable"}
+          </div>
+          <div>
+            <strong>{memory?.content || "Unavailable"}</strong>
+            <p>
+              {item.provenance?.writer || memory?.writer || "Unavailable"} / rank{" "}
+              {typeof rank === "number" ? rank : "Unavailable"}
+            </p>
+          </div>
+          <IdentifierValue value={memory?.id} label="memory identity" quiet />
+        </article>
+      );
+    })
+  ) : (
+    <div className="empty-inline compact">
+      <Flask aria-hidden="true" size={20} />
+      <div>
+        <strong>No recorded reads</strong>
+        <p>This decision did not return a cited memory read.</p>
+      </div>
+    </div>
+  );
   return (
     <section className="influence-pane" aria-labelledby="influenceTitle">
       <header className="pane-heading">
@@ -361,37 +662,12 @@ export function InfluenceLedger({ influence }: { influence: InfluenceItem[] }) {
           <h2 id="influenceTitle">Cited memory reads</h2>
         </div>
         <span id="influenceCount" className="metric">
-          {influence.length} read{influence.length === 1 ? "" : "s"}
+          {state === "ready" || state === "empty"
+            ? `${influence.length} read${influence.length === 1 ? "" : "s"}`
+            : "Unavailable"}
         </span>
       </header>
-      <div id="influenceList" className="influence-list">
-        {influence.length ? (
-          influence.map((item, index) => {
-            const memory = item.memory;
-            return (
-              <article key={item.read?.id || memory?.id || index}>
-                <div className="influence-rank">{String(index + 1).padStart(2, "0")}</div>
-                <div>
-                  <strong>{memory?.content || "Memory content unavailable"}</strong>
-                  <p>
-                    {item.provenance?.writer || memory?.writer || "writer unavailable"} / rank{" "}
-                    {item.read?.rank ?? index + 1}
-                  </p>
-                </div>
-                <IdentifierValue value={memory?.id} label="memory identity" quiet />
-              </article>
-            );
-          })
-        ) : (
-          <div className="empty-inline compact">
-            <Flask aria-hidden="true" size={20} />
-            <div>
-              <strong>No reads selected</strong>
-              <p>Select or run a decision to inspect its cited memory.</p>
-            </div>
-          </div>
-        )}
-      </div>
+      <div id="influenceList" className="influence-list">{body}</div>
     </section>
   );
 }
@@ -425,7 +701,11 @@ export function Timeline({
         <div>
           <label htmlFor="timeline">Belief state</label>
           <output id="timeLabel" htmlFor="timeline">
-            {snapshot?.as_of ? `As of ${formatTime(snapshot.as_of)}` : "Live belief state"}
+            {snapshot
+              ? snapshot.as_of
+                ? `As of ${formatTime(snapshot.as_of)}`
+                : "Live belief state"
+              : "Unavailable"}
           </output>
         </div>
       </div>
@@ -452,6 +732,15 @@ function OperationRow({ operation }: { operation: MemoryOperation }) {
   const reviewCount = (operation.effects || []).filter(
     (effect) => effect.effect_type === "review_required",
   ).length;
+  const effectSummary = [
+    operation.invalidated_memory_ids
+      ? `closed ${operation.invalidated_memory_ids.length}`
+      : null,
+    operation.restored_memory_ids
+      ? `restored ${operation.restored_memory_ids.length}`
+      : null,
+    operation.effects && reviewCount ? `review ${reviewCount}` : null,
+  ].filter(Boolean).join(" / ");
   return (
     <article
       className={cn("operation", `operation-${operation.status}`)}
@@ -465,12 +754,8 @@ function OperationRow({ operation }: { operation: MemoryOperation }) {
         </strong>
         <span>{formatTime(operation.completed_at || operation.created_at)}</span>
       </div>
-      <p>{operation.reason || "No operation reason recorded."}</p>
-      <span>
-        closed {(operation.invalidated_memory_ids || []).length} / restored{" "}
-        {(operation.restored_memory_ids || []).length}
-        {reviewCount ? ` / review ${reviewCount}` : ""}
-      </span>
+      <p>{operation.reason || "Unavailable"}</p>
+      <span>{effectSummary || "Effect counts unavailable"}</span>
       {operation.failure_detail ? <p className="operation-failure">{operation.failure_detail}</p> : null}
     </article>
   );
@@ -507,41 +792,110 @@ export function OperationLedger({ operations }: { operations: MemoryOperation[] 
   );
 }
 
+function uniqueValues(values: Array<string | null | undefined>) {
+  return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))];
+}
+
+function reasoningModels(runs: Run[]) {
+  return uniqueValues(
+    runs.map((item) => {
+      const provider = item.provider || item.action_trace?.selection?.provider;
+      const model = item.model || item.action_trace?.selection?.model;
+      return provider || model ? `${provider || "Unavailable"} / ${model || "Unavailable"}` : null;
+    }),
+  );
+}
+
+function embeddingProfiles(runs: Run[]) {
+  const profiles: string[] = [];
+  for (const item of runs) {
+    const retrievals = item.trace?.retrievals || [];
+    for (const read of item.trace?.reads || []) {
+      const retrieval = retrievals.find((candidate) => candidate.id === read.retrieval_id);
+      const profileId = read.embedding_profile_id || retrieval?.embedding_profile_id;
+      const provider = retrieval?.embedding_provider;
+      const model = retrieval?.embedding_model;
+      if (!profileId && !provider && !model) continue;
+      const modelLabel = provider || model
+        ? `${provider || "Unavailable"} / ${model || "Unavailable"}`
+        : null;
+      profiles.push([modelLabel, profileId].filter(Boolean).join(" · "));
+    }
+  }
+  return uniqueValues(profiles);
+}
+
+function FactValues({ values }: { values: string[] }) {
+  if (!values.length) return <>Unavailable</>;
+  return (
+    <span className="fact-values">
+      {values.map((value) => (
+        <span key={value} title={value}>{value}</span>
+      ))}
+    </span>
+  );
+}
+
 export function StoryHeader({
   incident,
   namespace,
   run,
+  scenario,
 }: {
   incident: Incident | null;
   namespace: string;
   run: Run | null;
+  scenario: SignatureScenario | null;
 }) {
+  const runs = [...(scenario?.runs || []), ...(run ? [run] : [])].filter(
+    (item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index,
+  );
+  const recovered = recoveredRun(scenario, run);
+  const recordedIncident = scenario?.incident || incident;
+  const service = run?.service_slug || recovered?.service_slug || recordedIncident?.service_slug;
+  const models = reasoningModels(runs);
+  const profiles = embeddingProfiles(runs);
   return (
     <section className="story-header" aria-labelledby="incidentHeading">
       <div className="story-copy">
-        <p className="section-kicker">Guided signature replay</p>
-        <h1 id="incidentHeading">{incident?.title || "Governed memory, inspected end to end"}</h1>
+        <p className="section-kicker">Causal incident replay</p>
+        <h1 id="incidentHeading">{recordedIncident?.title || "Incident unavailable"}</h1>
         <p id="incidentSummary">
-          {incident?.summary ||
-            "Follow compromised guidance through decision influence, rewind, and a corrected outcome."}
+          {recordedIncident?.summary || "Unavailable"}
         </p>
       </div>
       <dl className="story-facts">
         <div>
           <dt>Severity</dt>
-          <dd id="incidentSeverity">{incident?.severity || "not recorded"}</dd>
+          <dd id="incidentSeverity">{recordedIncident?.severity || "Unavailable"}</dd>
         </div>
         <div>
           <dt>Service</dt>
-          <dd id="incidentService">{incident?.service_slug || "not recorded"}</dd>
+          <dd id="incidentService">{service || "Unavailable"}</dd>
+        </div>
+        <div>
+          <dt>Replay status</dt>
+          <dd>{humanStatus(scenario?.status)}</dd>
+        </div>
+        <div>
+          <dt>Current run</dt>
+          <dd id="runStatus">{humanStatus(run?.status)}</dd>
+        </div>
+        <div className="fact-models">
+          <dt>Reasoning provider / model</dt>
+          <dd>
+            <FactValues values={models} />
+          </dd>
+        </div>
+        <div className="fact-models">
+          <dt>Embedding profiles tied to reads</dt>
+          <dd>
+            <FactValues values={profiles} />
+          </dd>
         </div>
         <div className="fact-wide">
           <dt>Namespace</dt>
           <dd id="namespace" title={namespace}>{namespace}</dd>
-        </div>
-        <div>
-          <dt>Run</dt>
-          <dd id="runStatus">{run ? humanStatus(run.status) : "No run"}</dd>
         </div>
       </dl>
     </section>
@@ -555,7 +909,7 @@ export function LoadingSurface() {
       <div className="skeleton-line wide" />
       <div className="skeleton-line" />
       <div className="skeleton-grid">
-        {Array.from({ length: 5 }, (_, index) => (
+        {Array.from({ length: 4 }, (_, index) => (
           <div className="skeleton-cell" key={index} />
         ))}
       </div>
@@ -572,10 +926,9 @@ export function EmptySurface({ onSignIn }: { onSignIn: () => void }) {
     <section className="state-surface" aria-labelledby="emptyHeading">
       <Fingerprint aria-hidden="true" size={32} />
       <p className="section-kicker">Replay unavailable</p>
-      <h1 id="emptyHeading">No completed signature story is ready yet.</h1>
+      <h1 id="emptyHeading">No incident replay is available.</h1>
       <p>
-        Public replay begins only after a rejected decision, audited rewind, and corrected decision form
-        one coherent trace.
+        Sign in to create a scenario, or return when a recorded incident trace is available.
       </p>
       <Button type="button" variant="primary" onClick={onSignIn}>
         <SignIn aria-hidden="true" size={16} weight="bold" />
@@ -591,7 +944,7 @@ export function ErrorSurface({ message, onRetry }: { message: string; onRetry: (
       <Warning aria-hidden="true" size={32} />
       <p className="section-kicker">Trace interrupted</p>
       <h1 id="errorHeading">The replay could not be resolved.</h1>
-      <p>{message}</p>
+      <p>{message || "Unavailable"}</p>
       <Button type="button" variant="quiet" onClick={onRetry}>
         <ArrowClockwise aria-hidden="true" size={16} />
         Retry trace

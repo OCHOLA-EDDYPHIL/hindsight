@@ -9,6 +9,7 @@ import {
   LoadingSurface,
   OperationLedger,
   OutcomeComparison,
+  StoryHeader,
   Timeline,
 } from "@/components/cockpit";
 import type { SignatureScenario, Snapshot } from "@/types";
@@ -17,23 +18,40 @@ const scenario: SignatureScenario = {
   scenario_id: "49109a44-43e7-40de-b547-b4f9d0a387a2",
   namespace: "demo:payments-poison-rewind:session:49109a44",
   status: "completed",
+  session_status: "active",
+  rewind_anchor: "2026-07-17T10:30:00Z",
+  completed_at: "2026-07-17T11:30:00Z",
   incident: {
     slug: "demo-payments-checkout-latency:49109a44",
     title: "Checkout latency under retry amplification",
     summary: "A payment processor timeout multiplied checkout retries.",
+    severity: "SEV-1",
+    service_slug: "payments-api",
   },
   runs: [
     {
       id: "run-rejected",
       status: "rejected",
+      service_slug: "payments-api",
       decision_id: "decision-rejected",
+      action_approved: false,
       plan: "Scale payment workers while downstream retry fanout remains elevated.",
       proposed_action: "Scale payment workers while retry fanout remains elevated.",
       trace: {
+        retrievals: [
+          {
+            id: "retrieval-rejected",
+            embedding_profile_id: "profile-gemini-001",
+            embedding_provider: "gemini",
+            embedding_model: "text-embedding-004",
+          },
+        ],
         reads: [
           {
             id: "read-compromised",
             memory_id: "memory-compromised",
+            retrieval_id: "retrieval-rejected",
+            embedding_profile_id: "profile-gemini-001",
             writer: "demo.fixture-import",
             source_ref: "demo:stale-runbook-import",
             justification: "Previously approved retry guidance is stale for this incident.",
@@ -79,14 +97,26 @@ const scenario: SignatureScenario = {
     {
       id: "run-corrected",
       status: "completed",
+      service_slug: "payments-api",
       decision_id: "decision-corrected",
+      action_approved: true,
       plan: "Retry fanout amplified processor timeouts; inspect queue depth; throttle retry workers.",
       proposed_action: "Throttle retry fanout while processor health recovers.",
       trace: {
+        retrievals: [
+          {
+            id: "retrieval-corrected",
+            embedding_profile_id: "profile-gemini-002",
+            embedding_provider: "gemini",
+            embedding_model: "text-embedding-004",
+          },
+        ],
         reads: [
           {
             id: "read-baseline",
             memory_id: "memory-baseline",
+            retrieval_id: "retrieval-corrected",
+            embedding_profile_id: "profile-gemini-002",
             writer: "demo.seed",
             source_ref: "demo:known-good-payment-incident",
             justification: "Resolved incident evidence supports throttling retries.",
@@ -182,17 +212,85 @@ const snapshot: Snapshot = {
 };
 
 describe("guided replay cockpit", () => {
-  it("renders the five durable causal identities in chronology", () => {
-    render(<CausalRail scenario={scenario} />);
+  it("renders the four recorded causal nodes before any raw identity", () => {
+    render(<CausalRail scenario={scenario} snapshot={snapshot} activeRun={null} />);
 
     const rail = screen.getByRole("list", { name: "Signature replay chronology" });
-    expect(within(rail).getAllByRole("listitem")).toHaveLength(5);
-    expect(within(rail).getByText("Baseline")).toBeVisible();
-    expect(within(rail).getByText("Corrected decision")).toBeVisible();
-    expect(screen.getByLabelText(/Copy Influenced decision identity/)).toHaveAttribute(
+    expect(within(rail).getAllByRole("listitem")).toHaveLength(4);
+    expect(within(rail).getByText("Cited belief")).toBeVisible();
+    expect(within(rail).getByText("Rejected recommendation")).toBeVisible();
+    expect(within(rail).getByText("Audited rewind")).toBeVisible();
+    expect(within(rail).getByText("Recovered recommendation")).toBeVisible();
+    expect(within(rail).getByText(/Stale guidance recommends scaling workers/)).toBeVisible();
+    expect(screen.getByLabelText(/Copy rejected decision identity/)).toHaveAttribute(
       "title",
       "decision-rejected",
     );
+  });
+
+  it("uses the newest active run instead of resurrecting an older completed result", () => {
+    const activeRun = {
+      id: "run-latest-active",
+      status: "awaiting_approval",
+      decision_id: "decision-latest-active",
+      proposed_action: "Inspect the latest processor state before approving a change.",
+    };
+    render(
+      <CausalRail
+        scenario={{
+          ...scenario,
+          status: "active",
+          completed_at: null,
+          stages: { ...scenario.stages, corrected_decision_id: null },
+        }}
+        snapshot={snapshot}
+        activeRun={activeRun}
+      />,
+    );
+
+    expect(screen.getByText("Rerun recommendation")).toBeVisible();
+    expect(screen.getByText(/Inspect the latest processor state/)).toBeVisible();
+  });
+
+  it("does not present a pre-rewind active run as the rerun", () => {
+    render(
+      <CausalRail
+        scenario={{
+          ...scenario,
+          status: "active",
+          completed_at: null,
+          runs: [],
+          operation: null,
+          stages: {
+            baseline_memory_id: "memory-baseline",
+            compromised_memory_id: "memory-compromised",
+          },
+        }}
+        snapshot={{ ...snapshot, operations: [] }}
+        activeRun={{
+          id: "run-first-active",
+          status: "awaiting_approval",
+          decision_id: "decision-first-active",
+          proposed_action: "First-run recommendation must not appear in the rerun node.",
+        }}
+      />,
+    );
+
+    expect(screen.queryByText(/First-run recommendation/)).not.toBeInTheDocument();
+  });
+
+  it("uses recorded read justification when belief content is unavailable", () => {
+    const metadataOnlySnapshot = {
+      ...snapshot,
+      memories: snapshot.memories.map((memory) =>
+        memory.id === "memory-compromised" ? { ...memory, content: null } : memory,
+      ),
+    };
+    render(
+      <CausalRail scenario={scenario} snapshot={metadataOnlySnapshot} activeRun={null} />,
+    );
+
+    expect(screen.getByText(/Previously approved retry guidance is stale/)).toBeVisible();
   });
 
   it("keeps historical and current outcomes together in structured plan sections", () => {
@@ -203,7 +301,8 @@ describe("guided replay cockpit", () => {
     expect(screen.getAllByText("Cause")).toHaveLength(2);
     expect(screen.getAllByText("Checks")).toHaveLength(2);
     expect(screen.getAllByText("Action")).toHaveLength(2);
-    expect(screen.getAllByText("Safety")).toHaveLength(2);
+    expect(screen.getAllByText("Approval outcome")).toHaveLength(2);
+    expect(screen.getByText("Rejected by operator")).toBeVisible();
     expect(screen.getByText("not executed")).toBeVisible();
     expect(screen.getByText("recommendation approved")).toBeVisible();
     expect(screen.getAllByText(/gemini \/ gemini-2.5-flash/)).toHaveLength(2);
@@ -320,6 +419,33 @@ describe("guided replay cockpit", () => {
 
     rerender(<BeliefLedger snapshot={historical} />);
     expect(screen.getByRole("heading", { name: "Beliefs As Of" })).toBeVisible();
+  });
+
+  it("shows recorded service, reasoning models, and every embedding profile tied to reads", () => {
+    render(
+      <StoryHeader
+        incident={scenario.incident || null}
+        namespace={scenario.namespace}
+        run={scenario.runs[1]}
+        scenario={scenario}
+      />,
+    );
+
+    expect(screen.getByText("payments-api")).toBeVisible();
+    expect(screen.getAllByText("gemini / gemini-2.5-flash")).not.toHaveLength(0);
+    expect(screen.getByText(/profile-gemini-001/)).toBeVisible();
+    expect(screen.getByText(/profile-gemini-002/)).toBeVisible();
+  });
+
+  it("distinguishes decision-evidence loading, error, and empty states", () => {
+    const { rerender } = render(<InfluenceLedger influence={[]} state="loading" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading decision evidence");
+
+    rerender(<InfluenceLedger influence={[]} state="error" error="trace read failed" />);
+    expect(screen.getByRole("alert")).toHaveTextContent("trace read failed");
+
+    rerender(<InfluenceLedger influence={[]} state="empty" />);
+    expect(screen.getByText("No recorded reads")).toBeVisible();
   });
 
   it("provides explicit loading and retryable failure surfaces", () => {
