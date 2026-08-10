@@ -435,6 +435,7 @@ run "isolated_bootstrap" {
       for action in [
         "cognito-idp:CreateUserPoolClient",
         "cognito-idp:CreateUserPoolDomain",
+        "cognito-idp:GetUserPoolMfaConfig",
         "wafv2:CreateWebACL",
         "wafv2:UpdateWebACL",
         ] : contains(one([
@@ -442,7 +443,7 @@ run "isolated_bootstrap" {
           if statement.sid == "ApplicationLifecycle"
       ]).actions, action)
     ])
-    error_message = "The deployment role must be able to materialize the optional identity and edge-protection resources."
+    error_message = "The deployment role must be able to materialize and refresh the optional identity and edge-protection resources."
   }
 
   assert {

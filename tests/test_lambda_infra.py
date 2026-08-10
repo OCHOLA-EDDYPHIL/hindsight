@@ -333,6 +333,7 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "events:PutTargets" in bootstrap
     assert "lambda:PutFunctionConcurrency" in bootstrap
     assert "lambda:DeleteFunctionConcurrency" in bootstrap
+    assert '"cognito-idp:GetUserPoolMfaConfig"' in bootstrap
     version_refresh = bootstrap.split('sid       = "LambdaVersionRefresh"', 1)[1].split(
         "\n  statement {", 1
     )[0]

@@ -753,6 +753,7 @@ data "aws_iam_policy_document" "github_deploy" {
       "cognito-idp:DescribeUserPoolClient",
       "cognito-idp:DescribeUserPoolDomain",
       "cognito-idp:GetGroup",
+      "cognito-idp:GetUserPoolMfaConfig",
       "cognito-idp:ListTagsForResource",
       "cognito-idp:ListUserPoolClients",
       "cognito-idp:ListUserPools",
