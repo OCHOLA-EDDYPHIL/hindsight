@@ -133,16 +133,30 @@ def test_diagnostic_action_is_selected_only_by_structured_model_output():
 
 
 def test_model_selected_retraction_preview_is_capped_at_ten_causal_effects():
-    from hindsight.agent import AgentDecisionError, _bounded_retraction_effect_count
+    from hindsight.agent import AgentDecisionError, _bounded_retraction_effects
 
-    assert _bounded_retraction_effect_count(
-        {"effect_payload": {"close_memory_ids": [f"memory-{index}" for index in range(10)]}}
-    ) == 10
-    with pytest.raises(AgentDecisionError, match="between one and ten"):
-        _bounded_retraction_effect_count(
+    effects = _bounded_retraction_effects(
+        {
+            "effect_payload": {
+                "close_memory_ids": [f"memory-{index}" for index in range(9)],
+                "review_resolutions": [
+                    {
+                        "id": "review-1",
+                        "semantic_memory_id": "memory-0",
+                        "status": "superseded",
+                    }
+                ],
+            }
+        }
+    )
+    assert effects["mutation_count"] == 10
+    assert effects["review_resolutions"][0]["id"] == "review-1"
+    with pytest.raises(AgentDecisionError, match="between one and ten mutations"):
+        _bounded_retraction_effects(
             {
                 "effect_payload": {
-                    "close_memory_ids": [f"memory-{index}" for index in range(11)]
+                    "close_memory_ids": [f"memory-{index}" for index in range(10)],
+                    "review_resolutions": [{"id": "review-1"}],
                 }
             }
         )
@@ -302,6 +316,143 @@ def test_reflection_marks_only_cited_recalled_memories_as_causal(monkeypatch):
     assert captured["structured_payload"]["cited_memory_ids"] == ["memory-cited"]
 
 
+def test_reused_thread_resets_all_per_run_checkpoint_state(monkeypatch):
+    import hindsight.agent as agent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        SequencedReasoningProvider,
+        recommendation_decision,
+        retraction_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    class FakeMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def remember_agent_reflection(self, **_kwargs):
+            return {"id": "reflection-old", "belief_id": "belief-old"}
+
+    current_memory = {
+        "id": "memory-current",
+        "namespace": "namespace-reused",
+        "belief_id": "belief-current",
+        "version_number": 1,
+        "content": "Increase retry fanout while the processor remains saturated.",
+        "trust_status": "active",
+    }
+
+    def fake_recall(state, **_kwargs):
+        return {
+            "recalled_memories": [current_memory] if state["run_id"] == "run-new" else [],
+            "retrieval_id": f"retrieval:{state['run_id']}",
+            "selection_namespace_revision": 2,
+        }
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(agent, "_recall_for_state", fake_recall)
+    monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
+    monkeypatch.setattr(
+        agent,
+        "preview_retraction",
+        lambda **_kwargs: {
+            "id": "preview-new",
+            "fingerprint": "f" * 64,
+            "expires_at": "2026-08-10T23:15:00Z",
+            "effect_payload": {
+                "close_memory_ids": ["memory-current"],
+                "review_resolutions": [],
+            },
+        },
+    )
+    reasoning = SequencedReasoningProvider(
+        [
+            recommendation_decision("Retain the first run only as an audit record."),
+            retraction_decision(
+                memory_id="memory-current",
+                quote="Increase retry fanout while the processor remains saturated.",
+            ),
+        ]
+    )
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ).compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-reused"}}
+    old = agent._new_incident_state(
+        agent.IncidentInput(
+            user_input="first report",
+            incident_id="incident-old",
+            namespace="namespace-reused",
+        ),
+        thread_id="thread-reused",
+        run_id="run-old",
+        decision_id="decision-old",
+        pause_before_act=False,
+        model_call_count=0,
+        diagnostic_call_count=0,
+    )
+    old.update(
+        {
+            "approval_namespace_revision": 99,
+            "stale_replan_count": 1,
+            "operation_result": {"id": "operation-old"},
+            "action_preview": {"id": "preview-old"},
+            "approval_actor": "actor-old",
+            "tool_calls": [{"id": "tool-old"}],
+            "observations": [{"id": "observation-old"}],
+        }
+    )
+    first = graph.invoke(old, config)
+    assert first["reflected_memory"]["id"] == "reflection-old"
+    assert first["operation_result"]["id"] == "operation-old"
+
+    new = agent._new_incident_state(
+        agent.IncidentInput(
+            user_input="second report",
+            incident_id="incident-new",
+            namespace="namespace-reused",
+        ),
+        thread_id="thread-reused",
+        run_id="run-new",
+        decision_id="decision-new",
+        pause_before_act=False,
+        model_call_count=0,
+        diagnostic_call_count=0,
+    )
+    assert set(new) == set(agent.IncidentAgentState.__annotations__)
+    second = graph.invoke(new, config)
+
+    assert second["run_id"] == "run-new"
+    assert second["recommendation_id"] == ""
+    assert second["reflected_memory"] == {}
+    assert second["operation_result"] == {}
+    assert second["stale_replan_count"] == 0
+    assert second["approval_namespace_revision"] == 0
+    assert second["tool_calls"] == []
+    assert second["observations"] == []
+    assert second["approval_actor"] == "agent:no_operator"
+    assert second["action_preview"]["id"] == "preview-new"
+    assert second["action_trace"]["mode"] == "governed_memory_remediation"
+    assert second["action_approved"] is False
+
+
 def test_graph_records_cloudwatch_result_then_replans_to_recommendation(monkeypatch):
     import hindsight.agent as agent
     from tests.fakes import (
@@ -458,7 +609,16 @@ def test_approved_model_selected_retraction_executes_governed_operation(monkeypa
             "id": "preview-action",
             "fingerprint": "f" * 64,
             "expires_at": "2026-08-10T23:15:00Z",
-            "effect_payload": {"close_memory_ids": ["memory-unsafe"]},
+            "effect_payload": {
+                "close_memory_ids": ["memory-unsafe"],
+                "review_resolutions": [
+                    {
+                        "id": "review-unsafe",
+                        "semantic_memory_id": "memory-unsafe",
+                        "status": "superseded",
+                    }
+                ],
+            },
         },
     )
 
@@ -552,7 +712,17 @@ def test_approved_model_selected_retraction_executes_governed_operation(monkeypa
     assert trace["schema_version"] == 3
     assert trace["mode"] == "governed_memory_remediation"
     assert trace["approval"]["actor"] == "product:operator:test"
-    assert trace["preview"]["effect_count"] == 1
+    assert trace["preview"]["effect_count"] == 2
+    assert trace["preview"]["effects"] == {
+        "close_memory_ids": ["memory-unsafe"],
+        "review_resolutions": [
+            {
+                "id": "review-unsafe",
+                "semantic_memory_id": "memory-unsafe",
+                "status": "superseded",
+            }
+        ],
+    }
     assert trace["execution"]["status"] == "completed"
     assert trace["execution"]["events"][0]["status"] == "completed"
     assert trace["execution"]["events"][0]["id"] == str(event_id)

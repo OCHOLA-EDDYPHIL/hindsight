@@ -1071,6 +1071,24 @@ def finish_run_attempt(
                     summary=summary,
                     metadata=metadata,
                 )
+                if status in TERMINAL_RUN_STATUSES:
+                    cur.execute(
+                        """
+                            UPDATE memory_decisions
+                            SET status = 'sealed', sealed_at = COALESCE(sealed_at, now())
+                            WHERE id = %s AND status = 'open'
+                        """,
+                        (row["decision_id"],),
+                    )
+                    cur.execute(
+                        "SELECT status FROM memory_decisions WHERE id = %s",
+                        (row["decision_id"],),
+                    )
+                    decision = cur.fetchone()
+                    if decision is None or decision["status"] != "sealed":
+                        raise RunConflictError(
+                            f"terminal run decision was not sealed: {row['decision_id']}"
+                        )
                 return _jsonable(dict(row))
 
 

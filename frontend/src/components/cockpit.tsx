@@ -456,9 +456,19 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
           <strong>{humanStatus(execution?.status || "awaiting_approval")}</strong>
           <span>{remediationAction.target_excerpt || "Target excerpt unavailable"}</span>
           <span>
-            {`${remediationPreview?.effect_count ?? 0} causal effect${remediationPreview?.effect_count === 1 ? "" : "s"} · expires ${formatTime(remediationPreview?.expires_at)}`}
+            {`${remediationPreview?.effect_count ?? 0} bounded mutation${remediationPreview?.effect_count === 1 ? "" : "s"} · expires ${formatTime(remediationPreview?.expires_at)}`}
           </span>
           <span>{`Preview ${remediationPreview?.fingerprint || "unavailable"}`}</span>
+          <ul aria-label="Approval-bound retraction effects">
+            {(remediationPreview?.effects?.close_memory_ids || []).map((memoryId) => (
+              <li key={`close:${memoryId}`}>{`Close memory ${memoryId}`}</li>
+            ))}
+            {(remediationPreview?.effects?.review_resolutions || []).map((resolution) => (
+              <li key={`review:${resolution.id || resolution.semantic_memory_id}`}>
+                {`Resolve review ${resolution.id || "unavailable"} for memory ${resolution.semantic_memory_id || "unavailable"} as ${resolution.status || "unavailable"}`}
+              </li>
+            ))}
+          </ul>
           {execution?.operation_id ? (
             <span>{`Operation ${execution.operation_id}: ${humanStatus(execution.operation_status)}`}</span>
           ) : null}

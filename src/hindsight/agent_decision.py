@@ -8,13 +8,14 @@ from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 AGENT_DECISION_SCHEMA_VERSION = 2
 MAX_MODEL_TURNS = 4
 MAX_DIAGNOSTIC_CALLS = 3
 CLOUDWATCH_DIAGNOSTIC_TOOL = "aws_cloudwatch_diagnostics"
+MIN_CITATION_QUOTE_LENGTH = 12
 
 
 class AgentDecisionError(RuntimeError):
@@ -28,10 +29,17 @@ class MemoryCitation(BaseModel):
 
     memory_id: str = Field(min_length=1, max_length=200)
     quote: str = Field(
-        min_length=1,
+        min_length=MIN_CITATION_QUOTE_LENGTH,
         max_length=2_000,
-        description="A verbatim excerpt from the recalled memory version.",
+        description="A meaningful verbatim excerpt from the recalled memory version.",
     )
+
+    @field_validator("quote")
+    @classmethod
+    def validate_meaningful_quote(cls, value: str) -> str:
+        if len(" ".join(value.split())) < MIN_CITATION_QUOTE_LENGTH:
+            raise ValueError("citation quote is too short after whitespace normalization")
+        return value
 
 
 class DiagnosticToolCall(BaseModel):
@@ -174,9 +182,7 @@ def agent_decision_provider_schema(
         and diagnostic_calls_used < MAX_DIAGNOSTIC_CALLS
         and model_turn < MAX_MODEL_TURNS
     )
-    action_available = bool(recalled_ids) and (
-        not query_keys or diagnostic_observation_available
-    )
+    action_available = bool(recalled_ids) and (not query_keys or diagnostic_observation_available)
     terminal_branches = [
         {
             "properties": {

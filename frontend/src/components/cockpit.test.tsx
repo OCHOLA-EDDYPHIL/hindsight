@@ -375,7 +375,17 @@ describe("guided replay cockpit", () => {
               id: "preview-1",
               fingerprint: "d".repeat(64),
               expires_at: "2026-08-10T23:15:00Z",
-              effect_count: 1,
+              effect_count: 2,
+              effects: {
+                close_memory_ids: ["memory-unsafe"],
+                review_resolutions: [
+                  {
+                    id: "review-unsafe",
+                    semantic_memory_id: "memory-unsafe",
+                    status: "superseded",
+                  },
+                ],
+              },
             },
             execution: {
               status: "completed",
@@ -390,7 +400,11 @@ describe("guided replay cockpit", () => {
 
     const result = container.querySelector(".action-execution");
     expect(result).toHaveTextContent("Increase retry fanout during saturation.");
-    expect(result).toHaveTextContent("1 causal effect");
+    expect(result).toHaveTextContent("2 bounded mutations");
+    expect(result).toHaveTextContent("Close memory memory-unsafe");
+    expect(result).toHaveTextContent(
+      "Resolve review review-unsafe for memory memory-unsafe as superseded",
+    );
     expect(result).toHaveTextContent("Preview dddddddd");
     expect(result).toHaveTextContent("Operation operation-1: completed");
   });

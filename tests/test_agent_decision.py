@@ -247,7 +247,12 @@ def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
     "payload,match",
     [
         ({**_payload(), "unexpected": True}, "AgentDecisionV2"),
-        (_payload(recalled_memory_citations=[{"memory_id": "other", "quote": "x"}]), "cited"),
+        (
+            _payload(
+                recalled_memory_citations=[{"memory_id": "other", "quote": "Unknown memory quote."}]
+            ),
+            "cited",
+        ),
         (
             _payload(
                 next_step_kind="diagnostic_tool",
@@ -319,6 +324,36 @@ def test_configured_diagnostics_require_one_current_observation_before_recommend
 
 
 def test_memory_citation_must_quote_the_recalled_version():
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            json.dumps(
+                _payload(
+                    recalled_memory_citations=[{"memory_id": "memory-1", "quote": "processor"}]
+                )
+            ),
+            recalled_memory_ids={"memory-1"},
+            recalled_memory_text={"memory-1": "Inspect processor saturation first."},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            json.dumps(
+                _payload(
+                    recalled_memory_citations=[{"memory_id": "memory-1", "quote": "a     b     c"}]
+                )
+            ),
+            recalled_memory_ids={"memory-1"},
+            recalled_memory_text={"memory-1": "Inspect processor saturation first."},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
     with pytest.raises(AgentDecisionError, match="not a quote"):
         parse_agent_decision(
             json.dumps(_payload()),

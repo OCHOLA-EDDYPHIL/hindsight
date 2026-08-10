@@ -76,7 +76,17 @@ function remediationApprovalScenario(): SignatureScenario {
           preview: {
             id: "preview-1",
             fingerprint: "d".repeat(64),
-            effect_count: 1,
+            effect_count: 2,
+            effects: {
+              close_memory_ids: ["memory-unsafe"],
+              review_resolutions: [
+                {
+                  id: "review-unsafe",
+                  semantic_memory_id: "memory-unsafe",
+                  status: "superseded",
+                },
+              ],
+            },
           },
         },
       },

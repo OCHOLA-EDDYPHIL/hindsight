@@ -187,6 +187,14 @@ export interface RecommendationActionTrace {
     fingerprint?: string;
     expires_at?: string | null;
     effect_count?: number;
+    effects?: {
+      close_memory_ids?: Identifier[];
+      review_resolutions?: Array<{
+        id?: Identifier;
+        semantic_memory_id?: Identifier;
+        status?: string;
+      }>;
+    };
   };
   approval?: {
     approved?: boolean;

@@ -275,7 +275,17 @@ describe("operator console", () => {
               id: "preview-1",
               fingerprint: "d".repeat(64),
               expires_at: "2026-08-10T23:15:00Z",
-              effect_count: 1,
+              effect_count: 2,
+              effects: {
+                close_memory_ids: ["memory-unsafe"],
+                review_resolutions: [
+                  {
+                    id: "review-unsafe",
+                    semantic_memory_id: "memory-unsafe",
+                    status: "superseded",
+                  },
+                ],
+              },
             },
           },
         }}
@@ -283,7 +293,11 @@ describe("operator console", () => {
     );
 
     expect(screen.getByText("Increase retry fanout during saturation.")).toBeVisible();
-    expect(screen.getByText(/1 causal effect/)).toHaveTextContent("dddddddddddd");
+    expect(screen.getByText(/2 bounded mutations/)).toHaveTextContent("dddddddddddd");
+    expect(screen.getByText("Close memory memory-unsafe")).toBeVisible();
+    expect(
+      screen.getByText("Resolve review review-unsafe for memory memory-unsafe as superseded"),
+    ).toBeVisible();
     const approve = screen.getByRole("button", { name: "Approve retraction" });
     expect(approve).toBeEnabled();
     fireEvent.click(approve);

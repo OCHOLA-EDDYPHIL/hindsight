@@ -231,25 +231,15 @@ def run_incident_agent(
     )
     resolved_thread_id = thread_id or incident.incident_id or f"incident-{uuid4()}"
     resolved_run_id = run_id or str(uuid4())
-    namespace = incident.namespace or incident.incident_id
-    initial_state: IncidentAgentState = {
-        "run_id": resolved_run_id,
-        "thread_id": resolved_thread_id,
-        "incident_id": incident.incident_id,
-        "namespace": namespace,
-        "service_slug": incident.service_slug,
-        "severity": incident.severity,
-        "title": incident.title,
-        "user_input": incident.user_input,
-        "metadata": dict(incident.metadata),
-        "pause_before_act": pause_before_act,
-        "decision_id": decision_id or f"agent:{resolved_run_id}:plan",
-        "reasoning_steps": [],
-        "model_turn_count": initial_model_call_count,
-        "tool_calls": [],
-        "observations": [],
-        "diagnostic_call_count": initial_diagnostic_call_count,
-    }
+    initial_state = _new_incident_state(
+        incident,
+        thread_id=resolved_thread_id,
+        run_id=resolved_run_id,
+        decision_id=decision_id or f"agent:{resolved_run_id}:plan",
+        pause_before_act=pause_before_act,
+        model_call_count=initial_model_call_count,
+        diagnostic_call_count=initial_diagnostic_call_count,
+    )
     state = _invoke_graph(
         initial_state,
         thread_id=resolved_thread_id,
@@ -262,6 +252,63 @@ def run_incident_agent(
         progress_callback=progress_callback,
     )
     return _agent_result(resolved_thread_id, state)
+
+
+def _new_incident_state(
+    incident: IncidentInput,
+    *,
+    thread_id: str,
+    run_id: str,
+    decision_id: str,
+    pause_before_act: bool,
+    model_call_count: int,
+    diagnostic_call_count: int,
+) -> IncidentAgentState:
+    """Return a complete state replacement for a new run on any thread."""
+
+    return {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "incident_id": incident.incident_id,
+        "namespace": incident.namespace or incident.incident_id,
+        "service_slug": incident.service_slug,
+        "severity": incident.severity,
+        "title": incident.title,
+        "user_input": incident.user_input,
+        "metadata": dict(incident.metadata),
+        "pause_before_act": pause_before_act,
+        "triage": {},
+        "chat_messages": [],
+        "recalled_memories": [],
+        "recall_error": None,
+        "decision_id": decision_id,
+        "plan": "",
+        "plan_payload": {},
+        "reasoning": {},
+        "reasoning_steps": [],
+        "model_turn_count": model_call_count,
+        "tool_calls": [],
+        "observations": [],
+        "diagnostic_call_count": diagnostic_call_count,
+        "embedding_profile": {},
+        "selection_fingerprint": "",
+        "selection_namespace_revision": 0,
+        "approval_namespace_revision": 0,
+        "recommendation_id": "",
+        "remediation_action_id": "",
+        "observation_fingerprint": "",
+        "action_preview": {},
+        "approval_actor": "",
+        "stale_replan_count": 0,
+        "operation_result": {},
+        "approval_stale": False,
+        "proposed_action": "",
+        "action_trace": {},
+        "action_approved": False,
+        "guidance_eligible": False,
+        "reflected_memory": {},
+        "retrieval_id": None,
+    }
 
 
 async def run_incident_agent_async(
@@ -636,7 +683,7 @@ def build_incident_graph(
             authorized_namespaces=[state["namespace"]],
             db_url=resolved_db_url,
         )
-        effect_count = _bounded_retraction_effect_count(preview)
+        approved_effects = _bounded_retraction_effects(preview)
         prepared = _jsonable_row(preview)
         trace = _remediation_action_trace(
             state=state,
@@ -644,7 +691,7 @@ def build_incident_graph(
             action_identity=state["remediation_action_id"],
             target_excerpt=citation.quote,
             preview=prepared,
-            effect_count=effect_count,
+            approved_effects=approved_effects,
         )
         update = {
             "action_preview": prepared,
@@ -1688,7 +1735,7 @@ def _remediation_action_trace(
     action_identity: str,
     target_excerpt: str,
     preview: dict[str, Any],
-    effect_count: int,
+    approved_effects: dict[str, Any],
 ) -> dict[str, Any]:
     action = decision.remediation_action
     assert action is not None
@@ -1726,7 +1773,11 @@ def _remediation_action_trace(
             "id": str(preview.get("id") or ""),
             "fingerprint": str(preview.get("fingerprint") or ""),
             "expires_at": preview.get("expires_at"),
-            "effect_count": effect_count,
+            "effect_count": approved_effects["mutation_count"],
+            "effects": {
+                "close_memory_ids": approved_effects["close_memory_ids"],
+                "review_resolutions": approved_effects["review_resolutions"],
+            },
         },
         "execution": {
             "status": "awaiting_approval",
@@ -1735,14 +1786,20 @@ def _remediation_action_trace(
     }
 
 
-def _bounded_retraction_effect_count(preview: dict[str, Any]) -> int:
+def _bounded_retraction_effects(preview: dict[str, Any]) -> dict[str, Any]:
     effect = dict(preview.get("effect_payload") or {})
-    effect_count = len(effect.get("close_memory_ids") or [])
-    if effect_count < 1 or effect_count > 10:
-        raise AgentDecisionError(
-            "remediation action must affect between one and ten memory versions"
-        )
-    return effect_count
+    close_memory_ids = [str(value) for value in (effect.get("close_memory_ids") or [])]
+    review_resolutions = [
+        _jsonable_row(dict(value)) for value in (effect.get("review_resolutions") or [])
+    ]
+    mutation_count = len(close_memory_ids) + len(review_resolutions)
+    if mutation_count < 1 or mutation_count > 10:
+        raise AgentDecisionError("remediation action must contain between one and ten mutations")
+    return {
+        "close_memory_ids": close_memory_ids,
+        "review_resolutions": review_resolutions,
+        "mutation_count": mutation_count,
+    }
 
 
 def _validate_action_approval(
