@@ -126,6 +126,10 @@ jobs:
           test "$ready" = true
           docker compose exec -T crdb cockroach sql --insecure \
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+      - name: Establish shared migration roles
+        run: |
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'CREATE ROLE IF NOT EXISTS hindsight_lifecycle NOLOGIN'
       - name: Verify populated upgrade and schema parity
         run: |
           mkdir -p build/schema
