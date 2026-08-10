@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
@@ -35,7 +36,8 @@ DATABASE_PREFIX = "hindsight_recovery_"
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
 CONNECT_TIMEOUT_SECONDS = 5
-CLEANUP_TIMEOUT_SECONDS = 30
+CLEANUP_TIMEOUT_SECONDS = 120
+SCHEMA_MANIFEST_MAX_READS = 3
 PRE_BACKUP_MARKER_KEY = "recovery_drill_pre_backup"
 POST_BACKUP_MARKER_KEY = "recovery_drill_post_backup"
 SCHEMA_VERSION = "hindsight.recovery_drill.v1"
@@ -233,16 +235,24 @@ def _initialize_agent_storage(database_url: str, deadline: Deadline) -> None:
 def _schema_manifest(database_url: str, deadline: Deadline) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="hindsight-recovery-schema-") as directory:
         output = Path(directory) / "schema.json"
-        _run_repository_script(
-            "schema_manifest.py",
-            ["export", "--output", str(output), "--apply-roles"],
-            database_url=database_url,
-            deadline=deadline,
-        )
-        value = json.loads(output.read_text())
-    if not isinstance(value, dict):
-        raise RuntimeError("schema manifest did not contain a JSON object")
-    return value
+        previous: dict[str, Any] | None = None
+        for _ in range(SCHEMA_MANIFEST_MAX_READS):
+            _run_repository_script(
+                "schema_manifest.py",
+                ["export", "--output", str(output), "--apply-roles"],
+                database_url=database_url,
+                deadline=deadline,
+            )
+            value = json.loads(output.read_text())
+            if not isinstance(value, dict):
+                raise RuntimeError("schema manifest did not contain a JSON object")
+            if value == previous:
+                return value
+            previous = value
+    raise RuntimeError(
+        "schema manifest did not converge across "
+        f"{SCHEMA_MANIFEST_MAX_READS} consecutive reads"
+    )
 
 
 def _canonical_value(value: Any) -> Any:
@@ -341,7 +351,36 @@ def _manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
             key: len(value) if isinstance(value, (dict, list)) else 1
             for key, value in sorted(manifest.items())
         },
+        "section_sha256": {
+            key: _sha256(value) for key, value in sorted(manifest.items())
+        },
     }
+
+
+def _manifest_difference_sample(
+    source: dict[str, Any], restored: dict[str, Any], *, limit: int = 5
+) -> dict[str, Any]:
+    """Return bounded schema-only diagnostics for non-identical manifests."""
+
+    differences: dict[str, Any] = {}
+    for section in sorted(set(source).union(restored)):
+        source_value = source.get(section)
+        restored_value = restored.get(section)
+        if source_value == restored_value:
+            continue
+        source_items = source_value if isinstance(source_value, list) else [source_value]
+        restored_items = restored_value if isinstance(restored_value, list) else [restored_value]
+        source_counter = Counter(_canonical_json(item) for item in source_items)
+        restored_counter = Counter(_canonical_json(item) for item in restored_items)
+        source_only = list((source_counter - restored_counter).elements())
+        restored_only = list((restored_counter - source_counter).elements())
+        differences[section] = {
+            "source_only_count": len(source_only),
+            "restored_only_count": len(restored_only),
+            "source_only_sample": source_only[:limit],
+            "restored_only_sample": restored_only[:limit],
+        }
+    return differences
 
 
 def _migration_summary(database_url: str, deadline: Deadline) -> dict[str, Any]:
@@ -613,6 +652,9 @@ def run_drill(
         post_absent = POST_BACKUP_MARKER_KEY not in restored_markers
         schema_matches = restored_manifest == source_manifest
         data_matches = restored_data == source_data
+        manifest_differences = (
+            {} if schema_matches else _manifest_difference_sample(source_manifest, restored_manifest)
+        )
         evidence["validation"] = {
             "markers": {
                 "pre_backup_present": pre_present,
@@ -622,6 +664,8 @@ def run_drill(
                 "matches": schema_matches,
                 "source": _manifest_summary(source_manifest),
                 "restored": _manifest_summary(restored_manifest),
+                "differing_sections": sorted(manifest_differences),
+                "difference_sample": manifest_differences,
             },
             "data_identity": {
                 "matches": data_matches,

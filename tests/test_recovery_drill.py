@@ -119,6 +119,32 @@ def test_canonical_digest_is_stable_and_type_sensitive():
     assert drill._sha256({"value": b"1"}) != drill._sha256({"value": "1"})
 
 
+def test_manifest_summary_and_difference_are_section_scoped_and_bounded():
+    drill = _module()
+    source = {
+        "tables": ["a", "b", "c"],
+        "roles": [["hindsight_api", False]],
+    }
+    restored = {
+        "tables": ["a", "changed", "c"],
+        "roles": [["hindsight_api", False]],
+    }
+
+    summary = drill._manifest_summary(source)
+    differences = drill._manifest_difference_sample(source, restored, limit=1)
+
+    assert summary["section_counts"] == {"roles": 1, "tables": 3}
+    assert set(summary["section_sha256"]) == {"roles", "tables"}
+    assert differences == {
+        "tables": {
+            "source_only_count": 1,
+            "restored_only_count": 1,
+            "source_only_sample": ['"b"'],
+            "restored_only_sample": ['"changed"'],
+        }
+    }
+
+
 def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch):
     drill = _module()
     calls = []
@@ -132,14 +158,28 @@ def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch)
     deadline = drill.Deadline.after(60)
 
     assert drill._schema_manifest("postgresql://fixture", deadline) == {"tables": []}
-    assert calls == [
-        (
-            "schema_manifest.py",
-            ["export", "--output", calls[0][1][2], "--apply-roles"],
-            "postgresql://fixture",
-            deadline,
-        )
-    ]
+    assert len(calls) == 2
+    assert all(call[0] == "schema_manifest.py" for call in calls)
+    assert all(call[1] == ["export", "--output", calls[0][1][2], "--apply-roles"] for call in calls)
+    assert all(call[2:] == ("postgresql://fixture", deadline) for call in calls)
+
+
+def test_schema_snapshot_fails_when_bounded_reads_never_converge(monkeypatch):
+    drill = _module()
+    calls = 0
+
+    def run_repository_script(_script, args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        output = Path(args[args.index("--output") + 1])
+        output.write_text(json.dumps({"tables": [f"version-{calls}"]}))
+
+    monkeypatch.setattr(drill, "_run_repository_script", run_repository_script)
+
+    with pytest.raises(RuntimeError, match="did not converge"):
+        drill._schema_manifest("postgresql://fixture", drill.Deadline.after(60))
+
+    assert calls == drill.SCHEMA_MANIFEST_MAX_READS
 
 
 def test_recovery_initializes_agent_storage_as_part_of_the_backup_fixture(monkeypatch):
