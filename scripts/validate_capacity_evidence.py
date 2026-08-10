@@ -25,6 +25,14 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _matches_exact_integers(value: Any, expected: dict[str, int]) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == set(expected)
+        and all(type(value[key]) is int and value[key] == expected[key] for key in expected)
+    )
+
+
 def _measurement_map(rows: list[Any]) -> dict[str, dict[str, Any]]:
     if any(not isinstance(row, dict) or not isinstance(row.get("name"), str) for row in rows):
         raise ValueError("capacity raw measurements must be named objects")
@@ -48,27 +56,38 @@ def _validate_measurements(rows: list[Any]) -> None:
     seed = values["vector_seed"]
     storage_checks = seed.get("storage_checks")
     if (
-        seed.get("batches") != TARGETS["tenants"]
+        type(seed.get("batches")) is not int
+        or seed["batches"] != TARGETS["tenants"]
         or not isinstance(storage_checks, list)
         or len(storage_checks) != TARGETS["tenants"]
-        or [row.get("tenants_seeded") for row in storage_checks if isinstance(row, dict)]
+        or [row.get("completion_sequence") for row in storage_checks if isinstance(row, dict)]
         != list(range(1, TARGETS["tenants"] + 1))
         or any(
             not isinstance(row, dict)
-            or not isinstance(row.get("bytes"), int)
-            or not 0 <= row["bytes"] <= EXPECTED_CEILINGS["storage_bytes"]
+            or type(row.get("completion_sequence")) is not int
+            or type(row.get("completed_tenants")) is not int
+            or row["completed_tenants"] != row["completion_sequence"]
+            or type(row.get("bytes")) is not int
+            or not 0 < row["bytes"] <= EXPECTED_CEILINGS["storage_bytes"]
             for row in storage_checks
         )
-        or seed.get("peak_storage_bytes") != max(row["bytes"] for row in storage_checks)
+        or type(seed.get("peak_storage_bytes")) is not int
+        or seed["peak_storage_bytes"] != max(row["bytes"] for row in storage_checks)
     ):
         raise ValueError("capacity seeding does not prove the enforced storage ceiling")
     counts = values["vector_counts"]
     per_tenant = counts.get("per_tenant")
     if (
-        counts.get("total") != TARGETS["vectors"]
+        type(counts.get("total")) is not int
+        or counts["total"] != TARGETS["vectors"]
         or not isinstance(per_tenant, list)
         or len(per_tenant) != TARGETS["tenants"]
-        or any(not isinstance(row, dict) or row.get("vectors") != 5_000 for row in per_tenant)
+        or any(
+            not isinstance(row, dict)
+            or type(row.get("vectors")) is not int
+            or row["vectors"] != 5_000
+            for row in per_tenant
+        )
     ):
         raise ValueError("capacity measurements do not prove exact vector and tenant counts")
     clients = values["bounded_clients"].get("clients")
@@ -78,6 +97,7 @@ def _validate_measurements(rows: list[Any]) -> None:
         or {row.get("client") for row in clients if isinstance(row, dict)} != set(range(1, 21))
         or any(
             not isinstance(row, dict)
+            or type(row.get("client")) is not int
             or row.get("qualified_index") != EXPECTED_INDEX
             or "vector search" not in str(row.get("plan", "")).lower()
             or f"@{EXPECTED_INDEX}" not in str(row.get("plan", ""))
@@ -89,28 +109,47 @@ def _validate_measurements(rows: list[Any]) -> None:
     backlog = values["synthetic_backlog"]
     per_client = backlog.get("per_client_counts")
     if (
-        backlog.get("messages_enqueued") != TARGETS["backlog_messages"]
-        or backlog.get("messages_drained") != TARGETS["backlog_messages"]
-        or backlog.get("messages_accounted_for") != TARGETS["backlog_messages"]
-        or backlog.get("queue_capacity") != TARGETS["backlog_messages"]
-        or backlog.get("pending_before_drain") != TARGETS["backlog_messages"]
-        or backlog.get("pending_after_drain") != 0
-        or backlog.get("observed_max_pending") != TARGETS["backlog_messages"]
-        or backlog.get("clients") != TARGETS["clients"]
-        or backlog.get("live_worker_invocations") != 0
-        or backlog.get("paid_model_calls") != 0
+        not _matches_exact_integers(
+            {
+                key: backlog.get(key)
+                for key in (
+                    "messages_enqueued",
+                    "messages_drained",
+                    "messages_accounted_for",
+                    "queue_capacity",
+                    "pending_before_drain",
+                    "pending_after_drain",
+                    "observed_max_pending",
+                    "clients",
+                    "live_worker_invocations",
+                    "paid_model_calls",
+                )
+            },
+            {
+                "messages_enqueued": TARGETS["backlog_messages"],
+                "messages_drained": TARGETS["backlog_messages"],
+                "messages_accounted_for": TARGETS["backlog_messages"],
+                "queue_capacity": TARGETS["backlog_messages"],
+                "pending_before_drain": TARGETS["backlog_messages"],
+                "pending_after_drain": 0,
+                "observed_max_pending": TARGETS["backlog_messages"],
+                "clients": TARGETS["clients"],
+                "live_worker_invocations": 0,
+                "paid_model_calls": 0,
+            },
+        )
         or not isinstance(per_client, list)
         or len(per_client) != TARGETS["clients"]
-        or any(not isinstance(count, int) or count <= 0 for count in per_client)
+        or any(type(count) is not int or count <= 0 for count in per_client)
         or sum(per_client) != TARGETS["backlog_messages"]
     ):
         raise ValueError("capacity measurements do not prove the isolated synthetic backlog")
     storage = values["storage"].get("bytes")
     duration = values["total"].get("duration_seconds")
-    if not isinstance(storage, int) or not 0 < storage <= EXPECTED_CEILINGS["storage_bytes"]:
+    if type(storage) is not int or not 0 < storage <= EXPECTED_CEILINGS["storage_bytes"]:
         raise ValueError("capacity measurements exceed or omit the storage ceiling")
     if (
-        not isinstance(duration, (int, float))
+        type(duration) not in {int, float}
         or not 0 < duration <= EXPECTED_CEILINGS["duration_seconds"]
     ):
         raise ValueError("capacity measurements exceed or omit the duration ceiling")
@@ -141,17 +180,19 @@ def validate(
         raise ValueError("capacity evidence must belong to the exact tested main revision")
     if document.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("capacity evidence schema version is unsupported")
-    if document.get("targets") != TARGETS:
+    if not _matches_exact_integers(document.get("targets"), TARGETS):
         raise ValueError("capacity evidence does not match the bounded target shape")
-    if document.get("ceilings") != EXPECTED_CEILINGS:
+    if not _matches_exact_integers(document.get("ceilings"), EXPECTED_CEILINGS):
         raise ValueError("capacity evidence does not enforce the required hard ceilings")
     if not document.get("method") or not document.get("environment"):
         raise ValueError("capacity evidence requires method and environment")
     environment = document["environment"]
     if (
         not isinstance(environment, dict)
-        or environment.get("paid_model_calls") != 0
-        or environment.get("live_worker_invocations") != 0
+        or type(environment.get("paid_model_calls")) is not int
+        or environment["paid_model_calls"] != 0
+        or type(environment.get("live_worker_invocations")) is not int
+        or environment["live_worker_invocations"] != 0
         or environment.get("isolation") != "run_scoped_database_and_compose_project"
     ):
         raise ValueError("capacity environment is not isolated from paid and live services")
@@ -169,17 +210,24 @@ def validate(
         or qualification.get("qualified") is not True
         or qualification.get("main_sha") != source_revision
         or qualification.get("index") != EXPECTED_INDEX
-        or qualification.get("vector_dimensions") != 1024
-        or qualification.get("vector_count") != TARGETS["vectors"]
-        or qualification.get("tenant_count") != TARGETS["tenants"]
+        or type(qualification.get("vector_dimensions")) is not int
+        or qualification["vector_dimensions"] != 1024
+        or type(qualification.get("vector_count")) is not int
+        or qualification["vector_count"] != TARGETS["vectors"]
+        or type(qualification.get("tenant_count")) is not int
+        or qualification["tenant_count"] != TARGETS["tenants"]
     ):
         raise ValueError("index qualification does not prove the exact populated target")
     counts = qualification.get("per_tenant_counts")
     if (
         not isinstance(counts, list)
         or len(counts) != TARGETS["tenants"]
-        or any(row.get("vectors") != 5_000 for row in counts if isinstance(row, dict))
-        or any(not isinstance(row, dict) for row in counts)
+        or any(
+            not isinstance(row, dict)
+            or type(row.get("vectors")) is not int
+            or row["vectors"] != 5_000
+            for row in counts
+        )
     ):
         raise ValueError("index qualification has invalid per-tenant counts")
     plans = qualification.get("plans")
@@ -188,7 +236,9 @@ def validate(
         or len(plans) != TARGETS["clients"]
         or {row.get("client") for row in plans if isinstance(row, dict)} != set(range(1, 21))
         or any(
-            not isinstance(row, dict) or row.get("qualified_index") != EXPECTED_INDEX
+            not isinstance(row, dict)
+            or type(row.get("client")) is not int
+            or row.get("qualified_index") != EXPECTED_INDEX
             for row in plans
         )
     ):
@@ -203,7 +253,8 @@ def validate(
         or not str(cleanup.get("database", "")).startswith("hindsight_capacity_")
         or cleanup.get("database_removed") is not True
         or cleanup.get("source_revision") != source_revision
-        or cleanup.get("timeout_seconds") != 120
+        or type(cleanup.get("timeout_seconds")) is not int
+        or cleanup["timeout_seconds"] != 120
     ):
         raise ValueError("capacity evidence requires verified disposable-state cleanup")
     expected_names = {"index-qualification.json", "capacity-report.json", "cleanup.json"}

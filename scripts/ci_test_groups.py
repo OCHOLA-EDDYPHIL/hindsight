@@ -41,6 +41,7 @@ MIGRATION_CASES = {
 
 DATABASE_GROUPS = {
     "product": (
+        "tests/test_capacity_qualification_database.py",
         "tests/test_agent.py",
         "tests/test_consolidation.py",
         "tests/test_governed_memory.py",

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import multiprocessing
 import queue
 import re
 import subprocess
@@ -40,6 +41,7 @@ MAX_DURATION_SECONDS = 1_200
 MAX_STORAGE_BYTES = 1_500_000_000
 MAX_EXTERNAL_COST_USD = 0
 MAX_CLIENTS = 20
+SEED_SHARDS = 5
 MAX_CLEANUP_SECONDS = 120
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]{8,20}")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -49,8 +51,26 @@ NAMESPACE_PREFIX = "capacity.synthetic"
 LIMITATIONS = [
     "This is a single-node local CockroachDB benchmark, not a production topology.",
     "The deterministic synthetic vectors and in-process backlog do not model live traffic.",
+    "Synthetic fixture loading restores write triggers before qualification; it does not "
+    "measure application ingestion throughput or realtime outbox load.",
     "The measurements are benchmark evidence and are not production SLO claims.",
 ]
+BULK_SEED_GUARDS = {
+    "semantic_beliefs": "semantic_beliefs_tenant_lifecycle_state",
+    "semantic_memories": "semantic_memories_tenant_lifecycle_state",
+    "semantic_memory_vectors": "semantic_memory_vectors_tenant_lifecycle_state",
+}
+BULK_SEED_MEMORY_TRIGGERS = {
+    "semantic_memory_open_producer": (
+        "CREATE TRIGGER semantic_memory_open_producer BEFORE INSERT ON semantic_memories "
+        "FOR EACH ROW EXECUTE FUNCTION guard_open_memory_producer()"
+    ),
+    "semantic_memories_tenant_event_outbox": (
+        "CREATE TRIGGER semantic_memories_tenant_event_outbox "
+        "AFTER INSERT OR UPDATE OR DELETE ON semantic_memories "
+        "FOR EACH ROW EXECUTE FUNCTION emit_tenant_event_outbox()"
+    ),
+}
 
 
 class Deadline:
@@ -136,6 +156,13 @@ def _connection(url: str, deadline: Deadline) -> psycopg.Connection[Any]:
     return conn
 
 
+def _refresh_qualification_timeout(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    conn.execute(
+        "SELECT set_config('statement_timeout', %s, false)",
+        (f"{deadline.remaining() * 1000}ms",),
+    )
+
+
 def _create_database(admin_url: str, database: str, deadline: Deadline) -> None:
     if not _is_disposable(database):
         raise RuntimeError("refusing to create a non-capacity database")
@@ -198,9 +225,322 @@ def _namespace(number: int) -> str:
     return f"{NAMESPACE_PREFIX}.{number:02d}"
 
 
+def _create_seed_staging(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    _refresh_qualification_timeout(conn, deadline)
+    conn.execute(
+        """
+        CREATE TABLE capacity_tenant_seed (
+            tenant_number INT8 PRIMARY KEY,
+            tenant_id UUID NOT NULL,
+            slug STRING NOT NULL,
+            namespace STRING NOT NULL,
+            decision_id STRING NOT NULL,
+            embedding VECTOR(1024) NOT NULL
+        )
+        """
+    )
+    _refresh_qualification_timeout(conn, deadline)
+    conn.execute(
+        """
+        CREATE TABLE capacity_seed (
+            tenant_number INT8 NOT NULL,
+            ordinal INT8 NOT NULL,
+            memory_id UUID NOT NULL,
+            PRIMARY KEY (tenant_number, ordinal)
+        )
+        """
+    )
+
+
+def _insert_tenant_staging(
+    conn: psycopg.Connection[Any], *, run_id: str, tenant_number: int
+) -> None:
+    conn.execute(
+        "INSERT INTO capacity_tenant_seed "
+        "(tenant_number, tenant_id, slug, namespace, decision_id, embedding) "
+        "VALUES (%s, %s, %s, %s, %s, %s::VECTOR(1024))",
+        (
+            tenant_number,
+            _tenant_id(run_id, tenant_number),
+            f"capacity-{run_id}-{tenant_number:02d}",
+            _namespace(tenant_number),
+            f"capacity:{run_id}:{tenant_number}",
+            _vector(tenant_number),
+        ),
+    )
+
+
+def _insert_seed_staging(
+    conn: psycopg.Connection[Any], *, tenant_number: int, row_count: int
+) -> None:
+    conn.execute(
+        "INSERT INTO capacity_seed SELECT %s, value, gen_random_uuid() "
+        "FROM generate_series(1, %s) AS generated(value)",
+        (tenant_number, row_count),
+    )
+
+
+def _remove_bulk_seed_guards(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    for table, trigger in BULK_SEED_GUARDS.items():
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            sql.SQL("DROP TRIGGER {} ON {}").format(sql.Identifier(trigger), sql.Identifier(table))
+        )
+
+
+def _restore_bulk_seed_guards(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    for table, trigger in BULK_SEED_GUARDS.items():
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            sql.SQL(
+                "CREATE TRIGGER {} BEFORE INSERT OR UPDATE OR DELETE ON {} "
+                "FOR EACH ROW EXECUTE FUNCTION guard_tenant_lifecycle_row_state()"
+            ).format(sql.Identifier(trigger), sql.Identifier(table))
+        )
+
+
+def _remove_bulk_seed_memory_triggers(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    for trigger in BULK_SEED_MEMORY_TRIGGERS:
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            sql.SQL("DROP TRIGGER {} ON {}").format(
+                sql.Identifier(trigger), sql.Identifier("semantic_memories")
+            )
+        )
+
+
+def _restore_bulk_seed_memory_triggers(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    for statement in BULK_SEED_MEMORY_TRIGGERS.values():
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(sql.SQL(statement))
+
+
+def _prepare_seed_load(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    _refresh_qualification_timeout(conn, deadline)
+    conn.execute(
+        "INSERT INTO tenants (id, slug, tenant_kind) "
+        "SELECT tenant_id, slug, 'diagnostic' FROM capacity_tenant_seed"
+    )
+    _refresh_qualification_timeout(conn, deadline)
+    conn.execute(
+        "INSERT INTO memory_namespaces (tenant_id, namespace) "
+        "SELECT tenant_id, namespace FROM capacity_tenant_seed"
+    )
+    _refresh_qualification_timeout(conn, deadline)
+    conn.execute(
+        """
+        INSERT INTO memory_decisions (
+            tenant_id, id, actor, decision_kind, purpose, namespace, status
+        )
+        SELECT tenant_id, decision_id, 'capacity.synthetic', 'capacity_seed',
+               'Bounded synthetic index qualification', namespace, 'open'
+        FROM capacity_tenant_seed
+        """
+    )
+    _remove_bulk_seed_guards(conn, deadline)
+    _remove_bulk_seed_memory_triggers(conn, deadline)
+
+
+def _load_seed_shard(database_url: str, deadline: Deadline, shard: int) -> None:
+    with _connection(database_url, deadline) as conn:
+        shard_params = (SEED_SHARDS, shard)
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            """
+            INSERT INTO semantic_beliefs (tenant_id, id, namespace)
+            SELECT tenant.tenant_id, seed.memory_id, tenant.namespace
+            FROM capacity_seed AS seed
+            JOIN capacity_tenant_seed AS tenant USING (tenant_number)
+            WHERE mod(seed.tenant_number - 1, %s) = %s
+            """,
+            shard_params,
+        )
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            """
+            INSERT INTO semantic_memories (
+                tenant_id, id, belief_id, version_number, namespace, content, metadata,
+                writer, source_ref, justification, producer_decision_id, transition_kind,
+                content_schema, structured_payload, payload_digest, lineage_status,
+                trust_status, prompt_safety_status, prompt_safety_scanner_version,
+                prompt_safety_reason_codes
+            )
+            SELECT tenant.tenant_id, seed.memory_id, seed.memory_id, 1, tenant.namespace,
+                   'synthetic capacity row ' || seed.ordinal::STRING, '{}'::JSONB,
+                   'capacity.synthetic', 'capacity:' || seed.ordinal::STRING,
+                   'Bounded synthetic index qualification', tenant.decision_id, 'assertion',
+                   'capacity.synthetic.v1', jsonb_build_object('ordinal', seed.ordinal),
+                   sha256(('capacity:' || seed.ordinal::STRING)::BYTES),
+                   'complete', 'active', 'clear', 'capacity.synthetic.v1', '[]'::JSONB
+            FROM capacity_seed AS seed
+            JOIN capacity_tenant_seed AS tenant USING (tenant_number)
+            WHERE mod(seed.tenant_number - 1, %s) = %s
+            """,
+            shard_params,
+        )
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            """
+            INSERT INTO semantic_memory_vectors (
+                tenant_id, memory_id, profile_id, namespace, content_digest, embedding
+            )
+            SELECT tenant.tenant_id, seed.memory_id, %s, tenant.namespace,
+                   sha256(('capacity:' || seed.ordinal::STRING)::BYTES), tenant.embedding
+            FROM capacity_seed AS seed
+            JOIN capacity_tenant_seed AS tenant USING (tenant_number)
+            WHERE mod(seed.tenant_number - 1, %s) = %s
+            """,
+            (PROFILE_ID, *shard_params),
+        )
+
+
+def _seed_shard_worker(
+    database_url: str,
+    expires_at: float,
+    shard: int,
+    results: multiprocessing.Queue,
+) -> None:
+    try:
+        _load_seed_shard(database_url, Deadline(expires_at), shard)
+    except BaseException as error:
+        detail = f"{type(error).__name__}: {error}"[:800]
+    else:
+        detail = None
+    results.put((shard, detail))
+
+
+def _stop_seed_processes(processes: list[multiprocessing.Process], deadline: Deadline) -> None:
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    grace_expires_at = min(deadline.expires_at, time.monotonic() + 5)
+    for process in processes:
+        process.join(timeout=max(0.0, grace_expires_at - time.monotonic()))
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    for process in processes:
+        process.join(timeout=max(0.0, deadline.expires_at - time.monotonic()))
+    if any(process.is_alive() for process in processes):
+        raise RuntimeError("capacity seed processes did not terminate after cleanup")
+
+
+def _run_seed_shards(database_url: str, deadline: Deadline) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_seed_shard_worker,
+            args=(database_url, deadline.expires_at, shard, results),
+            name=f"capacity-seed-shard-{shard}",
+        )
+        for shard in range(SEED_SHARDS)
+    ]
+    started: list[multiprocessing.Process] = []
+    received: set[int] = set()
+    try:
+        for process in processes:
+            process.start()
+            started.append(process)
+        while len(received) < SEED_SHARDS:
+            deadline.remaining()
+            try:
+                shard, error = results.get(
+                    timeout=min(1.0, max(0.01, deadline.expires_at - time.monotonic()))
+                )
+            except queue.Empty:
+                missing = [
+                    process
+                    for process in processes
+                    if process.exitcode is not None
+                    and int(process.name.rsplit("-", 1)[1]) not in received
+                ]
+                if missing:
+                    raise RuntimeError(f"{missing[0].name} exited without delivering a result")
+                continue
+            if shard in received or shard not in range(SEED_SHARDS):
+                raise RuntimeError("capacity seed shard returned an invalid duplicate result")
+            received.add(shard)
+            if error is not None:
+                raise RuntimeError(f"capacity seed shard {shard} failed: {error}")
+        for process in processes:
+            process.join(timeout=max(0.0, deadline.expires_at - time.monotonic()))
+        if any(process.is_alive() or process.exitcode != 0 for process in processes):
+            raise RuntimeError("capacity seed processes did not exit successfully")
+    except BaseException:
+        _stop_seed_processes(started, Deadline.after(MAX_CLEANUP_SECONDS))
+        raise
+    finally:
+        results.close()
+        results.join_thread()
+
+
+def _seal_and_measure(
+    database_url: str,
+    run_id: str,
+    number: int,
+    deadline: Deadline,
+    completion_sequence: int,
+) -> dict[str, int]:
+    tenant_id = _tenant_id(run_id, number)
+    with _connection(database_url, deadline) as conn:
+        conn.execute("SELECT set_config('hindsight.tenant_id', %s, false)", (str(tenant_id),))
+        updated = conn.execute(
+            """
+            UPDATE memory_decisions
+            SET status = 'sealed', sealed_at = now()
+            WHERE tenant_id = %s AND id = %s AND status = 'open'
+            """,
+            (tenant_id, f"capacity:{run_id}:{number}"),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError(f"tenant {number} seed decision was not sealed exactly once")
+        return _check_storage(
+            database_url,
+            deadline,
+            completion_sequence=completion_sequence,
+            completed_tenants=completion_sequence,
+            conn=conn,
+        )
+
+
+def _verify_bulk_seed_provenance(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    expected_triggers = set(BULK_SEED_GUARDS.values()) | set(BULK_SEED_MEMORY_TRIGGERS)
+    _refresh_qualification_timeout(conn, deadline)
+    restored_triggers = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT trigger_name FROM information_schema.triggers "
+            "WHERE trigger_name = ANY(%s)",
+            (list(expected_triggers),),
+        ).fetchall()
+    }
+    if restored_triggers != expected_triggers:
+        raise RuntimeError("capacity fixture write triggers were not restored exactly")
+    _refresh_qualification_timeout(conn, deadline)
+    missing_producers = conn.execute(
+        """
+        SELECT count(*)::INT8
+        FROM semantic_memories AS memory
+        LEFT JOIN memory_decisions AS decision
+          ON decision.tenant_id = memory.tenant_id
+         AND decision.id = memory.producer_decision_id
+         AND decision.status = 'open'
+        WHERE decision.id IS NULL
+        """
+    ).fetchone()
+    if int(missing_producers[0]) != 0:
+        raise RuntimeError("capacity seed contains memory without an open producer decision")
+    _refresh_qualification_timeout(conn, deadline)
+    outbox_rows = conn.execute(
+        "SELECT count(*)::INT8 FROM tenant_event_outbox WHERE aggregate_type = 'semantic_memories'"
+    ).fetchone()
+    if int(outbox_rows[0]) != 0:
+        raise RuntimeError("capacity fixture unexpectedly emitted semantic memory outbox rows")
+
+
 def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
     started = time.monotonic()
-    storage_checks: list[dict[str, int]] = []
     with _connection(database_url, deadline) as conn:
         conn.execute(
             """
@@ -216,77 +556,34 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
             "UPDATE embedding_index_state SET active_profile_id = %s, generation = 1",
             (PROFILE_ID,),
         )
+        _refresh_qualification_timeout(conn, deadline)
+        _create_seed_staging(conn, deadline)
         for number in range(1, TARGETS["tenants"] + 1):
-            tenant_id = _tenant_id(run_id, number)
-            decision_id = f"capacity:{run_id}:{number}"
-            namespace = _namespace(number)
-            conn.execute("SELECT set_config('hindsight.tenant_id', %s, false)", (str(tenant_id),))
-            conn.execute(
-                "INSERT INTO tenants (id, slug, tenant_kind) VALUES (%s, %s, 'diagnostic')",
-                (tenant_id, f"capacity-{run_id}-{number:02d}"),
+            _refresh_qualification_timeout(conn, deadline)
+            _insert_tenant_staging(conn, run_id=run_id, tenant_number=number)
+            _insert_seed_staging(conn, tenant_number=number, row_count=ROWS_PER_TENANT)
+        _prepare_seed_load(conn, deadline)
+    _run_seed_shards(database_url, deadline)
+    storage_checks: list[dict[str, int]] = []
+    with _connection(database_url, deadline) as conn:
+        _refresh_qualification_timeout(conn, deadline)
+        _restore_bulk_seed_guards(conn, deadline)
+        _restore_bulk_seed_memory_triggers(conn, deadline)
+        _verify_bulk_seed_provenance(conn, deadline)
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute("DROP TABLE capacity_seed, capacity_tenant_seed")
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute("ANALYZE semantic_memory_vectors")
+    for number in range(1, TARGETS["tenants"] + 1):
+        storage_checks.append(
+            _seal_and_measure(
+                database_url,
+                run_id,
+                number,
+                deadline,
+                len(storage_checks) + 1,
             )
-            conn.execute(
-                "INSERT INTO memory_namespaces (tenant_id, namespace) VALUES (%s, %s)",
-                (tenant_id, namespace),
-            )
-            conn.execute(
-                """
-                INSERT INTO memory_decisions (
-                    tenant_id, id, actor, decision_kind, purpose, namespace, status, sealed_at
-                ) VALUES (%s, %s, 'capacity.synthetic', 'capacity_seed',
-                          'Bounded synthetic index qualification', %s, 'sealed', now())
-                """,
-                (tenant_id, decision_id, namespace),
-            )
-            conn.execute(
-                "CREATE TEMP TABLE capacity_seed (ordinal INT8 PRIMARY KEY, memory_id UUID NOT NULL)"
-            )
-            conn.execute(
-                "INSERT INTO capacity_seed SELECT value, gen_random_uuid() "
-                "FROM generate_series(1, %s) AS generated(value)",
-                (ROWS_PER_TENANT,),
-            )
-            conn.execute(
-                """
-                INSERT INTO semantic_beliefs (tenant_id, id, namespace)
-                SELECT %s, memory_id, %s FROM capacity_seed
-                """,
-                (tenant_id, namespace),
-            )
-            conn.execute(
-                """
-                INSERT INTO semantic_memories (
-                    tenant_id, id, belief_id, version_number, namespace, content, metadata,
-                    writer, source_ref, justification, producer_decision_id, transition_kind,
-                    content_schema, structured_payload, payload_digest, lineage_status,
-                    trust_status, prompt_safety_status, prompt_safety_scanner_version,
-                    prompt_safety_reason_codes
-                )
-                SELECT %s, memory_id, memory_id, 1, %s,
-                       'synthetic capacity row ' || ordinal::STRING, '{}'::JSONB,
-                       'capacity.synthetic', 'capacity:' || ordinal::STRING,
-                       'Bounded synthetic index qualification', %s, 'assertion',
-                       'capacity.synthetic.v1', jsonb_build_object('ordinal', ordinal),
-                       encode(sha256(('capacity:' || ordinal::STRING)::BYTES), 'hex'),
-                       'complete', 'active', 'clear', 'capacity.synthetic.v1', '[]'::JSONB
-                FROM capacity_seed
-                """,
-                (tenant_id, namespace, decision_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO semantic_memory_vectors (
-                    tenant_id, memory_id, profile_id, namespace, content_digest, embedding
-                )
-                SELECT %s, memory_id, %s, %s,
-                       encode(sha256(('capacity:' || ordinal::STRING)::BYTES), 'hex'),
-                       %s::VECTOR(1024)
-                FROM capacity_seed
-                """,
-                (tenant_id, PROFILE_ID, namespace, _vector(number)),
-            )
-            conn.execute("DROP TABLE capacity_seed")
-            storage_checks.append(_check_storage(database_url, deadline, tenants_seeded=number))
+        )
     return {
         "name": "vector_seed",
         "duration_seconds": round(time.monotonic() - started, 6),
@@ -296,9 +593,7 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
     }
 
 
-def _counts(
-    database_url: str, run_id: str, deadline: Deadline
-) -> tuple[int, list[dict[str, Any]]]:
+def _counts(database_url: str, run_id: str, deadline: Deadline) -> tuple[int, list[dict[str, Any]]]:
     per_tenant: list[dict[str, Any]] = []
     with _connection(database_url, deadline) as conn:
         for number in range(1, TARGETS["tenants"] + 1):
@@ -406,26 +701,43 @@ def _exercise_backlog() -> dict[str, Any]:
     }
 
 
-def _storage_bytes(database_url: str, deadline: Deadline) -> int:
+def _storage_bytes(
+    database_url: str,
+    deadline: Deadline,
+    *,
+    conn: psycopg.Connection[Any] | None = None,
+) -> int:
     database = unquote(urlsplit(database_url).path.lstrip("/"))
-    with _connection(database_url, deadline) as conn:
-        row = conn.execute(
-            sql.SQL(
-                "SELECT coalesce(sum(range_size), 0)::INT8 "
-                "FROM [SHOW RANGES FROM DATABASE {} WITH DETAILS]"
-            ).format(sql.Identifier(database))
-        ).fetchone()
+    statement = sql.SQL(
+        "SELECT coalesce(sum(range_size), 0)::INT8 FROM [SHOW RANGES FROM DATABASE {} WITH DETAILS]"
+    ).format(sql.Identifier(database))
+    if conn is not None:
+        _refresh_qualification_timeout(conn, deadline)
+        row = conn.execute(statement).fetchone()
+    else:
+        with _connection(database_url, deadline) as owned_conn:
+            row = owned_conn.execute(statement).fetchone()
     return int(row[0])
 
 
 def _check_storage(
-    database_url: str, deadline: Deadline, *, tenants_seeded: int
+    database_url: str,
+    deadline: Deadline,
+    *,
+    completion_sequence: int,
+    completed_tenants: int,
+    conn: psycopg.Connection[Any] | None = None,
 ) -> dict[str, int]:
-    storage_bytes = _storage_bytes(database_url, deadline)
-    observation = {"tenants_seeded": tenants_seeded, "bytes": storage_bytes}
+    storage_bytes = _storage_bytes(database_url, deadline, conn=conn)
+    observation = {
+        "completion_sequence": completion_sequence,
+        "completed_tenants": completed_tenants,
+        "bytes": storage_bytes,
+    }
     if storage_bytes > MAX_STORAGE_BYTES:
         raise RuntimeError(
-            f"capacity qualification exceeded its storage ceiling after tenant {tenants_seeded}"
+            "capacity qualification exceeded its storage ceiling after "
+            f"completion {completion_sequence}"
         )
     return observation
 
@@ -467,6 +779,8 @@ def _run(
         "method": {
             "database": "disposable_local_single_node_cockroachdb",
             "vectors": "deterministic_synthetic_one_hot_1024d",
+            "seeding": "five_set_based_shards_with_serialized_completion_checks",
+            "fixture_write_triggers": "restored_and_catalog_verified_before_completion_checks",
             "clients": "twenty_bounded_parallel_index_queries",
             "backlog": "in_process_synthetic_accounting_without_live_worker",
         },
