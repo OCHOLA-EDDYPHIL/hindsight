@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       fixture_id:
-        description: Optional UUIDv4 used to retry the same isolated fixture
-        required: false
+        description: UUIDv4 retained by this dispatch and used for exact retries
+        required: true
         type: string
       confirmation:
-        description: Type create-lifecycle-fixture to create durable disposable data
+        description: Type create-lifecycle-fixture-<fixture UUID>
         required: true
         type: string
       deployment_environment:
@@ -18,7 +18,6 @@ on:
         default: demo
         options:
           - demo
-          - demo-candidate
 
 permissions:
   contents: read
@@ -45,6 +44,26 @@ jobs:
       HINDSIGHT_COGNITO_USER_POOL_ID: ${{ vars.HINDSIGHT_COGNITO_USER_POOL_ID }}
       HINDSIGHT_COGNITO_ISSUER: ${{ vars.HINDSIGHT_COGNITO_ISSUER }}
     steps:
+      - name: Validate durable fixture identity
+        shell: bash
+        env:
+          REQUESTED_FIXTURE_ID: ${{ inputs.fixture_id }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          python - "$REQUESTED_FIXTURE_ID" <<'PY'
+          import sys
+          from uuid import UUID
+
+          requested = sys.argv[1]
+          try:
+              parsed = UUID(requested)
+          except ValueError as exc:
+              raise SystemExit("fixture_id must be a canonical UUIDv4") from exc
+          if parsed.version != 4 or str(parsed) != requested:
+              raise SystemExit("fixture_id must be a canonical UUIDv4")
+          PY
+          test "$REQUESTED_CONFIRMATION" = "create-lifecycle-fixture-$REQUESTED_FIXTURE_ID"
+          echo "Lifecycle fixture ID: $REQUESTED_FIXTURE_ID"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -62,10 +81,8 @@ jobs:
       - name: Verify fixed fixture environment
         shell: bash
         env:
-          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
           REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment }}
         run: |
-          test "$REQUESTED_CONFIRMATION" = "create-lifecycle-fixture"
           test -n "$EXPECTED_AWS_ACCOUNT_ID"
           test "$DEPLOYED_STAGE" = "$REQUESTED_ENVIRONMENT"
           test "$DEPLOY_DATABASE_PARAMETER" = "/hindsight/$DEPLOYED_STAGE/database-url"
@@ -79,17 +96,13 @@ jobs:
         env:
           REQUESTED_FIXTURE_ID: ${{ inputs.fixture_id }}
         run: |
-          FIXTURE_ID="$REQUESTED_FIXTURE_ID"
-          if [[ -z "$FIXTURE_ID" ]]; then
-            FIXTURE_ID="$(uv run python -c 'import uuid; print(uuid.uuid4())')"
-          fi
           DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           echo "::add-mask::$DATABASE_URL"
           export DATABASE_URL
           mkdir -p build
           if uv run python scripts/provision_lifecycle_fixture.py \
               --region "$AWS_REGION" \
-              --fixture-id "$FIXTURE_ID" \
+              --fixture-id "$REQUESTED_FIXTURE_ID" \
               --user-pool-id "$HINDSIGHT_COGNITO_USER_POOL_ID" \
               --issuer "$HINDSIGHT_COGNITO_ISSUER" \
               | tee build/lifecycle-fixture-receipt.json; then
@@ -97,7 +110,7 @@ jobs:
           else
             exit_code="${PIPESTATUS[0]}"
             jq -cn \
-              --arg fixture_id "$FIXTURE_ID" \
+              --arg fixture_id "$REQUESTED_FIXTURE_ID" \
               '{fixture_id:$fixture_id,status:"failed"}' \
               > build/lifecycle-fixture-receipt.json
             exit "$exit_code"

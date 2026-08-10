@@ -346,15 +346,44 @@ def test_fixture_workflow_is_owner_gated_and_uses_only_the_deploy_role():
     workflow_text = path.read_text()
     workflow = yaml.safe_load(workflow_text)
     job = workflow["jobs"]["provision"]
+    trigger = workflow.get("on", workflow.get(True))["workflow_dispatch"]
+    inputs = trigger["inputs"]
+    steps = job["steps"]
+    validation_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Validate durable fixture identity"
+    )
+    credentials_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses", "").startswith("aws-actions/configure-aws-credentials@")
+    )
+    provision_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Provision isolated fixture"
+    )
 
     assert "github.ref == 'refs/heads/main'" in job["if"]
     assert "github.actor == github.repository_owner" in job["if"]
     assert "github.triggering_actor == github.repository_owner" in job["if"]
     assert job["environment"] == "${{ inputs.deployment_environment }}"
     assert job["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
+    assert inputs["fixture_id"]["required"] is True
+    assert inputs["deployment_environment"]["options"] == ["demo"]
+    assert validation_index < credentials_index < provision_index
+    assert "UUID(requested)" in steps[validation_index]["run"]
+    assert "parsed.version != 4" in steps[validation_index]["run"]
+    assert "str(parsed) != requested" in steps[validation_index]["run"]
+    assert "Lifecycle fixture ID:" in steps[validation_index]["run"]
     assert "role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}" in workflow_text
     assert "AWS_LIFECYCLE_ROLE_ARN" not in workflow_text
-    assert 'test "$REQUESTED_CONFIRMATION" = "create-lifecycle-fixture"' in workflow_text
+    assert (
+        'test "$REQUESTED_CONFIRMATION" = "create-lifecycle-fixture-$REQUESTED_FIXTURE_ID"'
+    ) in workflow_text
+    assert "uuid.uuid4" not in workflow_text
+    assert 'fixture_id "$REQUESTED_FIXTURE_ID"' in workflow_text
     assert "scripts/provision_lifecycle_fixture.py" in workflow_text
     assert "admin-delete-user" not in workflow_text.casefold()
     assert "DELETE FROM tenants" not in workflow_text

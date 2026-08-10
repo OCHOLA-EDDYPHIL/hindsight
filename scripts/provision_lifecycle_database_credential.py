@@ -1,4 +1,4 @@
-"""Create the one restricted database credential used for tenant lifecycle work."""
+"""Reconcile the one restricted database credential used for lifecycle work."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import secrets
 import sys
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import boto3
 import psycopg
@@ -55,21 +55,29 @@ def _snapshot_parameter(ssm: Any, name: str) -> ParameterSnapshot:
     )
 
 
+def _url_parts(value: str) -> SplitResult:
+    parts = urlsplit(value)
+    if parts.scheme not in {"postgres", "postgresql"} or not parts.hostname or not parts.path:
+        raise RuntimeError("database URL is invalid")
+    return parts
+
+
 def _runtime_url(deploy_url: str, *, password: str) -> str:
-    parts = urlsplit(deploy_url)
-    if not parts.hostname or not parts.path:
-        raise RuntimeError("deploy database URL is invalid")
-    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
-    port = f":{parts.port}" if parts.port is not None else ""
-    authority = f"{quote(LIFECYCLE_LOGIN, safe='')}:{quote(password, safe='')}@{host}{port}"
+    parts = _url_parts(deploy_url)
+    host_port = parts.netloc.rsplit("@", 1)[-1]
+    authority = f"{quote(LIFECYCLE_LOGIN, safe='')}:{quote(password, safe='')}@{host_port}"
     return urlunsplit(parts._replace(netloc=authority))
 
 
-def _database_target(value: str) -> tuple[str, int | None, str]:
-    parts = urlsplit(value)
-    if not parts.hostname or not parts.path:
-        raise RuntimeError("database URL is invalid")
-    return parts.hostname.casefold(), parts.port, parts.path
+def _noncredential_url(value: str) -> tuple[str, str, str, str, str]:
+    parts = _url_parts(value)
+    return (
+        parts.scheme,
+        parts.netloc.rsplit("@", 1)[-1],
+        parts.path,
+        parts.query,
+        parts.fragment,
+    )
 
 
 def _parameter_login(value: str) -> tuple[str, str]:
@@ -116,17 +124,32 @@ def _role_state(connection: psycopg.Connection, name: str) -> RoleState:
 
 def _assert_permission_role(connection: psycopg.Connection) -> None:
     state = _role_state(connection, LIFECYCLE_ROLE)
-    if not state.exists or state.can_login or state.is_superuser or state.bypasses_rls:
+    if (
+        not state.exists
+        or state.can_login
+        or state.is_superuser
+        or state.bypasses_rls
+        or state.memberships
+    ):
         raise RuntimeError("lifecycle permission role is missing or unsafe")
 
 
-def _assert_managed_login(state: RoleState) -> None:
+def _assert_recoverable_login(state: RoleState) -> None:
     if not state.exists:
         raise RuntimeError("lifecycle database login is missing")
     if not state.can_login or state.is_superuser or state.bypasses_rls:
         raise RuntimeError("lifecycle database login is not restricted")
-    if state.memberships != frozenset({LIFECYCLE_ROLE}):
+    if state.memberships not in {
+        frozenset(),
+        frozenset({LIFECYCLE_ROLE}),
+    }:
         raise RuntimeError("lifecycle database login has unexpected memberships")
+
+
+def _assert_managed_login(state: RoleState) -> None:
+    _assert_recoverable_login(state)
+    if state.memberships != frozenset({LIFECYCLE_ROLE}):
+        raise RuntimeError("lifecycle database login is missing its permission role")
 
 
 def _verify_runtime(value: str) -> None:
@@ -147,40 +170,72 @@ def _put_parameter(ssm: Any, value: str) -> None:
         Name=LIFECYCLE_DATABASE_PARAMETER,
         Value=value,
         Type="SecureString",
-        Overwrite=True,
+        Overwrite=False,
     )
 
 
-def _restore_parameter(ssm: Any, snapshot: ParameterSnapshot) -> None:
-    if snapshot.exists:
-        if snapshot.parameter_type != "SecureString" or snapshot.value is None:
-            raise RuntimeError("refusing to restore a non-secret lifecycle parameter")
-        _put_parameter(ssm, snapshot.value)
-        return
-    try:
-        ssm.delete_parameter(Name=LIFECYCLE_DATABASE_PARAMETER)
-    except ssm.exceptions.ParameterNotFound:
-        pass
+def _parameter_password(snapshot: ParameterSnapshot, *, deploy_url: str) -> str:
+    if not snapshot.exists or snapshot.value is None:
+        raise RuntimeError("lifecycle database parameter is missing")
+    if snapshot.parameter_type != "SecureString":
+        raise RuntimeError("lifecycle database parameter must be a SecureString")
+    username, password = _parameter_login(snapshot.value)
+    if username != LIFECYCLE_LOGIN:
+        raise RuntimeError("lifecycle parameter belongs to another database login")
+    if _noncredential_url(snapshot.value) != _noncredential_url(deploy_url):
+        raise RuntimeError("lifecycle parameter targets another database configuration")
+    return password
 
 
-def _drop_created_login(deploy_url: str) -> None:
-    with psycopg.connect(
-        database_url_with_tls_roots(deploy_url),
-        autocommit=True,
-        connect_timeout=5,
-        application_name="hindsight-lifecycle-credential-rollback",
-    ) as connection:
+def _write_new_parameter(ssm: Any, *, deploy_url: str) -> ParameterSnapshot:
+    password = secrets.token_urlsafe(48)
+    runtime_url = _runtime_url(deploy_url, password=password)
+    _put_parameter(ssm, runtime_url)
+    written = _snapshot_parameter(ssm, LIFECYCLE_DATABASE_PARAMETER)
+    if (
+        not written.exists
+        or written.parameter_type != "SecureString"
+        or written.value != runtime_url
+    ):
+        raise RuntimeError("lifecycle database parameter verification failed")
+    return written
+
+
+def _assert_parameter_unchanged(ssm: Any, expected: ParameterSnapshot) -> None:
+    if _snapshot_parameter(ssm, LIFECYCLE_DATABASE_PARAMETER) != expected:
+        raise RuntimeError("lifecycle database parameter changed during reconciliation")
+
+
+def _reconcile_login(
+    connection: psycopg.Connection,
+    *,
+    existing: RoleState,
+    password: str,
+) -> None:
+    if existing.exists:
+        _assert_recoverable_login(existing)
         connection.execute(
-            sql.SQL("REVOKE {} FROM {}").format(
-                sql.Identifier(LIFECYCLE_ROLE),
-                sql.Identifier(LIFECYCLE_LOGIN),
-            )
+            sql.SQL("ALTER ROLE {} WITH PASSWORD %s").format(sql.Identifier(LIFECYCLE_LOGIN)),
+            (password,),
         )
-        connection.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(LIFECYCLE_LOGIN)))
+    else:
+        connection.execute(
+            sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD %s NOBYPASSRLS").format(
+                sql.Identifier(LIFECYCLE_LOGIN)
+            ),
+            (password,),
+        )
+    connection.execute(
+        sql.SQL("GRANT {} TO {}").format(
+            sql.Identifier(LIFECYCLE_ROLE),
+            sql.Identifier(LIFECYCLE_LOGIN),
+        )
+    )
+    _assert_managed_login(_role_state(connection, LIFECYCLE_LOGIN))
 
 
 def reconcile(*, profile: str | None, region: str) -> str:
-    """Create or verify the fixed lifecycle login and its sole parameter."""
+    """Create, repair, or verify the fixed lifecycle login and its sole parameter."""
 
     session = boto3.Session(profile_name=profile, region_name=region)
     ssm = session.client("ssm", config=aws_client_config(read_timeout=10))
@@ -198,70 +253,54 @@ def reconcile(*, profile: str | None, region: str) -> str:
         _assert_permission_role(connection)
         existing = _role_state(connection, LIFECYCLE_LOGIN)
 
+    initial_role_exists = existing.exists
+    initial_parameter_exists = lifecycle_snapshot.exists
+
     if existing.exists:
-        _assert_managed_login(existing)
-        if not lifecycle_snapshot.exists or lifecycle_snapshot.value is None:
-            raise RuntimeError("managed lifecycle login has no recoverable parameter")
-        if lifecycle_snapshot.parameter_type != "SecureString":
-            raise RuntimeError("lifecycle database parameter must be a SecureString")
-        username, _password = _parameter_login(lifecycle_snapshot.value)
-        if username != LIFECYCLE_LOGIN:
-            raise RuntimeError("lifecycle parameter belongs to another database login")
-        if _database_target(lifecycle_snapshot.value) != _database_target(deploy_url):
-            raise RuntimeError("lifecycle parameter targets another database")
-        _verify_runtime(lifecycle_snapshot.value)
-        return "unchanged"
-
+        _assert_recoverable_login(existing)
     if lifecycle_snapshot.exists:
-        raise RuntimeError("lifecycle parameter exists without its managed database login")
+        _parameter_password(lifecycle_snapshot, deploy_url=deploy_url)
 
-    password = secrets.token_urlsafe(48)
-    runtime_url = _runtime_url(deploy_url, password=password)
-    created = False
+    if (
+        existing.exists
+        and existing.memberships == frozenset({LIFECYCLE_ROLE})
+        and lifecycle_snapshot.exists
+        and lifecycle_snapshot.value is not None
+    ):
+        try:
+            _verify_runtime(lifecycle_snapshot.value)
+        except (psycopg.Error, RuntimeError):
+            pass
+        else:
+            _assert_parameter_unchanged(ssm, lifecycle_snapshot)
+            return "unchanged"
+
     try:
+        if not lifecycle_snapshot.exists:
+            lifecycle_snapshot = _write_new_parameter(ssm, deploy_url=deploy_url)
+        password = _parameter_password(lifecycle_snapshot, deploy_url=deploy_url)
         with psycopg.connect(
             database_url_with_tls_roots(deploy_url),
             autocommit=True,
             connect_timeout=5,
             application_name="hindsight-lifecycle-credential-provisioner",
         ) as connection:
-            connection.execute(
-                sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD %s NOBYPASSRLS").format(
-                    sql.Identifier(LIFECYCLE_LOGIN)
-                ),
-                (password,),
+            _assert_permission_role(connection)
+            current = _role_state(connection, LIFECYCLE_LOGIN)
+            _reconcile_login(
+                connection,
+                existing=current,
+                password=password,
             )
-            created = True
-            connection.execute(
-                sql.SQL("GRANT {} TO {}").format(
-                    sql.Identifier(LIFECYCLE_ROLE),
-                    sql.Identifier(LIFECYCLE_LOGIN),
-                )
-            )
-            _assert_managed_login(_role_state(connection, LIFECYCLE_LOGIN))
-        _verify_runtime(runtime_url)
-        _put_parameter(ssm, runtime_url)
-        written = _snapshot_parameter(ssm, LIFECYCLE_DATABASE_PARAMETER)
-        if (
-            not written.exists
-            or written.parameter_type != "SecureString"
-            or written.value != runtime_url
-        ):
-            raise RuntimeError("lifecycle database parameter verification failed")
+        if lifecycle_snapshot.value is None:
+            raise RuntimeError("lifecycle database parameter is missing")
+        _verify_runtime(lifecycle_snapshot.value)
+        _assert_parameter_unchanged(ssm, lifecycle_snapshot)
     except Exception as exc:
-        parameter_restored = False
-        try:
-            _restore_parameter(ssm, lifecycle_snapshot)
-            parameter_restored = True
-        except Exception:
-            pass
-        if created and parameter_restored:
-            try:
-                _drop_created_login(deploy_url)
-            except Exception:
-                pass
         raise RuntimeError("lifecycle database credential reconciliation failed") from exc
-    return "created"
+    if not initial_role_exists and not initial_parameter_exists:
+        return "created"
+    return "recovered"
 
 
 def main(argv: list[str] | None = None) -> int:
