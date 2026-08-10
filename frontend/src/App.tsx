@@ -88,7 +88,7 @@ export default function App() {
           </>
         ) : null}
 
-        {cockpit.canWrite ? (
+        {cockpit.canWrite && showReplay ? (
           <OperatorConsole
             incidents={cockpit.incidents}
             incident={cockpit.incident}

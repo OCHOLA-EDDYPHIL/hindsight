@@ -253,6 +253,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.ID, "identityButton").click()
         driver.find_element(By.ID, "identitySignIn").click()
         _complete_operator_sign_in(driver, wait)
+        wait.until(expected.presence_of_element_located((By.ID, "memories")))
         wait.until(expected.presence_of_element_located((By.ID, "startRun")))
         wait.until_not(
             lambda browser: browser.find_element(By.ID, "startRun").get_attribute("disabled")
@@ -260,15 +261,26 @@ def test_operator_can_run_and_explain_signature_workflow():
 
         walkthrough = driver.find_element(By.ID, "operatorWalkthrough")
         assert not walkthrough.is_displayed()
-        driver.find_element(By.ID, "walkthroughToggle").click()
+        walkthrough_toggle = driver.find_element(By.ID, "walkthroughToggle")
+        assert walkthrough_toggle.get_attribute("aria-expanded") == "false"
+        walkthrough_toggle.click()
         wait.until(
-            lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed()
+            lambda browser: (
+                browser.find_element(By.ID, "walkthroughToggle").get_attribute("aria-expanded")
+                == "true"
+                and browser.find_element(By.ID, "operatorWalkthrough").is_displayed()
+            )
         )
+        walkthrough = driver.find_element(By.ID, "operatorWalkthrough")
         assert "Reset the replay" in walkthrough.text
         assert "Inspect history" in walkthrough.text
         driver.find_element(By.ID, "walkthroughToggle").click()
         wait.until_not(
-            lambda browser: browser.find_element(By.ID, "operatorWalkthrough").is_displayed()
+            lambda browser: (
+                browser.find_element(By.ID, "walkthroughToggle").get_attribute("aria-expanded")
+                == "true"
+                or browser.find_element(By.ID, "operatorWalkthrough").is_displayed()
+            )
         )
 
         previous_namespace = driver.find_element(By.ID, "namespace").text
