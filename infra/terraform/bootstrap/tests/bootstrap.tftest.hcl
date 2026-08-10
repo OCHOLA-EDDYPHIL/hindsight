@@ -394,9 +394,37 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "CognitoUserPoolCreate"
+      ]).actions) == toset(["cognito-idp:CreateUserPool"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "CognitoUserPoolCreate"
+      ]).resources) == toset(["*"]) &&
+      toset([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+          if statement.sid == "CognitoUserPoolCreate"
+        ]).condition : "${condition.test}:${condition.variable}:${join(",", condition.values)}"
+        ]) == toset([
+        "StringEquals:aws:RequestTag/Project:hindsight",
+        "StringEquals:aws:RequestTag/Environment:demo",
+        "StringEquals:aws:RequestTag/ManagedBy:terraform",
+        "ForAllValues:StringEquals:aws:TagKeys:Environment,ManagedBy,Project",
+      ]) &&
+      !contains(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "ApplicationLifecycle"
+      ]).actions, "cognito-idp:CreateUserPool")
+    )
+    error_message = "User-pool creation must require the exact stage-owned Terraform tags because Cognito does not support resource scoping before creation."
+  }
+
+  assert {
     condition = alltrue([
       for action in [
-        "cognito-idp:CreateUserPool",
         "cognito-idp:CreateUserPoolClient",
         "cognito-idp:CreateUserPoolDomain",
         "wafv2:CreateWebACL",
@@ -473,14 +501,20 @@ run "isolated_bootstrap" {
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
         if statement.sid == "ObservabilityBudget"
-      ]).actions) == toset(["budgets:ModifyBudget", "budgets:ViewBudget"]) &&
+        ]).actions) == toset([
+        "budgets:ListTagsForResource",
+        "budgets:ModifyBudget",
+        "budgets:TagResource",
+        "budgets:UntagResource",
+        "budgets:ViewBudget",
+      ]) &&
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
         if statement.sid == "ObservabilityBudget"
       ]).resources) == toset([local.observability_budget_arn]) &&
       local.observability_budget_arn == "arn:aws:budgets::123456789012:budget/hindsight-demo-monthly-five-usd"
     )
-    error_message = "Budget access must be limited to read and management of the stage five-dollar budget."
+    error_message = "Budget access, including Terraform tag reconciliation, must stay limited to the stage five-dollar budget."
   }
 
   assert {

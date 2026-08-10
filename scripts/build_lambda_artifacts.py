@@ -11,6 +11,11 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE_PACKAGE = ROOT / "src" / "hindsight"
 BUILD_ROOT = ROOT / "build" / "lambda-artifacts"
+AWS_LAMBDA_UNZIPPED_LIMIT_BYTES = 262_144_000
+# Confirmed from the official AWS ADOT Python layer used by the bounded
+# observability deployment. Lambda applies its extracted-size limit to the
+# function artifact and every attached layer together.
+ADOT_PYTHON_LAYER_UNZIPPED_BYTES = 53_504_816
 
 ARTIFACTS = {
     "api": {
@@ -55,8 +60,10 @@ ARTIFACTS = {
         ],
     },
     "worker": {
+        # boto3/botocore are supplied by the managed Python runtime, as they
+        # are for the API and realtime artifacts. Bundling a second copy adds
+        # more than 20 MB to the extracted worker without changing its API use.
         "dependencies": [
-            "boto3>=1.43.46",
             "certifi>=2026.6.17",
             "cryptography>=50.0.0",
             "google-genai>=2.11.0",
@@ -165,7 +172,27 @@ def build_artifact(name: str) -> pathlib.Path:
         for path in package_root.rglob("*"):
             if path.is_file():
                 archive.write(path, path.relative_to(package_root))
+    validate_unzipped_size(name, zip_path)
     return zip_path
+
+
+def unzipped_size(zip_path: pathlib.Path) -> int:
+    """Return the extracted file bytes Lambda counts for one artifact."""
+
+    with zipfile.ZipFile(zip_path) as archive:
+        return sum(member.file_size for member in archive.infolist())
+
+
+def validate_unzipped_size(name: str, zip_path: pathlib.Path) -> None:
+    """Fail before upload when an artifact plus the ADOT layer exceeds Lambda's limit."""
+
+    artifact_bytes = unzipped_size(zip_path)
+    combined_bytes = artifact_bytes + ADOT_PYTHON_LAYER_UNZIPPED_BYTES
+    if combined_bytes > AWS_LAMBDA_UNZIPPED_LIMIT_BYTES:
+        raise RuntimeError(
+            f"{name} Lambda artifact and ADOT layer extract to {combined_bytes} bytes; "
+            f"limit is {AWS_LAMBDA_UNZIPPED_LIMIT_BYTES} bytes"
+        )
 
 
 if __name__ == "__main__":

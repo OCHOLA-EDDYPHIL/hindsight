@@ -33,6 +33,26 @@ def test_application_stack_uses_split_artifacts_and_external_secret_references()
     assert 'resource "aws_dynamodb_table" "gemini_key_health"' in stack
 
 
+def test_worker_and_other_runtime_lambdas_keep_bounded_adot_xray_tracing():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    resource_names = ("api", "worker", "websocket", "changefeed")
+    for index, name in enumerate(resource_names):
+        body = stack.split(f'resource "aws_lambda_function" "{name}"', 1)[1]
+        if index + 1 < len(resource_names):
+            body = body.split(
+                f'resource "aws_lambda_function" "{resource_names[index + 1]}"', 1
+            )[0]
+        else:
+            body = body.split('resource "aws_lambda_event_source_mapping"', 1)[0]
+        assert "layers" in body
+        assert "var.adot_python_layer_arn" in body
+        assert 'tracing_config { mode = var.enable_bounded_observability ? "Active"' in body
+        assert 'HINDSIGHT_OTEL_ENABLED' in body
+        assert 'OTEL_EXPORTER_OTLP_ENDPOINT' in body
+        assert 'OTEL_PROPAGATORS' in body
+        assert 'OTEL_TRACES_SAMPLER' in body
+
+
 def test_saved_plan_sources_do_not_capture_a_runner_checkout_path():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
 
@@ -295,6 +315,9 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     application_lifecycle = bootstrap.split('sid = "ApplicationLifecycle"', 1)[1].split(
         "\n  statement {", 1
     )[0]
+    cognito_create = bootstrap.split('sid       = "CognitoUserPoolCreate"', 1)[1].split(
+        "\n  statement {", 1
+    )[0]
     assert bootstrap.count('"lambda:ListVersionsByFunction"') == 1
     assert re.search(
         r'lambda_version_refresh_actions\s*=\s*\["lambda:ListVersionsByFunction"\]',
@@ -303,6 +326,13 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "actions   = local.lambda_version_refresh_actions" in version_refresh
     assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle
+    assert 'actions   = ["cognito-idp:CreateUserPool"]' in cognito_create
+    assert 'resources = ["*"]' in cognito_create
+    assert 'variable = "aws:RequestTag/Project"' in cognito_create
+    assert 'variable = "aws:RequestTag/Environment"' in cognito_create
+    assert 'variable = "aws:RequestTag/ManagedBy"' in cognito_create
+    assert 'variable = "aws:TagKeys"' in cognito_create
+    assert '"cognito-idp:CreateUserPool",' not in application_lifecycle
     assert "function:hindsight-${var.stage}-${component}" in bootstrap
     assert "s3:GetBucketAcl" in bootstrap
     assert "s3:GetBucketCORS" in bootstrap
