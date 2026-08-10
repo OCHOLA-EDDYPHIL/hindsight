@@ -542,7 +542,11 @@ run "isolated_bootstrap" {
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
         if statement.sid == "ObservabilitySamplingRuleRead"
-      ]).actions) == toset(["xray:GetSamplingRules", "xray:GetSamplingTargets"]) &&
+        ]).actions) == toset([
+        "xray:BatchGetTraces",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets",
+      ]) &&
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
         if statement.sid == "ObservabilitySamplingRuleRead"
@@ -564,6 +568,28 @@ run "isolated_bootstrap" {
       ])
     )
     error_message = "X-Ray list reads must stay separate from the stage sampling-rule lifecycle."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityEvidenceLogQuery"
+      ]).actions) == toset(["logs:StartQuery"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityEvidenceLogQuery"
+      ]).resources) == toset(local.observability_metric_log_group_arns) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityEvidenceLogQueryResults"
+      ]).actions) == toset(["logs:GetQueryResults", "logs:StopQuery"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityEvidenceLogQueryResults"
+      ]).resources) == toset(["*"])
+    )
+    error_message = "Evidence log queries must start only on bounded-profile groups and poll by query ID."
   }
 
   assert {

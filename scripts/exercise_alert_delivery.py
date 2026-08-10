@@ -13,11 +13,20 @@ from typing import Any
 import boto3
 
 
-def publish(*, topic_arn: str, profile: str, source_revision: str, session: Any = None) -> dict[str, Any]:
+def publish(
+    *,
+    topic_arn: str,
+    profile: str | None,
+    source_revision: str,
+    session: Any = None,
+) -> dict[str, Any]:
     if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
         raise ValueError("source revision must be a full lowercase Git SHA")
-    resolved_session = session or boto3.Session(profile_name=profile)
-    response = resolved_session.client("sns", region_name=topic_arn.split(":")[3]).publish(
+    arn = topic_arn.split(":", 5)
+    if len(arn) != 6 or arn[:3] != ["arn", "aws", "sns"] or not arn[3] or not arn[4]:
+        raise ValueError("topic ARN must identify an AWS SNS topic")
+    resolved_session = session or boto3.Session(profile_name=profile or None)
+    response = resolved_session.client("sns", region_name=arn[3]).publish(
         TopicArn=topic_arn,
         Subject="Hindsight alert delivery exercise",
         Message=json.dumps({"kind": "alert_delivery_exercise", "source_revision": source_revision}),
@@ -29,6 +38,8 @@ def publish(*, topic_arn: str, profile: str, source_revision: str, session: Any 
         "schema_version": 1,
         "kind": "alert_delivery_evidence",
         "source_revision": source_revision,
+        "account_id": arn[4],
+        "region": arn[3],
         "topic_arn": topic_arn,
         "message_id": message_id,
         "published_at": datetime.now(UTC).isoformat(),
@@ -39,7 +50,7 @@ def publish(*, topic_arn: str, profile: str, source_revision: str, session: Any 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--topic-arn", required=True)
-    parser.add_argument("--profile", required=True)
+    parser.add_argument("--profile")
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

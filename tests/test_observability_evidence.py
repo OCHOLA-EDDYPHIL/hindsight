@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,9 @@ SOURCE_REVISION = "a" * 40
 
 
 def _script(name: str):
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
     spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -114,6 +119,212 @@ def test_alert_exercise_records_only_acknowledgement_and_revision():
     )
     assert evidence["message_id"] == "message-1"
     assert evidence["source_revision"] == SOURCE_REVISION
+    assert evidence["account_id"] == "123456789012"
+    assert evidence["region"] == "us-east-1"
+
+
+def _acceptance_documents():
+    started = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+    run = {
+        "id": 123,
+        "run_attempt": 2,
+        "head_sha": SOURCE_REVISION,
+        "head_branch": "main",
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/live-acceptance.yml",
+        "conclusion": "success",
+        "run_started_at": started.isoformat(),
+        "updated_at": (started + timedelta(minutes=30)).isoformat(),
+        "repository": {"full_name": "owner/hindsight"},
+        "actor": {"login": "owner"},
+        "triggering_actor": {"login": "owner"},
+    }
+    provenance = {
+        "repository": "owner/hindsight",
+        "run_id": "123",
+        "run_attempt": "2",
+        "head_sha": SOURCE_REVISION,
+        "acceptance_mode": "full",
+        "deployment_environment": "demo",
+        "bounded_observability_enabled": True,
+    }
+    return run, provenance
+
+
+def test_observability_provenance_requires_successful_bounded_full_acceptance():
+    module = _script("collect_observability_evidence")
+    run, provenance = _acceptance_documents()
+    start, end = module.validate_provenance(
+        run,
+        provenance,
+        repository="owner/hindsight",
+        source_revision=SOURCE_REVISION,
+        acceptance_run_id="123",
+        acceptance_run_attempt="2",
+        deployment_environment="demo",
+    )
+    assert (end - start).total_seconds() == 40 * 60
+
+    provenance["bounded_observability_enabled"] = False
+    with pytest.raises(ValueError, match="did not enable bounded observability"):
+        module.validate_provenance(
+            run,
+            provenance,
+            repository="owner/hindsight",
+            source_revision=SOURCE_REVISION,
+            acceptance_run_id="123",
+            acceptance_run_attempt="2",
+            deployment_environment="demo",
+        )
+
+
+def test_observability_log_query_is_bounded_and_rejects_secret_fields():
+    module = _script("collect_observability_evidence")
+    groups = module.expected_log_groups("demo")
+
+    class Logs:
+        def __init__(self, message):
+            self.message = message
+            self.started = None
+
+        def start_query(self, **kwargs):
+            self.started = kwargs
+            return {"queryId": "query-1"}
+
+        def get_query_results(self, **kwargs):
+            assert kwargs == {"queryId": "query-1"}
+            return {
+                "status": "Complete",
+                "statistics": {"bytesScanned": 100, "recordsScanned": 4, "recordsMatched": 1},
+                "results": [
+                    [
+                        {"field": "@timestamp", "value": "2026-08-10 10:00:00.000"},
+                        {"field": "@log", "value": f"123456789012:{groups[0]}"},
+                        {"field": "@message", "value": json.dumps(self.message)},
+                    ]
+                ],
+            }
+
+    safe = {
+        "event": "api_request",
+        "status": "202",
+        "tenant_id": "tenant-1",
+        "trace_id": "a" * 32,
+        "span_id": "b" * 16,
+    }
+    client = Logs(safe)
+    events, statistics = module.collect_logs(
+        client,
+        log_groups=groups,
+        start=datetime.now(UTC) - timedelta(minutes=1),
+        end=datetime.now(UTC),
+    )
+    assert events[0]["event"] == "api_request"
+    assert statistics["bytes_scanned"] == 100
+    assert client.started["limit"] == module.MAX_LOG_EVENTS
+    assert client.started["logGroupNames"] == groups
+
+    client = Logs({**safe, "api_key": "never"})
+    with pytest.raises(RuntimeError, match="unexpected field"):
+        module.collect_logs(
+            client,
+            log_groups=groups,
+            start=datetime.now(UTC) - timedelta(minutes=1),
+            end=datetime.now(UTC),
+        )
+
+
+def test_observability_correlation_requires_all_product_boundaries():
+    module = _script("collect_observability_evidence")
+    trace_id = "a" * 32
+    common = {
+        "tenant_id": "tenant-1",
+        "run_id": "run-1",
+        "dispatch_id": "dispatch-1",
+        "dispatch_attempt_id": "dispatch-attempt-1",
+        "trace_id": trace_id,
+        "span_id": "b" * 16,
+    }
+    logs = [
+        {"event": "api_request", "status": "202", "tenant_id": "tenant-1", "trace_id": trace_id},
+        {"event": "run_dispatch", "status": "sent", "message_id": "message-1", **common},
+        {"event": "worker_record", "status": "completed", "message_id": "message-1", **common},
+        {
+            "event": "realtime_changefeed",
+            "status": "delivered",
+            "tenant_id": "tenant-1",
+            "run_id": "run-1",
+            "trace_id": "c" * 32,
+        },
+    ]
+    traces = {
+        trace_id: {
+            "xray_trace_id": "1-aaaaaaaa-aaaaaaaaaaaaaaaaaaaaaaaa",
+            "nodes": [
+                {"name": "hindsight.api.request"},
+                {"name": "hindsight.worker.message"},
+            ],
+        }
+    }
+    result = module.correlate(logs, traces)
+    assert result["run_id"] == "run-1"
+    assert result["dispatch"]["message_id"] == result["worker"]["message_id"]
+    assert module.candidate_trace_ids(logs) == [trace_id]
+
+    with pytest.raises(RuntimeError, match="no complete"):
+        module.correlate(logs[:-1], traces)
+
+
+def test_observability_fetches_only_log_derived_trace_ids():
+    module = _script("collect_observability_evidence")
+    trace_id = "a" * 32
+
+    class Xray:
+        def __init__(self):
+            self.calls = []
+
+        def batch_get_traces(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "Traces": [
+                    {
+                        "Id": "1-aaaaaaaa-aaaaaaaaaaaaaaaaaaaaaaaa",
+                        "Duration": 1,
+                        "Segments": [
+                            {"Document": json.dumps({"name": "hindsight.api.request"})}
+                        ],
+                    }
+                ]
+            }
+
+    client = Xray()
+    traces = module.collect_traces(client, trace_ids=[trace_id])
+    assert client.calls == [{"TraceIds": ["1-aaaaaaaa-aaaaaaaaaaaaaaaaaaaaaaaa"]}]
+    assert list(traces) == [trace_id]
+
+
+def test_observability_report_has_verifiable_payload_digest():
+    module = _script("collect_observability_evidence")
+    report = module.build_report(
+        source_revision=SOURCE_REVISION,
+        repository="owner/hindsight",
+        acceptance_run_id="123",
+        acceptance_run_attempt="2",
+        deployment_environment="demo",
+        identity={"account_id": "123456789012", "caller_arn": "arn:aws:iam::123:role/test", "region": "us-east-1"},
+        start=datetime.now(UTC) - timedelta(minutes=1),
+        end=datetime.now(UTC),
+        log_groups=module.expected_log_groups("demo"),
+        correlation={"trace_id": "a" * 32},
+        log_statistics={"bytes_scanned": 1},
+        trace_ids_requested=1,
+        traces_returned=1,
+        collection_attempt=1,
+        alert={"message_id": "message-1"},
+    )
+    assert module.validate_report_digest(report)
+    report["source_revision"] = "b" * 40
+    assert not module.validate_report_digest(report)
 
 
 def test_correlation_fields_drop_arbitrary_values_and_include_trace_ids():

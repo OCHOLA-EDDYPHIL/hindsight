@@ -984,8 +984,26 @@ data "aws_iam_policy_document" "github_deploy_observability" {
   statement {
     sid = "ObservabilitySamplingRuleRead"
     actions = [
+      "xray:BatchGetTraces",
       "xray:GetSamplingRules",
       "xray:GetSamplingTargets",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "ObservabilityEvidenceLogQuery"
+    actions = [
+      "logs:StartQuery",
+    ]
+    resources = local.observability_metric_log_group_arns
+  }
+
+  statement {
+    sid = "ObservabilityEvidenceLogQueryResults"
+    actions = [
+      "logs:GetQueryResults",
+      "logs:StopQuery",
     ]
     resources = ["*"]
   }

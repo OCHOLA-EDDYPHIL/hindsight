@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -45,6 +47,9 @@ RUN_MAX_ATTEMPTS_ENV = "HINDSIGHT_RUN_MAX_ATTEMPTS"
 RUN_ATTEMPT_LEASE_SECONDS_ENV = "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS"
 RUN_DLQ_ARN_ENV = "HINDSIGHT_RUN_DLQ_ARN"
 LOGGER = logging.getLogger(__name__)
+_RECORD_OBSERVER: ContextVar[Callable[[Exception | None], None] | None] = ContextVar(
+    "worker_record_observer", default=None
+)
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -59,31 +64,45 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         attributes = record.get("attributes") or {}
         receive_count = str(attributes.get("ApproximateReceiveCount") or "unknown")
         message: dict[str, Any] = {}
+        observed = False
         try:
             message = json.loads(record.get("body") or "{}")
-            process_message(
-                message,
-                dead_letter=bool(source_arn and source_arn == os.environ.get(RUN_DLQ_ARN_ENV)),
-                worker_message_id=message_id,
-            )
-            _log_record_result(
-                status="completed",
-                message=message,
-                message_id=message_id,
-                receive_count=receive_count,
-                source_arn=source_arn,
-                context=context,
-            )
+
+            def observe(error: Exception | None) -> None:
+                nonlocal observed
+                observed = True
+                _log_record_result(
+                    status="failed" if error is not None else "completed",
+                    message=message,
+                    message_id=message_id,
+                    receive_count=receive_count,
+                    source_arn=source_arn,
+                    context=context,
+                    error=error,
+                )
+
+            token = _RECORD_OBSERVER.set(observe)
+            try:
+                process_message(
+                    message,
+                    dead_letter=bool(source_arn and source_arn == os.environ.get(RUN_DLQ_ARN_ENV)),
+                    worker_message_id=message_id,
+                )
+            finally:
+                _RECORD_OBSERVER.reset(token)
+            if not observed:
+                observe(None)
         except Exception as exc:
-            _log_record_result(
-                status="failed",
-                message=message,
-                message_id=message_id,
-                receive_count=receive_count,
-                source_arn=source_arn,
-                context=context,
-                error=exc,
-            )
+            if not observed:
+                _log_record_result(
+                    status="failed",
+                    message=message,
+                    message_id=message_id,
+                    receive_count=receive_count,
+                    source_arn=source_arn,
+                    context=context,
+                    error=exc,
+                )
             failures.append({"itemIdentifier": message_id})
     return {"batchItemFailures": failures}
 
@@ -152,11 +171,20 @@ def process_message(
     with tenant_scope(tenant_id), start_span(
         "hindsight.worker.message", attributes, context=extract(carrier)
     ):
-        return _process_tenant_message(
-            message,
-            dead_letter=dead_letter,
-            worker_message_id=worker_message_id,
-        )
+        observer = _RECORD_OBSERVER.get()
+        try:
+            result = _process_tenant_message(
+                message,
+                dead_letter=dead_letter,
+                worker_message_id=worker_message_id,
+            )
+        except Exception as exc:
+            if observer is not None:
+                observer(exc)
+            raise
+        if observer is not None:
+            observer(None)
+        return result
 
 
 def _process_tenant_message(

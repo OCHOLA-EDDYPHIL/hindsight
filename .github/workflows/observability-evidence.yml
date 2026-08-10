@@ -1,0 +1,148 @@
+name: observability evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      acceptance_run_id:
+        description: Successful full live-acceptance workflow run ID
+        required: true
+        type: string
+      acceptance_run_attempt:
+        description: Successful full live-acceptance workflow run attempt
+        required: true
+        type: string
+        default: "1"
+      deployment_environment:
+        description: Protected environment used by the full acceptance run
+        required: true
+        type: choice
+        default: demo
+        options:
+          - demo
+          - demo-candidate
+
+permissions: {}
+
+concurrency:
+  group: hindsight-observability-evidence-${{ inputs.acceptance_run_id }}-${{ inputs.acceptance_run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    outputs:
+      source_revision: ${{ steps.authorization.outputs.source_revision }}
+      acceptance_run_id: ${{ steps.authorization.outputs.acceptance_run_id }}
+      acceptance_run_attempt: ${{ steps.authorization.outputs.acceptance_run_attempt }}
+      deployment_environment: ${{ steps.authorization.outputs.deployment_environment }}
+    steps:
+      - id: authorization
+        name: Authorize exact-main evidence collection
+        env:
+          REF_NAME: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ inputs.acceptance_run_attempt }}
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
+        shell: bash
+        run: |
+          [[ "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/observability-evidence.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ \
+            && "$ACCEPTANCE_RUN_ID" =~ ^[1-9][0-9]*$ \
+            && "$ACCEPTANCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Observability evidence requires the repository owner on exact main." >&2
+            exit 1
+          }
+          [[ "$DEPLOYMENT_ENVIRONMENT" == "demo" || "$DEPLOYMENT_ENVIRONMENT" == "demo-candidate" ]] || {
+            echo "Unsupported deployment environment." >&2
+            exit 1
+          }
+          {
+            echo "source_revision=$EVENT_SHA"
+            echo "acceptance_run_id=$ACCEPTANCE_RUN_ID"
+            echo "acceptance_run_attempt=$ACCEPTANCE_RUN_ATTEMPT"
+            echo "deployment_environment=$DEPLOYMENT_ENVIRONMENT"
+          } >> "$GITHUB_OUTPUT"
+
+  collect:
+    needs: authorize
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_revision }}
+          persist-credentials: false
+      - name: Verify exact product revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.source_revision }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - name: Download exact acceptance provenance
+        uses: actions/download-artifact@v4
+        with:
+          name: product-provenance-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_attempt }}
+          path: build/observability-input
+          run-id: ${{ needs.authorize.outputs.acceptance_run_id }}
+          github-token: ${{ github.token }}
+      - name: Fetch exact acceptance attempt metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ACCEPTANCE_RUN_ID: ${{ needs.authorize.outputs.acceptance_run_id }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ needs.authorize.outputs.acceptance_run_attempt }}
+        run: >-
+          gh api
+          "repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID/attempts/$ACCEPTANCE_RUN_ATTEMPT"
+          > build/observability-input/acceptance-run.json
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Collect bounded observability evidence
+        run: >-
+          uv run python scripts/collect_observability_evidence.py
+          --source-revision "${{ needs.authorize.outputs.source_revision }}"
+          --repository "$GITHUB_REPOSITORY"
+          --acceptance-run-id "${{ needs.authorize.outputs.acceptance_run_id }}"
+          --acceptance-run-attempt "${{ needs.authorize.outputs.acceptance_run_attempt }}"
+          --acceptance-run build/observability-input/acceptance-run.json
+          --acceptance-provenance build/observability-input/product-provenance.json
+          --deployment-environment "${{ needs.authorize.outputs.deployment_environment }}"
+          --stage "$HINDSIGHT_STAGE"
+          --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID"
+          --region "$AWS_REGION"
+          --output build/observability-evidence.json
+          --checksum-output build/observability-evidence.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: observability-evidence-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_id }}-${{ needs.authorize.outputs.acceptance_run_attempt }}
+          path: |
+            build/observability-evidence.json
+            build/observability-evidence.sha256
+            build/observability-input/product-provenance.json
+          if-no-files-found: error
+          retention-days: 90

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -9,12 +10,14 @@ from uuid import UUID, uuid4
 from psycopg.rows import dict_row
 
 from hindsight.db import connect
+from hindsight.observability import structured_event
 from hindsight.queueing import enqueue_run
 from hindsight.security import safe_error_detail
 
 RUN_DISPATCH_LEASE_TTL = timedelta(seconds=30)
 RUN_DISPATCH_ACK_TTL = timedelta(minutes=5)
 RUN_DISPATCH_BATCH_LIMIT = 25
+LOGGER = logging.getLogger(__name__)
 
 
 def dispatch_run_commands(
@@ -68,6 +71,16 @@ def dispatch_run_commands(
             message_id=message_id,
             db_url=db_url,
         ):
+            LOGGER.info(
+                structured_event(
+                    "run_dispatch",
+                    {
+                        **payload,
+                        "status": "sent",
+                        "message_id": message_id,
+                    },
+                )
+            )
             dispatched += 1
         else:
             lease_lost += 1
