@@ -53,7 +53,7 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv lock --check
       - run: uv sync --frozen
-      - run: uv run pip-audit
+      - run: uv run pip-audit --cache-dir "$RUNNER_TEMP/pip-audit"
       - run: uv run python scripts/ci_test_groups.py validate
       - run: uv run ruff check .
       - run: uv run python scripts/ci_test_groups.py run unit
