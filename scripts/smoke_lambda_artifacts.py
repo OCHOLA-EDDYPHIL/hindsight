@@ -73,6 +73,18 @@ if not (artifact_root / "boto3").exists():
     class ClientError(Exception):
         pass
 
+    class BotoCoreError(Exception):
+        pass
+
+    class ConnectTimeoutError(BotoCoreError):
+        pass
+
+    class EndpointConnectionError(BotoCoreError):
+        pass
+
+    class ReadTimeoutError(BotoCoreError):
+        pass
+
     class Condition:
         def __init__(self, *args):
             self.args = args
@@ -90,7 +102,11 @@ if not (artifact_root / "boto3").exists():
             return Condition(self, other)
 
     config.Config = Config
+    exceptions.BotoCoreError = BotoCoreError
     exceptions.ClientError = ClientError
+    exceptions.ConnectTimeoutError = ConnectTimeoutError
+    exceptions.EndpointConnectionError = EndpointConnectionError
+    exceptions.ReadTimeoutError = ReadTimeoutError
     conditions.Attr = Condition
     conditions.Key = Condition
     sys.modules.update(

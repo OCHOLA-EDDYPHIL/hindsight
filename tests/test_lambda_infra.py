@@ -33,6 +33,26 @@ def test_application_stack_uses_split_artifacts_and_external_secret_references()
     assert 'resource "aws_dynamodb_table" "gemini_key_health"' in stack
 
 
+def test_worker_and_other_runtime_lambdas_keep_bounded_adot_xray_tracing():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    resource_names = ("api", "worker", "websocket", "changefeed")
+    for index, name in enumerate(resource_names):
+        body = stack.split(f'resource "aws_lambda_function" "{name}"', 1)[1]
+        if index + 1 < len(resource_names):
+            body = body.split(
+                f'resource "aws_lambda_function" "{resource_names[index + 1]}"', 1
+            )[0]
+        else:
+            body = body.split('resource "aws_lambda_event_source_mapping"', 1)[0]
+        assert "layers" in body
+        assert "var.adot_python_layer_arn" in body
+        assert 'tracing_config { mode = var.enable_bounded_observability ? "Active"' in body
+        assert 'HINDSIGHT_OTEL_ENABLED' in body
+        assert 'OTEL_EXPORTER_OTLP_ENDPOINT' in body
+        assert 'OTEL_PROPAGATORS' in body
+        assert 'OTEL_TRACES_SAMPLER' in body
+
+
 def test_saved_plan_sources_do_not_capture_a_runner_checkout_path():
     stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
 

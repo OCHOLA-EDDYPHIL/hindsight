@@ -3,6 +3,9 @@
 import importlib.util
 import pathlib
 import sys
+import zipfile
+
+import pytest
 
 
 def _builder():
@@ -88,6 +91,41 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
         "tenant.py",
     } <= set(worker["modules"])
     assert {"lifecycle.py", "lifecycle_aws.py"}.isdisjoint(worker["modules"])
+
+
+def test_worker_uses_managed_runtime_aws_sdk_instead_of_bundling_a_second_copy():
+    builder = _builder()
+
+    assert not any(
+        dependency.startswith(("boto3", "botocore"))
+        for dependency in builder.ARTIFACTS["worker"]["dependencies"]
+    )
+
+
+def test_lambda_size_budget_includes_confirmed_adot_layer():
+    builder = _builder()
+
+    assert builder.AWS_LAMBDA_UNZIPPED_LIMIT_BYTES == 262_144_000
+    assert builder.ADOT_PYTHON_LAYER_UNZIPPED_BYTES == 53_504_816
+    assert (
+        builder.AWS_LAMBDA_UNZIPPED_LIMIT_BYTES
+        - builder.ADOT_PYTHON_LAYER_UNZIPPED_BYTES
+        == 208_639_184
+    )
+
+
+def test_lambda_size_guard_rejects_combined_artifact_and_layer_over_limit(
+    tmp_path, monkeypatch
+):
+    builder = _builder()
+    artifact = tmp_path / "worker.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr("payload", b"1234567")
+    monkeypatch.setattr(builder, "AWS_LAMBDA_UNZIPPED_LIMIT_BYTES", 10)
+    monkeypatch.setattr(builder, "ADOT_PYTHON_LAYER_UNZIPPED_BYTES", 4)
+
+    with pytest.raises(RuntimeError, match="extract to 11 bytes; limit is 10 bytes"):
+        builder.validate_unzipped_size("worker", artifact)
 
 
 def test_artifact_smoke_uses_every_terraform_configured_handler():
