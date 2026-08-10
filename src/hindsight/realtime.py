@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import boto3
@@ -724,6 +725,11 @@ def _management_client() -> Any:
     endpoint = os.environ.get(MANAGEMENT_ENDPOINT_ENV)
     if not endpoint:
         raise RuntimeError(f"{MANAGEMENT_ENDPOINT_ENV} is required")
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https" or not parsed.netloc or not parsed.path.strip("/"):
+        raise RuntimeError(
+            f"{MANAGEMENT_ENDPOINT_ENV} must be an HTTPS stage endpoint"
+        )
     return boto3.client(
         "apigatewaymanagementapi",
         endpoint_url=endpoint,
