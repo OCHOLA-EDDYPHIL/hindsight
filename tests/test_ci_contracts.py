@@ -94,7 +94,9 @@ def test_historical_migration_qualification_uses_durable_hosted_runner():
         (ROOT / ".github/workflows/migration-compatibility.yml").read_text()
     )
 
-    assert workflow["jobs"]["migration_compatibility"]["runs-on"] == "ubuntu-latest"
+    job = workflow["jobs"]["migration_compatibility"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["env"]["COCKROACH_IMAGE"] == "cockroachdb/cockroach:v25.4.5"
 
 
 def test_persistent_runner_databases_are_isolated_by_run_and_attempt():

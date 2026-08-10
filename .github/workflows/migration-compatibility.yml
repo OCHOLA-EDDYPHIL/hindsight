@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       COMPOSE_PROJECT_NAME: hindsight_migrations_${{ github.run_id }}_${{ github.run_attempt }}
+      COCKROACH_IMAGE: cockroachdb/cockroach:v25.4.5
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EXTENDED_DATABASE_URL: postgresql://root@localhost:26257/migration_extended_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
     steps:
