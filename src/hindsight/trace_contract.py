@@ -192,7 +192,7 @@ def signature_scenario_trace(
                 None,
             )
 
-        rejected = next((run for run in runs if run["status"] == "rejected"), None)
+        rejected = _rejected_run_for_operation(runs=runs, operation=operation)
         corrected = next(
             (run for run in reversed(runs) if _is_proven_recovery(run=run, operation=operation)),
             None,
@@ -266,6 +266,17 @@ def _run_precedes_operation(run: dict[str, Any], operation: Any | None) -> bool:
         return False
     completed_at = run.get("completed_at")
     return bool(completed_at is not None and completed_at < operation["completed_at"])
+
+
+def _rejected_run_for_operation(
+    *,
+    runs: list[dict[str, Any]],
+    operation: Any | None,
+) -> dict[str, Any] | None:
+    rejected = [run for run in runs if run.get("status") == "rejected"]
+    if operation is not None and operation.get("completed_at") is not None:
+        rejected = [run for run in rejected if _run_precedes_operation(run, operation)]
+    return rejected[-1] if rejected else None
 
 
 def _is_proven_recovery(*, run: dict[str, Any], operation: Any | None) -> bool:

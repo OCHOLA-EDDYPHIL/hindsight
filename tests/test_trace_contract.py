@@ -8,6 +8,36 @@ import pytest
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
+def test_signature_trace_pairs_latest_pre_rewind_rejection_with_correction():
+    from datetime import UTC, datetime, timedelta
+
+    from hindsight.trace_contract import _rejected_run_for_operation
+
+    rewind_completed_at = datetime.now(UTC)
+    oldest = {
+        "id": "oldest-rejection",
+        "status": "rejected",
+        "completed_at": rewind_completed_at - timedelta(minutes=3),
+    }
+    corrected_rejection = {
+        "id": "corrected-rejection",
+        "status": "rejected",
+        "completed_at": rewind_completed_at - timedelta(minutes=1),
+    }
+    later_rejection = {
+        "id": "later-rejection",
+        "status": "rejected",
+        "completed_at": rewind_completed_at + timedelta(minutes=1),
+    }
+
+    selected = _rejected_run_for_operation(
+        runs=[oldest, corrected_rejection, later_rejection],
+        operation={"completed_at": rewind_completed_at},
+    )
+
+    assert selected == corrected_rejection
+
+
 @requires_db
 def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage():
     from hindsight.db import database_url
