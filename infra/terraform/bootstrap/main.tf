@@ -87,6 +87,11 @@ locals {
   observability_adot_layer_arns = [
     "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-*:*",
   ]
+  application_resource_tags = {
+    Project     = "hindsight"
+    Environment = var.stage
+    ManagedBy   = "terraform"
+  }
 }
 
 check "expected_aws_account" {
@@ -663,6 +668,36 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   statement {
+    sid       = "CognitoUserPoolCreate"
+    actions   = ["cognito-idp:CreateUserPool"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Project"
+      values   = [local.application_resource_tags.Project]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Environment"
+      values   = [local.application_resource_tags.Environment]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/ManagedBy"
+      values   = [local.application_resource_tags.ManagedBy]
+    }
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = keys(local.application_resource_tags)
+    }
+  }
+
+  statement {
     sid = "ApplicationLifecycle"
     actions = [
       "apigateway:DELETE",
@@ -707,7 +742,6 @@ data "aws_iam_policy_document" "github_deploy" {
       "cognito-idp:AdminRemoveUserFromGroup",
       "cognito-idp:AdminSetUserPassword",
       "cognito-idp:CreateGroup",
-      "cognito-idp:CreateUserPool",
       "cognito-idp:CreateUserPoolClient",
       "cognito-idp:CreateUserPoolDomain",
       "cognito-idp:DeleteGroup",
@@ -927,8 +961,14 @@ data "aws_iam_policy_document" "github_deploy_observability" {
   }
 
   statement {
-    sid       = "ObservabilityBudget"
-    actions   = ["budgets:ModifyBudget", "budgets:ViewBudget"]
+    sid = "ObservabilityBudget"
+    actions = [
+      "budgets:ListTagsForResource",
+      "budgets:ModifyBudget",
+      "budgets:TagResource",
+      "budgets:UntagResource",
+      "budgets:ViewBudget",
+    ]
     resources = [local.observability_budget_arn]
   }
 
