@@ -486,7 +486,11 @@ def test_deploy_maps_opt_in_observability_from_protected_configuration():
     ) in deploy
     assert deploy.count("Configure bounded observability inputs") == 2
     assert deploy.count("if: inputs.enable_bounded_observability == true") == 2
-    assert deploy.count("ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn }}") == 2
+    assert deploy.count(
+        "ADOT_PYTHON_LAYER_ARN: "
+        "${{ inputs.adot_python_layer_arn || vars.HINDSIGHT_ADOT_PYTHON_LAYER_ARN }}"
+    ) == 2
+    assert deploy.count("901920570463:layer:aws-otel-python-") == 2
     assert deploy.count("ALERT_RECIPIENT: ${{ secrets.HINDSIGHT_ALERT_RECIPIENT }}") == 2
     assert deploy.count('echo "::add-mask::$ALERT_RECIPIENT"') == 2
     assert deploy.count('echo "TF_VAR_adot_python_layer_arn=$ADOT_PYTHON_LAYER_ARN"') == 2
@@ -504,8 +508,4 @@ def test_deploy_maps_opt_in_observability_from_protected_configuration():
         "enable_bounded_observability: ${{ inputs.enable_bounded_observability }}"
         in deploy_call
     )
-    assert (
-        "adot_python_layer_arn: ${{ inputs.enable_bounded_observability && "
-        "vars.HINDSIGHT_ADOT_PYTHON_LAYER_ARN || '' }}"
-        in deploy_call
-    )
+    assert "adot_python_layer_arn:" not in deploy_call

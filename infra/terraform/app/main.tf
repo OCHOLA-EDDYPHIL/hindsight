@@ -71,12 +71,13 @@ check "bounded_observability" {
     error_message = "Bounded observability requires a region-matched ADOT Python layer ARN."
   }
   assert {
-    condition = var.adot_python_layer_arn == null || try(
-      split(":", var.adot_python_layer_arn)[2] == "lambda" &&
-      split(":", var.adot_python_layer_arn)[3] == var.aws_region,
-      false
+    condition = var.adot_python_layer_arn == null || can(
+      regex(
+        "^arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-(amd64|arm64)-ver-[0-9]+-[0-9]+-[0-9]+:[1-9][0-9]*$",
+        var.adot_python_layer_arn
+      )
     )
-    error_message = "The ADOT Python layer ARN must belong to the application region."
+    error_message = "The ADOT Python layer ARN must be an official AWS-published Python layer in the application region."
   }
 }
 

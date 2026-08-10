@@ -293,11 +293,11 @@ jobs:
       - name: Configure bounded observability inputs
         if: inputs.enable_bounded_observability == true
         env:
-          ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn }}
+          ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn || vars.HINDSIGHT_ADOT_PYTHON_LAYER_ARN }}
           ALERT_RECIPIENT: ${{ secrets.HINDSIGHT_ALERT_RECIPIENT }}
         shell: bash
         run: |
-          layer_pattern="^arn:(aws|aws-us-gov|aws-cn):lambda:${AWS_REGION}:[0-9]{12}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*$"
+          layer_pattern="^arn:aws:lambda:${AWS_REGION}:901920570463:layer:aws-otel-python-(amd64|arm64)-ver-[0-9]+-[0-9]+-[0-9]+:[1-9][0-9]*$"
           [[ "$ADOT_PYTHON_LAYER_ARN" =~ $layer_pattern ]] || {
             echo "Bounded observability requires a confirmed ADOT Python layer ARN in $AWS_REGION." >&2
             exit 1
@@ -422,11 +422,11 @@ jobs:
       - name: Configure bounded observability inputs
         if: inputs.enable_bounded_observability == true
         env:
-          ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn }}
+          ADOT_PYTHON_LAYER_ARN: ${{ inputs.adot_python_layer_arn || vars.HINDSIGHT_ADOT_PYTHON_LAYER_ARN }}
           ALERT_RECIPIENT: ${{ secrets.HINDSIGHT_ALERT_RECIPIENT }}
         shell: bash
         run: |
-          layer_pattern="^arn:(aws|aws-us-gov|aws-cn):lambda:${AWS_REGION}:[0-9]{12}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*$"
+          layer_pattern="^arn:aws:lambda:${AWS_REGION}:901920570463:layer:aws-otel-python-(amd64|arm64)-ver-[0-9]+-[0-9]+-[0-9]+:[1-9][0-9]*$"
           [[ "$ADOT_PYTHON_LAYER_ARN" =~ $layer_pattern ]] || {
             echo "Bounded observability requires a confirmed ADOT Python layer ARN in $AWS_REGION." >&2
             exit 1

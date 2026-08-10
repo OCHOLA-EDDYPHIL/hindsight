@@ -447,6 +447,20 @@ run "bounded_observability_rejects_cross_region_layer" {
   expect_failures = [check.bounded_observability]
 }
 
+run "bounded_observability_rejects_unapproved_layer_publisher" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-east-1:123456789012:layer:aws-otel-python-amd64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  expect_failures = [check.bounded_observability]
+}
+
 run "validation_timing_profile" {
   command = plan
 
