@@ -573,12 +573,23 @@ class MemoryStore:
             raise RuntimeError(f"embedding profile is not active: {profile_id}")
         service_join = ""
         service_filter = ""
-        params: list[Any] = [vector_literal(query_vector), namespace, profile_id]
+        params: list[Any] = [
+            vector_literal(query_vector),
+            namespace,
+            namespace,
+            profile_id,
+        ]
         if service_slug:
             service_join = """
-                JOIN incident_semantic_memories AS link ON link.memory_id = memory.id
-                JOIN incident_services AS incident_service ON incident_service.incident_id = link.incident_id
-                JOIN services AS service ON service.id = incident_service.service_id
+                JOIN incident_semantic_memories AS link
+                    ON link.tenant_id = memory.tenant_id
+                    AND link.memory_id = memory.id
+                JOIN incident_services AS incident_service
+                    ON incident_service.tenant_id = link.tenant_id
+                    AND incident_service.incident_id = link.incident_id
+                JOIN services AS service
+                    ON service.tenant_id = incident_service.tenant_id
+                    AND service.id = incident_service.service_id
             """
             service_filter = "AND service.slug = %s"
             params.append(service_slug)
@@ -600,11 +611,15 @@ class MemoryStore:
                     vector.embedded_at,
                     vector.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS}) AS distance
                 FROM current_semantic_memories AS memory
-                JOIN semantic_memory_vectors AS vector ON vector.memory_id = memory.id
+                JOIN semantic_memory_vectors AS vector
+                    ON vector.tenant_id = memory.tenant_id
+                    AND vector.memory_id = memory.id
                 JOIN embedding_profiles AS profile ON profile.id = vector.profile_id
                 {service_join}
                 WHERE memory.namespace = %s
                     {_semantic_eligibility_sql("memory", positive_guidance_only)}
+                    AND vector.tenant_id = current_hindsight_tenant_id()
+                    AND vector.namespace = %s
                     AND vector.profile_id = %s
                     {service_filter}
                     {distance_filter}
@@ -1524,30 +1539,40 @@ class MemoryStore:
                             r.title AS runbook_title
                         FROM current_semantic_memories AS m
                         JOIN semantic_memory_vectors AS vector
-                            ON vector.memory_id = m.id
+                            ON vector.tenant_id = m.tenant_id
+                            AND vector.memory_id = m.id
                         JOIN incident_semantic_memories AS im
-                            ON im.memory_id = m.id
+                            ON im.tenant_id = m.tenant_id
+                            AND im.memory_id = m.id
                         JOIN incidents AS i
-                            ON i.id = im.incident_id
+                            ON i.tenant_id = im.tenant_id
+                            AND i.id = im.incident_id
                         JOIN incident_services AS isvc
-                            ON isvc.incident_id = i.id
+                            ON isvc.tenant_id = i.tenant_id
+                            AND isvc.incident_id = i.id
                         JOIN services AS s
-                            ON s.id = isvc.service_id
+                            ON s.tenant_id = isvc.tenant_id
+                            AND s.id = isvc.service_id
                         LEFT JOIN (
                             SELECT
+                                ir.tenant_id,
                                 ir.incident_id,
                                 r.service_id,
                                 r.slug,
                                 r.title
                             FROM incident_runbooks AS ir
                             JOIN runbooks AS r
-                                ON r.id = ir.runbook_id
+                                ON r.tenant_id = ir.tenant_id
+                                AND r.id = ir.runbook_id
                         ) AS r
-                            ON r.incident_id = i.id
+                            ON r.tenant_id = i.tenant_id
+                            AND r.incident_id = i.id
                             AND (r.service_id = s.id OR r.service_id IS NULL)
                         WHERE m.namespace = %s
                             AND s.slug = %s
                             {_semantic_eligibility_sql("m", positive_guidance_only)}
+                            AND vector.tenant_id = current_hindsight_tenant_id()
+                            AND vector.namespace = %s
                             AND vector.profile_id = %s
                         ORDER BY vector.embedding <=> %s::VECTOR({EMBEDDING_DIMENSIONS})
                         LIMIT %s
@@ -1556,6 +1581,7 @@ class MemoryStore:
                         query_vector,
                         namespace,
                         service_slug,
+                        namespace,
                         profile.profile_id,
                         query_vector,
                         limit,

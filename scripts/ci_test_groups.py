@@ -33,6 +33,10 @@ MIGRATION_CASES = {
         "tests/test_learning_evidence_foundation.py::"
         "test_qualification_family_authority_migration_is_executable_and_immutable"
     ),
+    "tenant_vector_index": (
+        "tests/test_migrations_and_roles.py::"
+        "test_tenant_vector_index_fresh_and_populated_upgrade_qualification"
+    ),
 }
 
 DATABASE_GROUPS = {

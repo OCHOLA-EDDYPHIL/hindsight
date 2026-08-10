@@ -66,6 +66,7 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
         "prompt_safety_upgrade",
         "dispatch_upgrade",
         "qualification_authority",
+        "tenant_vector_index",
     }
 
 
