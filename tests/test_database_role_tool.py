@@ -7,6 +7,7 @@ import sys
 from urllib.parse import parse_qs, urlsplit
 
 import certifi
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -85,3 +86,32 @@ def test_role_tool_preserves_explicit_tls_root(monkeypatch):
     )
 
     assert parse_qs(urlsplit(connected_urls[0]).query)["sslrootcert"] == ["system"]
+
+
+def test_role_tool_requires_worker_dispatch_attempt_insert(monkeypatch):
+    import apply_database_roles as roles
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, statement):
+            if statement == "SELECT current_user":
+                return type("Result", (), {"fetchone": lambda self: ("worker",)})()
+            if "rolsuper, rolbypassrls" in statement:
+                return type(
+                    "Result", (), {"fetchone": lambda self: (False, False)}
+                )()
+            raise roles.psycopg.errors.InsufficientPrivilege()
+
+    monkeypatch.setattr(roles.psycopg, "connect", lambda *_args, **_kwargs: Connection())
+
+    with pytest.raises(RuntimeError, match="cannot insert dispatch attempts"):
+        roles._assert_restricted(
+            "postgresql://worker@db.example/hindsight",
+            label="worker",
+            deploy_url="postgresql://deploy@db.example/hindsight",
+        )

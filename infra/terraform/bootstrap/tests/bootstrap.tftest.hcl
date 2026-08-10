@@ -391,6 +391,25 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition = (
+      local.changefeed_function_arn == "arn:aws:lambda:us-east-1:123456789012:function:hindsight-demo-changefeed" &&
+      length([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "ChangefeedConfigurationRead"
+      ]) == 1 &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "ChangefeedConfigurationRead"
+      ]).actions) == toset(["lambda:GetFunctionConfiguration"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "ChangefeedConfigurationRead"
+      ]).resources) == toset([local.changefeed_function_arn])
+    )
+    error_message = "Changefeed configuration read access must contain one read action on only the stage changefeed function."
+  }
+
+  assert {
     condition = toset([
       for action in one([
         for statement in data.aws_iam_policy_document.github_deploy.statement : statement

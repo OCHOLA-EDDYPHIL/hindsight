@@ -337,6 +337,9 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     version_refresh = bootstrap.split('sid       = "LambdaVersionRefresh"', 1)[1].split(
         "\n  statement {", 1
     )[0]
+    changefeed_configuration = bootstrap.split(
+        'sid       = "ChangefeedConfigurationRead"', 1
+    )[1].split("\n  statement {", 1)[0]
     application_lifecycle = bootstrap.split('sid = "ApplicationLifecycle"', 1)[1].split(
         "\n  statement {", 1
     )[0]
@@ -351,6 +354,14 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "actions   = local.lambda_version_refresh_actions" in version_refresh
     assert "resources = local.lambda_function_arns" in version_refresh
     assert "lambda:ListVersionsByFunction" not in application_lifecycle
+    assert bootstrap.count('"lambda:GetFunctionConfiguration"') == 1
+    assert 'actions   = ["lambda:GetFunctionConfiguration"]' in changefeed_configuration
+    assert "resources = [local.changefeed_function_arn]" in changefeed_configuration
+    assert re.search(
+        r'changefeed_function_arn\s*=\s*"arn:\$\{data\.aws_partition\.current\.partition\}:lambda:\$\{var\.aws_region\}:\$\{data\.aws_caller_identity\.current\.account_id\}:function:hindsight-\$\{var\.stage\}-changefeed"',
+        bootstrap,
+    )
+    assert "lambda:GetFunctionConfiguration" not in application_lifecycle
     assert 'actions   = ["cognito-idp:CreateUserPool"]' in cognito_create
     assert 'resources = ["*"]' in cognito_create
     assert 'variable = "aws:RequestTag/Project"' in cognito_create

@@ -30,6 +30,18 @@ def _assert_restricted(url: str, *, label: str, deploy_url: str) -> str:
         ).fetchone()
         if role_flags != (False, False):
             raise RuntimeError(f"{label} database identity can bypass tenant isolation")
+        if label == "worker":
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO agent_run_dispatch_attempts (id, dispatch_id, sequence)
+                    SELECT gen_random_uuid(), gen_random_uuid(), 1 WHERE false
+                    """
+                )
+            except psycopg.errors.InsufficientPrivilege as exc:
+                raise RuntimeError(
+                    "worker database identity cannot insert dispatch attempts"
+                ) from exc
         for statement in (
             f"CREATE TABLE {table_name} (id INT PRIMARY KEY)",
             "DELETE FROM semantic_memories WHERE false",

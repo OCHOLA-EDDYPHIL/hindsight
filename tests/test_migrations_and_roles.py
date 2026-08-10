@@ -156,8 +156,31 @@ def test_loss_safe_run_delivery_is_staged_and_tenant_fenced():
     assert "agent_run_dispatch_attempts" in agent_insert
     assert "agent_run_dispatch_attempts" in agent_update
     assert "agent_run_dispatch_attempts" in worker_select
-    assert "agent_run_dispatch_attempts" not in worker_insert
+    assert "agent_run_dispatch_attempts" in worker_insert
     assert "agent_run_dispatch_attempts" in worker_update
+
+
+@requires_db
+def test_worker_role_can_manage_dispatch_attempts_without_delete_access():
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        conn.execute((ROOT / "infra/db/roles.sql").read_text())
+        conn.execute("SET ROLE hindsight_memory_worker")
+        try:
+            conn.execute("SELECT id FROM agent_run_dispatch_attempts WHERE false")
+            conn.execute(
+                """
+                INSERT INTO agent_run_dispatch_attempts (id, dispatch_id, sequence)
+                SELECT gen_random_uuid(), gen_random_uuid(), 1 WHERE false
+                """
+            )
+            conn.execute(
+                "UPDATE agent_run_dispatch_attempts "
+                "SET updated_at = updated_at WHERE false"
+            )
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("DELETE FROM agent_run_dispatch_attempts WHERE false")
+        finally:
+            conn.execute("RESET ROLE")
 
 
 def test_product_writers_have_only_foreign_key_read_access_to_learning_preparations():

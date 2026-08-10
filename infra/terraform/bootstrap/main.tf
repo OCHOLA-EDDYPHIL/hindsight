@@ -61,6 +61,7 @@ locals {
     for component in ["api", "worker", "websocket", "changefeed"] :
     "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:hindsight-${var.stage}-${component}"
   ]
+  changefeed_function_arn        = "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:hindsight-${var.stage}-changefeed"
   observability_alert_topic_arn  = "arn:${data.aws_partition.current.partition}:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:hindsight-${var.stage}-alerts"
   observability_budget_topic_arn = "arn:${data.aws_partition.current.partition}:sns:us-east-1:${data.aws_caller_identity.current.account_id}:hindsight-${var.stage}-budget-alerts"
   observability_topic_arns = [
@@ -632,6 +633,12 @@ data "aws_iam_policy_document" "github_deploy" {
     sid       = "LambdaVersionRefresh"
     actions   = local.lambda_version_refresh_actions
     resources = local.lambda_function_arns
+  }
+
+  statement {
+    sid       = "ChangefeedConfigurationRead"
+    actions   = ["lambda:GetFunctionConfiguration"]
+    resources = [local.changefeed_function_arn]
   }
 
   dynamic "statement" {
