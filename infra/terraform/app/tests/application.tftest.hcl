@@ -461,6 +461,20 @@ run "bounded_observability_rejects_unapproved_layer_publisher" {
   expect_failures = [check.bounded_observability]
 }
 
+run "bounded_observability_rejects_incompatible_layer_architecture" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-arm64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  expect_failures = [check.bounded_observability]
+}
+
 run "validation_timing_profile" {
   command = plan
 

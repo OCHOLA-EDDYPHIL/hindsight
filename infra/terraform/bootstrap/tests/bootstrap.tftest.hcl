@@ -516,7 +516,7 @@ run "isolated_bootstrap" {
     condition = (
       length(local.observability_metric_log_group_arns) == 5 &&
       alltrue([
-        for arn in local.observability_metric_log_group_arns : !endswith(arn, ":*")
+        for arn in local.observability_metric_log_group_arns : endswith(arn, ":*")
       ]) &&
       toset(one([
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
@@ -544,7 +544,7 @@ run "isolated_bootstrap" {
         for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
         if statement.sid == "ObservabilityAdotLayerRead"
       ]).resources) == toset(local.observability_adot_layer_arns) &&
-      toset(local.observability_adot_layer_arns) == toset(["arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-*:*"])
+      toset(local.observability_adot_layer_arns) == toset(["arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-*:*"])
     )
     error_message = "ADOT refresh must be read-only, Python-layer scoped, and attached to the existing deploy role."
   }

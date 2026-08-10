@@ -73,7 +73,7 @@ check "bounded_observability" {
   assert {
     condition = var.adot_python_layer_arn == null || can(
       regex(
-        "^arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-(amd64|arm64)-ver-[0-9]+-[0-9]+-[0-9]+:[1-9][0-9]*$",
+        "^arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-ver-[0-9]+-[0-9]+-[0-9]+:[1-9][0-9]*$",
         var.adot_python_layer_arn
       )
     )

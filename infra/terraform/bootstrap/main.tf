@@ -82,10 +82,10 @@ locals {
       "/aws/lambda/hindsight-${var.stage}-api",
       "/aws/lambda/hindsight-${var.stage}-worker",
       "/aws/lambda/hindsight-${var.stage}-changefeed",
-    ] : "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${name}"
+    ] : "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${name}:*"
   ]
   observability_adot_layer_arns = [
-    "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-*:*",
+    "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-*:*",
   ]
 }
 
