@@ -213,7 +213,7 @@ jobs:
           version: v0.69.3
           scan-type: config
           scan-ref: infra/terraform
-          trivyignores: infra/terraform/.trivyignore.yaml
+          trivy-config: infra/terraform/trivy.yaml
           severity: HIGH,CRITICAL
           exit-code: 1
       - run: terraform fmt -check -recursive infra/terraform
