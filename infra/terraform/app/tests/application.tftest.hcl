@@ -65,6 +65,14 @@ run "complete_demo_graph" {
   }
 
   assert {
+    condition = (
+      length(aws_sns_topic_subscription.alert_email) == 0 &&
+      length(aws_sns_topic_subscription.budget_alert_email) == 0
+    )
+    error_message = "Email notification subscriptions must remain disabled by default."
+  }
+
+  assert {
     condition     = aws_lambda_function.worker.reserved_concurrent_executions == 2
     error_message = "Model-spend concurrency must remain bounded."
   }
@@ -309,6 +317,52 @@ run "complete_demo_graph" {
       endswith(aws_iam_role_policy_attachment.apigateway_cloudwatch.policy_arn, "AmazonAPIGatewayPushToCloudWatchLogs")
     )
     error_message = "API Gateway access logs require the Terraform-owned account role and managed policy."
+  }
+}
+
+run "alert_email_subscribes_operational_and_budget_topics" {
+  command = plan
+
+  variables {
+    alert_email       = "alerts@example.com"
+    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  override_resource {
+    target          = aws_sns_topic.alerts
+    override_during = plan
+    values = {
+      arn = "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts"
+    }
+  }
+
+  override_resource {
+    target          = aws_sns_topic.budget_alerts
+    override_during = plan
+    values = {
+      arn = "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts"
+    }
+  }
+
+  assert {
+    condition = (
+      length(aws_sns_topic_subscription.alert_email) == 1 &&
+      length(aws_sns_topic_subscription.budget_alert_email) == 1 &&
+      aws_sns_topic_subscription.alert_email[0].topic_arn == aws_sns_topic.alerts.arn &&
+      aws_sns_topic_subscription.budget_alert_email[0].topic_arn == aws_sns_topic.budget_alerts.arn &&
+      aws_sns_topic_subscription.alert_email[0].protocol == "email" &&
+      aws_sns_topic_subscription.budget_alert_email[0].protocol == "email" &&
+      aws_sns_topic_subscription.alert_email[0].endpoint == var.alert_email &&
+      aws_sns_topic_subscription.budget_alert_email[0].endpoint == var.alert_email &&
+      length(aws_budgets_budget.monthly.notification) == 2 &&
+      alltrue([
+        for notification in aws_budgets_budget.monthly.notification :
+        toset(notification.subscriber_sns_topic_arns) == toset([aws_sns_topic.budget_alerts.arn])
+      ])
+    )
+    error_message = "The protected alert email must subscribe to both notification topics and receive every budget alert."
   }
 }
 

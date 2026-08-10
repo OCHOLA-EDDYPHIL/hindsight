@@ -201,7 +201,7 @@ variable "alarm_actions" {
 }
 
 variable "alert_email" {
-  description = "Optional confirmed subscriber for operational notifications."
+  description = "Optional confirmed subscriber for operational and budget notifications."
   type        = string
   default     = null
   nullable    = true

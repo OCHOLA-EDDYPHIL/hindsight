@@ -1426,10 +1426,22 @@ resource "aws_sns_topic_subscription" "alert_email" {
   endpoint  = var.alert_email
 }
 
+resource "aws_sns_topic_subscription" "budget_alert_email" {
+  provider = aws.us_east_1
+  count    = var.alert_email == null ? 0 : 1
+
+  topic_arn = aws_sns_topic.budget_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
 resource "aws_budgets_budget" "monthly" {
   provider = aws.us_east_1
 
-  depends_on = [aws_sns_topic_policy.budget_alerts]
+  depends_on = [
+    aws_sns_topic_policy.budget_alerts,
+    aws_sns_topic_subscription.budget_alert_email,
+  ]
 
   name         = "${local.name}-monthly-five-usd"
   budget_type  = "COST"
