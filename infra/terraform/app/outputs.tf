@@ -117,3 +117,11 @@ output "websocket_subscription_table" {
 output "waf_web_acl_arn" {
   value = var.enable_waf ? aws_wafv2_web_acl.ui[0].arn : null
 }
+
+output "alert_topic_arn" {
+  value = aws_sns_topic.alerts.arn
+}
+
+output "bounded_observability_enabled" {
+  value = var.enable_bounded_observability
+}

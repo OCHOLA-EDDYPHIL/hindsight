@@ -103,6 +103,41 @@ def test_normal_ci_and_migration_qualification_pin_supported_cockroach_version()
     assert job["env"]["COCKROACH_IMAGE"] == COCKROACH_IMAGE
 
 
+def test_security_audits_use_writable_cache_and_repo_scoped_exceptions():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    python_steps = workflow["jobs"]["python_static"]["steps"]
+
+    assert any(
+        step.get("run") == 'uv run pip-audit --cache-dir "$RUNNER_TEMP/pip-audit"'
+        for step in python_steps
+    )
+
+    terraform_steps = workflow["jobs"]["terraform"]["steps"]
+    trivy_step = next(
+        step for step in terraform_steps if step.get("uses", "").startswith("aquasecurity/trivy-action@")
+    )
+    assert "trivyignores" not in trivy_step["with"]
+    assert trivy_step["with"]["trivy-config"] == "infra/terraform/trivy.yaml"
+
+    trivy_config = yaml.safe_load((ROOT / "infra/terraform/trivy.yaml").read_text())
+    assert trivy_config == {"ignorefile": "infra/terraform/.trivyignore.yaml"}
+
+    ignore = yaml.safe_load((ROOT / "infra/terraform/.trivyignore.yaml").read_text())
+    ignored_paths = {
+        path
+        for entry in ignore["misconfigurations"]
+        for path in entry["paths"]
+    }
+    assert ignored_paths == {
+        "app/main.tf",
+        "bootstrap/main.tf",
+    }
+    assert {entry["id"] for entry in ignore["misconfigurations"]} == {
+        "AWS-0095",
+        "AWS-0132",
+    }
+
+
 def test_persistent_runner_databases_are_isolated_by_run_and_attempt():
     workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = workflow_path.read_text()

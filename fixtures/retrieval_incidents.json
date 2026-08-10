@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "sanitized": true,
+  "cases": [
+    {"query_id": "checkout-latency", "relevant_memory_ids": ["mem-checkout-timeout"]},
+    {"query_id": "certificate-expiry", "relevant_memory_ids": ["mem-certificate-rotation"]},
+    {"query_id": "queue-backlog", "relevant_memory_ids": ["mem-worker-backpressure"]},
+    {"query_id": "database-contention", "relevant_memory_ids": ["mem-transaction-retry"]}
+  ]
+}

@@ -42,6 +42,15 @@ def enqueue_run(message: dict[str, Any], *, client: Any | None = None) -> str:
         **message,
         "tenant_id": bound_tenant or normalized_supplied or public_demo_tenant_id(),
     }
+    carrier: dict[str, str] = {}
+    try:
+        from opentelemetry.propagate import inject
+    except ImportError:
+        inject = None
+    if inject is not None:
+        inject(carrier)
+    if traceparent := carrier.get("traceparent"):
+        message["traceparent"] = traceparent
     queue_url = os.environ.get(RUN_QUEUE_URL_ENV)
     if queue_url:
         resolved_client = client or boto3.client(

@@ -65,6 +65,14 @@ run "complete_demo_graph" {
   }
 
   assert {
+    condition = (
+      length(aws_sns_topic_subscription.alert_email) == 0 &&
+      length(aws_sns_topic_subscription.budget_alert_email) == 0
+    )
+    error_message = "Email notification subscriptions must remain disabled by default."
+  }
+
+  assert {
     condition     = aws_lambda_function.worker.reserved_concurrent_executions == 2
     error_message = "Model-spend concurrency must remain bounded."
   }
@@ -312,6 +320,52 @@ run "complete_demo_graph" {
   }
 }
 
+run "alert_email_subscribes_operational_and_budget_topics" {
+  command = plan
+
+  variables {
+    alert_email       = "alerts@example.com"
+    api_zip_path      = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path   = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  override_resource {
+    target          = aws_sns_topic.alerts
+    override_during = plan
+    values = {
+      arn = "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts"
+    }
+  }
+
+  override_resource {
+    target          = aws_sns_topic.budget_alerts
+    override_during = plan
+    values = {
+      arn = "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts"
+    }
+  }
+
+  assert {
+    condition = (
+      length(aws_sns_topic_subscription.alert_email) == 1 &&
+      length(aws_sns_topic_subscription.budget_alert_email) == 1 &&
+      aws_sns_topic_subscription.alert_email[0].topic_arn == aws_sns_topic.alerts.arn &&
+      aws_sns_topic_subscription.budget_alert_email[0].topic_arn == aws_sns_topic.budget_alerts.arn &&
+      aws_sns_topic_subscription.alert_email[0].protocol == "email" &&
+      aws_sns_topic_subscription.budget_alert_email[0].protocol == "email" &&
+      aws_sns_topic_subscription.alert_email[0].endpoint == var.alert_email &&
+      aws_sns_topic_subscription.budget_alert_email[0].endpoint == var.alert_email &&
+      length(aws_budgets_budget.monthly.notification) == 2 &&
+      alltrue([
+        for notification in aws_budgets_budget.monthly.notification :
+        toset(notification.subscriber_sns_topic_arns) == toset([aws_sns_topic.budget_alerts.arn])
+      ])
+    )
+    error_message = "The protected alert email must subscribe to both notification topics and receive every budget alert."
+  }
+}
+
 run "waf_enabled" {
   command = plan
 
@@ -338,6 +392,87 @@ run "waf_enabled" {
     )
     error_message = "Opting into WAF must attach CloudFront rate limiting and the AWS managed common protections."
   }
+}
+
+run "bounded_observability_profile" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  assert {
+    condition = (
+      length(aws_cloudwatch_log_metric_filter.bounded) == 5 &&
+      length(aws_cloudwatch_metric_alarm.lambda_errors) +
+      1 +
+      length(aws_cloudwatch_metric_alarm.bounded) == 10
+    )
+    error_message = "The bounded profile must stop at five custom series and ten alarm metrics."
+  }
+
+  assert {
+    condition = (
+      aws_xray_sampling_rule.bounded[0].fixed_rate == 0.05 &&
+      aws_xray_sampling_rule.bounded[0].reservoir_size == 0
+    )
+    error_message = "X-Ray sampling must remain at five percent with no fixed reservoir."
+  }
+
+  assert {
+    condition = (
+      aws_budgets_budget.monthly.limit_amount == "5" &&
+      aws_budgets_budget.monthly.limit_unit == "USD"
+    )
+    error_message = "The monthly five-dollar budget must notify on actual and forecasted cost."
+  }
+
+}
+
+run "bounded_observability_rejects_cross_region_layer" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-west-2:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  expect_failures = [check.bounded_observability]
+}
+
+run "bounded_observability_rejects_unapproved_layer_publisher" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-east-1:123456789012:layer:aws-otel-python-amd64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  expect_failures = [check.bounded_observability]
+}
+
+run "bounded_observability_rejects_incompatible_layer_architecture" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-arm64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  expect_failures = [check.bounded_observability]
 }
 
 run "validation_timing_profile" {

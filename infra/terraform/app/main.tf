@@ -51,6 +51,34 @@ locals {
     ".js"   = "text/javascript; charset=utf-8"
     ".svg"  = "image/svg+xml"
   }
+
+  custom_metric_series = {
+    api_5xx          = { log_group = aws_cloudwatch_log_group.http_access.name, pattern = "{ $.status >= 500 }" }
+    websocket_5xx    = { log_group = aws_cloudwatch_log_group.websocket_access.name, pattern = "{ $.status >= 500 }" }
+    worker_failed    = { log_group = aws_cloudwatch_log_group.lambda["worker"].name, pattern = "{ $.event = \"worker_record\" && $.status = \"failed\" }" }
+    api_error        = { log_group = aws_cloudwatch_log_group.lambda["api"].name, pattern = "?ERROR ?Task timed out" }
+    changefeed_error = { log_group = aws_cloudwatch_log_group.lambda["changefeed"].name, pattern = "?ERROR ?Task timed out" }
+  }
+}
+
+check "bounded_observability" {
+  assert {
+    condition     = length(local.custom_metric_series) <= 5
+    error_message = "The bounded profile permits at most five custom metric series."
+  }
+  assert {
+    condition     = !var.enable_bounded_observability || var.adot_python_layer_arn != null
+    error_message = "Bounded observability requires a region-matched ADOT Python layer ARN."
+  }
+  assert {
+    condition = var.adot_python_layer_arn == null || can(
+      regex(
+        "^arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-ver-[0-9]+-[0-9]+-[0-9]+:[1-9][0-9]*$",
+        var.adot_python_layer_arn
+      )
+    )
+    error_message = "The ADOT Python layer ARN must be an official AWS-published Python layer in the application region."
+  }
 }
 
 check "custom_domain_configuration" {
@@ -623,6 +651,9 @@ resource "aws_lambda_function" "api" {
   source_code_hash = try(filebase64sha256(local.api_zip), null)
 
   reserved_concurrent_executions = 5
+  layers                         = var.enable_bounded_observability ? [var.adot_python_layer_arn] : []
+
+  tracing_config { mode = var.enable_bounded_observability ? "Active" : "PassThrough" }
 
   environment {
     variables = {
@@ -641,6 +672,11 @@ resource "aws_lambda_function" "api" {
       EMBEDDING_PROVIDER                   = var.embedding_provider
       GEMINI_EMBEDDING_MODEL               = var.gemini_embedding_model
       HINDSIGHT_GEMINI_REPRESENTATION      = var.gemini_embedding_representation
+      HINDSIGHT_OTEL_ENABLED               = var.enable_bounded_observability ? "1" : "0"
+      OTEL_EXPORTER_OTLP_ENDPOINT          = "http://localhost:4317"
+      OTEL_PROPAGATORS                     = "xray,tracecontext"
+      OTEL_TRACES_SAMPLER                  = "xray"
+      OTEL_TRACES_SAMPLER_ARG              = "endpoint=http://localhost:2000"
     }
   }
 }
@@ -659,6 +695,9 @@ resource "aws_lambda_function" "worker" {
   source_code_hash = try(filebase64sha256(local.worker_zip), null)
 
   reserved_concurrent_executions = 2
+  layers                         = var.enable_bounded_observability ? [var.adot_python_layer_arn] : []
+
+  tracing_config { mode = var.enable_bounded_observability ? "Active" : "PassThrough" }
 
   lifecycle {
     precondition {
@@ -693,6 +732,11 @@ resource "aws_lambda_function" "worker" {
       GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
       HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
       REASONING_MAX_ATTEMPTS              = tostring(var.reasoning_max_attempts)
+      HINDSIGHT_OTEL_ENABLED              = var.enable_bounded_observability ? "1" : "0"
+      OTEL_EXPORTER_OTLP_ENDPOINT         = "http://localhost:4317"
+      OTEL_PROPAGATORS                    = "xray,tracecontext"
+      OTEL_TRACES_SAMPLER                 = "xray"
+      OTEL_TRACES_SAMPLER_ARG             = "endpoint=http://localhost:2000"
     }
   }
 }
@@ -710,12 +754,20 @@ resource "aws_lambda_function" "websocket" {
   source_code_hash = try(filebase64sha256(local.realtime_zip), null)
 
   reserved_concurrent_executions = 5
+  layers                         = var.enable_bounded_observability ? [var.adot_python_layer_arn] : []
+
+  tracing_config { mode = var.enable_bounded_observability ? "Active" : "PassThrough" }
 
   environment {
     variables = {
       HINDSIGHT_WEBSOCKET_CONNECTION_TABLE   = aws_dynamodb_table.connections.name
       HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE = aws_dynamodb_table.subscriptions.name
       HINDSIGHT_REALTIME_TICKET_TABLE        = aws_dynamodb_table.realtime_tickets.name
+      HINDSIGHT_OTEL_ENABLED                 = var.enable_bounded_observability ? "1" : "0"
+      OTEL_EXPORTER_OTLP_ENDPOINT            = "http://localhost:4317"
+      OTEL_PROPAGATORS                       = "xray,tracecontext"
+      OTEL_TRACES_SAMPLER                    = "xray"
+      OTEL_TRACES_SAMPLER_ARG                = "endpoint=http://localhost:2000"
     }
   }
 }
@@ -733,6 +785,9 @@ resource "aws_lambda_function" "changefeed" {
   source_code_hash = try(filebase64sha256(local.realtime_zip), null)
 
   reserved_concurrent_executions = 5
+  layers                         = var.enable_bounded_observability ? [var.adot_python_layer_arn] : []
+
+  tracing_config { mode = var.enable_bounded_observability ? "Active" : "PassThrough" }
 
   environment {
     variables = {
@@ -743,6 +798,11 @@ resource "aws_lambda_function" "changefeed" {
       HINDSIGHT_CHANGEFEED_IDEMPOTENCY_TABLE  = aws_dynamodb_table.changefeed_idempotency.name
       HINDSIGHT_CHANGEFEED_LEASE_SECONDS      = tostring(local.changefeed_lease_seconds)
       HINDSIGHT_RUN_QUEUE_URL                 = aws_sqs_queue.runs.url
+      HINDSIGHT_OTEL_ENABLED                  = var.enable_bounded_observability ? "1" : "0"
+      OTEL_EXPORTER_OTLP_ENDPOINT             = "http://localhost:4317"
+      OTEL_PROPAGATORS                        = "xray,tracecontext"
+      OTEL_TRACES_SAMPLER                     = "xray"
+      OTEL_TRACES_SAMPLER_ARG                 = "endpoint=http://localhost:2000"
     }
   }
 
@@ -1248,7 +1308,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
+  alarm_actions       = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
   dimensions          = { FunctionName = each.value }
 }
 
@@ -1263,6 +1323,184 @@ resource "aws_cloudwatch_metric_alarm" "run_dlq" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
+  alarm_actions       = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
   dimensions          = { QueueName = aws_sqs_queue.run_dlq.name }
+}
+
+resource "aws_xray_sampling_rule" "bounded" {
+  count = var.enable_bounded_observability ? 1 : 0
+
+  rule_name      = "${local.name}-bounded"
+  priority       = 1000
+  version        = 1
+  reservoir_size = 0
+  fixed_rate     = 0.05
+  url_path       = "*"
+  host           = "*"
+  http_method    = "*"
+  service_type   = "*"
+  service_name   = "hindsight-*"
+  resource_arn   = "*"
+}
+
+resource "aws_iam_role_policy_attachment" "xray" {
+  for_each = var.enable_bounded_observability ? {
+    api        = aws_iam_role.api.name
+    worker     = aws_iam_role.worker.name
+    websocket  = aws_iam_role.websocket.name
+    changefeed = aws_iam_role.changefeed.name
+  } : {}
+
+  role       = each.value
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AWSXRayDaemonWriteAccess"
+}
+
+resource "aws_sns_topic" "alerts" {
+  name = "${local.name}-alerts"
+}
+
+resource "aws_sns_topic" "budget_alerts" {
+  provider = aws.us_east_1
+
+  name = "${local.name}-budget-alerts"
+}
+
+data "aws_iam_policy_document" "alerts" {
+  statement {
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.alerts.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:*"]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "alerts" {
+  arn    = aws_sns_topic.alerts.arn
+  policy = data.aws_iam_policy_document.alerts.json
+}
+
+data "aws_iam_policy_document" "budget_alerts" {
+  statement {
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.budget_alerts.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["budgets.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:*"]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "budget_alerts" {
+  provider = aws.us_east_1
+
+  arn    = aws_sns_topic.budget_alerts.arn
+  policy = data.aws_iam_policy_document.budget_alerts.json
+}
+
+resource "aws_sns_topic_subscription" "alert_email" {
+  count = var.alert_email == null ? 0 : 1
+
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+resource "aws_sns_topic_subscription" "budget_alert_email" {
+  provider = aws.us_east_1
+  count    = var.alert_email == null ? 0 : 1
+
+  topic_arn = aws_sns_topic.budget_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+resource "aws_budgets_budget" "monthly" {
+  provider = aws.us_east_1
+
+  depends_on = [
+    aws_sns_topic_policy.budget_alerts,
+    aws_sns_topic_subscription.budget_alert_email,
+  ]
+
+  name         = "${local.name}-monthly-five-usd"
+  budget_type  = "COST"
+  limit_amount = "5"
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  notification {
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 80
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
+  }
+
+  notification {
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 100
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "FORECASTED"
+    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "bounded" {
+  for_each = var.enable_bounded_observability ? local.custom_metric_series : {}
+
+  name           = "${local.name}-${replace(each.key, "_", "-")}"
+  log_group_name = each.value.log_group
+  pattern        = each.value.pattern
+
+  metric_transformation {
+    name      = each.key
+    namespace = "Hindsight/Bounded"
+    value     = "1"
+    unit      = "Count"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "bounded" {
+  for_each = aws_cloudwatch_log_metric_filter.bounded
+
+  alarm_name          = "${local.name}-${replace(each.key, "_", "-")}"
+  namespace           = "Hindsight/Bounded"
+  metric_name         = each.key
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
+}
+
+check "alarm_metric_cap" {
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.lambda_errors) + 1 + length(aws_cloudwatch_metric_alarm.bounded) <= 10
+    error_message = "The deployment permits at most ten alarm metrics."
+  }
 }

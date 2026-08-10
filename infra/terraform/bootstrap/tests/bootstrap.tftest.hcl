@@ -408,6 +408,146 @@ run "isolated_bootstrap" {
     ])
     error_message = "The deployment role must be able to materialize the optional identity and edge-protection resources."
   }
+
+  assert {
+    condition = (
+      toset(local.observability_topic_arns) == toset([
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts",
+      ]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityTopicLifecycle"
+      ]).resources) == toset(local.observability_topic_arns) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityTopicLifecycle"
+        ]).actions) == toset([
+        "sns:CreateTopic",
+        "sns:DeleteTopic",
+        "sns:GetTopicAttributes",
+        "sns:ListTagsForResource",
+        "sns:SetTopicAttributes",
+        "sns:TagResource",
+        "sns:UntagResource",
+      ])
+    )
+    error_message = "Observability topic management must remain limited to the two stage-owned topics."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilitySubscriptions"
+      ]).resources) == toset(local.observability_subscription_arns) &&
+      toset(local.observability_subscription_arns) == toset([
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts:*",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts",
+        "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts:*",
+      ]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilitySubscriptions"
+        ]).actions) == toset([
+        "sns:GetSubscriptionAttributes",
+        "sns:ListSubscriptionsByTopic",
+        "sns:Subscribe",
+        "sns:Unsubscribe",
+      ]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityAlertExercise"
+      ]).resources) == toset([local.observability_alert_topic_arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityAlertExercise"
+      ]).actions) == toset(["sns:Publish"])
+    )
+    error_message = "Alert subscription permissions must stay on the two stage topics, and publish must stay on the operational topic."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityBudget"
+      ]).actions) == toset(["budgets:ModifyBudget", "budgets:ViewBudget"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityBudget"
+      ]).resources) == toset([local.observability_budget_arn]) &&
+      local.observability_budget_arn == "arn:aws:budgets::123456789012:budget/hindsight-demo-monthly-five-usd"
+    )
+    error_message = "Budget access must be limited to read and management of the stage five-dollar budget."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilitySamplingRuleRead"
+      ]).actions) == toset(["xray:GetSamplingRules", "xray:GetSamplingTargets"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilitySamplingRuleRead"
+      ]).resources) == toset(["*"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilitySamplingRuleLifecycle"
+      ]).resources) == toset([local.observability_sampling_rule_arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilitySamplingRuleLifecycle"
+        ]).actions) == toset([
+        "xray:CreateSamplingRule",
+        "xray:DeleteSamplingRule",
+        "xray:ListTagsForResource",
+        "xray:TagResource",
+        "xray:UntagResource",
+        "xray:UpdateSamplingRule",
+      ])
+    )
+    error_message = "X-Ray list reads must stay separate from the stage sampling-rule lifecycle."
+  }
+
+  assert {
+    condition = (
+      length(local.observability_metric_log_group_arns) == 5 &&
+      alltrue([
+        for arn in local.observability_metric_log_group_arns : endswith(arn, ":*")
+      ]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityMetricFilterRead"
+      ]).resources) == toset(["*"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityMetricFilterLifecycle"
+      ]).resources) == toset(local.observability_metric_log_group_arns) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityMetricFilterLifecycle"
+      ]).actions) == toset(["logs:DeleteMetricFilter", "logs:PutMetricFilter"])
+    )
+    error_message = "Metric-filter writes must remain limited to the five bounded-profile log groups."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityAdotLayerRead"
+      ]).actions) == toset(["lambda:GetLayerVersion"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "ObservabilityAdotLayerRead"
+      ]).resources) == toset(local.observability_adot_layer_arns) &&
+      toset(local.observability_adot_layer_arns) == toset(["arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-*:*"])
+    )
+    error_message = "ADOT refresh must be read-only, Python-layer scoped, and attached to the existing deploy role."
+  }
 }
 
 run "product_only_bootstrap" {

@@ -46,6 +46,7 @@ def test_realtime_artifact_has_no_third_party_dependency_bundle():
         "security.py",
         "server_tenants.py",
         "tenant.py",
+        "tracing.py",
     ]
 
 

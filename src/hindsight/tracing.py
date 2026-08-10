@@ -62,10 +62,15 @@ def configure_tracing_from_env(*, service_name: str = SERVICE_NAME) -> bool:
 
 
 @contextmanager
-def start_span(name: str, attributes: Mapping[str, Any] | None = None) -> Iterator[Span]:
+def start_span(
+    name: str,
+    attributes: Mapping[str, Any] | None = None,
+    *,
+    context: Any | None = None,
+) -> Iterator[Span]:
     """Start a span and apply only safe, non-sensitive attributes."""
 
-    with tracer().start_as_current_span(name) as span:
+    with tracer().start_as_current_span(name, context=context) as span:
         set_span_attributes(span, attributes or {})
         yield span
 

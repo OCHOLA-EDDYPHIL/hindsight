@@ -61,6 +61,32 @@ locals {
     for component in ["api", "worker", "websocket", "changefeed"] :
     "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:hindsight-${var.stage}-${component}"
   ]
+  observability_alert_topic_arn  = "arn:${data.aws_partition.current.partition}:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:hindsight-${var.stage}-alerts"
+  observability_budget_topic_arn = "arn:${data.aws_partition.current.partition}:sns:us-east-1:${data.aws_caller_identity.current.account_id}:hindsight-${var.stage}-budget-alerts"
+  observability_topic_arns = [
+    local.observability_alert_topic_arn,
+    local.observability_budget_topic_arn,
+  ]
+  observability_subscription_arns = flatten([
+    for topic_arn in local.observability_topic_arns : [
+      topic_arn,
+      "${topic_arn}:*",
+    ]
+  ])
+  observability_budget_arn        = "arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:budget/hindsight-${var.stage}-monthly-five-usd"
+  observability_sampling_rule_arn = "arn:${data.aws_partition.current.partition}:xray:${var.aws_region}:${data.aws_caller_identity.current.account_id}:sampling-rule/hindsight-${var.stage}-bounded"
+  observability_metric_log_group_arns = [
+    for name in [
+      "/aws/apigateway/hindsight-${var.stage}-http",
+      "/aws/apigateway/hindsight-${var.stage}-websocket",
+      "/aws/lambda/hindsight-${var.stage}-api",
+      "/aws/lambda/hindsight-${var.stage}-worker",
+      "/aws/lambda/hindsight-${var.stage}-changefeed",
+    ] : "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${name}:*"
+  ]
+  observability_adot_layer_arns = [
+    "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-*:*",
+  ]
 }
 
 check "expected_aws_account" {
@@ -866,6 +892,93 @@ data "aws_iam_policy_document" "github_deploy" {
 resource "aws_iam_role_policy" "github_deploy" {
   role   = aws_iam_role.github_deploy.id
   policy = data.aws_iam_policy_document.github_deploy.json
+}
+
+data "aws_iam_policy_document" "github_deploy_observability" {
+  statement {
+    sid = "ObservabilityTopicLifecycle"
+    actions = [
+      "sns:CreateTopic",
+      "sns:DeleteTopic",
+      "sns:GetTopicAttributes",
+      "sns:ListTagsForResource",
+      "sns:SetTopicAttributes",
+      "sns:TagResource",
+      "sns:UntagResource",
+    ]
+    resources = local.observability_topic_arns
+  }
+
+  statement {
+    sid = "ObservabilitySubscriptions"
+    actions = [
+      "sns:GetSubscriptionAttributes",
+      "sns:ListSubscriptionsByTopic",
+      "sns:Subscribe",
+      "sns:Unsubscribe",
+    ]
+    resources = local.observability_subscription_arns
+  }
+
+  statement {
+    sid       = "ObservabilityAlertExercise"
+    actions   = ["sns:Publish"]
+    resources = [local.observability_alert_topic_arn]
+  }
+
+  statement {
+    sid       = "ObservabilityBudget"
+    actions   = ["budgets:ModifyBudget", "budgets:ViewBudget"]
+    resources = [local.observability_budget_arn]
+  }
+
+  statement {
+    sid = "ObservabilitySamplingRuleRead"
+    actions = [
+      "xray:GetSamplingRules",
+      "xray:GetSamplingTargets",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "ObservabilitySamplingRuleLifecycle"
+    actions = [
+      "xray:CreateSamplingRule",
+      "xray:DeleteSamplingRule",
+      "xray:ListTagsForResource",
+      "xray:TagResource",
+      "xray:UntagResource",
+      "xray:UpdateSamplingRule",
+    ]
+    resources = [local.observability_sampling_rule_arn]
+  }
+
+  statement {
+    sid       = "ObservabilityMetricFilterRead"
+    actions   = ["logs:DescribeMetricFilters"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "ObservabilityMetricFilterLifecycle"
+    actions = [
+      "logs:DeleteMetricFilter",
+      "logs:PutMetricFilter",
+    ]
+    resources = local.observability_metric_log_group_arns
+  }
+
+  statement {
+    sid       = "ObservabilityAdotLayerRead"
+    actions   = ["lambda:GetLayerVersion"]
+    resources = local.observability_adot_layer_arns
+  }
+}
+
+resource "aws_iam_role_policy" "github_deploy_observability" {
+  role   = aws_iam_role.github_deploy.id
+  policy = data.aws_iam_policy_document.github_deploy_observability.json
 }
 
 data "aws_iam_policy_document" "github_evidence" {
