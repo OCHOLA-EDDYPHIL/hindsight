@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   authorize:
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     permissions:
       contents: read
     outputs:
@@ -65,7 +65,7 @@ jobs:
 
   verify:
     needs: authorize
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     timeout-minutes: 10
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     permissions:

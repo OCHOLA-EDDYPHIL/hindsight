@@ -42,7 +42,7 @@ env:
 
 jobs:
   authorize:
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     permissions:
       contents: read
     outputs:
@@ -92,7 +92,7 @@ jobs:
 
   exact_main_ci:
     needs: authorize
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     permissions:
       actions: read
       contents: read
@@ -129,7 +129,7 @@ jobs:
     needs:
       - authorize
       - exact_main_ci
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     permissions:
       contents: read
@@ -174,7 +174,7 @@ jobs:
       - exact_main_ci
       - acceptance_plan
     if: needs.acceptance_plan.outputs.run_product_preflight == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
@@ -279,7 +279,7 @@ jobs:
   semantic_product:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
@@ -332,7 +332,7 @@ jobs:
   consolidation_product:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
@@ -397,7 +397,7 @@ jobs:
   worker_product:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 25
     permissions:
@@ -443,7 +443,7 @@ jobs:
         needs.deploy.result == 'skipped') ||
        (needs.acceptance_plan.outputs.reuse_candidate == 'false' &&
         needs.deploy.result == 'success'))
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 20
     permissions:
@@ -559,7 +559,7 @@ jobs:
   database_roles:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 10
     permissions:
@@ -598,7 +598,7 @@ jobs:
       - worker_product
       - browser_product
       - database_roles
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     permissions:
       contents: read
     steps:
