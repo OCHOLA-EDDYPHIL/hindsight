@@ -40,6 +40,15 @@ _HLC_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 _CHANGEFEED_TOKEN_CACHE: str | None = None
 
 
+def _otel_enabled() -> bool:
+    return os.environ.get("HINDSIGHT_OTEL_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 @dataclass(frozen=True)
 class OutboxEventClaim:
     """Result of attempting to own one durable outbox projection."""
@@ -58,6 +67,24 @@ class OutboxEventLeaseLost(RuntimeError):
 
 def websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Handle API Gateway WebSocket connect, disconnect, and subscription routes."""
+
+    if _otel_enabled():
+        from hindsight.tracing import configure_tracing_from_env, start_span
+
+        configure_tracing_from_env(service_name="hindsight-realtime")
+        request_context = event.get("requestContext") or {}
+        with start_span(
+            "hindsight.realtime.websocket",
+            {
+                "hindsight.realtime.route": request_context.get("routeKey"),
+                "hindsight.realtime.connection_id": request_context.get("connectionId"),
+            },
+        ):
+            return _websocket_handler(event, context)
+    return _websocket_handler(event, context)
+
+
+def _websocket_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     request_context = event.get("requestContext") or {}
     route = str(request_context.get("routeKey") or "$default")
@@ -197,6 +224,16 @@ def _tenant_realtime_fenced(table: Any, tenant_id: str) -> bool:
 
 
 def changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    if _otel_enabled():
+        from hindsight.tracing import configure_tracing_from_env, start_span
+
+        configure_tracing_from_env(service_name="hindsight-realtime")
+        with start_span("hindsight.realtime.changefeed"):
+            return _changefeed_handler(event, context)
+    return _changefeed_handler(event, context)
+
+
+def _changefeed_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Authenticate one webhook batch and fan normalized rows out to subscribers."""
 
     if not _changefeed_authorized(event):

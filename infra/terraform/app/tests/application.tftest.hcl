@@ -340,6 +340,44 @@ run "waf_enabled" {
   }
 }
 
+run "bounded_observability_profile" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  assert {
+    condition = (
+      length(aws_cloudwatch_log_metric_filter.bounded) == 5 &&
+      length(aws_cloudwatch_metric_alarm.lambda_errors) +
+      1 +
+      length(aws_cloudwatch_metric_alarm.bounded) == 10
+    )
+    error_message = "The bounded profile must stop at five custom series and ten alarm metrics."
+  }
+
+  assert {
+    condition = (
+      aws_xray_sampling_rule.bounded[0].fixed_rate == 0.05 &&
+      aws_xray_sampling_rule.bounded[0].reservoir_size == 0
+    )
+    error_message = "X-Ray sampling must remain at five percent with no fixed reservoir."
+  }
+
+  assert {
+    condition = (
+      aws_budgets_budget.monthly.limit_amount == "5" &&
+      aws_budgets_budget.monthly.limit_unit == "USD"
+    )
+    error_message = "The monthly five-dollar budget must notify on actual and forecasted cost."
+  }
+}
+
 run "validation_timing_profile" {
   command = plan
 

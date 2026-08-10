@@ -16,10 +16,13 @@ ARTIFACTS = {
     "api": {
         "dependencies": [
             "certifi>=2026.6.17",
+            "cryptography>=50.0.0",
             "fastapi>=0.135.0",
             "google-genai>=2.11.0",
             "mangum>=0.19.0",
             "opentelemetry-api>=1.43.0",
+            "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+            "opentelemetry-sdk>=1.43.0",
             "psycopg[binary]>=3.2",
             "python-dotenv>=1.0",
         ],
@@ -35,6 +38,7 @@ ARTIFACTS = {
             "identity.py",
             "memory.py",
             "operations.py",
+            "observability.py",
             "prompt_safety.py",
             "queueing.py",
             "realtime_ticket.py",
@@ -54,6 +58,7 @@ ARTIFACTS = {
         "dependencies": [
             "boto3>=1.43.46",
             "certifi>=2026.6.17",
+            "cryptography>=50.0.0",
             "google-genai>=2.11.0",
             "langchain-cockroachdb>=0.2.1",
             "langgraph>=1.2.9",
@@ -76,6 +81,7 @@ ARTIFACTS = {
             "gemini.py",
             "memory.py",
             "operations.py",
+            "observability.py",
             "prompt_safety.py",
             "queueing.py",
             "reasoning.py",
@@ -100,6 +106,7 @@ ARTIFACTS = {
             "security.py",
             "server_tenants.py",
             "tenant.py",
+            "tracing.py",
         ],
     },
 }

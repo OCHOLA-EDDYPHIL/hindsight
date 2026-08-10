@@ -169,6 +169,15 @@ def connect(
     resolved = resolved_tenant_id(tenant_id)
     if resolved is None and _tenant_context_required():
         raise RuntimeError("tenant context is required for this database connection")
+    from opentelemetry import trace
+
+    span = trace.get_current_span()
+    if span.is_recording():
+        span.set_attribute("db.system", "cockroachdb")
+        span.set_attribute("db.operation.name", "connect")
+        span.set_attribute("hindsight.db.application", application_name)
+        if resolved is not None:
+            span.set_attribute("hindsight.tenant_id", resolved)
     connection = psycopg.connect(
         database_url_with_tls_roots(url) if url is not None else database_url(),
         connect_timeout=connect_timeout,

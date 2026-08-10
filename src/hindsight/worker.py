@@ -8,6 +8,8 @@ import os
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
+from opentelemetry import trace
+from opentelemetry.propagate import extract
 
 from hindsight.agent import IncidentInput, resume_incident_agent, run_incident_agent
 from hindsight.cloudwatch_diagnostics import optional_cloudwatch_diagnostics_from_env
@@ -15,6 +17,7 @@ from hindsight.consolidation import enqueue_consolidation_job, process_consolida
 from hindsight.embeddings import embedding_provider_from_env
 from hindsight.gemini import GeminiPoolExhaustedError, gemini_pool_from_env
 from hindsight.operations import execute_operation, reap_exhausted_operations
+from hindsight.observability import structured_event
 from hindsight.reasoning import reasoning_provider_from_env, retrying_reasoning_provider
 from hindsight.run_dispatch import dispatch_run_commands
 from hindsight.runtime import (
@@ -36,7 +39,7 @@ from hindsight.runs import (
 from hindsight.security import safe_error_detail
 from hindsight.server_tenants import public_demo_tenant_id, worker_tenant_id
 from hindsight.tenant import current_tenant_id, tenant_scope
-from hindsight.tracing import configure_tracing_from_env
+from hindsight.tracing import configure_tracing_from_env, set_span_attributes, start_span
 
 RUN_MAX_ATTEMPTS_ENV = "HINDSIGHT_RUN_MAX_ATTEMPTS"
 RUN_ATTEMPT_LEASE_SECONDS_ENV = "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS"
@@ -117,9 +120,9 @@ def _log_record_result(
     if error is not None:
         record["error_code"] = type(error).__name__
         record["error_detail"] = safe_error_detail(error, max_chars=1000)
-        LOGGER.error(json.dumps(record, sort_keys=True))
+        LOGGER.error(structured_event("worker_record", record))
     else:
-        LOGGER.info(json.dumps(record, sort_keys=True))
+        LOGGER.info(structured_event("worker_record", record))
 
 
 def process_message(
@@ -137,7 +140,16 @@ def process_message(
         else current_tenant_id()
         or worker_tenant_id(os.environ.get("HINDSIGHT_WORKER_TENANT_ID", public_demo_tenant_id()))
     )
-    with tenant_scope(tenant_id):
+    configure_tracing_from_env(service_name="hindsight-worker")
+    carrier = {"traceparent": str(message.get("traceparent") or "")}
+    attributes = {
+        f"hindsight.{key}": value
+        for key in ("tenant_id", "run_id", "dispatch_id", "dispatch_attempt_id")
+        if (value := message.get(key))
+    }
+    with tenant_scope(tenant_id), start_span(
+        "hindsight.worker.message", attributes, context=extract(carrier)
+    ):
         return _process_tenant_message(
             message,
             dead_letter=dead_letter,
@@ -262,6 +274,11 @@ def _process_tenant_message(
         raise RuntimeError(f"claimed run attempt is incomplete: {run_id}")
     run = claim.run
     attempt_id = claim.attempt_id
+    message["attempt_id"] = attempt_id
+    set_span_attributes(
+        trace.get_current_span(),
+        {"hindsight.attempt_id": attempt_id},
+    )
 
     def progress(phase: str, status: str, state: dict[str, Any]) -> None:
         if phase == "approval":

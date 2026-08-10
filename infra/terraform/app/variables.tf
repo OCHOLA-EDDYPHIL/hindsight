@@ -200,6 +200,26 @@ variable "alarm_actions" {
   default     = []
 }
 
+variable "alert_email" {
+  description = "Optional confirmed subscriber for operational notifications."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "enable_bounded_observability" {
+  description = "Enable the opt-in ADOT/X-Ray and custom-metric profile."
+  type        = bool
+  default     = false
+}
+
+variable "adot_python_layer_arn" {
+  description = "Region-matched AWS Distro for OpenTelemetry Python Lambda layer ARN."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
 variable "enable_waf" {
   description = "Create and attach the CloudFront Web ACL."
   type        = bool

@@ -6,6 +6,7 @@ import base64
 import binascii
 import dataclasses
 import json
+import logging
 import os
 import time
 from datetime import datetime
@@ -58,6 +59,7 @@ from hindsight.operations import (
     preview_rewind,
     preview_supersession,
 )
+from hindsight.observability import structured_event
 from hindsight.queueing import RunQueueUnavailableError, enqueue_run
 from hindsight.run_dispatch import dispatch_run_commands
 from hindsight.runtime import (
@@ -85,6 +87,7 @@ from hindsight.trace_contract import (
     decision_influence,
     signature_scenario_trace,
 )
+from hindsight.tracing import configure_tracing_from_env, start_span
 
 API_PREFIX = "/v1"
 V2_PREFIX = "/v2"
@@ -93,6 +96,7 @@ TENANT_SELECTOR_HEADERS = frozenset(
     {"x-tenant-id", "x-hindsight-tenant", "x-hindsight-tenant-id"}
 )
 TENANT_SELECTOR_QUERY_KEYS = frozenset({"tenant", "tenant_id"})
+LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_origin(value: str) -> str | None:
@@ -164,7 +168,7 @@ async def bind_server_tenant(request: Request, call_next):
             )
     if request.url.path.startswith(f"{API_PREFIX}/"):
         with tenant_scope(public_demo_tenant_id()):
-            return await call_next(request)
+            return await _observed_request(request, call_next, public_demo_tenant_id())
     if request.url.path.startswith(f"{V2_PREFIX}/"):
         try:
             identity = _v2_identity(request)
@@ -186,8 +190,24 @@ async def bind_server_tenant(request: Request, call_next):
         request.state.v2_identity = identity
         request.state.v2_scopes = identity.scopes
         with tenant_scope(identity.tenant_id):
-            return await call_next(request)
+            return await _observed_request(request, call_next, identity.tenant_id)
     return await call_next(request)
+
+
+async def _observed_request(request: Request, call_next, tenant_id: str):
+    configure_tracing_from_env(service_name="hindsight-api")
+    values = {"tenant_id": tenant_id}
+    with start_span(
+        "hindsight.api.request",
+        {
+            "http.request.method": request.method,
+            "http.route": request.url.path,
+            "hindsight.tenant_id": tenant_id,
+        },
+    ):
+        response = await call_next(request)
+        LOGGER.info(structured_event("api_request", {**values, "status": response.status_code}))
+        return response
 
 
 def _request_has_tenant_selector(request: Request) -> bool:

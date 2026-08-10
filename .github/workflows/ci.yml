@@ -53,6 +53,7 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv lock --check
       - run: uv sync --frozen
+      - run: uv run pip-audit
       - run: uv run python scripts/ci_test_groups.py validate
       - run: uv run ruff check .
       - run: uv run python scripts/ci_test_groups.py run unit
@@ -171,6 +172,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run audit:web
       - run: npm run check:web
       - run: npm run test:web
       - run: npm run build:web
@@ -206,14 +208,20 @@ jobs:
             terraform-${{ runner.os }}-
             ${{ hashFiles('infra/terraform/**/.terraform.lock.hcl') }}
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          severity: HIGH,CRITICAL
+          exit-code: 1
       - run: terraform fmt -check -recursive infra/terraform
-      - run: terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false -lockfile=readonly
       - run: terraform -chdir=infra/terraform/bootstrap validate
       - run: terraform -chdir=infra/terraform/bootstrap test
-      - run: terraform -chdir=infra/terraform/app init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform/app init -backend=false -input=false -lockfile=readonly
       - run: terraform -chdir=infra/terraform/app validate
       - run: terraform -chdir=infra/terraform/app test
-      - run: terraform -chdir=infra/terraform/edge init -backend=false -input=false
+      - run: terraform -chdir=infra/terraform/edge init -backend=false -input=false -lockfile=readonly
       - run: terraform -chdir=infra/terraform/edge validate
       - run: terraform -chdir=infra/terraform/edge test
 
