@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     outputs:
       source_sha: ${{ steps.authorization.outputs.source_sha }}
     steps:
@@ -42,7 +42,7 @@ jobs:
 
   qualify:
     needs: authorize
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     timeout-minutes: 25
     env:
       COMPOSE_PROJECT_NAME: hindsight_capacity_${{ github.run_id }}_${{ github.run_attempt }}

@@ -7,14 +7,16 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER_EXPRESSION = "${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}"
+RUNNER_EXPRESSION = "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
 COCKROACH_IMAGE = "cockroachdb/cockroach:v25.4.5"
-RUNNER_ROUTED_WORKFLOWS = (
-    "ci.yml",
-    "deploy-demo.yml",
-    "destroy-demo.yml",
-    "live-acceptance.yml",
-    "verify-deployed.yml",
+WORKFLOW_DIRECTORY = ROOT / ".github/workflows"
+WORKFLOW_PATHS = tuple(
+    sorted(
+        (
+            *WORKFLOW_DIRECTORY.glob("*.yml"),
+            *WORKFLOW_DIRECTORY.glob("*.yaml"),
+        )
+    )
 )
 
 
@@ -71,23 +73,23 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
     }
 
 
-@pytest.mark.parametrize("workflow_name", RUNNER_ROUTED_WORKFLOWS)
-def test_hosted_workflow_jobs_honor_opt_in_runner_override(workflow_name: str):
-    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / workflow_name).read_text())
-    jobs = workflow["jobs"].values()
+@pytest.mark.parametrize("workflow_path", WORKFLOW_PATHS, ids=lambda path: path.name)
+def test_every_workflow_job_uses_owner_controlled_runner(workflow_path: Path):
+    workflow = yaml.safe_load(workflow_path.read_text())
+    jobs = list(workflow["jobs"].values())
     executable_jobs = [job for job in jobs if "runs-on" in job]
 
-    assert executable_jobs
-    assert all("runs-on" in job or "uses" in job for job in jobs)
-    assert {job["runs-on"] for job in executable_jobs} == {RUNNER_EXPRESSION}
+    assert jobs
+    assert all(("runs-on" in job) != ("uses" in job) for job in jobs)
+    assert all(job["runs-on"] == RUNNER_EXPRESSION for job in executable_jobs)
 
 
-def test_reusable_deploy_workflow_preserves_hosted_runner_default():
+def test_reusable_deploy_workflow_uses_owner_controlled_runner():
     workflow = (ROOT / ".github" / "workflows" / "deploy-demo.yml").read_text()
 
     assert "workflow_call:" in workflow
     assert RUNNER_EXPRESSION in workflow
-    assert "runs-on: ubuntu-latest" not in workflow
+    assert "ubuntu-latest" not in workflow
 
 
 def test_normal_ci_and_migration_qualification_pin_supported_cockroach_version():
@@ -99,7 +101,7 @@ def test_normal_ci_and_migration_qualification_pin_supported_cockroach_version()
     )
 
     job = workflow["jobs"]["migration_compatibility"]
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == RUNNER_EXPRESSION
     assert job["env"]["COCKROACH_IMAGE"] == COCKROACH_IMAGE
 
 
