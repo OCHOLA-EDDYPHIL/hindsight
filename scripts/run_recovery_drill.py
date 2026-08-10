@@ -144,12 +144,16 @@ def _connection(url: str, deadline: Deadline) -> Iterator[psycopg.Connection[Any
         connect_timeout=deadline.limit(CONNECT_TIMEOUT_SECONDS),
         application_name="hindsight-recovery-drill",
     ) as conn:
-        statement_timeout_ms = deadline.limit(MAX_TIMEOUT_SECONDS) * 1000
-        conn.execute(
-            "SELECT set_config('statement_timeout', %s, false)",
-            (f"{statement_timeout_ms}ms",),
-        )
+        _refresh_statement_timeout(conn, deadline)
         yield conn
+
+
+def _refresh_statement_timeout(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    statement_timeout_ms = deadline.limit(MAX_TIMEOUT_SECONDS) * 1000
+    conn.execute(
+        "SELECT set_config('statement_timeout', %s, false)",
+        (f"{statement_timeout_ms}ms",),
+    )
 
 
 def _existing_databases(conn: psycopg.Connection[Any]) -> set[str]:
@@ -190,9 +194,17 @@ def _create_database(admin_url: str, database: str, deadline: Deadline) -> None:
         conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
 
 
-def _drop_database(conn: psycopg.Connection[Any], database: str, *, allowed: set[str]) -> None:
+def _drop_database(
+    conn: psycopg.Connection[Any],
+    database: str,
+    *,
+    allowed: set[str],
+    deadline: Deadline | None = None,
+) -> None:
     if database not in allowed or not _is_disposable_database(database):
         raise RuntimeError("refusing to drop a database outside the exact drill target set")
+    if deadline is not None:
+        _refresh_statement_timeout(conn, deadline)
     conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database)))
 
 
@@ -515,23 +527,27 @@ def _cleanup_resources(admin_url: str, targets: DrillTargets) -> tuple[dict[str,
     allowed = {targets.source_database, targets.restore_database}
     try:
         with _connection(admin_url, deadline) as conn:
-            _drop_database(conn, targets.restore_database, allowed=allowed)
-            _drop_database(conn, targets.source_database, allowed=allowed)
+            _drop_database(conn, targets.restore_database, allowed=allowed, deadline=deadline)
+            _drop_database(conn, targets.source_database, allowed=allowed, deadline=deadline)
             payload_table = f"{targets.userfile_prefix}_upload_payload"
             files_table = f"{targets.userfile_prefix}_upload_files"
+            _refresh_statement_timeout(conn, deadline)
             conn.execute(
                 sql.SQL("DROP TABLE IF EXISTS defaultdb.public.{}").format(
                     sql.Identifier(payload_table)
                 )
             )
+            _refresh_statement_timeout(conn, deadline)
             conn.execute(
                 sql.SQL("DROP TABLE IF EXISTS defaultdb.public.{} CASCADE").format(
                     sql.Identifier(files_table)
                 )
             )
+            _refresh_statement_timeout(conn, deadline)
             databases = _existing_databases(conn)
             cleanup["source_database_absent"] = targets.source_database not in databases
             cleanup["restore_database_absent"] = targets.restore_database not in databases
+            _refresh_statement_timeout(conn, deadline)
             remaining_tables = {
                 str(row[0])
                 for row in conn.execute(

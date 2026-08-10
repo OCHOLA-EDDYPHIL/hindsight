@@ -209,6 +209,65 @@ def test_schema_snapshot_fails_when_bounded_reads_never_converge(monkeypatch):
     assert calls == drill.SCHEMA_MANIFEST_MAX_READS
 
 
+def test_cleanup_refreshes_the_shared_deadline_before_each_statement(monkeypatch):
+    drill = _module()
+    targets = drill._targets("abcdef1234567890")
+
+    class FakeDeadline:
+        def __init__(self):
+            self.remaining = 20
+
+        def limit(self, maximum):
+            value = min(maximum, self.remaining)
+            self.remaining -= 1
+            return value
+
+    class FakeResult:
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def __init__(self):
+            self.statement_timeouts = []
+
+        def execute(self, query, params=None):
+            if query == "SELECT set_config('statement_timeout', %s, false)":
+                self.statement_timeouts.append(params[0])
+            return FakeResult()
+
+    class FakeConnectionContext:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, *_args):
+            return False
+
+    deadline = FakeDeadline()
+    conn = FakeConnection()
+    monkeypatch.setattr(drill.Deadline, "after", lambda _seconds: deadline)
+    monkeypatch.setattr(
+        drill,
+        "_connection",
+        lambda _url, _deadline: FakeConnectionContext(conn),
+    )
+
+    cleanup, errors = drill._cleanup_resources("postgresql://fixture", targets)
+
+    assert errors == []
+    assert all(cleanup.values())
+    assert conn.statement_timeouts == [
+        "20000ms",
+        "19000ms",
+        "18000ms",
+        "17000ms",
+        "16000ms",
+        "15000ms",
+    ]
+
+
 def test_recovery_initializes_agent_storage_as_part_of_the_backup_fixture(monkeypatch):
     drill = _module()
     calls = []
