@@ -119,6 +119,59 @@ def test_canonical_digest_is_stable_and_type_sensitive():
     assert drill._sha256({"value": b"1"}) != drill._sha256({"value": "1"})
 
 
+def test_manifest_summary_and_difference_are_section_scoped_and_bounded():
+    drill = _module()
+    source = {
+        "tables": ["a", "b", "c"],
+        "roles": [["hindsight_api", False]],
+    }
+    restored = {
+        "tables": ["a", "changed", "c"],
+        "roles": [["hindsight_api", False]],
+    }
+
+    summary = drill._manifest_summary(source)
+    differences = drill._manifest_difference_sample(source, restored, limit=1)
+
+    assert summary["section_counts"] == {"roles": 1, "tables": 3}
+    assert set(summary["section_sha256"]) == {"roles", "tables"}
+    assert differences == {
+        "tables": {
+            "source_only_count": 1,
+            "restored_only_count": 1,
+            "source_only_sample": ['"b"'],
+            "restored_only_sample": ['"changed"'],
+        }
+    }
+
+
+def test_manifest_difference_bounds_items_and_distinguishes_missing_from_null():
+    drill = _module()
+    long_definition = "x" * 200
+
+    differences = drill._manifest_difference_sample(
+        {"missing_from_restored": None, "functions": [long_definition]},
+        {"missing_from_source": None, "functions": ["changed"]},
+        max_item_chars=80,
+    )
+
+    assert differences["missing_from_restored"] == {
+        "source_only_count": 1,
+        "restored_only_count": 0,
+        "source_only_sample": ["null"],
+        "restored_only_sample": [],
+    }
+    assert differences["missing_from_source"] == {
+        "source_only_count": 0,
+        "restored_only_count": 1,
+        "source_only_sample": [],
+        "restored_only_sample": ["null"],
+    }
+    source_sample = differences["functions"]["source_only_sample"][0]
+    assert len(source_sample) == 80
+    assert source_sample.endswith("...<truncated; original chars=202>")
+
+
 def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch):
     drill = _module()
     calls = []
@@ -132,13 +185,86 @@ def test_schema_snapshot_reapplies_database_roles_before_comparison(monkeypatch)
     deadline = drill.Deadline.after(60)
 
     assert drill._schema_manifest("postgresql://fixture", deadline) == {"tables": []}
-    assert calls == [
-        (
-            "schema_manifest.py",
-            ["export", "--output", calls[0][1][2], "--apply-roles"],
-            "postgresql://fixture",
-            deadline,
-        )
+    assert len(calls) == 2
+    assert all(call[0] == "schema_manifest.py" for call in calls)
+    assert all(call[1] == ["export", "--output", calls[0][1][2], "--apply-roles"] for call in calls)
+    assert all(call[2:] == ("postgresql://fixture", deadline) for call in calls)
+
+
+def test_schema_snapshot_fails_when_bounded_reads_never_converge(monkeypatch):
+    drill = _module()
+    calls = 0
+
+    def run_repository_script(_script, args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        output = Path(args[args.index("--output") + 1])
+        output.write_text(json.dumps({"tables": [f"version-{calls}"]}))
+
+    monkeypatch.setattr(drill, "_run_repository_script", run_repository_script)
+
+    with pytest.raises(RuntimeError, match="did not converge"):
+        drill._schema_manifest("postgresql://fixture", drill.Deadline.after(60))
+
+    assert calls == drill.SCHEMA_MANIFEST_MAX_READS
+
+
+def test_cleanup_refreshes_the_shared_deadline_before_each_statement(monkeypatch):
+    drill = _module()
+    targets = drill._targets("abcdef1234567890")
+
+    class FakeDeadline:
+        def __init__(self):
+            self.remaining = 20
+
+        def limit(self, maximum):
+            value = min(maximum, self.remaining)
+            self.remaining -= 1
+            return value
+
+    class FakeResult:
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def __init__(self):
+            self.statement_timeouts = []
+
+        def execute(self, query, params=None):
+            if query == "SELECT set_config('statement_timeout', %s, false)":
+                self.statement_timeouts.append(params[0])
+            return FakeResult()
+
+    class FakeConnectionContext:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, *_args):
+            return False
+
+    deadline = FakeDeadline()
+    conn = FakeConnection()
+    monkeypatch.setattr(drill.Deadline, "after", lambda _seconds: deadline)
+    monkeypatch.setattr(
+        drill,
+        "_connection",
+        lambda _url, _deadline: FakeConnectionContext(conn),
+    )
+
+    cleanup, errors = drill._cleanup_resources("postgresql://fixture", targets)
+
+    assert errors == []
+    assert all(cleanup.values())
+    assert conn.statement_timeouts == [
+        "20000ms",
+        "19000ms",
+        "18000ms",
+        "17000ms",
+        "16000ms",
+        "15000ms",
     ]
 
 

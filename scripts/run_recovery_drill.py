@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
@@ -35,7 +36,9 @@ DATABASE_PREFIX = "hindsight_recovery_"
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
 CONNECT_TIMEOUT_SECONDS = 5
-CLEANUP_TIMEOUT_SECONDS = 30
+CLEANUP_TIMEOUT_SECONDS = 120
+SCHEMA_MANIFEST_MAX_READS = 3
+SCHEMA_DIAGNOSTIC_ITEM_MAX_CHARS = 1000
 PRE_BACKUP_MARKER_KEY = "recovery_drill_pre_backup"
 POST_BACKUP_MARKER_KEY = "recovery_drill_post_backup"
 SCHEMA_VERSION = "hindsight.recovery_drill.v1"
@@ -141,12 +144,16 @@ def _connection(url: str, deadline: Deadline) -> Iterator[psycopg.Connection[Any
         connect_timeout=deadline.limit(CONNECT_TIMEOUT_SECONDS),
         application_name="hindsight-recovery-drill",
     ) as conn:
-        statement_timeout_ms = deadline.limit(MAX_TIMEOUT_SECONDS) * 1000
-        conn.execute(
-            "SELECT set_config('statement_timeout', %s, false)",
-            (f"{statement_timeout_ms}ms",),
-        )
+        _refresh_statement_timeout(conn, deadline)
         yield conn
+
+
+def _refresh_statement_timeout(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    statement_timeout_ms = deadline.limit(MAX_TIMEOUT_SECONDS) * 1000
+    conn.execute(
+        "SELECT set_config('statement_timeout', %s, false)",
+        (f"{statement_timeout_ms}ms",),
+    )
 
 
 def _existing_databases(conn: psycopg.Connection[Any]) -> set[str]:
@@ -187,9 +194,17 @@ def _create_database(admin_url: str, database: str, deadline: Deadline) -> None:
         conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
 
 
-def _drop_database(conn: psycopg.Connection[Any], database: str, *, allowed: set[str]) -> None:
+def _drop_database(
+    conn: psycopg.Connection[Any],
+    database: str,
+    *,
+    allowed: set[str],
+    deadline: Deadline | None = None,
+) -> None:
     if database not in allowed or not _is_disposable_database(database):
         raise RuntimeError("refusing to drop a database outside the exact drill target set")
+    if deadline is not None:
+        _refresh_statement_timeout(conn, deadline)
     conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database)))
 
 
@@ -233,16 +248,23 @@ def _initialize_agent_storage(database_url: str, deadline: Deadline) -> None:
 def _schema_manifest(database_url: str, deadline: Deadline) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="hindsight-recovery-schema-") as directory:
         output = Path(directory) / "schema.json"
-        _run_repository_script(
-            "schema_manifest.py",
-            ["export", "--output", str(output), "--apply-roles"],
-            database_url=database_url,
-            deadline=deadline,
-        )
-        value = json.loads(output.read_text())
-    if not isinstance(value, dict):
-        raise RuntimeError("schema manifest did not contain a JSON object")
-    return value
+        previous: dict[str, Any] | None = None
+        for _ in range(SCHEMA_MANIFEST_MAX_READS):
+            _run_repository_script(
+                "schema_manifest.py",
+                ["export", "--output", str(output), "--apply-roles"],
+                database_url=database_url,
+                deadline=deadline,
+            )
+            value = json.loads(output.read_text())
+            if not isinstance(value, dict):
+                raise RuntimeError("schema manifest did not contain a JSON object")
+            if value == previous:
+                return value
+            previous = value
+    raise RuntimeError(
+        f"schema manifest did not converge across {SCHEMA_MANIFEST_MAX_READS} consecutive reads"
+    )
 
 
 def _canonical_value(value: Any) -> Any:
@@ -341,7 +363,56 @@ def _manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
             key: len(value) if isinstance(value, (dict, list)) else 1
             for key, value in sorted(manifest.items())
         },
+        "section_sha256": {key: _sha256(value) for key, value in sorted(manifest.items())},
     }
+
+
+def _manifest_difference_sample(
+    source: dict[str, Any],
+    restored: dict[str, Any],
+    *,
+    limit: int = 5,
+    max_item_chars: int = SCHEMA_DIAGNOSTIC_ITEM_MAX_CHARS,
+) -> dict[str, Any]:
+    """Return bounded schema-only diagnostics for non-identical manifests."""
+
+    def bounded_item(value: str) -> str:
+        if len(value) <= max_item_chars:
+            return value
+        suffix = f"...<truncated; original chars={len(value)}>"
+        if len(suffix) >= max_item_chars:
+            return suffix[:max_item_chars]
+        return value[: max_item_chars - len(suffix)] + suffix
+
+    differences: dict[str, Any] = {}
+    for section in sorted(set(source).union(restored)):
+        source_present = section in source
+        restored_present = section in restored
+        source_value = source.get(section)
+        restored_value = restored.get(section)
+        if source_present == restored_present and source_value == restored_value:
+            continue
+        source_items = (
+            (source_value if isinstance(source_value, list) else [source_value])
+            if source_present
+            else []
+        )
+        restored_items = (
+            (restored_value if isinstance(restored_value, list) else [restored_value])
+            if restored_present
+            else []
+        )
+        source_counter = Counter(_canonical_json(item) for item in source_items)
+        restored_counter = Counter(_canonical_json(item) for item in restored_items)
+        source_only = list((source_counter - restored_counter).elements())
+        restored_only = list((restored_counter - source_counter).elements())
+        differences[section] = {
+            "source_only_count": len(source_only),
+            "restored_only_count": len(restored_only),
+            "source_only_sample": [bounded_item(item) for item in source_only[:limit]],
+            "restored_only_sample": [bounded_item(item) for item in restored_only[:limit]],
+        }
+    return differences
 
 
 def _migration_summary(database_url: str, deadline: Deadline) -> dict[str, Any]:
@@ -456,23 +527,27 @@ def _cleanup_resources(admin_url: str, targets: DrillTargets) -> tuple[dict[str,
     allowed = {targets.source_database, targets.restore_database}
     try:
         with _connection(admin_url, deadline) as conn:
-            _drop_database(conn, targets.restore_database, allowed=allowed)
-            _drop_database(conn, targets.source_database, allowed=allowed)
+            _drop_database(conn, targets.restore_database, allowed=allowed, deadline=deadline)
+            _drop_database(conn, targets.source_database, allowed=allowed, deadline=deadline)
             payload_table = f"{targets.userfile_prefix}_upload_payload"
             files_table = f"{targets.userfile_prefix}_upload_files"
+            _refresh_statement_timeout(conn, deadline)
             conn.execute(
                 sql.SQL("DROP TABLE IF EXISTS defaultdb.public.{}").format(
                     sql.Identifier(payload_table)
                 )
             )
+            _refresh_statement_timeout(conn, deadline)
             conn.execute(
                 sql.SQL("DROP TABLE IF EXISTS defaultdb.public.{} CASCADE").format(
                     sql.Identifier(files_table)
                 )
             )
+            _refresh_statement_timeout(conn, deadline)
             databases = _existing_databases(conn)
             cleanup["source_database_absent"] = targets.source_database not in databases
             cleanup["restore_database_absent"] = targets.restore_database not in databases
+            _refresh_statement_timeout(conn, deadline)
             remaining_tables = {
                 str(row[0])
                 for row in conn.execute(
@@ -613,6 +688,11 @@ def run_drill(
         post_absent = POST_BACKUP_MARKER_KEY not in restored_markers
         schema_matches = restored_manifest == source_manifest
         data_matches = restored_data == source_data
+        manifest_differences = (
+            {}
+            if schema_matches
+            else _manifest_difference_sample(source_manifest, restored_manifest)
+        )
         evidence["validation"] = {
             "markers": {
                 "pre_backup_present": pre_present,
@@ -622,6 +702,8 @@ def run_drill(
                 "matches": schema_matches,
                 "source": _manifest_summary(source_manifest),
                 "restored": _manifest_summary(restored_manifest),
+                "differing_sections": sorted(manifest_differences),
+                "difference_sample": manifest_differences,
             },
             "data_identity": {
                 "matches": data_matches,
