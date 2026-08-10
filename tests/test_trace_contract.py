@@ -8,6 +8,36 @@ import pytest
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
+def test_signature_trace_pairs_latest_pre_rewind_rejection_with_correction():
+    from datetime import UTC, datetime, timedelta
+
+    from hindsight.trace_contract import _rejected_run_for_operation
+
+    rewind_completed_at = datetime.now(UTC)
+    oldest = {
+        "id": "oldest-rejection",
+        "status": "rejected",
+        "completed_at": rewind_completed_at - timedelta(minutes=3),
+    }
+    corrected_rejection = {
+        "id": "corrected-rejection",
+        "status": "rejected",
+        "completed_at": rewind_completed_at - timedelta(minutes=1),
+    }
+    later_rejection = {
+        "id": "later-rejection",
+        "status": "rejected",
+        "completed_at": rewind_completed_at + timedelta(minutes=1),
+    }
+
+    selected = _rejected_run_for_operation(
+        runs=[oldest, corrected_rejection, later_rejection],
+        operation={"completed_at": rewind_completed_at},
+    )
+
+    assert selected == corrected_rejection
+
+
 @requires_db
 def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage():
     from hindsight.db import database_url
@@ -128,19 +158,41 @@ def test_decision_trace_exposes_retrieval_profile_version_evidence_and_lineage()
 @requires_db
 def test_explicit_signature_scenario_returns_partial_identity_state():
     from hindsight.db import database_url
-    from hindsight.demo_state import reset_poison_rewind_state
+    from hindsight.demo_state import (
+        ensure_poison_rewind_incident,
+        record_poison_rewind_anchor,
+        reset_poison_rewind_state,
+    )
     from hindsight.trace_contract import signature_scenario_trace
 
+    fixture_id = uuid4()
+    incident = ensure_poison_rewind_incident(
+        fixture_id=fixture_id,
+        db_url=database_url(),
+    )
     namespace = reset_poison_rewind_state(
         namespace=f"partial-signature:{uuid4()}",
+        session_id=fixture_id,
+        incident_id=fixture_id,
+        db_url=database_url(),
+    )
+    rewind_anchor = record_poison_rewind_anchor(
+        namespace=namespace,
         db_url=database_url(),
     )
 
     scenario = signature_scenario_trace(namespace=namespace, db_url=database_url())
 
     assert scenario is not None
+    assert scenario["scenario_id"] == fixture_id
     assert scenario["namespace"] == namespace
-    assert scenario["incident"] is None
+    assert scenario["status"] == "active"
+    assert scenario["session_status"] == "active"
+    assert scenario["completed_at"] is None
+    assert scenario["rewind_anchor"] == rewind_anchor
+    assert scenario["incident"]["id"] == fixture_id
+    assert scenario["incident"]["slug"] == incident["slug"]
+    assert scenario["incident"]["service_slug"] == "payments-api"
     assert scenario["runs"] == []
     assert scenario["operation"] is None
     assert scenario["stages"] == {
@@ -161,6 +213,7 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
         DEMO_NAMESPACE,
         ensure_poison_rewind_incident,
         poison_demo_memory,
+        record_poison_rewind_anchor,
         reset_poison_rewind_state,
         seed_good_demo_memory,
     )
@@ -172,19 +225,24 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
 
     provider = DeterministicEmbeddingProvider()
     fixture_id = uuid4()
+    incident = ensure_poison_rewind_incident(
+        fixture_id=fixture_id,
+        db_url=database_url(),
+    )
     namespace = reset_poison_rewind_state(
         namespace=DEMO_NAMESPACE,
         session_id=fixture_id,
-        db_url=database_url(),
-    )
-    incident = ensure_poison_rewind_incident(
-        fixture_id=fixture_id,
+        incident_id=fixture_id,
         db_url=database_url(),
     )
     seed = seed_good_demo_memory(
         namespace=namespace,
         db_url=database_url(),
         embedding_provider=provider,
+    )
+    rewind_anchor = record_poison_rewind_anchor(
+        namespace=namespace,
+        db_url=database_url(),
     )
     poison = poison_demo_memory(
         namespace=namespace,
@@ -195,12 +253,6 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
         incident_slug=incident["slug"],
         namespace=namespace,
         user_input="poisoned run",
-        db_url=database_url(),
-    )
-    corrected, _ = create_run(
-        incident_slug=incident["slug"],
-        namespace=namespace,
-        user_input="corrected run",
         db_url=database_url(),
     )
     with MemoryStore(url=database_url(), embedding_provider=provider) as store:
@@ -226,43 +278,35 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
             )
             conn.execute(
                 """
-                    UPDATE agent_runs
-                    SET status = 'completed', plan = 'throttle retry fanout',
-                        action_approved = true, completed_at = now()
-                    WHERE id = %s
+                    INSERT INTO agent_run_events (
+                        run_id, sequence, phase, status, summary, metadata
+                    )
+                    SELECT %s, COALESCE(max(sequence), 0) + 1,
+                           'completion', 'rejected', 'Operator rejected recommendation', %s
+                    FROM agent_run_events WHERE run_id = %s
                 """,
-                (corrected["id"],),
+                (
+                    bad["id"],
+                    Jsonb(
+                        {
+                            "action_trace": {
+                                "mode": "recommendation_only",
+                                "approval": {"approved": False, "disposition": "rejected"},
+                                "execution": {"status": "not_executed"},
+                            }
+                        }
+                    ),
+                    bad["id"],
+                ),
             )
-            for run, trace in (
-                (
-                    bad,
-                    {
-                        "request": {"id": "action:bad", "actions": ["scale_workers"]},
-                        "score": {"recovered": False, "unsafe_action_count": 1},
-                    },
-                ),
-                (
-                    corrected,
-                    {
-                        "request": {
-                            "id": "action:corrected",
-                            "actions": ["inspect_dependency", "throttle_retries"],
-                        },
-                        "score": {"recovered": True, "unsafe_action_count": 0},
-                    },
-                ),
-            ):
-                conn.execute(
-                    """
-                        INSERT INTO agent_run_events (
-                            run_id, sequence, phase, status, summary, metadata
-                        )
-                        SELECT %s, COALESCE(max(sequence), 0) + 1,
-                               'completion', 'completed', 'Externally scored action', %s
-                        FROM agent_run_events WHERE run_id = %s
-                    """,
-                    (run["id"], Jsonb({"action_trace": trace}), run["id"]),
-                )
+    with MemoryStore(url=database_url()) as store:
+        store.invalidate(
+            memory_id=str(poison["id"]),
+            actor="pytest.trace",
+            reason="Remove poison",
+        )
+    with connect(database_url()) as conn:
+        with conn.transaction():
             operation = conn.execute(
                 """
                     INSERT INTO memory_operations (
@@ -299,12 +343,12 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
                 """,
                 (operation, poison["id"], poison["belief_id"], namespace),
             )
-    with MemoryStore(url=database_url()) as store:
-        store.invalidate(
-            memory_id=str(poison["id"]),
-            actor="pytest.trace",
-            reason="Remove poison",
-        )
+    corrected, _ = create_run(
+        incident_slug=incident["slug"],
+        namespace=namespace,
+        user_input="corrected run",
+        db_url=database_url(),
+    )
     with MemoryStore(url=database_url(), embedding_provider=provider) as store:
         corrected_retrieval = store.retrieve_semantic(
             namespace=namespace,
@@ -315,9 +359,44 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
             positive_guidance_only=True,
         )
     assert str(poison["id"]) not in {str(row["id"]) for row in corrected_retrieval.hits}
+    with connect(database_url()) as conn:
+        with conn.transaction():
+            conn.execute(
+                """
+                    UPDATE agent_runs
+                    SET status = 'completed', plan = 'throttle retry fanout',
+                        action_approved = true, completed_at = now()
+                    WHERE id = %s
+                """,
+                (corrected["id"],),
+            )
+            conn.execute(
+                """
+                    INSERT INTO agent_run_events (
+                        run_id, sequence, phase, status, summary, metadata
+                    )
+                    SELECT %s, COALESCE(max(sequence), 0) + 1,
+                           'completion', 'completed', 'Recommendation approved', %s
+                    FROM agent_run_events WHERE run_id = %s
+                """,
+                (
+                    corrected["id"],
+                    Jsonb(
+                        {
+                            "action_trace": {
+                                "mode": "recommendation_only",
+                                "approval": {"approved": True, "disposition": "approved"},
+                                "execution": {"status": "recommendation_approved"},
+                            }
+                        }
+                    ),
+                    corrected["id"],
+                ),
+            )
 
     validation_namespace = reset_poison_rewind_state(
-        namespace=f"live-browser:{uuid4()}",
+        namespace=f"{DEMO_NAMESPACE}:session:{uuid4().hex}",
+        incident_id=fixture_id,
         db_url=database_url(),
     )
     validation_bad, _ = create_run(
@@ -343,7 +422,9 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
             )
             conn.execute(
                 """
-                    UPDATE agent_runs SET status = 'completed', completed_at = now()
+                    UPDATE agent_runs
+                    SET status = 'completed', action_approved = true,
+                        completed_at = now()
                     WHERE id = %s
                 """,
                 (validation_corrected["id"],),
@@ -369,8 +450,14 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
 
     default = signature_scenario_trace(db_url=database_url())
     assert default is not None
+    assert default["scenario_id"] == fixture_id
     assert default["namespace"] == namespace
+    assert default["status"] == "completed"
+    assert default["session_status"] == "active"
+    assert default["completed_at"] is not None
+    assert default["rewind_anchor"] == rewind_anchor
     assert default["incident"]["slug"] == incident["slug"]
+    assert default["incident"]["service_slug"] == "payments-api"
     assert default["stages"]["baseline_memory_id"] == seed["id"]
     assert default["stages"]["compromised_memory_id"] == poison["id"]
     assert default["stages"]["poison_memory_id"] == poison["id"]
@@ -379,20 +466,25 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert default["stages"]["corrected_decision_id"] == corrected["decision_id"]
     bad_trace = next(run for run in default["runs"] if str(run["id"]) == bad["id"])
     corrected_trace = next(run for run in default["runs"] if str(run["id"]) == corrected["id"])
-    assert bad_trace["action_trace"]["score"] == {
-        "recovered": False,
-        "unsafe_action_count": 1,
-    }
+    assert bad_trace["action_trace"]["mode"] == "recommendation_only"
+    assert bad_trace["action_trace"]["approval"]["approved"] is False
+    assert bad_trace["action_trace"]["execution"]["status"] == "not_executed"
     poison_read = next(
         read for read in bad_trace["trace"]["reads"] if str(read["memory_id"]) == str(poison["id"])
     )
     assert poison_read["writer"] == "demo.fixture-import"
     assert poison_read["source_ref"] == "demo:stale-runbook-import"
     assert "previously approved payment runbook" in poison_read["justification"]
-    assert corrected_trace["action_trace"]["score"] == {
-        "recovered": True,
-        "unsafe_action_count": 0,
-    }
+    assert corrected_trace["action_trace"]["mode"] == "recommendation_only"
+    assert corrected_trace["action_trace"]["approval"]["approved"] is True
+    assert corrected_trace["action_trace"]["execution"]["status"] == "recommendation_approved"
+    assert corrected_trace["created_at"] > default["operation"]["completed_at"]
+    assert corrected_trace["trace"]["reads"]
+    assert all(
+        str(read["memory_id"])
+        not in {str(value) for value in default["operation"]["invalidated_memory_ids"]}
+        for read in corrected_trace["trace"]["reads"]
+    )
     assert (
         next(row for row in default["memories"] if row["id"] == poison["id"])["t_invalid"]
         is not None
@@ -413,6 +505,8 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     assert by_decision is not None and by_decision["namespace"] == namespace
     assert validation_by_decision is not None
     assert validation_by_decision["namespace"] == validation_namespace
+    assert validation_by_decision["status"] == "active"
+    assert validation_by_decision["stages"]["corrected_decision_id"] is None
 
     from fastapi.testclient import TestClient
     from hindsight.api import app

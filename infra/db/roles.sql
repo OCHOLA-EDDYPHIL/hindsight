@@ -486,6 +486,7 @@ GRANT INSERT ON TABLE tenant_event_outbox TO hindsight_lifecycle;
 GRANT UPDATE ON TABLE
     agent_reflections,
     agent_runs,
+    demo_sessions,
     incidents,
     memory_decisions
 TO hindsight_lifecycle;

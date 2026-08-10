@@ -82,6 +82,35 @@ describe("operator console", () => {
     expect(screen.getByText("diagnostics")).toBeVisible();
   });
 
+  it("marks the final observed phase complete for terminal runs and failed for failures", () => {
+    const { rerender } = render(
+      <OperatorConsole
+        {...props}
+        run={{
+          id: "run-complete",
+          status: "completed",
+          events: [{ phase: "triage" }, { phase: "reflection" }],
+        }}
+      />,
+    );
+
+    expect(document.querySelector('[data-phase="reflection"]')).toHaveAttribute(
+      "data-phase-state",
+      "complete",
+    );
+
+    rerender(
+      <OperatorConsole
+        {...props}
+        run={{ id: "run-failed", status: "failed", events: [{ phase: "triage" }] }}
+      />,
+    );
+    expect(document.querySelector('[data-phase="triage"]')).toHaveAttribute(
+      "data-phase-state",
+      "failed",
+    );
+  });
+
   it("keeps the walkthrough optional and never invokes mutation callbacks", () => {
     render(<OperatorConsole {...props} />);
 
@@ -112,6 +141,9 @@ describe("operator console", () => {
       scenario_id: "scenario-1",
       namespace: baselineSnapshot.namespace,
       status: "active",
+      session_status: "active",
+      rewind_anchor: "2026-07-18T00:00:00Z",
+      completed_at: null,
       runs: [],
       memories: [],
       stages: { compromised_memory_id: compromisedMemoryId },
@@ -162,12 +194,20 @@ describe("operator console", () => {
       deriveWalkthroughStep({
         ...state,
         snapshot: rewoundSnapshot,
+        run: { id: "good", status: "awaiting_approval" },
+      }),
+    ).toBe("review");
+    expect(
+      deriveWalkthroughStep({
+        ...state,
+        snapshot: rewoundSnapshot,
         run: { id: "bad", status: "rejected" },
       }),
     ).toBe("reanalyze");
     expect(
       deriveWalkthroughStep({
         ...state,
+        scenario: { ...compromisedScenario, status: "completed" },
         snapshot: rewoundSnapshot,
         run: { id: "good", status: "completed" },
       }),

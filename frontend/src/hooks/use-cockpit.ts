@@ -9,6 +9,11 @@ import {
 import { createHostedUiAuthAdapter, type AuthAdapter } from "@/lib/auth";
 import { isoToLocalInput, localInputToIso } from "@/lib/format";
 import { BoundedRealtimeTracker, parseRealtimeEnvelopeV2 } from "@/lib/realtime";
+import {
+  influenceFromRun,
+  latestScenarioRun,
+  readReplayLocation,
+} from "@/lib/replay-state";
 import type {
   AuthStatus,
   EffectiveIdentity,
@@ -29,6 +34,7 @@ const TERMINAL_RUN_STATES = new Set(["completed", "rejected", "failed"]);
 
 type LoadState = "loading" | "ready" | "empty" | "error";
 type ConnectionState = "connecting" | "live" | "historical" | "reconnecting" | "disconnected";
+export type InfluenceLoadState = "loading" | "ready" | "empty" | "error";
 
 interface Notice {
   message: string;
@@ -44,8 +50,9 @@ interface RunStartResponse {
 }
 
 interface ResetResponse {
+  scenario_id: string;
   namespace: string;
-  rewind_anchor?: string | null;
+  rewind_anchor: string | null;
   incident?: Incident | null;
 }
 
@@ -113,11 +120,10 @@ export function parseEffectiveIdentity(value: unknown): EffectiveIdentity {
 }
 
 function initialNamespace(config: RuntimeConfig): string {
-  return (
-    new URLSearchParams(window.location.search).get("namespace") ||
-    config.defaultNamespace ||
-    DEFAULT_NAMESPACE
-  );
+  return readReplayLocation(
+    window.location.search,
+    config.defaultNamespace || DEFAULT_NAMESPACE,
+  ).namespace;
 }
 
 export function useCockpit(options: UseCockpitOptions = {}) {
@@ -136,13 +142,21 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     }
   }
   const authAdapter = authSelection.current.adapter;
-  const params = useRef(new URLSearchParams(window.location.search)).current;
-  const explicitNamespace = params.has("namespace");
+  const initialParams = useRef(new URLSearchParams(window.location.search)).current;
+  const initialLocation = useRef(
+    readReplayLocation(
+      window.location.search,
+      config.defaultNamespace || DEFAULT_NAMESPACE,
+    ),
+  ).current;
+  const explicitNamespace = initialParams.has("namespace");
 
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [loadError, setLoadError] = useState("");
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [scenario, setScenario] = useState<SignatureScenario | null>(null);
+  const scenarioRef = useRef<SignatureScenario | null>(null);
+  const scenarioIdRef = useRef<string | null>(initialLocation.scenarioId);
   const [namespace, setNamespaceValue] = useState(() => initialNamespace(config));
   const namespaceRef = useRef(namespace);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -152,6 +166,8 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const [run, setRun] = useState<Run | null>(null);
   const runRef = useRef<Run | null>(null);
   const [influence, setInfluence] = useState<InfluenceItem[]>([]);
+  const [influenceState, setInfluenceState] = useState<InfluenceLoadState>("empty");
+  const [influenceError, setInfluenceError] = useState("");
   const [authStatus, setAuthStatus] = useState<AuthStatus>("initializing");
   const authStatusRef = useRef<AuthStatus>("initializing");
   const [identity, setIdentity] = useState<EffectiveIdentity | null>(null);
@@ -175,18 +191,45 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const incidentRequest = useRef(0);
   const runRequest = useRef(0);
   const influenceRequest = useRef(0);
+  const scenarioRequest = useRef(0);
+  const scenarioRefreshTimer = useRef<number>();
+  const refreshScenarioRef = useRef<() => void>(() => undefined);
   const realtimeTracker = useRef(new BoundedRealtimeTracker());
   const initialized = useRef(false);
+
+  const updateReplayUrl = useCallback(
+    (
+      update: {
+        namespace?: string;
+        scenarioId?: string | null;
+        asOf?: string | null;
+      },
+      mode: "replace" | "push" = "replace",
+    ) => {
+      const url = new URL(window.location.href);
+      if (update.namespace !== undefined) {
+        url.searchParams.set("namespace", update.namespace);
+      }
+      if (update.scenarioId !== undefined) {
+        if (update.scenarioId) url.searchParams.set("scenario_id", update.scenarioId);
+        else url.searchParams.delete("scenario_id");
+      }
+      if (update.asOf !== undefined) {
+        if (update.asOf) url.searchParams.set("as_of", update.asOf);
+        else url.searchParams.delete("as_of");
+      }
+      window.history[mode === "push" ? "pushState" : "replaceState"]({}, "", url);
+    },
+    [],
+  );
 
   const updateNamespace = useCallback((value: string, updateUrl = true) => {
     namespaceRef.current = value;
     setNamespaceValue(value);
     if (updateUrl) {
-      const url = new URL(window.location.href);
-      url.searchParams.set("namespace", value);
-      window.history.replaceState({}, "", url);
+      updateReplayUrl({ namespace: value });
     }
-  }, []);
+  }, [updateReplayUrl]);
 
   const announce = useCallback((message: string, kind: Notice["kind"] = "status") => {
     window.clearTimeout(noticeTimer.current);
@@ -322,17 +365,25 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const loadInfluence = useCallback(
     async (decisionId: string, expectedRunId?: string) => {
       const requestId = ++influenceRequest.current;
+      setInfluence([]);
+      setInfluenceError("");
+      setInfluenceState("loading");
       try {
         const payload = await readJson<{ memories?: InfluenceItem[] }>(
           `/decisions/${encodeURIComponent(decisionId)}/influence`,
         );
         if (requestId !== influenceRequest.current) return;
         if (expectedRunId && expectedRunId !== activeRunId.current) return;
-        setInfluence(payload.memories || []);
+        const memories = payload.memories || [];
+        setInfluence(memories);
+        setInfluenceState(memories.length ? "ready" : "empty");
       } catch (error) {
         if (requestId !== influenceRequest.current) return;
         setInfluence([]);
-        announce(`Decision influence could not be loaded: ${(error as Error).message}`, "error");
+        const message = (error as Error).message;
+        setInfluenceError(message);
+        setInfluenceState("error");
+        announce(`Decision influence could not be loaded: ${message}`, "error");
       }
     },
     [announce, readJson],
@@ -341,6 +392,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const loadRun = useCallback(
     async (runId: string, poll = false) => {
       if (activeRunId.current && runId !== activeRunId.current) return;
+      if (!activeRunId.current) activeRunId.current = runId;
       const requestId = ++runRequest.current;
       try {
         const next = await readJson<Run>(`/runs/${encodeURIComponent(runId)}`);
@@ -348,8 +400,15 @@ export function useCockpit(options: UseCockpitOptions = {}) {
         runRef.current = next;
         setRun(next);
         if (next.decision_id) void loadInfluence(next.decision_id, runId);
+        else {
+          influenceRequest.current += 1;
+          setInfluence([]);
+          setInfluenceError("");
+          setInfluenceState("empty");
+        }
         if (TERMINAL_RUN_STATES.has(next.status) && snapshotView.current === "live") {
           await loadSnapshot(null).catch(() => undefined);
+          refreshScenarioRef.current();
         } else if (poll && next.status !== "awaiting_approval") {
           window.setTimeout(() => void loadRun(runId, true), 1400);
         }
@@ -365,7 +424,17 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     async (slug: string) => {
       if (!slug) return;
       const requestId = ++incidentRequest.current;
+      scenarioRequest.current += 1;
+      runRequest.current += 1;
+      influenceRequest.current += 1;
+      window.clearTimeout(scenarioRefreshTimer.current);
+      scenarioIdRef.current = null;
+      scenarioRef.current = null;
       activeRunId.current = null;
+      setScenario(null);
+      setRewindAnchor(null);
+      setRewindTimestamp("");
+      updateReplayUrl({ scenarioId: null, asOf: null }, "push");
       try {
         const nextIncident = await readJson<Incident>(
           `/incidents/${encodeURIComponent(slug)}`,
@@ -380,17 +449,35 @@ export function useCockpit(options: UseCockpitOptions = {}) {
         setRun(nextRun);
         runRef.current = nextRun;
         activeRunId.current = nextRun?.id || null;
-        if (nextRun?.namespace) updateNamespace(nextRun.namespace);
+        const nextNamespace = nextRun?.namespace || namespaceRef.current;
+        updateNamespace(nextNamespace, false);
+        updateReplayUrl(
+          { namespace: nextNamespace, scenarioId: null, asOf: null },
+          "replace",
+        );
         setIncidentInput(nextRun?.user_input || nextIncident.summary || DEFAULT_REPORT);
-        await loadSnapshot(null, nextRun?.namespace || namespaceRef.current);
+        await loadSnapshot(null, nextNamespace);
+        if (requestId !== incidentRequest.current) return;
         if (nextRun?.decision_id) void loadInfluence(nextRun.decision_id, nextRun.id);
-        else setInfluence([]);
+        else {
+          influenceRequest.current += 1;
+          setInfluence([]);
+          setInfluenceError("");
+          setInfluenceState("empty");
+        }
       } catch (error) {
         if (requestId !== incidentRequest.current) return;
         announce(`Incident could not be loaded: ${(error as Error).message}`, "error");
       }
     },
-    [announce, loadInfluence, loadSnapshot, readJson, updateNamespace],
+    [
+      announce,
+      loadInfluence,
+      loadSnapshot,
+      readJson,
+      updateNamespace,
+      updateReplayUrl,
+    ],
   );
 
   const loadIncidents = useCallback(
@@ -418,44 +505,97 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   );
 
   const loadScenario = useCallback(
-    async (selector?: { namespace?: string; decisionId?: string }) => {
+    async (selector?: {
+      scenarioId?: string;
+      namespace?: string;
+      decisionId?: string;
+      asOf?: string | null;
+      updateUrl?: boolean;
+      refreshSnapshot?: boolean;
+      historyMode?: "replace" | "push";
+    }) => {
+      const requestId = ++scenarioRequest.current;
+      incidentRequest.current += 1;
       const query = new URLSearchParams();
       if (selector?.namespace) query.set("namespace", selector.namespace);
       if (selector?.decisionId) query.set("decision_id", selector.decisionId);
       const suffix = query.size ? `?${query}` : "";
-      const next = await readJson<SignatureScenario>(`/signature-scenarios${suffix}`);
+      const path = selector?.scenarioId
+        ? `/signature-scenarios/${encodeURIComponent(selector.scenarioId)}`
+        : `/signature-scenarios${suffix}`;
+      let next: SignatureScenario;
+      try {
+        next = await readJson<SignatureScenario>(path);
+      } catch (error) {
+        if (requestId !== scenarioRequest.current) return null;
+        throw error;
+      }
+      if (requestId !== scenarioRequest.current) return null;
+      const previousScenario = scenarioRef.current;
+      const scenarioChanged = previousScenario?.scenario_id !== next.scenario_id;
+      const anchorChanged = previousScenario?.rewind_anchor !== next.rewind_anchor;
+      scenarioRef.current = next;
+      scenarioIdRef.current = next.scenario_id;
       setScenario(next);
       setIncident(next.incident || null);
-      const preferredRun = [...next.runs].reverse().find((item) => item.status === "completed") ||
-        [...next.runs].reverse().find((item) => item.status === "rejected") ||
-        next.runs.at(-1) ||
-        null;
+      const preferredRun = latestScenarioRun(next.runs);
       setRun(preferredRun);
       runRef.current = preferredRun;
       activeRunId.current = preferredRun?.id || null;
-      setInfluence(
-        (preferredRun?.trace?.reads || []).map((read) => ({
-          status: read.memory_status || undefined,
-          read: {
-            id: read.id,
-            rank: read.rank,
-            distance: read.distance,
+      const recordedInfluence = influenceFromRun(preferredRun);
+      influenceRequest.current += 1;
+      setInfluence(recordedInfluence);
+      setInfluenceError("");
+      setInfluenceState(recordedInfluence.length ? "ready" : "empty");
+      if (scenarioChanged || anchorChanged) {
+        const anchor = next.rewind_anchor;
+        setRewindAnchor(anchor);
+        setRewindTimestamp(isoToLocalInput(anchor));
+      }
+      if (scenarioChanged) {
+        setIncidentInput(
+          preferredRun?.user_input || next.incident?.summary || DEFAULT_REPORT,
+        );
+      }
+      updateNamespace(next.namespace, false);
+      if (selector?.updateUrl !== false) {
+        updateReplayUrl(
+          {
+            namespace: next.namespace,
+            scenarioId: next.scenario_id,
+            asOf: selector?.asOf || null,
           },
-          memory: {
-            id: read.memory_id,
-            belief_id: read.belief_id,
-            version_number: read.version_number,
-            status: read.memory_status,
-          },
-        })),
-      );
-      updateNamespace(next.namespace, Boolean(selector));
-      await loadSnapshot(null, next.namespace).catch(() => undefined);
+          selector?.historyMode || "replace",
+        );
+      }
+      if (selector?.refreshSnapshot !== false) {
+        await loadSnapshot(selector?.asOf || null, next.namespace).catch(() => undefined);
+        if (requestId !== scenarioRequest.current) return null;
+      }
       setLoadState("ready");
       return next;
     },
-    [loadSnapshot, readJson, updateNamespace],
+    [loadSnapshot, readJson, updateNamespace, updateReplayUrl],
   );
+
+  const refreshScenario = useCallback(
+    (delay = 0) => {
+      const scenarioId = scenarioIdRef.current;
+      if (!scenarioId || snapshotView.current !== "live") return;
+      window.clearTimeout(scenarioRefreshTimer.current);
+      scenarioRefreshTimer.current = window.setTimeout(() => {
+        if (scenarioId !== scenarioIdRef.current || snapshotView.current !== "live") return;
+        void loadScenario({
+          scenarioId,
+          updateUrl: false,
+          refreshSnapshot: false,
+        }).catch(() => undefined);
+      }, delay);
+    },
+    [loadScenario],
+  );
+
+  refreshScenarioRef.current = () => refreshScenario(0);
 
   const initializeAuth = useCallback(async () => {
     if (authSelection.current?.error) {
@@ -490,25 +630,44 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const retryInitialLoad = useCallback(async () => {
     setLoadState("loading");
     setLoadError("");
+    const locationParams = new URLSearchParams(window.location.search);
+    const location = readReplayLocation(
+      window.location.search,
+      config.defaultNamespace || DEFAULT_NAMESPACE,
+    );
+    const hasNamespace = locationParams.has("namespace");
+    const hasScenario = locationParams.has("scenario_id");
+    updateNamespace(location.namespace, false);
     try {
       if (
         authStatusRef.current !== "authenticated" &&
         config.snapshotBase &&
-        !explicitNamespace
+        !hasNamespace &&
+        !hasScenario
       ) {
-        await loadSnapshot(params.get("as_of"), namespaceRef.current);
-        await loadIncidents(null, false);
+        await loadSnapshot(location.asOf, location.namespace);
         setLoadState("ready");
-      } else if (explicitNamespace) {
-        await loadSnapshot(params.get("as_of"), namespaceRef.current);
-        await loadIncidents(null, false);
+        void loadIncidents(null, false);
+      } else if (hasScenario && location.scenarioId) {
+        void loadIncidents(null, false);
+        await loadScenario({
+          scenarioId: location.scenarioId,
+          asOf: location.asOf,
+        });
+      } else if (hasNamespace) {
+        void loadIncidents(null, false);
         try {
-          await loadScenario({ namespace: namespaceRef.current });
+          await loadScenario({
+            namespace: location.namespace,
+            asOf: location.asOf,
+          });
         } catch (error) {
           if (!(error instanceof ApiError && error.status === 404)) throw error;
+          await loadSnapshot(location.asOf, location.namespace);
           setLoadState("ready");
         }
       } else {
+        void loadIncidents(null, false);
         try {
           await loadScenario();
         } catch (error) {
@@ -523,7 +682,14 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       setLoadState("error");
       setConnection("disconnected");
     }
-  }, [config.snapshotBase, explicitNamespace, loadIncidents, loadScenario, loadSnapshot, params]);
+  }, [
+    config.defaultNamespace,
+    config.snapshotBase,
+    loadIncidents,
+    loadScenario,
+    loadSnapshot,
+    updateNamespace,
+  ]);
 
   useEffect(() => {
     if (initialized.current) return;
@@ -533,6 +699,62 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       await retryInitialLoad();
     })();
   }, [initializeAuth, retryInitialLoad]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const location = readReplayLocation(
+        window.location.search,
+        config.defaultNamespace || DEFAULT_NAMESPACE,
+      );
+      snapshotRequest.current += 1;
+      incidentRequest.current += 1;
+      runRequest.current += 1;
+      influenceRequest.current += 1;
+      const navigationFence = ++scenarioRequest.current;
+      activeRunId.current = null;
+      updateNamespace(location.namespace, false);
+      setLoadState("loading");
+      setLoadError("");
+
+      if (location.scenarioId) {
+        scenarioIdRef.current = location.scenarioId;
+        void loadScenario({
+          scenarioId: location.scenarioId,
+          asOf: location.asOf,
+          updateUrl: false,
+        }).catch((error) => {
+          setLoadError((error as Error).message);
+          setLoadState("error");
+          setConnection("disconnected");
+        });
+        return;
+      }
+
+      scenarioIdRef.current = null;
+      scenarioRef.current = null;
+      setScenario(null);
+      setIncident(null);
+      setRun(null);
+      runRef.current = null;
+      setInfluence([]);
+      setInfluenceError("");
+      setInfluenceState("empty");
+      setRewindAnchor(null);
+      setRewindTimestamp("");
+      void loadSnapshot(location.asOf, location.namespace)
+        .then(() => {
+          if (navigationFence === scenarioRequest.current) setLoadState("ready");
+        })
+        .catch((error) => {
+          if (navigationFence !== scenarioRequest.current) return;
+          setLoadError((error as Error).message);
+          setLoadState("error");
+          setConnection("disconnected");
+        });
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [config.defaultNamespace, loadScenario, loadSnapshot, updateNamespace]);
 
   const handleLiveEvent = useCallback(
     (payload: unknown) => {
@@ -546,12 +768,16 @@ export function useCockpit(options: UseCockpitOptions = {}) {
         if (disposition === "duplicate") return;
         if (["memory", "operation"].includes(envelope.type)) {
           scheduleSnapshotRefresh();
+          refreshScenario(120);
           return;
         }
         const reference = envelope.data.reference as Record<string, unknown> | undefined;
         const runId = envelope.run_id ||
           (typeof reference?.run_id === "string" ? reference.run_id : null);
-        if (runId) void loadRun(runId);
+        if (runId && (!activeRunId.current || runId === activeRunId.current)) {
+          void loadRun(runId);
+        }
+        refreshScenario(120);
         return;
       }
 
@@ -559,6 +785,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       const data = raw.data || raw;
       if (["memory", "operation"].includes(type) && data.reference) {
         scheduleSnapshotRefresh();
+        refreshScenario(120);
         return;
       }
       if (type === "memory" && data.memory) {
@@ -581,6 +808,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
             timeline: [...timeline].sort(),
           });
         }
+        refreshScenario(120);
       }
       if (type === "operation" && data.operation) {
         const previous = snapshotRef.current;
@@ -589,13 +817,17 @@ export function useCockpit(options: UseCockpitOptions = {}) {
           operations.set(data.operation.id, data.operation);
           applySnapshot({ ...previous, operations: [...operations.values()] });
         }
+        refreshScenario(120);
       }
       if (["run", "run_event"].includes(type)) {
         const runId = raw.run_id || data.run_id;
-        if (runId) void loadRun(runId);
+        if (runId && (!activeRunId.current || runId === activeRunId.current)) {
+          void loadRun(runId);
+        }
+        refreshScenario(120);
       }
     },
-    [applySnapshot, loadRun, scheduleSnapshotRefresh],
+    [applySnapshot, loadRun, refreshScenario, scheduleSnapshotRefresh],
   );
 
   const subscribeSocket = useCallback((targetNamespace = namespaceRef.current) => {
@@ -634,6 +866,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
             if (snapshotView.current === "live") {
               setConnection("live");
               scheduleSnapshotRefresh(0);
+              refreshScenario(0);
               const active = runRef.current;
               if (active) void loadRun(active.id);
             }
@@ -669,6 +902,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
           void loadSnapshot(null).catch(() => undefined);
           const active = runRef.current;
           if (active && !TERMINAL_RUN_STATES.has(active.status)) void loadRun(active.id);
+          refreshScenario(0);
         }
       }, pollMs);
     }
@@ -677,6 +911,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       disposed = true;
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(snapshotRefreshTimer.current);
+      window.clearTimeout(scenarioRefreshTimer.current);
       window.clearInterval(interval);
       if (socketRef.current) {
         const socket = socketRef.current;
@@ -694,6 +929,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     loadSnapshot,
     namespace,
     readJson,
+    refreshScenario,
     scheduleSnapshotRefresh,
     subscribeSocket,
   ]);
@@ -717,6 +953,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     incidentRequest.current += 1;
     runRequest.current += 1;
     influenceRequest.current += 1;
+    scenarioRequest.current += 1;
     activeRunId.current = null;
     realtimeTracker.current = new BoundedRealtimeTracker();
     if (socketRef.current) {
@@ -724,12 +961,16 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       socketRef.current = null;
       socket.close();
     }
+    scenarioRef.current = null;
+    scenarioIdRef.current = null;
     setScenario(null);
     setIncidents([]);
     setIncident(null);
     setRun(null);
     runRef.current = null;
     setInfluence([]);
+    setInfluenceError("");
+    setInfluenceState("empty");
     applySnapshot({
       mode: "current",
       namespace: namespaceRef.current,
@@ -752,13 +993,16 @@ export function useCockpit(options: UseCockpitOptions = {}) {
         method: "POST",
         body: JSON.stringify({ namespace: namespaceRef.current }),
       });
-      updateNamespace(payload.namespace);
+      updateNamespace(payload.namespace, false);
       subscribeSocket(payload.namespace);
       setRewindAnchor(payload.rewind_anchor || null);
       setRewindTimestamp(isoToLocalInput(payload.rewind_anchor));
       setRewindPreview(null);
       await loadIncidents(payload.incident?.slug, false);
-      await loadScenario({ namespace: payload.namespace });
+      await loadScenario({
+        scenarioId: payload.scenario_id,
+        historyMode: "push",
+      });
       setLoadState("ready");
       announce("Known-good payment memory restored. The replay is ready.");
     } catch (error) {
@@ -789,7 +1033,12 @@ export function useCockpit(options: UseCockpitOptions = {}) {
         method: "POST",
         body: JSON.stringify({ namespace: namespaceRef.current }),
       });
-      await loadScenario({ namespace: namespaceRef.current });
+      const scenarioId = scenarioIdRef.current;
+      await loadScenario(
+        scenarioId
+          ? { scenarioId, updateUrl: false }
+          : { namespace: namespaceRef.current },
+      );
       announce("Stale retry-amplifying guidance imported with provenance.");
     } catch (error) {
       announce(`Guidance import failed: ${(error as Error).message}`, "error");
@@ -970,6 +1219,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       announce("Rewind queued. The approved preview is being verified.");
       const operation = await waitForOperation(accepted.operation_id);
       await loadSnapshot();
+      refreshScenario(0);
       if (operation.status === "completed") {
         announce("Belief state rewound. Historical versions remain available for audit.");
       } else {
@@ -989,6 +1239,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     loadSnapshot,
     productWriteJson,
     requireWriteAccess,
+    refreshScenario,
     rewindPreview,
     rewindReason,
     waitForOperation,
@@ -997,12 +1248,17 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const selectHistorical = useCallback(
     async (asOf?: string | null) => {
       try {
-        await loadSnapshot(asOf || null);
+        const target = asOf || null;
+        const requestId = snapshotRequest.current + 1;
+        await loadSnapshot(target);
+        if (requestId !== snapshotRequest.current) return;
+        updateReplayUrl({ asOf: target }, "push");
+        if (!target) refreshScenario(0);
       } catch (error) {
         announce(`Belief state could not be loaded: ${(error as Error).message}`, "error");
       }
     },
-    [announce, loadSnapshot],
+    [announce, loadSnapshot, refreshScenario, updateReplayUrl],
   );
 
   const canWrite =
@@ -1027,6 +1283,8 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     incident,
     run,
     influence,
+    influenceState,
+    influenceError,
     notice,
     incidentInput,
     rewindAnchor,

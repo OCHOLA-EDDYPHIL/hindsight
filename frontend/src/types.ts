@@ -58,7 +58,12 @@ export interface Incident {
   summary?: string | null;
   severity?: string | null;
   service_slug?: string | null;
-  runs?: Array<{ id: Identifier; status?: string }>;
+  runs?: Array<{
+    id: Identifier;
+    status?: string;
+    created_at?: string | null;
+    updated_at?: string | null;
+  }>;
   latest_run_status?: string | null;
 }
 
@@ -183,6 +188,7 @@ export interface Run {
   id: Identifier;
   incident_slug?: string | null;
   namespace?: string | null;
+  service_slug?: string | null;
   status: string;
   decision_id?: Identifier | null;
   plan?: string | null;
@@ -261,7 +267,10 @@ export interface SignatureScenario {
   scenario_id: Identifier;
   namespace: string;
   status: string;
+  session_status: string | null;
+  rewind_anchor: string | null;
   created_at?: string | null;
+  completed_at: string | null;
   incident?: Incident | null;
   runs: Run[];
   operation?: MemoryOperation | null;

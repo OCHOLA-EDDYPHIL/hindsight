@@ -1,7 +1,7 @@
 import type { Run } from "@/types";
 
 export function formatTime(value?: string | null): string {
-  if (!value) return "not recorded";
+  if (!value) return "Unavailable";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString([], {
@@ -11,20 +11,20 @@ export function formatTime(value?: string | null): string {
 }
 
 export function shortId(value?: string | null): string {
-  if (!value) return "pending";
+  if (!value) return "Unavailable";
   if (value.length <= 16) return value;
   return `${value.slice(0, 8)}…${value.slice(-6)}`;
 }
 
 export function humanStatus(value?: string | null): string {
-  return value?.replaceAll("_", " ") || "not recorded";
+  return value?.replaceAll("_", " ") || "Unavailable";
 }
 
 export interface StructuredPlan {
-  cause: string;
-  checks: string;
-  action: string;
-  safety: string;
+  cause: string | null;
+  checks: string | null;
+  action: string | null;
+  recordedPlan: string | null;
 }
 
 type PlanSection = "cause" | "checks" | "action";
@@ -96,46 +96,24 @@ function markdownSections(raw: string): {
   };
 }
 
-function plainFragments(raw: string): string[] {
-  return raw
-    .split(/\n+|;|\.(?:\s+|$)/)
-    .map((item) => item.replace(/^\s*(?:[-+*]|\d+[.)])\s+/, "").trim())
-    .filter(Boolean);
-}
-
 export function structurePlan(run?: Run | null): StructuredPlan {
-  const raw = run?.plan?.trim() || "No recommendation was recorded for this decision.";
-  const fragments = plainFragments(raw);
+  const raw = run?.plan?.trim() || "";
   const parsed = markdownSections(raw);
   const proposed = run?.proposed_action?.trim() || "";
   const parsedProposed = markdownSections(proposed);
-  const cause = parsed.found
-    ? parsed.sections.cause || parsed.preamble || fragments[0] || raw
-    : fragments[0] || raw;
-  const fallbackChecks = fragments.slice(1, 3);
-  const checks =
-    parsed.sections.checks ||
-    (fallbackChecks.length
-      ? fallbackChecks.map((item) => `- ${item}`).join("\n")
-      : "- Confirm the cited memory and current incident evidence.");
-  const actionCandidate =
-    parsedProposed.sections.action ||
-    parsed.sections.action ||
-    proposed ||
-    fragments.at(-1) ||
-    raw;
+  const proposedAction = parsedProposed.found
+    ? parsedProposed.sections.action || null
+    : proposed || null;
   const action =
-    actionCandidate.toLocaleLowerCase() === cause.toLocaleLowerCase()
-      ? "Apply this recommendation only after current checks and operator review."
-      : actionCandidate;
+    proposedAction ||
+    parsed.sections.action ||
+    null;
+  const recordedPlan = parsed.found ? parsed.preamble || null : raw || null;
   return {
-    cause,
-    checks,
+    cause: parsed.sections.cause || null,
+    checks: parsed.sections.checks || null,
     action,
-    safety:
-      run?.status === "rejected"
-        ? "Rejected. The recommendation remains historical and cannot guide the current state."
-        : "Operator approval is required before reflection or memory mutation.",
+    recordedPlan: recordedPlan === action ? null : recordedPlan,
   };
 }
 
