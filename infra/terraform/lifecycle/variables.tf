@@ -1,6 +1,11 @@
 variable "aws_region" {
   type    = string
   default = "us-east-1"
+
+  validation {
+    condition     = var.aws_region == "us-east-1"
+    error_message = "The demo lifecycle root is fixed to us-east-1."
+  }
 }
 
 variable "expected_aws_account_id" {
@@ -18,8 +23,8 @@ variable "stage" {
   default = "demo"
 
   validation {
-    condition     = can(regex("^[a-z][a-z0-9-]{1,15}$", var.stage))
-    error_message = "stage must be a lowercase Hindsight environment name."
+    condition     = var.stage == "demo"
+    error_message = "The lifecycle root owns only the demo environment."
   }
 }
 

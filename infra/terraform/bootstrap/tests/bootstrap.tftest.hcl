@@ -74,15 +74,25 @@ run "isolated_bootstrap" {
   }
 
   assert {
-    condition = toset(one([
-      for statement in data.aws_iam_policy_document.github_deploy.statement : statement
-      if statement.sid == "LifecycleArchiveMutationDenied"
-      ]).resources) == toset([
-      local.lifecycle_export_bucket_arn,
-      "${local.lifecycle_export_bucket_arn}/*",
-      local.lifecycle_recovery_bucket_arn,
-      "${local.lifecycle_recovery_bucket_arn}/*",
-    ])
+    condition = (
+      one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "LifecycleArchiveMutationDenied"
+      ]).effect == "Deny" &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "LifecycleArchiveMutationDenied"
+      ]).actions) == toset(local.lifecycle_archive_deploy_denied_actions) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if statement.sid == "LifecycleArchiveMutationDenied"
+        ]).resources) == toset([
+        local.lifecycle_export_bucket_arn,
+        "${local.lifecycle_export_bucket_arn}/*",
+        local.lifecycle_recovery_bucket_arn,
+        "${local.lifecycle_recovery_bucket_arn}/*",
+      ])
+    )
     error_message = "Bootstrap must expose its OIDC trust anchor and deny deployment mutation of both lifecycle archives."
   }
 

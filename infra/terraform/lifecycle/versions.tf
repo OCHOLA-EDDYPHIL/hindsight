@@ -8,7 +8,12 @@ terraform {
     }
   }
 
-  backend "s3" {}
+  backend "s3" {
+    key          = "hindsight/demo/lifecycle/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
 provider "aws" {

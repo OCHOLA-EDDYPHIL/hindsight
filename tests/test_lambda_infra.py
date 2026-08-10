@@ -469,7 +469,12 @@ def test_lifecycle_terraform_ownership_is_cloudflare_free_and_non_overlapping():
     assert "aws_ssm_parameter" not in lifecycle
     assert 'output "lifecycle_database_url_parameter_name"' in lifecycle_outputs
     assert 'output "lifecycle_database_url_parameter_arn"' in lifecycle_outputs
-    assert 'backend "s3" {}' in lifecycle_versions
+    assert 'key          = "hindsight/demo/lifecycle/terraform.tfstate"' in (
+        lifecycle_versions
+    )
+    assert 'region       = "us-east-1"' in lifecycle_versions
+    assert "encrypt      = true" in lifecycle_versions
+    assert "use_lockfile = true" in lifecycle_versions
     assert "lifecycle_state_key" not in lifecycle_variables
     assert 'output "backend_config"' not in lifecycle_outputs
 
