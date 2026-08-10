@@ -438,6 +438,63 @@ def test_schema_manifest_normalizes_database_names_in_nested_sections():
     }
 
 
+def test_schema_manifest_normalizes_equivalent_cockroach_view_line_wrapping():
+    schema_manifest = _load_script("schema_manifest")
+    same_line_alias = """
+        CREATE VIEW public.tenant_lifecycle_completeness_issues AS
+        WITH tenant_columns AS (
+            SELECT columns.table_name
+            FROM source_db.information_schema.columns AS columns
+            WHERE columns.column_name = 'tenant_id'
+        )
+        SELECT table_name FROM tenant_columns
+    """
+    line_broken_alias = """
+        CREATE VIEW public.tenant_lifecycle_completeness_issues AS
+        WITH tenant_columns AS (
+            SELECT columns.table_name
+            FROM source_db.information_schema.columns
+                AS columns
+            WHERE columns.column_name = 'tenant_id'
+        )
+        SELECT table_name FROM tenant_columns
+    """
+
+    assert schema_manifest._normalize(
+        same_line_alias,
+        database="source_db",
+    ) == schema_manifest._normalize(
+        line_broken_alias,
+        database="source_db",
+    )
+
+
+def test_schema_manifest_view_normalization_keeps_semantic_changes_distinct():
+    schema_manifest = _load_script("schema_manifest")
+    expected = """
+        CREATE VIEW public.tenant_lifecycle_completeness_issues AS
+        SELECT table_name FROM source_db.information_schema.columns
+        WHERE column_name = 'tenant_id'
+    """
+    changed_predicate = """
+        CREATE VIEW public.tenant_lifecycle_completeness_issues AS
+        SELECT table_name FROM source_db.information_schema.columns
+        WHERE column_name = 'tenant_key'
+    """
+    changed_literal_whitespace = expected.replace("'tenant_id'", "'tenant  id'")
+
+    normalized = schema_manifest._normalize(expected, database="source_db")
+
+    assert normalized != schema_manifest._normalize(
+        changed_predicate,
+        database="source_db",
+    )
+    assert normalized != schema_manifest._normalize(
+        changed_literal_whitespace,
+        database="source_db",
+    )
+
+
 def test_terminal_fixture_immutability_check_fails_closed():
     fixture = _load_script("populated_upgrade_fixture")
 

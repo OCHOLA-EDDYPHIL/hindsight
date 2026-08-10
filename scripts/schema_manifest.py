@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import psycopg
@@ -13,11 +14,69 @@ from hindsight.db import database_url
 
 
 ROOT = Path(__file__).resolve().parents[1]
+VIEW_DDL_PATTERN = re.compile(r"^\s*CREATE(?:\s+OR\s+REPLACE)?\s+VIEW\b", re.IGNORECASE)
+DOLLAR_QUOTE_PATTERN = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _normalize_view_sql(value: str) -> str:
+    if not VIEW_DDL_PATTERN.match(value):
+        return value
+
+    normalized: list[str] = []
+    pending_space = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character.isspace():
+            pending_space = True
+            index += 1
+            continue
+        if value.startswith("--", index) or value.startswith("/*", index):
+            return value
+        if pending_space and normalized:
+            normalized.append(" ")
+        pending_space = False
+
+        if character in {"'", '"'}:
+            quote = character
+            end = index + 1
+            while end < len(value):
+                if value[end] == "\\" and quote == "'" and end + 1 < len(value):
+                    end += 2
+                    continue
+                if value[end] != quote:
+                    end += 1
+                    continue
+                if end + 1 < len(value) and value[end + 1] == quote:
+                    end += 2
+                    continue
+                end += 1
+                break
+            normalized.append(value[index:end])
+            index = end
+            continue
+
+        dollar_quote = DOLLAR_QUOTE_PATTERN.match(value, index)
+        if dollar_quote is not None:
+            delimiter = dollar_quote.group(0)
+            end = value.find(delimiter, dollar_quote.end())
+            if end < 0:
+                return value
+            end += len(delimiter)
+            normalized.append(value[index:end])
+            index = end
+            continue
+
+        normalized.append(character)
+        index += 1
+
+    return "".join(normalized)
 
 
 def _normalize(value: object, *, database: str) -> object:
     if isinstance(value, str):
-        return value.replace(database, "<database>")
+        database_neutral = value.replace(database, "<database>")
+        return _normalize_view_sql(database_neutral)
     if isinstance(value, dict):
         return {
             key: _normalize(item, database=database) for key, item in value.items()
