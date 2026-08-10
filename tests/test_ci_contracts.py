@@ -170,6 +170,7 @@ def test_historical_migrations_share_one_manual_container():
     )
     job = workflow["jobs"]["migration_compatibility"]
 
+    assert job["timeout-minutes"] == 45
     assert sum(step.get("run") == "docker compose up -d crdb" for step in job["steps"]) == 1
     assert any(
         "scripts/run_migration_compatibility.py" in step.get("run", "")
