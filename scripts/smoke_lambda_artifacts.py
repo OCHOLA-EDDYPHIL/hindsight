@@ -41,12 +41,14 @@ _ARTIFACT = re.compile(
 )
 _IMPORT_HANDLER = """
 import importlib
+import os
 import pathlib
 import sys
 import types
 
 artifact_root = pathlib.Path(sys.argv[1]).resolve()
 handler = sys.argv[2]
+artifact = sys.argv[3]
 sys.path.insert(0, str(artifact_root))
 
 if not (artifact_root / "boto3").exists():
@@ -127,6 +129,23 @@ if module_path != artifact_root and artifact_root not in module_path.parents:
     raise RuntimeError(f"{module_name} was imported from {module_path}, not {artifact_root}")
 if not callable(getattr(module, attribute)):
     raise TypeError(f"configured handler is not callable: {handler}")
+
+if artifact == "realtime":
+    os.environ["HINDSIGHT_OTEL_ENABLED"] = "1"
+    os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://localhost:4317"
+    tracing = importlib.import_module("hindsight.tracing")
+    if not tracing.configure_tracing_from_env(service_name="hindsight-realtime"):
+        raise RuntimeError("realtime tracing was not configured")
+    for dependency in (
+        "opentelemetry.sdk.trace",
+        "opentelemetry.exporter.otlp.proto.grpc.trace_exporter",
+    ):
+        dependency_module = importlib.import_module(dependency)
+        dependency_path = pathlib.Path(dependency_module.__file__).resolve()
+        if dependency_path != artifact_root and artifact_root not in dependency_path.parents:
+            raise RuntimeError(
+                f"{dependency} was imported from {dependency_path}, not {artifact_root}"
+            )
 """
 
 
@@ -175,6 +194,7 @@ def import_handler(handler: LambdaHandler, *, build_root: Path = BUILD_ROOT) -> 
     zip_path = build_root / f"hindsight-{handler.artifact}.zip"
     if not zip_path.is_file():
         raise FileNotFoundError(f"Lambda artifact has not been built: {zip_path}")
+    _BUILDER.validate_unzipped_size(handler.artifact, zip_path)
     with tempfile.TemporaryDirectory(prefix=f"hindsight-{handler.function}-") as directory:
         artifact_root = Path(directory)
         with zipfile.ZipFile(zip_path) as archive:
@@ -188,6 +208,7 @@ def import_handler(handler: LambdaHandler, *, build_root: Path = BUILD_ROOT) -> 
                 _IMPORT_HANDLER,
                 str(artifact_root),
                 handler.handler,
+                handler.artifact,
             ],
             check=True,
             cwd=artifact_root,
