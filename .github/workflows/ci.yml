@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     outputs:
       python_static: ${{ steps.classify.outputs.python_static }}
       database: ${{ steps.classify.outputs.database }}
@@ -44,7 +44,7 @@ jobs:
   python_static:
     needs: changes
     if: needs.changes.outputs.python_static == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -62,7 +62,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.database == 'true'
     timeout-minutes: 30
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_database
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_product_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
@@ -100,7 +100,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.main_qualification == 'true'
     timeout-minutes: 30
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_ci_${{ github.run_id }}_${{ github.run_attempt }}_main
       FRESH_DATABASE_URL: postgresql://root@localhost:26257/hindsight_fresh_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
@@ -164,7 +164,7 @@ jobs:
   frontend:
     needs: changes
     if: needs.changes.outputs.frontend == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -181,7 +181,7 @@ jobs:
   lambda_artifacts:
     needs: changes
     if: needs.changes.outputs.lambda_artifacts == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -195,7 +195,7 @@ jobs:
   terraform:
     needs: changes
     if: needs.changes.outputs.terraform == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     env:
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
     steps:
@@ -237,7 +237,7 @@ jobs:
       - frontend
       - lambda_artifacts
       - terraform
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     env:
       CI_SELECTIONS: >-
         {"python_static":"${{ needs.changes.outputs.python_static }}",
