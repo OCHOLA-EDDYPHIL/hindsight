@@ -304,6 +304,30 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     deploy_policy = bootstrap.split(
         'data "aws_iam_policy_document" "github_deploy" {', 1
     )[1].split('resource "aws_iam_role_policy" "github_deploy"', 1)[0]
+    primary_inline_policy = bootstrap.split(
+        'resource "aws_iam_role_policy" "github_deploy" {', 1
+    )[1].split('data "aws_iam_policy_document" "github_deploy_observability"', 1)[0]
+    observability_policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_deploy_observability" {', 1
+    )[1].split('data "aws_iam_policy_document" "github_evidence"', 1)[0]
+    assert 'resource "aws_iam_policy" "github_deploy_observability"' in observability_policy
+    assert (
+        'resource "aws_iam_role_policy_attachment" "github_deploy_observability"'
+        in observability_policy
+    )
+    assert 'resource "aws_iam_role_policy" "github_deploy_observability"' not in bootstrap
+    assert 'github_deploy_observability_policy_name = "hindsight-github-deploy-observability"' in bootstrap
+    assert 'condition     = length(regexall("\\\\S",' in primary_inline_policy
+    assert ")) <= 10240" in primary_inline_policy
+    assert 'condition     = length(regexall("\\\\S",' in observability_policy
+    assert ")) <= 6144" in observability_policy
+    assert 'check "github_deploy_observability_managed_policy_size"' not in bootstrap
+    assert 'Project     = "hindsight"' in observability_policy
+    assert 'Environment = var.stage' in observability_policy
+    assert 'ManagedBy   = "terraform-bootstrap"' in observability_policy
+    assert "role       = aws_iam_role.github_deploy.name" in observability_policy
+    assert "policy_arn = aws_iam_policy.github_deploy_observability.arn" in observability_policy
+    assert "depends_on = [aws_iam_policy.github_deploy_observability]" not in observability_policy
     assert "s3:*" not in deploy_policy
     assert "events:PutRule" in bootstrap
     assert "events:PutTargets" in bootstrap
