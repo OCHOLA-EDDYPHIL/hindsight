@@ -18,7 +18,11 @@ EXPECTED_CEILINGS = {
     "external_cost_usd": 0,
 }
 EXPECTED_INDEX = "semantic_memory_vectors_tenant_namespace_profile_embedding_idx"
-SCHEMA_VERSION = "hindsight.capacity_qualification.v1"
+LEGACY_INDEX = "semantic_memory_vectors_embedding_idx"
+EXPECTED_INDEXES = sorted((LEGACY_INDEX, EXPECTED_INDEX))
+BASE_SCHEMA_THROUGH = "0029e_product_credential_locators.sql"
+TENANT_VECTOR_MIGRATION = "0030_tenant_vector_cosine_index.sql"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v2"
 
 
 def _sha256(path: Path) -> str:
@@ -45,7 +49,11 @@ def _measurement_map(rows: list[Any]) -> dict[str, dict[str, Any]]:
 def _validate_measurements(rows: list[Any]) -> None:
     values = _measurement_map(rows)
     if set(values) != {
+        "base_migrations",
         "vector_seed",
+        "tenant_index_build_input",
+        "post_seed_migrations",
+        "vector_indexes",
         "vector_counts",
         "bounded_clients",
         "synthetic_backlog",
@@ -53,6 +61,28 @@ def _validate_measurements(rows: list[Any]) -> None:
         "total",
     }:
         raise ValueError("capacity evidence does not contain the complete measurement set")
+    base_migrations = values["base_migrations"]
+    post_seed_migrations = values["post_seed_migrations"]
+    index_build_input = values["tenant_index_build_input"]
+    vector_indexes = values["vector_indexes"]
+    if (
+        base_migrations.get("through") != BASE_SCHEMA_THROUGH
+        or post_seed_migrations.get("through") != "latest"
+        or any(
+            type(row.get("duration_seconds")) not in {int, float}
+            or not 0 < row["duration_seconds"] <= EXPECTED_CEILINGS["duration_seconds"]
+            for row in (base_migrations, post_seed_migrations)
+        )
+        or type(index_build_input.get("vectors")) is not int
+        or index_build_input["vectors"] != TARGETS["vectors"]
+        or index_build_input.get("present_indexes") != [LEGACY_INDEX]
+        or index_build_input.get("absent_index") != EXPECTED_INDEX
+        or index_build_input.get("next_migration") != TENANT_VECTOR_MIGRATION
+        or vector_indexes.get("indexes") != EXPECTED_INDEXES
+    ):
+        raise ValueError(
+            "capacity evidence does not prove a populated tenant-index build with both indexes live"
+        )
     seed = values["vector_seed"]
     storage_checks = seed.get("storage_checks")
     if (
@@ -210,6 +240,7 @@ def validate(
         or qualification.get("qualified") is not True
         or qualification.get("main_sha") != source_revision
         or qualification.get("index") != EXPECTED_INDEX
+        or qualification.get("indexes") != EXPECTED_INDEXES
         or type(qualification.get("vector_dimensions")) is not int
         or qualification["vector_dimensions"] != 1024
         or type(qualification.get("vector_count")) is not int

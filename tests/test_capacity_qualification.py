@@ -27,6 +27,7 @@ def _qualification(validator):
         "qualified": True,
         "main_sha": SOURCE_SHA,
         "index": validator.EXPECTED_INDEX,
+        "indexes": validator.EXPECTED_INDEXES,
         "vector_dimensions": 1024,
         "vector_count": 100_000,
         "tenant_count": 20,
@@ -64,6 +65,11 @@ def _report(validator):
         },
         "raw_measurements": [
             {
+                "name": "base_migrations",
+                "duration_seconds": 1,
+                "through": validator.BASE_SCHEMA_THROUGH,
+            },
+            {
                 "name": "vector_seed",
                 "duration_seconds": 1,
                 "batches": 20,
@@ -77,6 +83,19 @@ def _report(validator):
                 ],
                 "peak_storage_bytes": 20_000,
             },
+            {
+                "name": "tenant_index_build_input",
+                "vectors": 100_000,
+                "present_indexes": [validator.LEGACY_INDEX],
+                "absent_index": validator.EXPECTED_INDEX,
+                "next_migration": validator.TENANT_VECTOR_MIGRATION,
+            },
+            {
+                "name": "post_seed_migrations",
+                "duration_seconds": 1,
+                "through": "latest",
+            },
+            {"name": "vector_indexes", "indexes": validator.EXPECTED_INDEXES},
             {
                 "name": "vector_counts",
                 "total": 100_000,
@@ -151,7 +170,7 @@ def test_producer_is_exact_bounded_and_deterministic():
     assert "_restore_bulk_seed_memory_triggers(conn, deadline)" in source
     assert "_verify_bulk_seed_provenance(conn, deadline)" in source
     assert "DROP INDEX" not in source
-    assert "five_set_based_shards_with_serialized_completion_checks" in source
+    assert "five_set_based_shards_before_tenant_vector_index_build" in source
     assert 'multiprocessing.get_context("spawn")' in source
     assert "_stop_seed_processes(started" in source
 
@@ -169,6 +188,71 @@ def test_producer_refuses_remote_or_unbounded_targets():
         )
     assert producer._is_disposable("hindsight_capacity_abcdefgh") is True
     assert producer._is_disposable("defaultdb") is False
+
+
+def test_migrations_stop_before_tenant_index_then_resume_latest(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(producer.subprocess, "run", run)
+    deadline = producer.Deadline.after(10)
+    base = producer._migrate(
+        "postgresql://db",
+        deadline,
+        name="base_migrations",
+        through=producer.BASE_SCHEMA_THROUGH,
+    )
+    latest = producer._migrate(
+        "postgresql://db",
+        deadline,
+        name="post_seed_migrations",
+    )
+
+    assert commands[0][-2:] == ["--through", producer.BASE_SCHEMA_THROUGH]
+    assert commands[1][-1].endswith("scripts/migrate.py")
+    assert base["through"] == producer.BASE_SCHEMA_THROUGH
+    assert latest["through"] == "latest"
+
+
+def test_tenant_index_build_requires_exact_populated_legacy_index(monkeypatch):
+    producer = _script("run_capacity_qualification")
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _statement, _params=None):
+            return SimpleNamespace(fetchone=lambda: (producer.TARGETS["vectors"],))
+
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    monkeypatch.setattr(
+        producer,
+        "_vector_index_names",
+        lambda *_args: frozenset({producer.LEGACY_VECTOR_INDEX}),
+    )
+    measurement = producer._tenant_index_build_input("postgresql://db", producer.Deadline.after(10))
+    assert measurement == {
+        "name": "tenant_index_build_input",
+        "vectors": 100_000,
+        "present_indexes": [producer.LEGACY_VECTOR_INDEX],
+        "absent_index": producer.TENANT_VECTOR_INDEX,
+        "next_migration": producer.TENANT_VECTOR_MIGRATION,
+    }
+
+    monkeypatch.setattr(
+        producer,
+        "_vector_index_names",
+        lambda *_args: producer.QUALIFIED_VECTOR_INDEXES,
+    )
+    with pytest.raises(RuntimeError, match="must be absent"):
+        producer._tenant_index_build_input("postgresql://db", producer.Deadline.after(10))
 
 
 def test_bulk_seed_lifecycle_guards_are_removed_and_restored_exactly():
@@ -290,6 +374,48 @@ def test_validator_requires_bound_supplemental_artifacts():
 
     with pytest.raises(ValueError, match="requires qualification, cleanup, and artifact"):
         validator.validate(_report(validator), source_revision=SOURCE_SHA)
+
+
+def test_validator_requires_populated_index_build_and_both_live_indexes():
+    validator = _script("validate_capacity_evidence")
+    report = _report(validator)
+    qualification = _qualification(validator)
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    digests = {
+        "index-qualification.json": "b" * 64,
+        "capacity-report.json": "c" * 64,
+        "cleanup.json": "d" * 64,
+    }
+
+    build_input = next(
+        row for row in report["raw_measurements"] if row["name"] == "tenant_index_build_input"
+    )
+    build_input["vectors"] = 99_999
+    with pytest.raises(ValueError, match="populated tenant-index build"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    qualification["indexes"] = [validator.EXPECTED_INDEX]
+    with pytest.raises(ValueError, match="exact populated target"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
 
 
 def test_validator_rejects_booleans_in_exact_numeric_evidence():
@@ -665,6 +791,151 @@ def test_primary_failure_preserves_bounded_cleanup_receipt(tmp_path, monkeypatch
     assert receipt["database_removed"] is False
     assert receipt["timeout_seconds"] == producer.MAX_CLEANUP_SECONDS
     assert receipt["error"] == "TimeoutError: cleanup deadline"
+
+
+def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path, monkeypatch):
+    producer = _script("run_capacity_qualification")
+    monkeypatch.setattr(producer, "_verify_checkout", lambda _source_sha: None)
+    monkeypatch.setattr(producer, "_create_database", lambda *_args: None)
+    monkeypatch.setattr(producer, "_drop_database", lambda *_args: None)
+
+    def migrate(_database_url, _deadline, *, name, through=None):
+        if name == "post_seed_migrations":
+            raise TimeoutError("tenant index build reached the global deadline")
+        return {"name": name, "duration_seconds": 1, "through": through or "latest"}
+
+    monkeypatch.setattr(producer, "_migrate", migrate)
+    monkeypatch.setattr(
+        producer,
+        "_seed",
+        lambda *_args: {"name": "vector_seed", "duration_seconds": 1},
+    )
+    monkeypatch.setattr(
+        producer,
+        "_tenant_index_build_input",
+        lambda *_args: {"name": "tenant_index_build_input", "vectors": 100_000},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_capacity_qualification.py",
+            "--admin-url",
+            "postgresql://root@localhost/defaultdb",
+            "--run-id",
+            "abcdefgh",
+            "--source-sha",
+            SOURCE_SHA,
+            "--output-dir",
+            str(tmp_path),
+            "--timeout-seconds",
+            "60",
+        ],
+    )
+
+    with pytest.raises(TimeoutError, match="tenant index build"):
+        producer.main()
+
+    progress = json.loads((tmp_path / producer.ATTEMPT_PROGRESS_FILENAME).read_text())
+    assert progress["schema_version"] == producer.ATTEMPT_PROGRESS_SCHEMA_VERSION
+    assert progress["kind"] == "capacity_attempt_diagnostic"
+    assert progress["qualification_evidence"] is False
+    assert progress["status"] == "failed"
+    assert progress["current_phase"] is None
+    assert [row["name"] for row in progress["completed_phases"]] == [
+        "database_create",
+        "base_migrations",
+        "vector_seed",
+        "tenant_index_build_input",
+    ]
+    assert all(row["duration_seconds"] > 0 for row in progress["completed_phases"])
+    assert progress["failure"]["phase"] == "post_seed_migrations"
+    assert progress["failure"]["type"] == "TimeoutError"
+    assert progress["failure"]["duration_seconds"] > 0
+    assert not list(tmp_path.glob(f".{producer.ATTEMPT_PROGRESS_FILENAME}.*.tmp"))
+
+
+def test_attempt_progress_failure_write_does_not_mask_primary_error(tmp_path, monkeypatch, capsys):
+    producer = _script("run_capacity_qualification")
+    monkeypatch.setattr(producer, "_verify_checkout", lambda _source_sha: None)
+    monkeypatch.setattr(producer, "_create_database", lambda *_args: None)
+    monkeypatch.setattr(producer, "_drop_database", lambda *_args: None)
+    monkeypatch.setattr(
+        producer,
+        "_run",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("primary qualification failure")),
+    )
+    write_json_atomic = producer._write_json_atomic
+
+    def fail_failure_checkpoint(path, value):
+        if value.get("status") == "failed":
+            raise OSError("diagnostic storage unavailable")
+        write_json_atomic(path, value)
+
+    monkeypatch.setattr(producer, "_write_json_atomic", fail_failure_checkpoint)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_capacity_qualification.py",
+            "--admin-url",
+            "postgresql://root@localhost/defaultdb",
+            "--run-id",
+            "abcdefgh",
+            "--source-sha",
+            SOURCE_SHA,
+            "--output-dir",
+            str(tmp_path),
+            "--timeout-seconds",
+            "60",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="primary qualification failure"):
+        producer.main()
+    assert "diagnostic failure checkpoint could not be written: OSError" in capsys.readouterr().err
+
+
+def test_attempt_progress_success_is_diagnostic_and_excluded_from_manifest(tmp_path, monkeypatch):
+    producer = _script("run_capacity_qualification")
+    monkeypatch.setattr(producer, "_verify_checkout", lambda _source_sha: None)
+    monkeypatch.setattr(producer, "_create_database", lambda *_args: None)
+    monkeypatch.setattr(producer, "_drop_database", lambda *_args: None)
+    monkeypatch.setattr(
+        producer,
+        "_run",
+        lambda *_args: (
+            {"schema_version": producer.SCHEMA_VERSION},
+            {"schema_version": producer.SCHEMA_VERSION},
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_capacity_qualification.py",
+            "--admin-url",
+            "postgresql://root@localhost/defaultdb",
+            "--run-id",
+            "abcdefgh",
+            "--source-sha",
+            SOURCE_SHA,
+            "--output-dir",
+            str(tmp_path),
+            "--timeout-seconds",
+            "60",
+        ],
+    )
+
+    assert producer.main() == 0
+    progress = json.loads((tmp_path / producer.ATTEMPT_PROGRESS_FILENAME).read_text())
+    manifest = json.loads((tmp_path / "artifact-manifest.json").read_text())
+    assert progress["status"] == "workload_completed"
+    assert progress["qualification_evidence"] is False
+    assert "qualified" not in progress
+    assert set(manifest["artifacts"]) == {
+        "index-qualification.json",
+        "capacity-report.json",
+        "cleanup.json",
+    }
+    assert producer.ATTEMPT_PROGRESS_FILENAME not in manifest["artifacts"]
 
 
 def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):

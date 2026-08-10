@@ -7,13 +7,17 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,7 +37,9 @@ from hindsight.vector_index_qualification import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "hindsight.capacity_qualification.v1"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v2"
+ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v1"
+ATTEMPT_PROGRESS_FILENAME = "capacity-attempt-progress.json"
 TARGETS = {"vectors": 100_000, "tenants": 20, "clients": 20, "backlog_messages": 1_000}
 VECTOR_DIMENSIONS = 1024
 ROWS_PER_TENANT = TARGETS["vectors"] // TARGETS["tenants"]
@@ -48,6 +54,10 @@ SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DATABASE_PREFIX = "hindsight_capacity_"
 PROFILE_ID = "capacity-synthetic-v1"
 NAMESPACE_PREFIX = "capacity.synthetic"
+BASE_SCHEMA_THROUGH = "0029e_product_credential_locators.sql"
+LEGACY_VECTOR_INDEX = "semantic_memory_vectors_embedding_idx"
+TENANT_VECTOR_MIGRATION = "0030_tenant_vector_cosine_index.sql"
+QUALIFIED_VECTOR_INDEXES = frozenset({LEGACY_VECTOR_INDEX, TENANT_VECTOR_INDEX})
 LIMITATIONS = [
     "This is a single-node local CockroachDB benchmark, not a production topology.",
     "The deterministic synthetic vectors and in-process backlog do not model live traffic.",
@@ -95,6 +105,121 @@ def _timestamp() -> str:
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+class CapacityAttemptProgress:
+    def __init__(self, path: Path, *, source_revision: str, run_id: str, database: str) -> None:
+        started_at = _timestamp()
+        self.path = path
+        self._started_monotonic = time.monotonic()
+        self._phase_started_monotonic: float | None = None
+        self._document: dict[str, Any] = {
+            "schema_version": ATTEMPT_PROGRESS_SCHEMA_VERSION,
+            "kind": "capacity_attempt_diagnostic",
+            "qualification_evidence": False,
+            "source_revision": source_revision,
+            "run_id": run_id,
+            "database": database,
+            "status": "running",
+            "started_at": started_at,
+            "updated_at": started_at,
+            "elapsed_seconds": 0.0,
+            "current_phase": None,
+            "completed_phases": [],
+            "failure": None,
+        }
+        self._checkpoint()
+
+    def _elapsed(self, started: float | None = None) -> float:
+        origin = started if started is not None else self._started_monotonic
+        return round(time.monotonic() - origin, 6)
+
+    def _checkpoint(self, **updates: Any) -> None:
+        document = {
+            **self._document,
+            **updates,
+            "updated_at": _timestamp(),
+            "elapsed_seconds": self._elapsed(),
+        }
+        _write_json_atomic(self.path, document)
+        self._document = document
+
+    @contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        if self._document["status"] != "running" or self._document["current_phase"] is not None:
+            raise RuntimeError("capacity attempt diagnostic phase state is invalid")
+        phase_started_monotonic = time.monotonic()
+        self._checkpoint(current_phase={"name": name, "started_at": _timestamp()})
+        self._phase_started_monotonic = phase_started_monotonic
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            completed_phases = [
+                *self._document["completed_phases"],
+                {
+                    "name": name,
+                    "duration_seconds": self._elapsed(phase_started_monotonic),
+                },
+            ]
+            self._checkpoint(current_phase=None, completed_phases=completed_phases)
+            self._phase_started_monotonic = None
+
+    def record_failure(self, error: BaseException) -> None:
+        try:
+            current_phase = self._document["current_phase"]
+            phase_name = current_phase["name"] if isinstance(current_phase, dict) else None
+            phase_duration = (
+                self._elapsed(self._phase_started_monotonic)
+                if self._phase_started_monotonic is not None
+                else None
+            )
+            self._checkpoint(
+                status="failed",
+                current_phase=None,
+                failure={
+                    "phase": phase_name,
+                    "type": type(error).__name__,
+                    "message": str(error)[:800],
+                    "duration_seconds": phase_duration,
+                },
+            )
+            self._phase_started_monotonic = None
+        except BaseException as progress_error:
+            print(
+                "capacity attempt diagnostic failure checkpoint could not be written: "
+                f"{type(progress_error).__name__}",
+                file=sys.stderr,
+            )
+
+    def mark_workload_completed(self) -> None:
+        if self._document["current_phase"] is not None:
+            raise RuntimeError("capacity attempt diagnostic has an unfinished phase")
+        self._checkpoint(status="workload_completed")
 
 
 def _sha256(path: Path) -> str:
@@ -196,19 +321,34 @@ def _refresh_cleanup_timeouts(conn: psycopg.Connection[Any], deadline: Deadline)
     conn.execute("SELECT set_config('lock_timeout', %s, false)", (timeout,))
 
 
-def _migrate(database_url: str, deadline: Deadline) -> None:
+def _migrate(
+    database_url: str,
+    deadline: Deadline,
+    *,
+    name: str,
+    through: str | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    command = [sys.executable, str(ROOT / "scripts/migrate.py")]
+    if through is not None:
+        command.extend(["--through", through])
     completed = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/migrate.py")],
+        command,
         cwd=ROOT,
-        env={**__import__("os").environ, "DATABASE_URL": database_url},
+        env={**os.environ, "DATABASE_URL": database_url},
         capture_output=True,
         text=True,
-        timeout=deadline.remaining(600),
+        timeout=deadline.remaining(),
         check=False,
     )
     if completed.returncode:
         detail = (completed.stderr or completed.stdout).strip().splitlines()
         raise RuntimeError(f"migration failed: {(detail[-1] if detail else 'unknown error')[:400]}")
+    return {
+        "name": name,
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "through": through or "latest",
+    }
 
 
 def _tenant_id(run_id: str, number: int) -> UUID:
@@ -593,6 +733,47 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
     }
 
 
+def _vector_index_names(conn: psycopg.Connection[Any], deadline: Deadline) -> frozenset[str]:
+    _refresh_qualification_timeout(conn, deadline)
+    rows = conn.execute(
+        "SELECT DISTINCT index_name FROM [SHOW INDEXES FROM semantic_memory_vectors] "
+        "WHERE index_name = ANY(%s)",
+        (sorted(QUALIFIED_VECTOR_INDEXES),),
+    ).fetchall()
+    return frozenset(str(row[0]) for row in rows)
+
+
+def _tenant_index_build_input(database_url: str, deadline: Deadline) -> dict[str, Any]:
+    with _connection(database_url, deadline) as conn:
+        _refresh_qualification_timeout(conn, deadline)
+        vector_count = int(
+            conn.execute("SELECT count(*)::INT8 FROM semantic_memory_vectors").fetchone()[0]
+        )
+        indexes = _vector_index_names(conn, deadline)
+    if vector_count != TARGETS["vectors"]:
+        raise RuntimeError("tenant vector index build input is not the exact populated target")
+    if indexes != frozenset({LEGACY_VECTOR_INDEX}):
+        raise RuntimeError("tenant vector index must be absent while the legacy index stays live")
+    return {
+        "name": "tenant_index_build_input",
+        "vectors": vector_count,
+        "present_indexes": sorted(indexes),
+        "absent_index": TENANT_VECTOR_INDEX,
+        "next_migration": TENANT_VECTOR_MIGRATION,
+    }
+
+
+def _qualified_vector_indexes(database_url: str, deadline: Deadline) -> dict[str, Any]:
+    with _connection(database_url, deadline) as conn:
+        indexes = _vector_index_names(conn, deadline)
+    if indexes != QUALIFIED_VECTOR_INDEXES:
+        raise RuntimeError("capacity qualification requires both live vector indexes")
+    return {
+        "name": "vector_indexes",
+        "indexes": sorted(indexes),
+    }
+
+
 def _counts(database_url: str, run_id: str, deadline: Deadline) -> tuple[int, list[dict[str, Any]]]:
     per_tenant: list[dict[str, Any]] = []
     with _connection(database_url, deadline) as conn:
@@ -743,15 +924,40 @@ def _check_storage(
 
 
 def _run(
-    database_url: str, run_id: str, source_sha: str, deadline: Deadline
+    database_url: str,
+    run_id: str,
+    source_sha: str,
+    deadline: Deadline,
+    progress: CapacityAttemptProgress,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     started = time.monotonic()
-    _migrate(database_url, deadline)
-    seed = _seed(database_url, run_id, deadline)
-    vector_count, per_tenant = _counts(database_url, run_id, deadline)
-    clients = _exercise_clients(database_url, run_id, deadline)
-    backlog = _exercise_backlog()
-    storage_bytes = _storage_bytes(database_url, deadline)
+    with progress.phase("base_migrations"):
+        base_migration = _migrate(
+            database_url,
+            deadline,
+            name="base_migrations",
+            through=BASE_SCHEMA_THROUGH,
+        )
+    with progress.phase("vector_seed"):
+        seed = _seed(database_url, run_id, deadline)
+    with progress.phase("tenant_index_build_input"):
+        index_build_input = _tenant_index_build_input(database_url, deadline)
+    with progress.phase("post_seed_migrations"):
+        post_seed_migrations = _migrate(
+            database_url,
+            deadline,
+            name="post_seed_migrations",
+        )
+    with progress.phase("vector_indexes"):
+        vector_indexes = _qualified_vector_indexes(database_url, deadline)
+    with progress.phase("vector_counts"):
+        vector_count, per_tenant = _counts(database_url, run_id, deadline)
+    with progress.phase("bounded_clients"):
+        clients = _exercise_clients(database_url, run_id, deadline)
+    with progress.phase("synthetic_backlog"):
+        backlog = _exercise_backlog()
+    with progress.phase("storage"):
+        storage_bytes = _storage_bytes(database_url, deadline)
     duration = round(time.monotonic() - started, 6)
     if vector_count != TARGETS["vectors"] or len(per_tenant) != TARGETS["tenants"]:
         raise RuntimeError("seeded vector counts do not match the bounded target")
@@ -766,6 +972,7 @@ def _run(
         "main_sha": source_sha,
         "qualified": True,
         "index": TENANT_VECTOR_INDEX,
+        "indexes": vector_indexes["indexes"],
         "vector_dimensions": VECTOR_DIMENSIONS,
         "vector_count": vector_count,
         "tenant_count": len(per_tenant),
@@ -779,7 +986,7 @@ def _run(
         "method": {
             "database": "disposable_local_single_node_cockroachdb",
             "vectors": "deterministic_synthetic_one_hot_1024d",
-            "seeding": "five_set_based_shards_with_serialized_completion_checks",
+            "seeding": "five_set_based_shards_before_tenant_vector_index_build",
             "fixture_write_triggers": "restored_and_catalog_verified_before_completion_checks",
             "clients": "twenty_bounded_parallel_index_queries",
             "backlog": "in_process_synthetic_accounting_without_live_worker",
@@ -796,7 +1003,11 @@ def _run(
             "external_cost_usd": MAX_EXTERNAL_COST_USD,
         },
         "raw_measurements": [
+            base_migration,
             seed,
+            index_build_input,
+            post_seed_migrations,
+            vector_indexes,
             {"name": "vector_counts", "total": vector_count, "per_tenant": per_tenant},
             {"name": "bounded_clients", "clients": clients},
             {"name": "synthetic_backlog", **backlog},
@@ -821,14 +1032,31 @@ def main() -> int:
     database = f"{DATABASE_PREFIX}{args.run_id}"
     database_url = _database_url(admin_url, database)
     deadline = Deadline.after(args.timeout_seconds)
+    progress = CapacityAttemptProgress(
+        args.output_dir / ATTEMPT_PROGRESS_FILENAME,
+        source_revision=args.source_sha,
+        run_id=args.run_id,
+        database=database,
+    )
     qualification: dict[str, Any] | None = None
     capacity: dict[str, Any] | None = None
     created = False
     cleanup: dict[str, Any]
     try:
-        _create_database(admin_url, database, deadline)
-        created = True
-        qualification, capacity = _run(database_url, args.run_id, args.source_sha, deadline)
+        with progress.phase("database_create"):
+            _create_database(admin_url, database, deadline)
+            created = True
+        qualification, capacity = _run(
+            database_url,
+            args.run_id,
+            args.source_sha,
+            deadline,
+            progress,
+        )
+        progress.mark_workload_completed()
+    except BaseException as error:
+        progress.record_failure(error)
+        raise
     finally:
         cleanup_started = _timestamp()
         cleanup_error: str | None = None
