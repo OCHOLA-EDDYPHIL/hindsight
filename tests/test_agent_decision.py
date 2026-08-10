@@ -8,7 +8,7 @@ from hindsight.agent_decision import (
     AGENT_DECISION_JSON_SCHEMA,
     MAX_MODEL_TURNS,
     AgentDecisionError,
-    AgentDecisionV1,
+    AgentDecisionV2,
     agent_decision_provider_schema,
     memory_selection_fingerprint,
     parse_agent_decision,
@@ -18,7 +18,7 @@ from hindsight.agent_decision import (
 
 def _payload(**overrides):
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "diagnosis": "Checkout latency follows downstream saturation.",
         "recalled_memory_citations": [
             {"memory_id": "memory-1", "quote": "Inspect the downstream processor first."}
@@ -26,6 +26,7 @@ def _payload(**overrides):
         "next_step_kind": "recommendation",
         "tool_call": None,
         "recommendation": "Throttle retry fanout while the processor recovers.",
+        "remediation_action": None,
         "rationale": "The retries amplify load on the constrained dependency.",
         "rollback": "Restore the previous retry policy.",
         "verification": ["Confirm checkout latency and processor depth both fall."],
@@ -45,7 +46,7 @@ def test_recommendation_contract_is_strict_and_content_addressed():
         model_turn=1,
     )
 
-    assert isinstance(decision, AgentDecisionV1)
+    assert isinstance(decision, AgentDecisionV2)
     first = recommendation_id(
         run_id="run-1",
         decision=decision,
@@ -79,6 +80,7 @@ def test_unobserved_provider_schema_requires_exact_diagnostic_and_empty_citation
     assert AGENT_DECISION_JSON_SCHEMA["properties"]["next_step_kind"]["enum"] == [
         "diagnostic_tool",
         "recommendation",
+        "remediation_action",
     ]
 
 
@@ -94,6 +96,7 @@ def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
     assert schema["properties"]["next_step_kind"]["enum"] == [
         "diagnostic_tool",
         "recommendation",
+        "remediation_action",
     ]
     assert schema["anyOf"] == [
         {
@@ -101,6 +104,7 @@ def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
                 "next_step_kind": {"const": "diagnostic_tool"},
                 "tool_call": {"$ref": "#/$defs/DiagnosticToolCall"},
                 "recommendation": {"type": "null"},
+                "remediation_action": {"type": "null"},
             }
         },
         {
@@ -112,6 +116,15 @@ def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
                     "minLength": 1,
                     "maxLength": 4_000,
                 },
+                "remediation_action": {"type": "null"},
+            }
+        },
+        {
+            "properties": {
+                "next_step_kind": {"const": "remediation_action"},
+                "tool_call": {"type": "null"},
+                "recommendation": {"type": "null"},
+                "remediation_action": {"$ref": "#/$defs/RetractRecalledMemoryAction"},
             }
         },
     ]
@@ -120,6 +133,76 @@ def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
         "memory-1",
         "memory-2",
     ]
+    assert schema["$defs"]["RetractRecalledMemoryAction"]["properties"]["target_memory_id"][
+        "enum"
+    ] == ["memory-1", "memory-2"]
+
+
+def test_remediation_action_requires_a_verbatim_citation_and_current_observation():
+    payload = _payload(
+        next_step_kind="remediation_action",
+        recommendation=None,
+        remediation_action={
+            "name": "retract_recalled_memory",
+            "target_memory_id": "memory-1",
+            "reason": "The observed state contradicts this guidance.",
+        },
+    )
+
+    with pytest.raises(AgentDecisionError, match="current diagnostic observation"):
+        parse_agent_decision(
+            json.dumps(payload),
+            recalled_memory_ids={"memory-1"},
+            recalled_memory_text={"memory-1": "Inspect the downstream processor first."},
+            allowed_query_keys={"payments.checkout_latency"},
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
+    decision = parse_agent_decision(
+        json.dumps(payload),
+        recalled_memory_ids={"memory-1"},
+        recalled_memory_text={"memory-1": "Inspect the downstream processor first."},
+        allowed_query_keys={"payments.checkout_latency"},
+        diagnostic_calls_used=1,
+        diagnostic_observation_available=True,
+        model_turn=2,
+    )
+    assert decision.remediation_action is not None
+    assert decision.remediation_action.target_memory_id == "memory-1"
+
+    payload["recalled_memory_citations"] = []
+    with pytest.raises(AgentDecisionError, match="cited verbatim"):
+        parse_agent_decision(
+            json.dumps(payload),
+            recalled_memory_ids={"memory-1"},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
+
+def test_remediation_branch_forbids_recommendation_and_tool_payloads():
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            json.dumps(
+                _payload(
+                    next_step_kind="remediation_action",
+                    remediation_action={
+                        "name": "retract_recalled_memory",
+                        "target_memory_id": "memory-1",
+                        "reason": "Retract contradicted guidance.",
+                    },
+                )
+            ),
+            recalled_memory_ids={"memory-1"},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
 
 
 def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
@@ -145,11 +228,25 @@ def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
             model_turn=MAX_MODEL_TURNS,
         )
 
+    constrained = agent_decision_provider_schema(
+        recalled_memory_ids={"memory-1"},
+        allowed_query_keys={"payments.checkout_latency_ms"},
+        diagnostic_calls_used=MAX_MODEL_TURNS - 1,
+        diagnostic_observation_available=False,
+        model_turn=MAX_MODEL_TURNS,
+    )
+    assert constrained["properties"]["next_step_kind"]["enum"] == ["recommendation"]
+    assert "RetractRecalledMemoryAction" in constrained["$defs"]
+    assert all(
+        branch["properties"]["next_step_kind"].get("const") != "remediation_action"
+        for branch in constrained["anyOf"]
+    )
+
 
 @pytest.mark.parametrize(
     "payload,match",
     [
-        ({**_payload(), "unexpected": True}, "AgentDecisionV1"),
+        ({**_payload(), "unexpected": True}, "AgentDecisionV2"),
         (_payload(recalled_memory_citations=[{"memory_id": "other", "quote": "x"}]), "cited"),
         (
             _payload(
@@ -159,6 +256,7 @@ def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
                     "query_key": "unconfigured.metric",
                 },
                 recommendation=None,
+                remediation_action=None,
             ),
             "allowlist",
         ),
@@ -187,6 +285,7 @@ def test_final_model_turn_cannot_request_another_diagnostic():
                         "query_key": "payments.checkout_latency",
                     },
                     recommendation=None,
+                    remediation_action=None,
                 )
             ),
             recalled_memory_ids={"memory-1"},

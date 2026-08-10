@@ -404,6 +404,8 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
   const historical = mode === "historical";
   const actionTrace = run?.action_trace;
   const recommendation = actionTrace?.recommendation;
+  const remediationAction = actionTrace?.remediation_action;
+  const remediationPreview = actionTrace?.preview;
   const execution = actionTrace?.execution;
   const selection = actionTrace?.selection;
   const latestToolCall = actionTrace?.tool_calls?.at(-1);
@@ -422,7 +424,9 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
               ? historical
                 ? "Rejected recommendation"
                 : run.status === "completed"
-                  ? "Recovered recommendation"
+                  ? remediationAction
+                    ? "Completed governed-memory retraction"
+                    : "Recovered recommendation"
                   : "Current recommendation"
               : "Recommendation unavailable"}
           </h3>
@@ -441,6 +445,23 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
             {selection?.provider || run?.provider || "Unavailable"} /{" "}
             {selection?.model || run?.model || "Unavailable"}
           </span>
+        </div>
+      ) : null}
+      {remediationAction ? (
+        <div
+          className="action-execution"
+          data-execution-status={execution?.status || "awaiting_approval"}
+        >
+          <span>Governed-memory retraction</span>
+          <strong>{humanStatus(execution?.status || "awaiting_approval")}</strong>
+          <span>{remediationAction.target_excerpt || "Target excerpt unavailable"}</span>
+          <span>
+            {`${remediationPreview?.effect_count ?? 0} causal effect${remediationPreview?.effect_count === 1 ? "" : "s"} · expires ${formatTime(remediationPreview?.expires_at)}`}
+          </span>
+          <span>{`Preview ${remediationPreview?.fingerprint || "unavailable"}`}</span>
+          {execution?.operation_id ? (
+            <span>{`Operation ${execution.operation_id}: ${humanStatus(execution.operation_status)}`}</span>
+          ) : null}
         </div>
       ) : null}
       {latestToolCall || latestObservation ? (

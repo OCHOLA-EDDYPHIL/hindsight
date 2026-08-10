@@ -143,7 +143,7 @@ export interface DiagnosticObservation {
 
 export interface RecommendationActionTrace {
   schema_version?: number;
-  mode?: "recommendation_only";
+  mode?: "recommendation_only" | "governed_memory_remediation";
   selection?: {
     fingerprint?: string;
     memory_ids?: Identifier[];
@@ -168,19 +168,50 @@ export interface RecommendationActionTrace {
     safety_constraints?: string[];
     status?: string;
   };
+  observation_fingerprint?: string;
+  remediation_action?: {
+    id?: Identifier;
+    name?: "retract_recalled_memory";
+    target_memory_id?: Identifier;
+    target_excerpt?: string;
+    reason?: string;
+    diagnosis?: string | null;
+    rationale?: string | null;
+    rollback?: string | null;
+    verification?: string[];
+    safety_constraints?: string[];
+    status?: string;
+  };
+  preview?: {
+    id?: Identifier;
+    fingerprint?: string;
+    expires_at?: string | null;
+    effect_count?: number;
+  };
   approval?: {
     approved?: boolean;
     disposition?: string;
     recommendation_id?: Identifier;
+    remediation_action_id?: Identifier;
     selection_fingerprint?: string;
+    observation_fingerprint?: string;
+    preview_id?: Identifier;
+    preview_fingerprint?: string;
+    actor?: string;
   };
   execution?: {
     status?:
       | "awaiting_approval"
       | "recommendation_approved"
+      | "approved"
+      | "completed"
       | "not_executed"
       | "replan_required";
-    mode?: "recommendation_only";
+    mode?: "recommendation_only" | "governed_memory_remediation";
+    operation_id?: Identifier;
+    operation_status?: string;
+    events?: Array<Record<string, unknown>>;
+    effects?: Array<Record<string, unknown>>;
   };
 }
 

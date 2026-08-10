@@ -27,11 +27,14 @@ from hindsight.agent_decision import (
     MAX_DIAGNOSTIC_CALLS,
     MAX_MODEL_TURNS,
     AgentDecisionError,
-    AgentDecisionV1,
+    AgentDecisionV2,
+    agent_decision_from_payload,
     agent_decision_provider_schema,
+    diagnostic_observation_fingerprint,
     memory_selection_fingerprint,
     parse_agent_decision,
     recommendation_id,
+    remediation_action_id,
 )
 from hindsight.embeddings import (
     EmbeddingProvider,
@@ -47,6 +50,12 @@ from hindsight.memory import (
     MemoryStore,
     Provenance,
     positive_guidance_eligible,
+)
+from hindsight.operations import (
+    OperationConflictError,
+    enqueue_operation,
+    execute_operation,
+    preview_retraction,
 )
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.tracing import memory_ids, set_span_attributes, start_span
@@ -97,6 +106,10 @@ class AgentStorageNotInitializedError(RuntimeError):
 
 class StaleRecommendationError(RuntimeError):
     """Raised when approval does not name the currently interrupted recommendation."""
+
+
+class RemediationActionError(RuntimeError):
+    """Raised when an approved governed-memory action cannot complete safely."""
 
 
 class DiagnosticTool(Protocol):
@@ -167,6 +180,12 @@ class IncidentAgentState(TypedDict, total=False):
     selection_namespace_revision: int
     approval_namespace_revision: int
     recommendation_id: str
+    remediation_action_id: str
+    observation_fingerprint: str
+    action_preview: dict[str, Any]
+    approval_actor: str
+    stale_replan_count: int
+    operation_result: dict[str, Any]
     approval_stale: bool
     proposed_action: str
     action_trace: NotRequired[dict[str, Any]]
@@ -289,8 +308,13 @@ def resume_incident_agent(
     *,
     thread_id: str,
     approved: bool,
-    recommendation_id: str,
-    selection_fingerprint: str,
+    recommendation_id: str | None = None,
+    selection_fingerprint: str = "",
+    remediation_action_id: str | None = None,
+    observation_fingerprint: str | None = None,
+    preview_id: str | None = None,
+    preview_fingerprint: str | None = None,
+    approval_actor: str | None = None,
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
@@ -316,13 +340,26 @@ def resume_incident_agent(
             limit=MAX_DIAGNOSTIC_CALLS,
             name="diagnostic_call_count",
         )
+    approval_payload: dict[str, Any]
+    if remediation_action_id is not None:
+        approval_payload = {
+            "approved": approved,
+            "remediation_action_id": remediation_action_id,
+            "selection_fingerprint": selection_fingerprint,
+            "observation_fingerprint": observation_fingerprint,
+            "preview_id": preview_id,
+            "preview_fingerprint": preview_fingerprint,
+            "actor": approval_actor,
+        }
+    else:
+        approval_payload = {
+            "approved": approved,
+            "recommendation_id": recommendation_id or "",
+            "selection_fingerprint": selection_fingerprint,
+        }
     state = _invoke_graph(
         Command(
-            resume={
-                "approved": approved,
-                "recommendation_id": recommendation_id,
-                "selection_fingerprint": selection_fingerprint,
-            },
+            resume=approval_payload,
             update={
                 **({"model_turn_count": model_call_count} if model_call_count is not None else {}),
                 **(
@@ -348,8 +385,13 @@ async def resume_incident_agent_async(
     *,
     thread_id: str,
     approved: bool,
-    recommendation_id: str,
-    selection_fingerprint: str,
+    recommendation_id: str | None = None,
+    selection_fingerprint: str = "",
+    remediation_action_id: str | None = None,
+    observation_fingerprint: str | None = None,
+    preview_id: str | None = None,
+    preview_fingerprint: str | None = None,
+    approval_actor: str | None = None,
     db_url: str | None = None,
     reasoning_provider: ReasoningProvider | None = None,
     embedding_provider: EmbeddingProvider | None = None,
@@ -369,6 +411,11 @@ async def resume_incident_agent_async(
             approved=approved,
             recommendation_id=recommendation_id,
             selection_fingerprint=selection_fingerprint,
+            remediation_action_id=remediation_action_id,
+            observation_fingerprint=observation_fingerprint,
+            preview_id=preview_id,
+            preview_fingerprint=preview_fingerprint,
+            approval_actor=approval_actor,
             db_url=db_url,
             reasoning_provider=reasoning_provider,
             embedding_provider=embedding_provider,
@@ -466,6 +513,7 @@ def build_incident_graph(
 
     def decide(state: IncidentAgentState) -> dict[str, Any]:
         selection_fingerprint = memory_selection_fingerprint(state.get("recalled_memories", []))
+        observation_fingerprint = diagnostic_observation_fingerprint(state.get("observations", []))
         with start_span(
             "hindsight.agent.reason",
             {
@@ -516,6 +564,7 @@ def build_incident_graph(
             "reasoning_steps": reasoning_steps,
             "model_turn_count": model_turn_count,
             "selection_fingerprint": selection_fingerprint,
+            "observation_fingerprint": observation_fingerprint,
             "approval_stale": False,
         }
         if decision.next_step_kind == "recommendation":
@@ -535,13 +584,80 @@ def build_incident_graph(
                     ),
                 }
             )
+        elif decision.next_step_kind == "remediation_action":
+            assert decision.remediation_action is not None
+            resolved_action_id = remediation_action_id(
+                run_id=state["run_id"],
+                decision=decision,
+                selection_fingerprint=selection_fingerprint,
+                observation_fingerprint=observation_fingerprint,
+            )
+            update.update(
+                {
+                    "remediation_action_id": resolved_action_id,
+                    "proposed_action": decision.remediation_action.reason,
+                }
+            )
+        _report_progress(progress_callback, "plan", "planning", state, update)
+        return update
+
+    def prepare_action(state: IncidentAgentState) -> dict[str, Any]:
+        decision = agent_decision_from_payload(state["plan_payload"])
+        if decision.next_step_kind != "remediation_action":
+            raise AgentDecisionError("action preparation received a non-action decision")
+        action = decision.remediation_action
+        assert action is not None
+        target = next(
+            (
+                memory
+                for memory in state.get("recalled_memories", [])
+                if str(memory.get("memory_id") or memory.get("id")) == action.target_memory_id
+            ),
+            None,
+        )
+        if target is None or str(target.get("namespace") or "") != state["namespace"]:
+            raise AgentDecisionError(
+                "remediation target is not a current same-namespace recalled memory"
+            )
+        citation = next(
+            (
+                item
+                for item in decision.recalled_memory_citations
+                if item.memory_id == action.target_memory_id
+            ),
+            None,
+        )
+        if citation is None:
+            raise AgentDecisionError("remediation target must be cited verbatim")
+        preview = preview_retraction(
+            root_memory_id=action.target_memory_id,
+            actor=f"agent.run:{state['run_id']}",
+            reason=action.reason,
+            authorized_namespaces=[state["namespace"]],
+            db_url=resolved_db_url,
+        )
+        effect_count = _bounded_retraction_effect_count(preview)
+        prepared = _jsonable_row(preview)
+        trace = _remediation_action_trace(
+            state=state,
+            decision=decision,
+            action_identity=state["remediation_action_id"],
+            target_excerpt=citation.quote,
+            preview=prepared,
+            effect_count=effect_count,
+        )
+        update = {
+            "action_preview": prepared,
+            "action_trace": trace,
+            "proposed_action": action.reason,
+        }
         _report_progress(progress_callback, "plan", "planning", state, update)
         return update
 
     def diagnose(state: IncidentAgentState) -> dict[str, Any]:
         if diagnostic_tool is None:
             raise AgentDecisionError("diagnostic tool is not configured")
-        decision = AgentDecisionV1.model_validate(state["plan_payload"])
+        decision = agent_decision_from_payload(state["plan_payload"])
         if decision.next_step_kind != "diagnostic_tool" or decision.tool_call is None:
             raise AgentDecisionError("diagnostic node received a non-tool decision")
         calls_used = int(state.get("diagnostic_call_count") or 0)
@@ -604,60 +720,120 @@ def build_incident_graph(
         return update
 
     def approve(state: IncidentAgentState) -> dict[str, Any]:
-        decision = AgentDecisionV1.model_validate(state["plan_payload"])
-        if decision.next_step_kind != "recommendation":
-            raise AgentDecisionError("approval node received a non-recommendation decision")
-        expected_recommendation_id = state["recommendation_id"]
+        decision = agent_decision_from_payload(state["plan_payload"])
+        if decision.next_step_kind not in {"recommendation", "remediation_action"}:
+            raise AgentDecisionError("approval node received a non-terminal decision")
+        is_action = decision.next_step_kind == "remediation_action"
         expected_selection_fingerprint = state["selection_fingerprint"]
-        approval: dict[str, Any] = {
-            "approved": False,
-            "recommendation_id": expected_recommendation_id,
-            "selection_fingerprint": expected_selection_fingerprint,
-        }
+        if is_action:
+            action = decision.remediation_action
+            assert action is not None
+            preview = state.get("action_preview") or {}
+            expected_action_id = state["remediation_action_id"]
+            expected_observation_fingerprint = state["observation_fingerprint"]
+            approval: dict[str, Any] = {
+                "approved": False,
+                "remediation_action_id": expected_action_id,
+                "selection_fingerprint": expected_selection_fingerprint,
+                "observation_fingerprint": expected_observation_fingerprint,
+                "preview_id": str(preview.get("id") or ""),
+                "preview_fingerprint": str(preview.get("fingerprint") or ""),
+                "actor": "agent:no_operator",
+            }
+            proposed_action = action.reason
+        else:
+            expected_recommendation_id = state["recommendation_id"]
+            approval = {
+                "approved": False,
+                "recommendation_id": expected_recommendation_id,
+                "selection_fingerprint": expected_selection_fingerprint,
+            }
+            proposed_action = decision.recommendation or ""
         if state.get("pause_before_act"):
+            approval_identity = (
+                {
+                    "remediation_action_id": expected_action_id,
+                    "selection_fingerprint": expected_selection_fingerprint,
+                    "observation_fingerprint": expected_observation_fingerprint,
+                    "preview_id": str(preview.get("id") or ""),
+                    "preview_fingerprint": str(preview.get("fingerprint") or ""),
+                }
+                if is_action
+                else {
+                    "recommendation_id": expected_recommendation_id,
+                    "selection_fingerprint": expected_selection_fingerprint,
+                }
+            )
             _report_progress(
                 progress_callback,
                 "approval",
                 "awaiting_approval",
                 state,
                 {
-                    "proposed_action": decision.recommendation or "",
-                    "recommendation_id": expected_recommendation_id,
-                    "selection_fingerprint": expected_selection_fingerprint,
+                    "proposed_action": proposed_action,
+                    **approval_identity,
                 },
             )
             resumed = interrupt(
                 {
                     "thread_id": state["thread_id"],
                     "incident_id": state["incident_id"],
-                    "proposed_action": decision.recommendation or "",
-                    "recommendation_id": expected_recommendation_id,
-                    "selection_fingerprint": expected_selection_fingerprint,
+                    "proposed_action": proposed_action,
+                    **approval_identity,
                     "action_trace": state.get("action_trace") or {},
                 }
             )
             if not isinstance(resumed, dict):
                 raise StaleRecommendationError("approval payload must be an object")
             approval = dict(resumed)
-        _validate_approval(
-            approval,
-            recommendation_identity=expected_recommendation_id,
-            selection_fingerprint=expected_selection_fingerprint,
-        )
+        if is_action:
+            _validate_action_approval(
+                approval,
+                action_identity=expected_action_id,
+                selection_fingerprint=expected_selection_fingerprint,
+                observation_fingerprint=expected_observation_fingerprint,
+                preview_id=str(preview.get("id") or ""),
+                preview_fingerprint=str(preview.get("fingerprint") or ""),
+            )
+        else:
+            _validate_approval(
+                approval,
+                recommendation_identity=expected_recommendation_id,
+                selection_fingerprint=expected_selection_fingerprint,
+            )
         approved = approval["approved"] is True
-        action_trace = {
-            **(state.get("action_trace") or {}),
-            "approval": {
-                "approved": approved,
-                "disposition": "approved" if approved else "rejected",
-                "recommendation_id": expected_recommendation_id,
-                "selection_fingerprint": expected_selection_fingerprint,
-            },
-            "execution": {
-                "status": "recommendation_approved" if approved else "not_executed",
-                "mode": "recommendation_only",
-            },
-        }
+        if is_action:
+            action_trace = {
+                **(state.get("action_trace") or {}),
+                "approval": {
+                    "approved": approved,
+                    "disposition": "approved" if approved else "rejected",
+                    "actor": approval["actor"],
+                    "remediation_action_id": expected_action_id,
+                    "selection_fingerprint": expected_selection_fingerprint,
+                    "observation_fingerprint": expected_observation_fingerprint,
+                    "preview_id": str(preview.get("id") or ""),
+                    "preview_fingerprint": str(preview.get("fingerprint") or ""),
+                },
+                "execution": {
+                    "status": "approved" if approved else "not_executed",
+                    "mode": "governed_memory_remediation",
+                },
+            }
+        else:
+            action_trace = {
+                **(state.get("action_trace") or {}),
+                "approval": {
+                    "approved": approved,
+                    "disposition": "approved" if approved else "rejected",
+                    "recommendation_id": expected_recommendation_id,
+                    "selection_fingerprint": expected_selection_fingerprint,
+                },
+                "execution": {
+                    "status": "recommendation_approved" if approved else "not_executed",
+                    "mode": "recommendation_only",
+                },
+            }
         if approved:
             refreshed = _recall_for_state(
                 state,
@@ -668,6 +844,13 @@ def build_incident_graph(
                 refreshed.get("recalled_memories", [])
             )
             if refreshed_fingerprint != expected_selection_fingerprint:
+                if is_action:
+                    return _stale_action_replan(
+                        state=state,
+                        refreshed=refreshed,
+                        action_trace=action_trace,
+                        detail="memory selection changed after approval",
+                    )
                 if int(state.get("model_turn_count") or 0) >= MAX_MODEL_TURNS:
                     raise StaleRecommendationError(
                         "memory selection changed and the model turn budget is exhausted"
@@ -681,11 +864,12 @@ def build_incident_graph(
                     "action_trace": _stale_approval_trace(action_trace),
                 }
         update = {
-            "proposed_action": decision.recommendation or "",
+            "proposed_action": proposed_action,
             "action_trace": action_trace,
             "action_approved": approved,
             "guidance_eligible": False,
             "approval_stale": False,
+            **({"approval_actor": approval["actor"]} if is_action else {}),
             **(
                 {"approval_namespace_revision": refreshed["selection_namespace_revision"]}
                 if approved
@@ -693,6 +877,98 @@ def build_incident_graph(
             ),
         }
         _report_progress(progress_callback, "approval", "reflecting", state, update)
+        return update
+
+    def execute_action(state: IncidentAgentState) -> dict[str, Any]:
+        decision = agent_decision_from_payload(state["plan_payload"])
+        if decision.next_step_kind != "remediation_action" or not state.get("action_approved"):
+            raise RemediationActionError("remediation execution requires explicit approval")
+        preview = state.get("action_preview") or {}
+        tenant_id = current_tenant_id(required=True)
+        identity_payload = {
+            "tenant_id": tenant_id,
+            "run_id": state["run_id"],
+            "remediation_action_id": state["remediation_action_id"],
+            "selection_fingerprint": state["selection_fingerprint"],
+            "observation_fingerprint": state["observation_fingerprint"],
+            "preview_id": str(preview.get("id") or ""),
+            "preview_fingerprint": str(preview.get("fingerprint") or ""),
+            "approval_actor": state["approval_actor"],
+        }
+        idempotency_key = (
+            "agent-remediation:"
+            + hashlib.sha256(
+                json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        )
+        try:
+            operation, _ = enqueue_operation(
+                preview_id=identity_payload["preview_id"],
+                fingerprint=identity_payload["preview_fingerprint"],
+                idempotency_key=idempotency_key,
+                actor=state["approval_actor"],
+                db_url=resolved_db_url,
+            )
+            result = execute_operation(
+                operation_id=str(operation["id"]),
+                embedding_provider=resolved_embedding_provider,
+                worker_id=f"agent-run:{state['run_id']}",
+                db_url=resolved_db_url,
+            )
+        except OperationConflictError:
+            refreshed = _recall_for_state(
+                state,
+                db_url=resolved_db_url,
+                embedding_provider=resolved_embedding_provider,
+            )
+            return _stale_action_replan(
+                state=state,
+                refreshed=refreshed,
+                action_trace=state.get("action_trace") or {},
+                detail="governed-memory preview became stale before execution",
+            )
+        if result.get("status") == "conflict":
+            refreshed = _recall_for_state(
+                state,
+                db_url=resolved_db_url,
+                embedding_provider=resolved_embedding_provider,
+            )
+            return _stale_action_replan(
+                state=state,
+                refreshed=refreshed,
+                action_trace=state.get("action_trace") or {},
+                detail="governed-memory state changed before execution",
+            )
+        if result.get("status") != "completed":
+            raise RemediationActionError(
+                f"governed-memory operation did not complete: {result.get('status')}"
+            )
+        events = _jsonable_rows(list(result.get("events") or []))
+        effects = _jsonable_rows(list(result.get("effects") or []))
+        action_trace = {
+            **(state.get("action_trace") or {}),
+            "execution": {
+                "status": "completed",
+                "mode": "governed_memory_remediation",
+                "operation_id": str(result["id"]),
+                "operation_status": str(result["status"]),
+                "events": events,
+                "effects": effects,
+            },
+        }
+        update = {
+            "operation_result": {
+                "id": str(result["id"]),
+                "status": str(result["status"]),
+                "invalidated_memory_ids": list(result.get("invalidated_memory_ids") or []),
+                "restored_memory_ids": list(result.get("restored_memory_ids") or []),
+            },
+            "action_trace": action_trace,
+            "action_approved": True,
+            "guidance_eligible": False,
+            "approval_stale": False,
+        }
+        _report_progress(progress_callback, "action", "reflecting", state, update)
         return update
 
     def reflect(state: IncidentAgentState) -> dict[str, Any]:
@@ -715,7 +991,7 @@ def build_incident_graph(
                     for row in state.get("recalled_memories", [])
                     if row.get("memory_id") or row.get("id")
                 ]
-                decision = AgentDecisionV1.model_validate(state["plan_payload"])
+                decision = agent_decision_from_payload(state["plan_payload"])
                 parent_memory_ids = [
                     citation.memory_id for citation in decision.recalled_memory_citations
                 ]
@@ -830,24 +1106,49 @@ def build_incident_graph(
     builder.add_node("recall", recall)
     builder.add_node("decide", decide)
     builder.add_node("diagnose", diagnose)
+    builder.add_node("prepare_action", prepare_action)
     builder.add_node("approve", approve)
+    builder.add_node("execute_action", execute_action)
     builder.add_node("reflect", reflect)
     builder.add_edge(START, "triage")
     builder.add_edge("triage", "recall")
     builder.add_edge("recall", "decide")
     builder.add_conditional_edges(
         "decide",
-        lambda state: AgentDecisionV1.model_validate(state["plan_payload"]).next_step_kind,
+        lambda state: agent_decision_from_payload(state["plan_payload"]).next_step_kind,
         {
             "diagnostic_tool": "diagnose",
             "recommendation": "approve",
+            "remediation_action": "prepare_action",
         },
     )
     builder.add_edge("diagnose", "decide")
+    builder.add_edge("prepare_action", "approve")
     builder.add_conditional_edges(
         "approve",
-        lambda state: "replan" if state.get("approval_stale") else "reflect",
-        {"replan": "decide", "reflect": "reflect"},
+        lambda state: (
+            "replan"
+            if state.get("approval_stale")
+            else "execute"
+            if agent_decision_from_payload(state["plan_payload"]).next_step_kind
+            == "remediation_action"
+            and state.get("action_approved")
+            else "done"
+            if agent_decision_from_payload(state["plan_payload"]).next_step_kind
+            == "remediation_action"
+            else "reflect"
+        ),
+        {
+            "replan": "decide",
+            "execute": "execute_action",
+            "reflect": "reflect",
+            "done": END,
+        },
+    )
+    builder.add_conditional_edges(
+        "execute_action",
+        lambda state: "replan" if state.get("approval_stale") else "done",
+        {"replan": "decide", "done": END},
     )
     builder.add_conditional_edges(
         "reflect",
@@ -1085,7 +1386,7 @@ def _plan_prompt(state: IncidentAgentState) -> str:
             "Recalled memories:",
             *memory_lines,
             "",
-            "Use this evidence to produce the next AgentDecisionV1 step.",
+            "Use this evidence to produce the next AgentDecisionV2 step.",
         ]
     )
 
@@ -1142,7 +1443,7 @@ def _generate_agent_decision(
     provider: ReasoningProvider,
     allowed_query_keys: set[str],
     call_reservation: BudgetReservation | None = None,
-) -> tuple[AgentDecisionV1, Any, int]:
+) -> tuple[AgentDecisionV2, Any, int]:
     """Generate one valid decision with at most one schema-repair turn."""
 
     starting_turn = int(state.get("model_turn_count") or 0)
@@ -1186,7 +1487,7 @@ def _generate_agent_decision(
             assert last_error is not None
             request_prompt = (
                 f"{prompt}\n\n"
-                "The prior response failed a server-enforced AgentDecisionV1 constraint. "
+                "The prior response failed a server-enforced AgentDecisionV2 constraint. "
                 f"Stable repair reason: {_decision_repair_reason(last_error)}. "
                 "Return only one JSON object matching the supplied schema for this turn. "
                 "Do not add markdown or commentary."
@@ -1197,10 +1498,12 @@ def _generate_agent_decision(
                     "You are Hindsight, an incident-response copilot. Use only memories "
                     "whose usage_instruction is positive_guidance as recommendations. "
                     "Audit-only memories may support diagnosis but must never direct a next "
-                    "step. Diagnostic tools are read-only. You cannot execute remediation. "
+                    "step. Diagnostic tools are read-only. The only executable action is "
+                    "retract_recalled_memory, and it may target only a recalled memory that "
+                    "you cite verbatim. Never propose another executable action. "
                     "Every recalled-memory citation quote must be a verbatim excerpt. "
                     "Every recommendation must be reversible, verifiable, and suitable for "
-                    "operator review. Return only AgentDecisionV1 JSON."
+                    "operator review. Return only AgentDecisionV2 JSON."
                 ),
                 prompt=request_prompt,
                 temperature=0,
@@ -1235,16 +1538,17 @@ def _generate_agent_decision(
 
 
 _DECISION_REPAIR_REASONS = {
-    "model response did not satisfy AgentDecisionV1": "agent_decision_schema_mismatch",
+    "model response did not satisfy AgentDecisionV2": "agent_decision_schema_mismatch",
     "a recalled memory may be cited only once per decision": "duplicate_memory_citation",
     "model cited memory that was not recalled": "unrecalled_memory_citation",
     "model citation is not a quote from recalled memory": "non_verbatim_memory_citation",
-    "final model turn must produce a recommendation": "final_turn_requires_recommendation",
+    "final model turn must produce a terminal decision": "final_turn_requires_terminal_decision",
     "diagnostic call budget is exhausted": "diagnostic_call_budget_exhausted",
     "model selected a diagnostic query outside the allowlist": "diagnostic_query_not_allowed",
-    "a current diagnostic observation is required before recommendation": (
+    "a current diagnostic observation is required before a terminal decision": (
         "current_diagnostic_observation_required"
     ),
+    "remediation target must be cited verbatim": "uncited_remediation_target",
 }
 
 
@@ -1288,21 +1592,30 @@ def _decision_prompt(
             f"Remaining logical model turns including this turn: {remaining_turns}",
             (
                 "When configured query keys are available and there is no current observation, "
-                "choose the most relevant diagnostic_tool before recommending. Otherwise choose "
+                "choose the most relevant diagnostic_tool before a terminal decision. Otherwise choose "
                 "diagnostic_tool only when another configured observation is necessary. The final "
-                "available turn must recommend."
+                "available turn must return a recommendation or the allowed remediation action."
             ),
         ]
     )
 
 
-def _decision_plan_text(decision: AgentDecisionV1) -> str:
+def _decision_plan_text(decision: AgentDecisionV2) -> str:
     verification = "; ".join(decision.verification)
     safety = "; ".join(decision.safety_constraints)
-    action = decision.recommendation or (
-        f"Read configured CloudWatch query {decision.tool_call.query_key}"
-        if decision.tool_call is not None
-        else "No next step"
+    action = (
+        decision.recommendation
+        or (
+            f"Retract recalled memory {decision.remediation_action.target_memory_id}: "
+            f"{decision.remediation_action.reason}"
+            if decision.remediation_action is not None
+            else None
+        )
+        or (
+            f"Read configured CloudWatch query {decision.tool_call.query_key}"
+            if decision.tool_call is not None
+            else "No next step"
+        )
     )
     return "\n".join(
         [
@@ -1317,7 +1630,7 @@ def _decision_plan_text(decision: AgentDecisionV1) -> str:
 def _recommendation_trace(
     *,
     state: IncidentAgentState,
-    decision: AgentDecisionV1,
+    decision: AgentDecisionV2,
     recommendation_identity: str,
 ) -> dict[str, Any]:
     return {
@@ -1366,6 +1679,145 @@ def _validate_approval(
         raise StaleRecommendationError("recommendation identity changed before approval")
     if approval["selection_fingerprint"] != selection_fingerprint:
         raise StaleRecommendationError("memory selection changed before approval")
+
+
+def _remediation_action_trace(
+    *,
+    state: IncidentAgentState,
+    decision: AgentDecisionV2,
+    action_identity: str,
+    target_excerpt: str,
+    preview: dict[str, Any],
+    effect_count: int,
+) -> dict[str, Any]:
+    action = decision.remediation_action
+    assert action is not None
+    return {
+        "schema_version": 3,
+        "mode": "governed_memory_remediation",
+        "selection": {
+            "fingerprint": state["selection_fingerprint"],
+            "memory_ids": [
+                str(memory.get("memory_id") or memory.get("id"))
+                for memory in state.get("recalled_memories", [])
+                if memory.get("memory_id") or memory.get("id")
+            ],
+            "provider": (state.get("reasoning") or {}).get("provider"),
+            "model": (state.get("reasoning") or {}).get("model"),
+        },
+        "reasoning_steps": state.get("reasoning_steps", []),
+        "tool_calls": state.get("tool_calls", []),
+        "observations": state.get("observations", []),
+        "observation_fingerprint": state["observation_fingerprint"],
+        "remediation_action": {
+            "id": action_identity,
+            "name": action.name,
+            "target_memory_id": action.target_memory_id,
+            "target_excerpt": target_excerpt,
+            "reason": action.reason,
+            "diagnosis": decision.diagnosis,
+            "rationale": decision.rationale,
+            "rollback": decision.rollback,
+            "verification": decision.verification,
+            "safety_constraints": decision.safety_constraints,
+            "status": "awaiting_approval",
+        },
+        "preview": {
+            "id": str(preview.get("id") or ""),
+            "fingerprint": str(preview.get("fingerprint") or ""),
+            "expires_at": preview.get("expires_at"),
+            "effect_count": effect_count,
+        },
+        "execution": {
+            "status": "awaiting_approval",
+            "mode": "governed_memory_remediation",
+        },
+    }
+
+
+def _bounded_retraction_effect_count(preview: dict[str, Any]) -> int:
+    effect = dict(preview.get("effect_payload") or {})
+    effect_count = len(effect.get("close_memory_ids") or [])
+    if effect_count < 1 or effect_count > 10:
+        raise AgentDecisionError(
+            "remediation action must affect between one and ten memory versions"
+        )
+    return effect_count
+
+
+def _validate_action_approval(
+    approval: dict[str, Any],
+    *,
+    action_identity: str,
+    selection_fingerprint: str,
+    observation_fingerprint: str,
+    preview_id: str,
+    preview_fingerprint: str,
+) -> None:
+    required = {
+        "approved",
+        "remediation_action_id",
+        "selection_fingerprint",
+        "observation_fingerprint",
+        "preview_id",
+        "preview_fingerprint",
+        "actor",
+    }
+    if (
+        set(approval) != required
+        or not isinstance(approval.get("approved"), bool)
+        or not isinstance(approval.get("actor"), str)
+        or not approval["actor"].strip()
+    ):
+        raise StaleRecommendationError("action approval payload does not match the contract")
+    expected = {
+        "remediation_action_id": action_identity,
+        "selection_fingerprint": selection_fingerprint,
+        "observation_fingerprint": observation_fingerprint,
+        "preview_id": preview_id,
+        "preview_fingerprint": preview_fingerprint,
+    }
+    if any(approval[key] != value for key, value in expected.items()):
+        raise StaleRecommendationError("remediation action changed before approval")
+
+
+def _stale_action_replan(
+    *,
+    state: IncidentAgentState,
+    refreshed: dict[str, Any],
+    action_trace: dict[str, Any],
+    detail: str,
+) -> dict[str, Any]:
+    stale_count = int(state.get("stale_replan_count") or 0)
+    if stale_count >= 1:
+        raise RemediationActionError("remediation state changed after its single replan")
+    if int(state.get("model_turn_count") or 0) >= MAX_MODEL_TURNS:
+        raise RemediationActionError(
+            "remediation state changed and the model turn budget is exhausted"
+        )
+    refreshed_fingerprint = memory_selection_fingerprint(refreshed.get("recalled_memories", []))
+    approval = action_trace.get("approval") or {}
+    return {
+        **refreshed,
+        "selection_fingerprint": refreshed_fingerprint,
+        "approval_stale": True,
+        "action_approved": False,
+        "guidance_eligible": False,
+        "stale_replan_count": stale_count + 1,
+        "action_trace": {
+            **action_trace,
+            "approval": {
+                **approval,
+                "approved": False,
+                "disposition": "stale",
+            },
+            "execution": {
+                "status": "replan_required",
+                "mode": "governed_memory_remediation",
+                "detail": detail,
+            },
+        },
+    }
 
 
 def _stale_approval_trace(action_trace: dict[str, Any]) -> dict[str, Any]:

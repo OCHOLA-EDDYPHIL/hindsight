@@ -162,8 +162,19 @@ export function OperatorConsole({
   });
   const walkthroughIndex = walkthroughSteps.findIndex((step) => step.id === walkthroughStep);
   const recommendationId = run?.action_trace?.recommendation?.id;
+  const remediationAction = run?.action_trace?.remediation_action;
+  const remediationPreview = run?.action_trace?.preview;
+  const remediation = run?.action_trace?.mode === "governed_memory_remediation";
   const selectionFingerprint = run?.action_trace?.selection?.fingerprint;
-  const approvalIdentityReady = Boolean(recommendationId && selectionFingerprint);
+  const approvalIdentityReady = remediation
+    ? Boolean(
+        remediationAction?.id &&
+          selectionFingerprint &&
+          run?.action_trace?.observation_fingerprint &&
+          remediationPreview?.id &&
+          remediationPreview?.fingerprint,
+      )
+    : Boolean(recommendationId && selectionFingerprint);
   const describedBy = walkthroughOpen ? "walkthroughCurrent" : undefined;
   const currentControl = (step: WalkthroughStep) =>
     walkthroughOpen && walkthroughStep === step
@@ -320,7 +331,7 @@ export function OperatorConsole({
               }
             >
               <span aria-hidden="true" />
-              {phase.label}
+              {phase.key === "action" && remediation ? "governed retraction" : phase.label}
               <span className="sr-only">
                 {`, ${state}`}
               </span>
@@ -334,9 +345,16 @@ export function OperatorConsole({
           <strong>Decision awaits operator review</strong>
           <span>
             {approvalIdentityReady
-              ? run?.action_trace?.recommendation?.summary || "Recommendation identity verified"
+              ? remediation
+                ? remediationAction?.target_excerpt || "Governed-memory target verified"
+                : run?.action_trace?.recommendation?.summary || "Recommendation identity verified"
               : "Approval identity unavailable. Refresh or rerun the analysis."}
           </span>
+          {remediation && approvalIdentityReady ? (
+            <span>
+              {`${remediationPreview?.effect_count ?? 0} causal effect${remediationPreview?.effect_count === 1 ? "" : "s"} · expires ${formatTime(remediationPreview?.expires_at)} · fingerprint ${remediationPreview?.fingerprint?.slice(0, 12)}`}
+            </span>
+          ) : null}
         </div>
         <Button
           id="rejectRun"
@@ -346,7 +364,7 @@ export function OperatorConsole({
           disabled={!approvalIdentityReady || busy === "reject"}
           onClick={() => onDecision(false)}
         >
-          Reject recommendation
+          {remediation ? "Reject retraction" : "Reject recommendation"}
         </Button>
         <Button
           id="approveRun"
@@ -357,7 +375,7 @@ export function OperatorConsole({
           onClick={() => onDecision(true)}
           {...currentControl(walkthroughStep === "review" ? "review" : "reanalyze")}
         >
-          Approve recommendation
+          {remediation ? "Approve retraction" : "Approve recommendation"}
         </Button>
       </div>
 
