@@ -1,0 +1,131 @@
+name: isolated exact-main capacity qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hindsight-capacity-qualification
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.authorization.outputs.source_sha }}
+    steps:
+      - id: authorization
+        name: Require repository owner on exact main
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/capacity-qualification.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Capacity qualification requires the repository owner on exact main." >&2
+            exit 1
+          }
+          echo "source_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+
+  qualify:
+    needs: authorize
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: hindsight_capacity_${{ github.run_id }}_${{ github.run_attempt }}
+      COCKROACH_IMAGE: cockroachdb/cockroach:v25.4.5
+      DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+      EVIDENCE_DIR: build/capacity-qualification
+      SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - name: Start isolated CockroachDB
+        run: docker compose up -d crdb
+      - name: Wait for CockroachDB
+        shell: bash
+        run: |
+          ready=false
+          for _ in $(seq 1 60); do
+            if docker compose exec -T crdb cockroach sql --insecure -e 'SELECT 1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker compose exec -T crdb cockroach sql --insecure \
+            -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
+      - name: Produce bounded synthetic capacity evidence
+        shell: bash
+        run: |
+          run_id="$(printf '%s' "${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}" | sha256sum | cut -c1-16)"
+          uv run python scripts/run_capacity_qualification.py \
+            --admin-url "$DATABASE_URL" \
+            --run-id "$run_id" \
+            --source-sha "$SOURCE_SHA" \
+            --output-dir "$EVIDENCE_DIR" \
+            --timeout-seconds 1200
+      - name: Validate bound evidence and artifact hashes
+        run: |
+          uv run python scripts/validate_capacity_evidence.py \
+            --input "$EVIDENCE_DIR/capacity-report.json" \
+            --qualification "$EVIDENCE_DIR/index-qualification.json" \
+            --cleanup "$EVIDENCE_DIR/cleanup.json" \
+            --manifest "$EVIDENCE_DIR/artifact-manifest.json" \
+            --source-revision "$SOURCE_SHA" \
+            --output "$EVIDENCE_DIR/validated-capacity-report.json"
+      - name: Remove isolated CockroachDB and storage
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          set +e
+          timeout 120 docker compose down --volumes --remove-orphans
+          down_status=$?
+          containers="$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | wc -l)"
+          volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | wc -l)"
+          jq -n \
+            --arg source_revision "$SOURCE_SHA" \
+            --argjson down_status "$down_status" \
+            --argjson remaining_containers "$containers" \
+            --argjson remaining_volumes "$volumes" \
+            '{source_revision: $source_revision, down_status: $down_status,
+              remaining_containers: $remaining_containers, remaining_volumes: $remaining_volumes,
+              compose_state_removed: ($down_status == 0 and $remaining_containers == 0 and $remaining_volumes == 0)}' \
+            > "$EVIDENCE_DIR/infrastructure-cleanup.json"
+          sha256sum "$EVIDENCE_DIR/infrastructure-cleanup.json" \
+            > "$EVIDENCE_DIR/infrastructure-cleanup.sha256"
+          test "$down_status" -eq 0
+          test "$containers" -eq 0
+          test "$volumes" -eq 0
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30

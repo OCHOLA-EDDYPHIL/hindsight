@@ -35,9 +35,10 @@ def test_retrieval_report_preserves_raw_measurements_and_limitations():
     assert "not a production SLO" in report["limitations"][1]
 
 
-def test_capacity_evidence_requires_qualified_index_for_exact_main_sha():
+def test_capacity_evidence_requires_bound_supplemental_artifacts():
     module = _script("validate_capacity_evidence")
     evidence = {
+        "schema_version": module.SCHEMA_VERSION,
         "source_revision": SOURCE_REVISION,
         "index_qualification": {
             "qualified": False,
@@ -45,17 +46,50 @@ def test_capacity_evidence_requires_qualified_index_for_exact_main_sha():
             "main_sha": SOURCE_REVISION,
         },
         "targets": module.TARGETS,
+        "ceilings": module.EXPECTED_CEILINGS,
         "method": {"duration_seconds": 60},
-        "environment": {"database": "hosted"},
-        "raw_measurements": [{"latency_ms": 10}],
-        "limitations": ["Bounded run only."],
+        "environment": {
+            "isolation": "run_scoped_database_and_compose_project",
+            "paid_model_calls": 0,
+            "live_worker_invocations": 0,
+        },
+        "raw_measurements": [
+            {"name": "vector_seed", "duration_seconds": 1},
+            {
+                "name": "vector_counts",
+                "total": 100_000,
+                "per_tenant": [
+                    {"tenant_id": f"tenant-{number}", "vectors": 5_000} for number in range(20)
+                ],
+            },
+            {
+                "name": "bounded_clients",
+                "clients": [
+                    {
+                        "client": number,
+                        "qualified_index": module.EXPECTED_INDEX,
+                        "prefix_spans": "[/tenant - /tenant]",
+                        "plan": f"vector search table: semantic_memory_vectors@{module.EXPECTED_INDEX}",
+                    }
+                    for number in range(1, 21)
+                ],
+            },
+            {
+                "name": "synthetic_backlog",
+                "messages_enqueued": 1_000,
+                "messages_accounted_for": 1_000,
+                "clients": 20,
+                "per_client_counts": [50] * 20,
+                "live_worker_invocations": 0,
+                "paid_model_calls": 0,
+            },
+            {"name": "storage", "bytes": 1_000_000},
+            {"name": "total", "duration_seconds": 10},
+        ],
+        "limitations": ["Bounded benchmark evidence; not production SLO claims."],
     }
-    with pytest.raises(ValueError, match="qualified populated vector index"):
+    with pytest.raises(ValueError, match="requires qualification, cleanup, and artifact"):
         module.validate(evidence, source_revision=SOURCE_REVISION)
-    evidence["index_qualification"]["qualified"] = True
-    assert module.validate(evidence, source_revision=SOURCE_REVISION)["claim_scope"] == (
-        "benchmark_evidence_not_production_slo"
-    )
 
 
 def test_alert_exercise_records_only_acknowledgement_and_revision():

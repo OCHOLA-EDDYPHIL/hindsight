@@ -43,6 +43,9 @@ CI_STATIC_FILES = frozenset(
     }
 )
 WORKFLOW_COMPONENTS = {
+    ".github/workflows/capacity-qualification.yml": frozenset(
+        {"database", "main_qualification"}
+    ),
     ".github/workflows/deploy-demo.yml": frozenset(
         {"database", "main_qualification", "lambda_artifacts", "terraform"}
     ),
@@ -66,11 +69,13 @@ WORKFLOW_COMPONENTS = {
 MAIN_QUALIFICATION_SCRIPTS = frozenset(
     {
         "apply_database_roles.py",
+        "run_capacity_qualification.py",
         "drop_diagnostic_database.py",
         "initialize_agent_storage.py",
         "migrate.py",
         "populated_upgrade_fixture.py",
         "schema_manifest.py",
+        "validate_capacity_evidence.py",
     }
 )
 DATABASE_SCRIPTS = frozenset(
