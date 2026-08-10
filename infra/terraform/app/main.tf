@@ -911,6 +911,26 @@ resource "aws_apigatewayv2_authorizer" "product" {
   }
 }
 
+moved {
+  from = aws_apigatewayv2_route.api_root
+  to   = aws_apigatewayv2_route.public_v1_root_get
+}
+
+moved {
+  from = aws_apigatewayv2_route.api_proxy
+  to   = aws_apigatewayv2_route.public_v1_proxy_get
+}
+
+moved {
+  from = aws_apigatewayv2_route.api_v2_root
+  to   = aws_apigatewayv2_route.product_v2_root
+}
+
+moved {
+  from = aws_apigatewayv2_route.api_v2_proxy
+  to   = aws_apigatewayv2_route.product_v2_proxy
+}
+
 resource "aws_apigatewayv2_route" "public_v1_root_get" {
   api_id    = aws_apigatewayv2_api.http.id
   route_key = "GET /v1"

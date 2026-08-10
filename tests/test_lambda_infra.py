@@ -168,6 +168,12 @@ def test_product_identity_boundary_is_jwt_gated_with_opaque_realtime_tickets():
     assert 'route_key = "GET /v1/{proxy+}"' in stack
     assert 'route_key = "POST /v1/realtime/ticket"' in stack
     assert stack.count('authorization_type = "JWT"') == 2
+    assert (
+        stack.count(
+            "authorizer_id      = aws_apigatewayv2_authorizer.product.id"
+        )
+        == 2
+    )
     assert stack.count('route_key = "OPTIONS /v2') == 2
     assert 'resource "aws_dynamodb_table" "realtime_tickets"' in stack
     assert 'hash_key     = "ticket_digest"' in stack
@@ -195,6 +201,32 @@ def test_product_identity_boundary_is_jwt_gated_with_opaque_realtime_tickets():
     assert "Viewer and operator passwords must be distinct" in deploy
     assert "cognito-idp:AdminInitiateAuth" in bootstrap
     assert "wafv2:CreateWebACL" in bootstrap
+
+
+def test_application_route_renames_preserve_existing_resource_identities():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    moves = dict(
+        re.findall(
+            r"moved\s*\{\s*from\s*=\s*(\S+)\s*to\s*=\s*(\S+)\s*\}",
+            stack,
+        )
+    )
+    expected = {
+        "aws_apigatewayv2_route.api_root": (
+            "aws_apigatewayv2_route.public_v1_root_get"
+        ),
+        "aws_apigatewayv2_route.api_proxy": (
+            "aws_apigatewayv2_route.public_v1_proxy_get"
+        ),
+        "aws_apigatewayv2_route.api_v2_root": (
+            "aws_apigatewayv2_route.product_v2_root"
+        ),
+        "aws_apigatewayv2_route.api_v2_proxy": (
+            "aws_apigatewayv2_route.product_v2_proxy"
+        ),
+    }
+
+    assert {source: moves.get(source) for source in expected} == expected
 
 
 def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():

@@ -200,8 +200,11 @@ run "complete_demo_graph" {
       aws_apigatewayv2_authorizer.product.authorizer_type == "JWT" &&
       toset(aws_apigatewayv2_authorizer.product.identity_sources) == toset(["$request.header.Authorization"]) &&
       aws_apigatewayv2_route.public_v1_root_get.route_key == "GET /v1" &&
+      aws_apigatewayv2_route.public_v1_root_get.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_proxy_get.route_key == "GET /v1/{proxy+}" &&
+      aws_apigatewayv2_route.public_v1_proxy_get.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_ticket_post.route_key == "POST /v1/realtime/ticket" &&
+      aws_apigatewayv2_route.public_v1_ticket_post.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_root_options.authorization_type == "NONE" &&
       aws_apigatewayv2_route.public_v1_proxy_options.authorization_type == "NONE" &&
       aws_apigatewayv2_route.product_v2_root_options.authorization_type == "NONE" &&
