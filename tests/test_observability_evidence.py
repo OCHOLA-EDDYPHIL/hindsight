@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_REVISION = "a" * 40
 
 
 def _script(name: str):
@@ -27,7 +28,7 @@ def test_retrieval_report_preserves_raw_measurements_and_limitations():
             for row in fixture["cases"]
         ],
     }
-    report = module.evaluate(fixture, results, source_revision="abc123")
+    report = module.evaluate(fixture, results, source_revision=SOURCE_REVISION)
     assert report["measurements"]["recall_at_k"] == 1.0
     assert report["measurements"]["mrr"] == 1.0
     assert report["raw_measurements"]
@@ -37,11 +38,11 @@ def test_retrieval_report_preserves_raw_measurements_and_limitations():
 def test_capacity_evidence_requires_qualified_index_for_exact_main_sha():
     module = _script("validate_capacity_evidence")
     evidence = {
-        "source_revision": "main-sha",
+        "source_revision": SOURCE_REVISION,
         "index_qualification": {
             "qualified": False,
-            "artifact_sha256": "qualified-index-digest",
-            "main_sha": "main-sha",
+            "artifact_sha256": "b" * 64,
+            "main_sha": SOURCE_REVISION,
         },
         "targets": module.TARGETS,
         "method": {"duration_seconds": 60},
@@ -50,9 +51,9 @@ def test_capacity_evidence_requires_qualified_index_for_exact_main_sha():
         "limitations": ["Bounded run only."],
     }
     with pytest.raises(ValueError, match="qualified populated vector index"):
-        module.validate(evidence, source_revision="main-sha")
+        module.validate(evidence, source_revision=SOURCE_REVISION)
     evidence["index_qualification"]["qualified"] = True
-    assert module.validate(evidence, source_revision="main-sha")["claim_scope"] == (
+    assert module.validate(evidence, source_revision=SOURCE_REVISION)["claim_scope"] == (
         "benchmark_evidence_not_production_slo"
     )
 
@@ -63,7 +64,7 @@ def test_alert_exercise_records_only_acknowledgement_and_revision():
     class Client:
         def publish(self, **kwargs):
             assert kwargs["TopicArn"].endswith(":alerts")
-            assert "main-sha" in kwargs["Message"]
+            assert SOURCE_REVISION in kwargs["Message"]
             return {"MessageId": "message-1"}
 
     class Session:
@@ -74,11 +75,11 @@ def test_alert_exercise_records_only_acknowledgement_and_revision():
     evidence = module.publish(
         topic_arn="arn:aws:sns:us-east-1:123456789012:alerts",
         profile="test",
-        source_revision="main-sha",
+        source_revision=SOURCE_REVISION,
         session=Session(),
     )
     assert evidence["message_id"] == "message-1"
-    assert evidence["source_revision"] == "main-sha"
+    assert evidence["source_revision"] == SOURCE_REVISION
 
 
 def test_correlation_fields_drop_arbitrary_values_and_include_trace_ids():
@@ -91,3 +92,27 @@ def test_correlation_fields_drop_arbitrary_values_and_include_trace_ids():
     assert fields["tenant_id"] == "tenant"
     assert len(fields["trace_id"]) == 32
     assert "secret" not in fields
+
+
+def test_worker_record_keeps_all_correlation_identities(caplog):
+    from hindsight.worker import _log_record_result
+
+    message = {
+        "tenant_id": "tenant-1",
+        "run_id": "run-1",
+        "dispatch_id": "dispatch-1",
+        "dispatch_attempt_id": "dispatch-attempt-1",
+        "attempt_id": "attempt-1",
+    }
+    context = type("Context", (), {"aws_request_id": "request-1"})()
+    with caplog.at_level("INFO", logger="hindsight.worker"):
+        _log_record_result(
+            status="succeeded",
+            message=message,
+            message_id="message-1",
+            receive_count="1",
+            source_arn="arn:aws:sqs:us-east-1:123456789012:runs",
+            context=context,
+        )
+    event = json.loads(caplog.records[-1].message)
+    assert {key: event[key] for key in message} == message

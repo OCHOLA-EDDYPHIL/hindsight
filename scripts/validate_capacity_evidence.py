@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,13 @@ TARGETS = {"vectors": 100_000, "tenants": 20, "clients": 20, "backlog_messages":
 
 
 def validate(document: dict[str, Any], *, source_revision: str) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        raise ValueError("source revision must be a full lowercase Git SHA")
     qualification = document.get("index_qualification") or {}
     if qualification.get("qualified") is not True:
         raise ValueError("capacity evidence requires a qualified populated vector index")
-    if not qualification.get("artifact_sha256"):
-        raise ValueError("capacity evidence requires the index qualification artifact digest")
+    if re.fullmatch(r"[0-9a-f]{64}", str(qualification.get("artifact_sha256") or "")) is None:
+        raise ValueError("capacity evidence requires a full SHA-256 qualification artifact digest")
     if qualification.get("main_sha") != source_revision:
         raise ValueError("index qualification must belong to the exact tested main revision")
     if document.get("source_revision") != source_revision:

@@ -108,11 +108,13 @@ def _log_record_result(
         "lambda_request_id": str(getattr(context, "aws_request_id", "local")),
     }
     for key in (
+        "tenant_id",
         "operation_id",
         "run_id",
         "incident_id",
         "dispatch_id",
         "dispatch_attempt_id",
+        "attempt_id",
     ):
         value = str(message.get(key) or "").strip()
         if value:

@@ -376,6 +376,28 @@ run "bounded_observability_profile" {
     )
     error_message = "The monthly five-dollar budget must notify on actual and forecasted cost."
   }
+
+  assert {
+    condition = (
+      aws_kms_key.budget_alerts.enable_key_rotation &&
+      length(aws_kms_key.alerts) == 0
+    )
+    error_message = "The default-region notification topics must share one rotating customer key."
+  }
+}
+
+run "bounded_observability_rejects_cross_region_layer" {
+  command = plan
+
+  variables {
+    enable_bounded_observability = true
+    adot_python_layer_arn        = "arn:aws:lambda:us-west-2:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1"
+    api_zip_path                 = "../../../src/hindsight/web/favicon.svg"
+    worker_zip_path              = "../../../src/hindsight/web/favicon.svg"
+    realtime_zip_path            = "../../../src/hindsight/web/favicon.svg"
+  }
+
+  expect_failures = [check.bounded_observability]
 }
 
 run "validation_timing_profile" {

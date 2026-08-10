@@ -208,10 +208,12 @@ jobs:
             terraform-${{ runner.os }}-
             ${{ hashFiles('infra/terraform/**/.terraform.lock.hcl') }}
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
-      - uses: aquasecurity/trivy-action@0.33.1
+      - uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
         with:
+          version: v0.69.3
           scan-type: config
           scan-ref: infra/terraform
+          trivyignores: infra/terraform/.trivyignore
           severity: HIGH,CRITICAL
           exit-code: 1
       - run: terraform fmt -check -recursive infra/terraform

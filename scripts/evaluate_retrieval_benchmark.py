@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ from typing import Any
 
 
 def evaluate(fixture: dict[str, Any], results: dict[str, Any], *, source_revision: str) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        raise ValueError("source revision must be a full lowercase Git SHA")
     if fixture.get("sanitized") is not True:
         raise ValueError("retrieval fixture must be explicitly sanitized")
     expected = {row["query_id"]: set(row["relevant_memory_ids"]) for row in fixture["cases"]}

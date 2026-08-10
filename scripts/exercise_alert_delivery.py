@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ import boto3
 
 
 def publish(*, topic_arn: str, profile: str, source_revision: str, session: Any = None) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        raise ValueError("source revision must be a full lowercase Git SHA")
     resolved_session = session or boto3.Session(profile_name=profile)
     response = resolved_session.client("sns", region_name=topic_arn.split(":")[3]).publish(
         TopicArn=topic_arn,

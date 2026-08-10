@@ -70,6 +70,14 @@ check "bounded_observability" {
     condition     = !var.enable_bounded_observability || var.adot_python_layer_arn != null
     error_message = "Bounded observability requires a region-matched ADOT Python layer ARN."
   }
+  assert {
+    condition = var.adot_python_layer_arn == null || try(
+      split(":", var.adot_python_layer_arn)[2] == "lambda" &&
+      split(":", var.adot_python_layer_arn)[3] == var.aws_region,
+      false
+    )
+    error_message = "The ADOT Python layer ARN must belong to the application region."
+  }
 }
 
 check "custom_domain_configuration" {
@@ -1348,14 +1356,88 @@ resource "aws_iam_role_policy_attachment" "xray" {
 
 resource "aws_sns_topic" "alerts" {
   name              = "${local.name}-alerts"
-  kms_master_key_id = "alias/aws/sns"
+  kms_master_key_id = var.aws_region == "us-east-1" ? aws_kms_key.budget_alerts.arn : aws_kms_key.alerts[0].arn
 }
 
 resource "aws_sns_topic" "budget_alerts" {
   provider = aws.us_east_1
 
   name              = "${local.name}-budget-alerts"
-  kms_master_key_id = "alias/aws/sns"
+  kms_master_key_id = aws_kms_key.budget_alerts.arn
+}
+
+data "aws_iam_policy_document" "notification_key" {
+  statement {
+    sid       = "EnableAccountAdministration"
+    actions   = ["kms:*"]
+    resources = ["*"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+  }
+
+  statement {
+    sid = "AllowNotificationServices"
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey*"
+    ]
+    resources = ["*"]
+    principals {
+      type        = "Service"
+      identifiers = ["budgets.amazonaws.com", "cloudwatch.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_kms_key" "budget_alerts" {
+  provider = aws.us_east_1
+
+  description             = "Encrypt Hindsight budget and us-east-1 operational notifications"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  policy                  = data.aws_iam_policy_document.notification_key.json
+}
+
+resource "aws_kms_key" "alerts" {
+  count = var.aws_region == "us-east-1" ? 0 : 1
+
+  description             = "Encrypt Hindsight operational notifications"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  policy                  = data.aws_iam_policy_document.notification_key.json
+}
+
+data "aws_iam_policy_document" "alerts" {
+  statement {
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.alerts.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:*"]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "alerts" {
+  arn    = aws_sns_topic.alerts.arn
+  policy = data.aws_iam_policy_document.alerts.json
 }
 
 data "aws_iam_policy_document" "budget_alerts" {
@@ -1370,6 +1452,11 @@ data "aws_iam_policy_document" "budget_alerts" {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
       values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:*"]
     }
   }
 }
@@ -1391,6 +1478,8 @@ resource "aws_sns_topic_subscription" "alert_email" {
 
 resource "aws_budgets_budget" "monthly" {
   provider = aws.us_east_1
+
+  depends_on = [aws_sns_topic_policy.budget_alerts]
 
   name         = "${local.name}-monthly-five-usd"
   budget_type  = "COST"
