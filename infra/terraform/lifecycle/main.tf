@@ -40,6 +40,17 @@ locals {
   lifecycle_websocket_arn         = "arn:${data.aws_partition.current.partition}:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*/${var.stage}/DELETE/@connections/*"
   expected_oidc_provider_arn      = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
   expected_deploy_role_arn        = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-deploy"
+  bootstrap_state_key             = "hindsight/bootstrap/terraform.tfstate"
+  bootstrap_state_bucket_arn      = "arn:${data.aws_partition.current.partition}:s3:::${var.bootstrap_state_bucket_name}"
+  bootstrap_state_object_arn      = "${local.bootstrap_state_bucket_arn}/${local.bootstrap_state_key}"
+  bootstrap_state_lock_object_arn = "${local.bootstrap_state_object_arn}.tflock"
+  bootstrap_role_arns = [
+    local.expected_deploy_role_arn,
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-evidence",
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-observability-evidence",
+  ]
+  bootstrap_observability_policy_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/hindsight-github-deploy-observability"
+  bootstrap_evidence_bucket_arn      = "arn:${data.aws_partition.current.partition}:s3:::hindsight-${var.stage}-learning-evidence-${data.aws_caller_identity.current.account_id}"
 }
 
 check "expected_aws_account" {
@@ -63,6 +74,29 @@ check "bootstrap_trust_anchors" {
       var.github_deploy_role_arn == local.expected_deploy_role_arn
     )
     error_message = "Lifecycle trust inputs must use the bootstrap-owned OIDC provider and deployment role in the selected account."
+  }
+}
+
+check "bootstrap_state_bucket_scope" {
+  assert {
+    condition     = var.bootstrap_state_bucket_name == "home-in-cloud-terraform-state-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
+    error_message = "bootstrap_state_bucket_name must use the fixed account and region state-bucket convention."
+  }
+}
+
+check "bootstrap_plan_read_anchors" {
+  assert {
+    condition = (
+      startswith(
+        var.bootstrap_certificate_arn,
+        "arn:${data.aws_partition.current.partition}:acm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:certificate/"
+      ) &&
+      startswith(
+        var.bootstrap_hmac_key_arn,
+        "arn:${data.aws_partition.current.partition}:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:key/"
+      )
+    )
+    error_message = "Bootstrap plan reads must stay in the selected account and region."
   }
 }
 
@@ -282,10 +316,158 @@ data "aws_iam_policy_document" "github_assume" {
   }
 }
 
+data "aws_iam_policy_document" "github_bootstrap_plan_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [var.github_oidc_provider_arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"]
+    }
+  }
+}
+
 resource "aws_iam_role" "github_lifecycle" {
   name                 = "hindsight-github-lifecycle"
   assume_role_policy   = data.aws_iam_policy_document.github_assume.json
   max_session_duration = 3600
+}
+
+resource "aws_iam_role" "github_bootstrap_plan" {
+  name                 = "hindsight-github-bootstrap-plan"
+  assume_role_policy   = data.aws_iam_policy_document.github_bootstrap_plan_assume.json
+  max_session_duration = 3600
+}
+
+data "aws_iam_policy_document" "github_bootstrap_plan" {
+  statement {
+    sid       = "CallerIdentity"
+    actions   = ["sts:GetCallerIdentity"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "BootstrapStateRead"
+    actions   = ["s3:GetObject"]
+    resources = [local.bootstrap_state_object_arn]
+  }
+
+  statement {
+    sid       = "BootstrapStateList"
+    actions   = ["s3:ListBucket"]
+    resources = [local.bootstrap_state_bucket_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "s3:prefix"
+      values = [
+        local.bootstrap_state_key,
+        "env:/",
+      ]
+    }
+  }
+
+  statement {
+    sid = "BootstrapStateLock"
+    actions = [
+      "s3:DeleteObject",
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = [local.bootstrap_state_lock_object_arn]
+  }
+
+  statement {
+    sid = "BootstrapArchiveRead"
+    actions = [
+      "s3:GetAccelerateConfiguration",
+      "s3:GetBucketAcl",
+      "s3:GetBucketCORS",
+      "s3:GetBucketLocation",
+      "s3:GetBucketLogging",
+      "s3:GetBucketObjectLockConfiguration",
+      "s3:GetBucketOwnershipControls",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketPublicAccessBlock",
+      "s3:GetBucketRequestPayment",
+      "s3:GetBucketTagging",
+      "s3:GetBucketVersioning",
+      "s3:GetBucketWebsite",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetLifecycleConfiguration",
+      "s3:GetReplicationConfiguration",
+      "s3:ListBucket",
+    ]
+    resources = [local.bootstrap_evidence_bucket_arn]
+  }
+
+  statement {
+    sid = "BootstrapRoleRead"
+    actions = [
+      "iam:GetRole",
+      "iam:GetRolePolicy",
+      "iam:ListAttachedRolePolicies",
+      "iam:ListRolePolicies",
+      "iam:ListRoleTags",
+    ]
+    resources = local.bootstrap_role_arns
+  }
+
+  statement {
+    sid = "BootstrapManagedPolicyRead"
+    actions = [
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+      "iam:ListPolicyTags",
+    ]
+    resources = [local.bootstrap_observability_policy_arn]
+  }
+
+  statement {
+    sid = "BootstrapCertificateRead"
+    actions = [
+      "acm:DescribeCertificate",
+      "acm:ListTagsForCertificate",
+    ]
+    resources = [var.bootstrap_certificate_arn]
+  }
+
+  statement {
+    sid = "BootstrapKeyRead"
+    actions = [
+      "kms:DescribeKey",
+      "kms:GetKeyPolicy",
+      "kms:GetKeyRotationStatus",
+      "kms:ListResourceTags",
+    ]
+    resources = [var.bootstrap_hmac_key_arn]
+  }
+
+  statement {
+    sid       = "BootstrapAliasRead"
+    actions   = ["kms:ListAliases"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "github_bootstrap_plan" {
+  role   = aws_iam_role.github_bootstrap_plan.id
+  policy = data.aws_iam_policy_document.github_bootstrap_plan.json
+
+  lifecycle {
+    precondition {
+      condition     = length(regexall("\\S", data.aws_iam_policy_document.github_bootstrap_plan.json)) <= 10240
+      error_message = "The bootstrap planning inline policy exceeds the IAM role-policy quota."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "lifecycle_export_replication_assume" {

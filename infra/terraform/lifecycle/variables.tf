@@ -48,6 +48,36 @@ variable "github_deploy_role_arn" {
   }
 }
 
+variable "bootstrap_state_bucket_name" {
+  description = "Existing account-scoped S3 bucket that owns the bootstrap Terraform state."
+  type        = string
+
+  validation {
+    condition     = can(regex("^home-in-cloud-terraform-state-[0-9]{12}-us-east-1$", var.bootstrap_state_bucket_name))
+    error_message = "bootstrap_state_bucket_name must identify the fixed us-east-1 account state bucket."
+  }
+}
+
+variable "bootstrap_certificate_arn" {
+  description = "Existing bootstrap-owned ACM certificate read during full bootstrap planning."
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:[a-z0-9-]+:acm:us-east-1:[0-9]{12}:certificate/[0-9a-f-]{36}$", var.bootstrap_certificate_arn))
+    error_message = "bootstrap_certificate_arn must identify one us-east-1 ACM certificate."
+  }
+}
+
+variable "bootstrap_hmac_key_arn" {
+  description = "Existing bootstrap-owned HMAC key read during full bootstrap planning."
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:[a-z0-9-]+:kms:us-east-1:[0-9]{12}:key/[0-9a-f-]{36}$", var.bootstrap_hmac_key_arn))
+    error_message = "bootstrap_hmac_key_arn must identify one us-east-1 KMS key."
+  }
+}
+
 variable "github_subjects" {
   description = "Allowed GitHub OIDC subjects for privileged lifecycle operations."
   type        = list(string)

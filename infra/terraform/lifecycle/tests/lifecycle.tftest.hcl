@@ -30,14 +30,203 @@ run "isolated_lifecycle" {
   command = plan
 
   variables {
-    expected_aws_account_id  = "123456789012"
-    github_oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
-    github_deploy_role_arn   = "arn:aws:iam::123456789012:role/hindsight-github-deploy"
+    expected_aws_account_id     = "123456789012"
+    github_oidc_provider_arn    = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    github_deploy_role_arn      = "arn:aws:iam::123456789012:role/hindsight-github-deploy"
+    bootstrap_state_bucket_name = "home-in-cloud-terraform-state-123456789012-us-east-1"
+    bootstrap_certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    bootstrap_hmac_key_arn      = "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000"
   }
 
   assert {
     condition     = aws_iam_role.github_lifecycle.name == "hindsight-github-lifecycle"
     error_message = "Tenant lifecycle operations must use a dedicated GitHub OIDC role."
+  }
+
+  assert {
+    condition = (
+      aws_iam_role.github_bootstrap_plan.name == "hindsight-github-bootstrap-plan" &&
+      aws_iam_role.github_bootstrap_plan.assume_role_policy == data.aws_iam_policy_document.github_bootstrap_plan_assume.json &&
+      length([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan_assume.statement : statement
+        if toset(statement.actions) == toset(["sts:AssumeRoleWithWebIdentity"]) &&
+        statement.effect == null &&
+        statement.not_actions == null &&
+        statement.resources == null &&
+        statement.not_resources == null &&
+        length(statement.principals) == 1 &&
+        length(statement.not_principals) == 0 &&
+        one(statement.principals).type == "Federated" &&
+        toset(one(statement.principals).identifiers) == toset([
+          "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com",
+        ]) &&
+        length(statement.condition) == 2 &&
+        length([
+          for trust_condition in statement.condition : trust_condition
+          if trust_condition.test == "StringEquals" &&
+          trust_condition.variable == "token.actions.githubusercontent.com:aud" &&
+          toset(trust_condition.values) == toset(["sts.amazonaws.com"])
+        ]) == 1 &&
+        length([
+          for trust_condition in statement.condition : trust_condition
+          if trust_condition.test == "StringEquals" &&
+          trust_condition.variable == "token.actions.githubusercontent.com:sub" &&
+          toset(trust_condition.values) == toset([
+            "repo:OCHOLA-EDDYPHIL/hindsight:environment:demo",
+          ])
+        ]) == 1
+      ]) == 1
+    )
+    error_message = "Bootstrap planning must use the exact repository, protected environment, audience, and account OIDC trust."
+  }
+
+  assert {
+    condition = (
+      {
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement :
+        statement.sid => {
+          actions   = toset(statement.actions)
+          resources = toset(statement.resources)
+        }
+        } == {
+        CallerIdentity = {
+          actions   = toset(["sts:GetCallerIdentity"])
+          resources = toset(["*"])
+        }
+        BootstrapStateRead = {
+          actions = toset(["s3:GetObject"])
+          resources = toset([
+            "arn:aws:s3:::home-in-cloud-terraform-state-123456789012-us-east-1/hindsight/bootstrap/terraform.tfstate",
+          ])
+        }
+        BootstrapStateList = {
+          actions = toset(["s3:ListBucket"])
+          resources = toset([
+            "arn:aws:s3:::home-in-cloud-terraform-state-123456789012-us-east-1",
+          ])
+        }
+        BootstrapStateLock = {
+          actions = toset([
+            "s3:DeleteObject",
+            "s3:GetObject",
+            "s3:PutObject",
+          ])
+          resources = toset([
+            "arn:aws:s3:::home-in-cloud-terraform-state-123456789012-us-east-1/hindsight/bootstrap/terraform.tfstate.tflock",
+          ])
+        }
+        BootstrapArchiveRead = {
+          actions = toset([
+            "s3:GetAccelerateConfiguration",
+            "s3:GetBucketAcl",
+            "s3:GetBucketCORS",
+            "s3:GetBucketLocation",
+            "s3:GetBucketLogging",
+            "s3:GetBucketObjectLockConfiguration",
+            "s3:GetBucketOwnershipControls",
+            "s3:GetBucketPolicy",
+            "s3:GetBucketPublicAccessBlock",
+            "s3:GetBucketRequestPayment",
+            "s3:GetBucketTagging",
+            "s3:GetBucketVersioning",
+            "s3:GetBucketWebsite",
+            "s3:GetEncryptionConfiguration",
+            "s3:GetLifecycleConfiguration",
+            "s3:GetReplicationConfiguration",
+            "s3:ListBucket",
+          ])
+          resources = toset([
+            "arn:aws:s3:::hindsight-demo-learning-evidence-123456789012",
+          ])
+        }
+        BootstrapRoleRead = {
+          actions = toset([
+            "iam:GetRole",
+            "iam:GetRolePolicy",
+            "iam:ListAttachedRolePolicies",
+            "iam:ListRolePolicies",
+            "iam:ListRoleTags",
+          ])
+          resources = toset([
+            "arn:aws:iam::123456789012:role/hindsight-github-deploy",
+            "arn:aws:iam::123456789012:role/hindsight-github-evidence",
+            "arn:aws:iam::123456789012:role/hindsight-github-observability-evidence",
+          ])
+        }
+        BootstrapManagedPolicyRead = {
+          actions = toset([
+            "iam:GetPolicy",
+            "iam:GetPolicyVersion",
+            "iam:ListPolicyTags",
+          ])
+          resources = toset([
+            "arn:aws:iam::123456789012:policy/hindsight-github-deploy-observability",
+          ])
+        }
+        BootstrapCertificateRead = {
+          actions = toset([
+            "acm:DescribeCertificate",
+            "acm:ListTagsForCertificate",
+          ])
+          resources = toset([
+            "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000",
+          ])
+        }
+        BootstrapKeyRead = {
+          actions = toset([
+            "kms:DescribeKey",
+            "kms:GetKeyPolicy",
+            "kms:GetKeyRotationStatus",
+            "kms:ListResourceTags",
+          ])
+          resources = toset([
+            "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000",
+          ])
+        }
+        BootstrapAliasRead = {
+          actions   = toset(["kms:ListAliases"])
+          resources = toset(["*"])
+        }
+      } &&
+      alltrue([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement :
+        statement.effect == null &&
+        statement.not_actions == null &&
+        statement.not_resources == null &&
+        length(statement.principals) == 0 &&
+        length(statement.not_principals) == 0
+      ])
+    )
+    error_message = "Bootstrap planning must expose only the exact reviewed action and resource allowlist."
+  }
+
+  assert {
+    condition = (
+      length(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement : statement
+        if statement.sid == "BootstrapStateList"
+      ]).condition) == 1 &&
+      one(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement : statement
+        if statement.sid == "BootstrapStateList"
+      ]).condition).test == "StringEquals" &&
+      one(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement : statement
+        if statement.sid == "BootstrapStateList"
+      ]).condition).variable == "s3:prefix" &&
+      toset(one(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement : statement
+        if statement.sid == "BootstrapStateList"
+        ]).condition).values) == toset([
+        "env:/",
+        "hindsight/bootstrap/terraform.tfstate",
+      ]) &&
+      length([
+        for statement in data.aws_iam_policy_document.github_bootstrap_plan.statement : statement
+        if statement.sid != "BootstrapStateList" && length(statement.condition) > 0
+      ]) == 0
+    )
+    error_message = "Bootstrap state listing must be limited to the exact state key and Terraform's default-workspace enumeration prefix."
   }
 
   assert {
@@ -263,6 +452,9 @@ run "cold_region_recovery_profile" {
     expected_aws_account_id             = "123456789012"
     github_oidc_provider_arn            = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
     github_deploy_role_arn              = "arn:aws:iam::123456789012:role/hindsight-github-deploy"
+    bootstrap_state_bucket_name         = "home-in-cloud-terraform-state-123456789012-us-east-1"
+    bootstrap_certificate_arn           = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    bootstrap_hmac_key_arn              = "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000"
     enable_cold_region_recovery_profile = true
     cold_region_recovery_region         = "eu-west-1"
   }

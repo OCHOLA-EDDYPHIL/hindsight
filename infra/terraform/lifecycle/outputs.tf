@@ -2,6 +2,10 @@ output "github_lifecycle_role_arn" {
   value = aws_iam_role.github_lifecycle.arn
 }
 
+output "github_bootstrap_plan_role_arn" {
+  value = aws_iam_role.github_bootstrap_plan.arn
+}
+
 output "lifecycle_database_url_parameter_name" {
   value = var.lifecycle_database_url_parameter_name
 }

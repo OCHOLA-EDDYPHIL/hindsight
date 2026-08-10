@@ -445,9 +445,11 @@ def test_lifecycle_terraform_ownership_is_cloudflare_free_and_non_overlapping():
         'resource "aws_s3_bucket_lifecycle_configuration" '
         '"tenant_lifecycle_recovery"',
         'resource "aws_iam_role" "github_lifecycle"',
+        'resource "aws_iam_role" "github_bootstrap_plan"',
         'resource "aws_iam_role" "lifecycle_export_replication"',
         'resource "aws_iam_role_policy" "lifecycle_export_replication"',
         'resource "aws_iam_role_policy" "github_lifecycle"',
+        'resource "aws_iam_role_policy" "github_bootstrap_plan"',
         'resource "aws_s3_bucket_policy" "tenant_lifecycle_exports"',
         'resource "aws_s3_bucket_policy" "tenant_lifecycle_recovery"',
         'resource "aws_s3_bucket_replication_configuration" '
@@ -466,9 +468,19 @@ def test_lifecycle_terraform_ownership_is_cloudflare_free_and_non_overlapping():
     assert 'variable "github_oidc_provider_arn"' in lifecycle_variables
     assert 'output "github_oidc_provider_arn"' in bootstrap_outputs
     assert 'variable "github_deploy_role_arn"' in lifecycle_variables
+    assert 'variable "bootstrap_state_bucket_name"' in lifecycle_variables
+    assert 'variable "bootstrap_certificate_arn"' in lifecycle_variables
+    assert 'variable "bootstrap_hmac_key_arn"' in lifecycle_variables
     assert "aws_ssm_parameter" not in lifecycle
     assert 'output "lifecycle_database_url_parameter_name"' in lifecycle_outputs
     assert 'output "lifecycle_database_url_parameter_arn"' in lifecycle_outputs
+    assert 'output "github_bootstrap_plan_role_arn"' in lifecycle_outputs
+    assert 'name                 = "hindsight-github-bootstrap-plan"' in lifecycle
+    assert 'data "aws_iam_policy_document" "github_bootstrap_plan_assume"' in lifecycle
+    assert 'values   = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"]' in lifecycle
+    assert 'sid       = "BootstrapStateRead"' in lifecycle
+    assert 'sid = "BootstrapStateLock"' in lifecycle
+    assert "iam:PutRolePolicy" not in lifecycle
     assert 'key          = "hindsight/demo/lifecycle/terraform.tfstate"' in (
         lifecycle_versions
     )
