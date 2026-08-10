@@ -29,9 +29,10 @@ def test_governed_operation_idempotency_is_tenant_scoped_and_restart_safe():
     source = (ROOT / "src" / "hindsight" / "operations.py").read_text()
 
     assert (
-        "DROP INDEX IF EXISTS memory_operations@memory_operations_idempotency_idx CASCADE"
+        "DROP INDEX IF EXISTS memory_operations@memory_operations_idempotency_idx;"
         in migration
     )
+    assert "CASCADE" not in migration
     assert "CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_tenant_idempotency_idx" in migration
     assert "ON memory_operations (tenant_id, idempotency_key)" in migration
     assert "WHERE idempotency_key IS NOT NULL" in migration
