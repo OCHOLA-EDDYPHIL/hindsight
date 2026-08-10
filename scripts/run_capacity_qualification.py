@@ -6,9 +6,11 @@ import argparse
 import hashlib
 import json
 import math
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -38,6 +40,7 @@ MAX_DURATION_SECONDS = 1_200
 MAX_STORAGE_BYTES = 1_500_000_000
 MAX_EXTERNAL_COST_USD = 0
 MAX_CLIENTS = 20
+MAX_CLEANUP_SECONDS = 120
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]{8,20}")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DATABASE_PREFIX = "hindsight_capacity_"
@@ -143,14 +146,27 @@ def _create_database(admin_url: str, database: str, deadline: Deadline) -> None:
         conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
 
 
-def _drop_database(admin_url: str, database: str) -> None:
+def _drop_database(admin_url: str, database: str, deadline: Deadline) -> None:
     if not _is_disposable(database):
         raise RuntimeError("refusing to drop a non-capacity database")
-    with psycopg.connect(admin_url, autocommit=True, connect_timeout=5) as conn:
+    with psycopg.connect(
+        admin_url,
+        autocommit=True,
+        connect_timeout=min(5, deadline.remaining(MAX_CLEANUP_SECONDS)),
+        application_name="hindsight-capacity-cleanup",
+    ) as conn:
+        _refresh_cleanup_timeouts(conn, deadline)
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database)))
+        _refresh_cleanup_timeouts(conn, deadline)
         remaining = {str(row[0]) for row in conn.execute("SHOW DATABASES").fetchall()}
     if database in remaining:
         raise RuntimeError("disposable capacity database still exists after cleanup")
+
+
+def _refresh_cleanup_timeouts(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    timeout = f"{deadline.remaining(MAX_CLEANUP_SECONDS) * 1000}ms"
+    conn.execute("SELECT set_config('statement_timeout', %s, false)", (timeout,))
+    conn.execute("SELECT set_config('lock_timeout', %s, false)", (timeout,))
 
 
 def _migrate(database_url: str, deadline: Deadline) -> None:
@@ -184,6 +200,7 @@ def _namespace(number: int) -> str:
 
 def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
     started = time.monotonic()
+    storage_checks: list[dict[str, int]] = []
     with _connection(database_url, deadline) as conn:
         conn.execute(
             """
@@ -269,7 +286,14 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
                 (tenant_id, PROFILE_ID, namespace, _vector(number)),
             )
             conn.execute("DROP TABLE capacity_seed")
-    return {"name": "vector_seed", "duration_seconds": round(time.monotonic() - started, 6)}
+            storage_checks.append(_check_storage(database_url, deadline, tenants_seeded=number))
+    return {
+        "name": "vector_seed",
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "batches": TARGETS["tenants"],
+        "storage_checks": storage_checks,
+        "peak_storage_bytes": max(row["bytes"] for row in storage_checks),
+    }
 
 
 def _counts(
@@ -339,15 +363,43 @@ def _exercise_clients(database_url: str, run_id: str, deadline: Deadline) -> lis
 
 def _exercise_backlog() -> dict[str, Any]:
     started = time.monotonic()
-    messages = tuple(range(TARGETS["backlog_messages"]))
-    partitions = [messages[number::MAX_CLIENTS] for number in range(MAX_CLIENTS)]
+    backlog: queue.Queue[int] = queue.Queue(maxsize=TARGETS["backlog_messages"])
+    observed_max_pending = 0
+    for message_id in range(TARGETS["backlog_messages"]):
+        backlog.put_nowait(message_id)
+        observed_max_pending = max(observed_max_pending, backlog.qsize())
+    pending_before_drain = backlog.qsize()
+    ready = threading.Barrier(MAX_CLIENTS)
+    initial_reads = threading.Barrier(MAX_CLIENTS)
+
+    def drain() -> int:
+        ready.wait(timeout=10)
+        backlog.get_nowait()
+        backlog.task_done()
+        count = 1
+        initial_reads.wait(timeout=10)
+        while True:
+            try:
+                backlog.get_nowait()
+            except queue.Empty:
+                return count
+            backlog.task_done()
+            count += 1
+
     with ThreadPoolExecutor(max_workers=MAX_CLIENTS) as executor:
-        counts = list(executor.map(len, partitions))
+        counts = list(executor.map(lambda _client: drain(), range(MAX_CLIENTS)))
+    backlog.join()
+    pending_after_drain = backlog.qsize()
     return {
-        "messages_enqueued": len(messages),
+        "queue_capacity": TARGETS["backlog_messages"],
+        "messages_enqueued": TARGETS["backlog_messages"],
+        "messages_drained": sum(counts),
         "messages_accounted_for": sum(counts),
         "clients": len(counts),
         "per_client_counts": counts,
+        "pending_before_drain": pending_before_drain,
+        "pending_after_drain": pending_after_drain,
+        "observed_max_pending": observed_max_pending,
         "duration_seconds": round(time.monotonic() - started, 6),
         "live_worker_invocations": 0,
         "paid_model_calls": 0,
@@ -364,6 +416,18 @@ def _storage_bytes(database_url: str, deadline: Deadline) -> int:
             ).format(sql.Identifier(database))
         ).fetchone()
     return int(row[0])
+
+
+def _check_storage(
+    database_url: str, deadline: Deadline, *, tenants_seeded: int
+) -> dict[str, int]:
+    storage_bytes = _storage_bytes(database_url, deadline)
+    observation = {"tenants_seeded": tenants_seeded, "bytes": storage_bytes}
+    if storage_bytes > MAX_STORAGE_BYTES:
+        raise RuntimeError(
+            f"capacity qualification exceeded its storage ceiling after tenant {tenants_seeded}"
+        )
+    return observation
 
 
 def _run(
@@ -456,7 +520,7 @@ def main() -> int:
         cleanup_error: str | None = None
         try:
             if created:
-                _drop_database(admin_url, database)
+                _drop_database(admin_url, database, Deadline.after(MAX_CLEANUP_SECONDS))
         except Exception as error:  # cleanup evidence must survive the primary failure
             cleanup_error = f"{type(error).__name__}: {error}"
         cleanup = {
@@ -466,6 +530,7 @@ def main() -> int:
             "started_at": cleanup_started,
             "completed_at": _timestamp(),
             "database_removed": created and cleanup_error is None,
+            "timeout_seconds": MAX_CLEANUP_SECONDS,
             "error": cleanup_error,
         }
         _write_json(args.output_dir / "cleanup.json", cleanup)

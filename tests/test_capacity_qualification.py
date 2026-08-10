@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,16 @@ def _report(validator):
             "live_worker_invocations": 0,
         },
         "raw_measurements": [
-            {"name": "vector_seed", "duration_seconds": 1},
+            {
+                "name": "vector_seed",
+                "duration_seconds": 1,
+                "batches": 20,
+                "storage_checks": [
+                    {"tenants_seeded": number, "bytes": number * 1_000}
+                    for number in range(1, 21)
+                ],
+                "peak_storage_bytes": 20_000,
+            },
             {
                 "name": "vector_counts",
                 "total": 100_000,
@@ -74,7 +84,12 @@ def _report(validator):
             {
                 "name": "synthetic_backlog",
                 "messages_enqueued": 1_000,
+                "messages_drained": 1_000,
                 "messages_accounted_for": 1_000,
+                "queue_capacity": 1_000,
+                "pending_before_drain": 1_000,
+                "pending_after_drain": 0,
+                "observed_max_pending": 1_000,
                 "clients": 20,
                 "per_client_counts": [50] * 20,
                 "live_worker_invocations": 0,
@@ -107,7 +122,11 @@ def test_producer_is_exact_bounded_and_deterministic():
     assert vector.count("1") == 1
     backlog = producer._exercise_backlog()
     assert backlog["messages_enqueued"] == backlog["messages_accounted_for"] == 1_000
+    assert backlog["messages_drained"] == 1_000
+    assert backlog["pending_before_drain"] == backlog["observed_max_pending"] == 1_000
+    assert backlog["pending_after_drain"] == 0
     assert backlog["clients"] == 20
+    assert all(count > 0 for count in backlog["per_client_counts"])
     assert backlog["live_worker_invocations"] == backlog["paid_model_calls"] == 0
 
 
@@ -135,6 +154,7 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
         "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
     }
     digests = {
         "index-qualification.json": "b" * 64,
@@ -155,11 +175,24 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
 
     qualification["vector_count"] = 99_999
     with pytest.raises(ValueError, match="exact populated target"):
-        validator.validate(report, source_revision=SOURCE_SHA, qualification=qualification)
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
     qualification["vector_count"] = 100_000
     qualification["plans"].pop()
     with pytest.raises(ValueError, match="twenty bounded clients"):
-        validator.validate(report, source_revision=SOURCE_SHA, qualification=qualification)
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+    qualification = _qualification(validator)
     with pytest.raises(ValueError, match="cleanup"):
         validator.validate(
             report,
@@ -169,11 +202,158 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
                 "database": "hindsight_capacity_abcdefgh",
                 "database_removed": False,
                 "source_revision": SOURCE_SHA,
+                "timeout_seconds": 120,
             },
+            qualification=qualification,
+            artifact_digests=digests,
         )
     report["ceilings"] = {**validator.EXPECTED_CEILINGS, "clients": 21}
     with pytest.raises(ValueError, match="hard ceilings"):
-        validator.validate(report, source_revision=SOURCE_SHA)
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+
+def test_validator_requires_bound_supplemental_artifacts():
+    validator = _script("validate_capacity_evidence")
+
+    with pytest.raises(ValueError, match="requires qualification, cleanup, and artifact"):
+        validator.validate(_report(validator), source_revision=SOURCE_SHA)
+
+
+def test_validator_rejects_unobserved_backlog_and_seed_storage():
+    validator = _script("validate_capacity_evidence")
+    qualification = _qualification(validator)
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    digests = {
+        "index-qualification.json": "b" * 64,
+        "capacity-report.json": "c" * 64,
+        "cleanup.json": "d" * 64,
+    }
+    report = _report(validator)
+    backlog = next(row for row in report["raw_measurements"] if row["name"] == "synthetic_backlog")
+    backlog["observed_max_pending"] = 999
+    with pytest.raises(ValueError, match="synthetic backlog"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    seed = next(row for row in report["raw_measurements"] if row["name"] == "vector_seed")
+    seed["storage_checks"][-1]["bytes"] = validator.EXPECTED_CEILINGS["storage_bytes"] + 1
+    seed["peak_storage_bytes"] = seed["storage_checks"][-1]["bytes"]
+    with pytest.raises(ValueError, match="enforced storage ceiling"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+
+def test_storage_is_checked_during_seeding_and_fails_at_ceiling(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    measurements = iter([producer.MAX_STORAGE_BYTES, producer.MAX_STORAGE_BYTES + 1])
+    monkeypatch.setattr(producer, "_storage_bytes", lambda *_args: next(measurements))
+    deadline = SimpleNamespace()
+
+    assert producer._check_storage("postgresql://db", deadline, tenants_seeded=1) == {
+        "tenants_seeded": 1,
+        "bytes": producer.MAX_STORAGE_BYTES,
+    }
+    with pytest.raises(RuntimeError, match="after tenant 2"):
+        producer._check_storage("postgresql://db", deadline, tenants_seeded=2)
+
+
+def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    calls = []
+
+    class Result:
+        def fetchall(self):
+            return [("defaultdb",)]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            calls.append((str(query), params))
+            return Result()
+
+    def connect(url, **kwargs):
+        assert url == "postgresql://root@localhost/defaultdb"
+        assert kwargs["connect_timeout"] == 5
+        assert kwargs["application_name"] == "hindsight-capacity-cleanup"
+        return Connection()
+
+    monkeypatch.setattr(producer.psycopg, "connect", connect)
+    deadline = SimpleNamespace(remaining=lambda maximum: 7)
+    producer._drop_database(
+        "postgresql://root@localhost/defaultdb",
+        "hindsight_capacity_abcdefgh",
+        deadline,
+    )
+
+    assert ("SELECT set_config('statement_timeout', %s, false)", ("7000ms",)) in calls
+    assert ("SELECT set_config('lock_timeout', %s, false)", ("7000ms",)) in calls
+
+
+def test_primary_failure_preserves_bounded_cleanup_receipt(tmp_path, monkeypatch):
+    producer = _script("run_capacity_qualification")
+    monkeypatch.setattr(producer, "_verify_checkout", lambda _source_sha: None)
+    monkeypatch.setattr(producer, "_create_database", lambda *_args: None)
+    monkeypatch.setattr(
+        producer,
+        "_run",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("qualification failed")),
+    )
+    monkeypatch.setattr(
+        producer,
+        "_drop_database",
+        lambda *_args: (_ for _ in ()).throw(TimeoutError("cleanup deadline")),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_capacity_qualification.py",
+            "--admin-url",
+            "postgresql://root@localhost/defaultdb",
+            "--run-id",
+            "abcdefgh",
+            "--source-sha",
+            SOURCE_SHA,
+            "--output-dir",
+            str(tmp_path),
+            "--timeout-seconds",
+            "60",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="qualification failed"):
+        producer.main()
+    receipt = json.loads((tmp_path / "cleanup.json").read_text())
+    assert receipt["database_removed"] is False
+    assert receipt["timeout_seconds"] == producer.MAX_CLEANUP_SECONDS
+    assert receipt["error"] == "TimeoutError: cleanup deadline"
 
 
 def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):
@@ -184,6 +364,7 @@ def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
         "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
     }
     qualification_path = tmp_path / "index-qualification.json"
     cleanup_path = tmp_path / "cleanup.json"

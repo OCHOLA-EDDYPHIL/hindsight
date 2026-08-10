@@ -45,6 +45,23 @@ def _validate_measurements(rows: list[Any]) -> None:
         "total",
     }:
         raise ValueError("capacity evidence does not contain the complete measurement set")
+    seed = values["vector_seed"]
+    storage_checks = seed.get("storage_checks")
+    if (
+        seed.get("batches") != TARGETS["tenants"]
+        or not isinstance(storage_checks, list)
+        or len(storage_checks) != TARGETS["tenants"]
+        or [row.get("tenants_seeded") for row in storage_checks if isinstance(row, dict)]
+        != list(range(1, TARGETS["tenants"] + 1))
+        or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("bytes"), int)
+            or not 0 <= row["bytes"] <= EXPECTED_CEILINGS["storage_bytes"]
+            for row in storage_checks
+        )
+        or seed.get("peak_storage_bytes") != max(row["bytes"] for row in storage_checks)
+    ):
+        raise ValueError("capacity seeding does not prove the enforced storage ceiling")
     counts = values["vector_counts"]
     per_tenant = counts.get("per_tenant")
     if (
@@ -73,13 +90,18 @@ def _validate_measurements(rows: list[Any]) -> None:
     per_client = backlog.get("per_client_counts")
     if (
         backlog.get("messages_enqueued") != TARGETS["backlog_messages"]
+        or backlog.get("messages_drained") != TARGETS["backlog_messages"]
         or backlog.get("messages_accounted_for") != TARGETS["backlog_messages"]
+        or backlog.get("queue_capacity") != TARGETS["backlog_messages"]
+        or backlog.get("pending_before_drain") != TARGETS["backlog_messages"]
+        or backlog.get("pending_after_drain") != 0
+        or backlog.get("observed_max_pending") != TARGETS["backlog_messages"]
         or backlog.get("clients") != TARGETS["clients"]
         or backlog.get("live_worker_invocations") != 0
         or backlog.get("paid_model_calls") != 0
         or not isinstance(per_client, list)
         or len(per_client) != TARGETS["clients"]
-        or any(not isinstance(count, int) or count < 0 for count in per_client)
+        or any(not isinstance(count, int) or count <= 0 for count in per_client)
         or sum(per_client) != TARGETS["backlog_messages"]
     ):
         raise ValueError("capacity measurements do not prove the isolated synthetic backlog")
@@ -102,6 +124,10 @@ def validate(
     cleanup: dict[str, Any] | None = None,
     artifact_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if qualification is None or cleanup is None or artifact_digests is None:
+        raise ValueError(
+            "capacity validation requires qualification, cleanup, and artifact manifest evidence"
+        )
     if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
         raise ValueError("source revision must be a full lowercase Git SHA")
     qualification_link = document.get("index_qualification") or {}
@@ -138,52 +164,51 @@ def validate(
         raise ValueError("capacity evidence requires explicit limitations")
     if "not production SLO claims" not in " ".join(map(str, limitations)):
         raise ValueError("capacity evidence must reject production SLO interpretation")
-    if qualification is not None:
-        if (
-            qualification.get("schema_version") != SCHEMA_VERSION
-            or qualification.get("qualified") is not True
-            or qualification.get("main_sha") != source_revision
-            or qualification.get("index") != EXPECTED_INDEX
-            or qualification.get("vector_dimensions") != 1024
-            or qualification.get("vector_count") != TARGETS["vectors"]
-            or qualification.get("tenant_count") != TARGETS["tenants"]
-        ):
-            raise ValueError("index qualification does not prove the exact populated target")
-        counts = qualification.get("per_tenant_counts")
-        if (
-            not isinstance(counts, list)
-            or len(counts) != TARGETS["tenants"]
-            or any(row.get("vectors") != 5_000 for row in counts if isinstance(row, dict))
-            or any(not isinstance(row, dict) for row in counts)
-        ):
-            raise ValueError("index qualification has invalid per-tenant counts")
-        plans = qualification.get("plans")
-        if (
-            not isinstance(plans, list)
-            or len(plans) != TARGETS["clients"]
-            or {row.get("client") for row in plans if isinstance(row, dict)} != set(range(1, 21))
-            or any(
-                not isinstance(row, dict) or row.get("qualified_index") != EXPECTED_INDEX
-                for row in plans
-            )
-        ):
-            raise ValueError("index qualification does not prove twenty bounded clients")
-        measured = _measurement_map(measurements)
-        if counts != measured["vector_counts"].get("per_tenant"):
-            raise ValueError("capacity report vector counts differ from index qualification")
-        if plans != measured["bounded_clients"].get("clients"):
-            raise ValueError("capacity report client plans differ from index qualification")
-    if cleanup is not None and (
+    if (
+        qualification.get("schema_version") != SCHEMA_VERSION
+        or qualification.get("qualified") is not True
+        or qualification.get("main_sha") != source_revision
+        or qualification.get("index") != EXPECTED_INDEX
+        or qualification.get("vector_dimensions") != 1024
+        or qualification.get("vector_count") != TARGETS["vectors"]
+        or qualification.get("tenant_count") != TARGETS["tenants"]
+    ):
+        raise ValueError("index qualification does not prove the exact populated target")
+    counts = qualification.get("per_tenant_counts")
+    if (
+        not isinstance(counts, list)
+        or len(counts) != TARGETS["tenants"]
+        or any(row.get("vectors") != 5_000 for row in counts if isinstance(row, dict))
+        or any(not isinstance(row, dict) for row in counts)
+    ):
+        raise ValueError("index qualification has invalid per-tenant counts")
+    plans = qualification.get("plans")
+    if (
+        not isinstance(plans, list)
+        or len(plans) != TARGETS["clients"]
+        or {row.get("client") for row in plans if isinstance(row, dict)} != set(range(1, 21))
+        or any(
+            not isinstance(row, dict) or row.get("qualified_index") != EXPECTED_INDEX
+            for row in plans
+        )
+    ):
+        raise ValueError("index qualification does not prove twenty bounded clients")
+    measured = _measurement_map(measurements)
+    if counts != measured["vector_counts"].get("per_tenant"):
+        raise ValueError("capacity report vector counts differ from index qualification")
+    if plans != measured["bounded_clients"].get("clients"):
+        raise ValueError("capacity report client plans differ from index qualification")
+    if (
         cleanup.get("schema_version") != SCHEMA_VERSION
         or not str(cleanup.get("database", "")).startswith("hindsight_capacity_")
         or cleanup.get("database_removed") is not True
         or cleanup.get("source_revision") != source_revision
+        or cleanup.get("timeout_seconds") != 120
     ):
         raise ValueError("capacity evidence requires verified disposable-state cleanup")
-    if artifact_digests is not None:
-        expected_names = {"index-qualification.json", "capacity-report.json", "cleanup.json"}
-        if set(artifact_digests) != expected_names:
-            raise ValueError("capacity artifact manifest is incomplete")
+    expected_names = {"index-qualification.json", "capacity-report.json", "cleanup.json"}
+    if set(artifact_digests) != expected_names:
+        raise ValueError("capacity artifact manifest is incomplete")
     return {
         **document,
         "kind": "bounded_capacity_evidence",
@@ -196,37 +221,33 @@ def main() -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--qualification", type=Path)
-    parser.add_argument("--cleanup", type=Path)
-    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--qualification", type=Path, required=True)
+    parser.add_argument("--cleanup", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args()
-    supplemental = (args.qualification, args.cleanup, args.manifest)
-    if any(supplemental) and not all(supplemental):
-        raise ValueError("qualification, cleanup, and manifest must be supplied together")
     document = json.loads(args.input.read_text())
-    qualification = json.loads(args.qualification.read_text()) if args.qualification else None
-    cleanup = json.loads(args.cleanup.read_text()) if args.cleanup else None
-    manifest = json.loads(args.manifest.read_text()) if args.manifest else None
+    qualification = json.loads(args.qualification.read_text())
+    cleanup = json.loads(args.cleanup.read_text())
+    manifest = json.loads(args.manifest.read_text())
     digests = manifest.get("artifacts") if isinstance(manifest, dict) else None
-    if args.manifest:
-        actual = {
-            "index-qualification.json": _sha256(args.qualification),
-            "capacity-report.json": _sha256(args.input),
-            "cleanup.json": _sha256(args.cleanup),
-        }
-        if (
-            digests != actual
-            or manifest.get("source_revision") != args.source_revision
-            or manifest.get("schema_version") != SCHEMA_VERSION
-        ):
-            raise ValueError("capacity artifact hashes do not match the supplied files")
-        if (
-            document.get("index_qualification", {}).get("artifact_sha256")
-            != actual["index-qualification.json"]
-        ):
-            raise ValueError("capacity report does not bind the qualification artifact")
-        if document.get("cleanup", {}).get("artifact_sha256") != actual["cleanup.json"]:
-            raise ValueError("capacity report does not bind the cleanup artifact")
+    actual = {
+        "index-qualification.json": _sha256(args.qualification),
+        "capacity-report.json": _sha256(args.input),
+        "cleanup.json": _sha256(args.cleanup),
+    }
+    if (
+        digests != actual
+        or manifest.get("source_revision") != args.source_revision
+        or manifest.get("schema_version") != SCHEMA_VERSION
+    ):
+        raise ValueError("capacity artifact hashes do not match the supplied files")
+    if (
+        document.get("index_qualification", {}).get("artifact_sha256")
+        != actual["index-qualification.json"]
+    ):
+        raise ValueError("capacity report does not bind the qualification artifact")
+    if document.get("cleanup", {}).get("artifact_sha256") != actual["cleanup.json"]:
+        raise ValueError("capacity report does not bind the cleanup artifact")
     report = validate(
         document,
         source_revision=args.source_revision,
