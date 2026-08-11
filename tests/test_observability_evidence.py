@@ -94,7 +94,11 @@ def test_capacity_evidence_requires_bound_supplemental_artifacts():
         "limitations": ["Bounded benchmark evidence; not production SLO claims."],
     }
     with pytest.raises(ValueError, match="requires qualification, cleanup, and artifact"):
-        module.validate(evidence, source_revision=SOURCE_REVISION)
+        module.validate(
+            evidence,
+            source_revision=SOURCE_REVISION,
+            execution_id="capacity_123_1_qualification",
+        )
 
 
 def test_alert_exercise_records_only_acknowledgement_and_revision():
