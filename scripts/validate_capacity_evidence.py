@@ -43,13 +43,20 @@ EXPECTED_FIXTURE_VECTOR_INDEXES = (
 EXPECTED_DATABASE_METHOD = (
     "disposable_local_single_node_cockroachdb_in_memory_2_gib_explicit_memory_budgets"
 )
-SCHEMA_VERSION = "hindsight.capacity_qualification.v4"
-DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v1"
-RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v1"
-INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION = "hindsight.capacity_infrastructure_cleanup.v1"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v5"
+DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v2"
+RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v2"
+INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION = "hindsight.capacity_infrastructure_cleanup.v2"
 EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
-    "image": "cockroachdb/cockroach:v25.4.5",
-    "runner_topology": "owner_runner_dind_inside_sampled_job_cgroup",
+    "image": (
+        "cockroachdb/cockroach@sha256:"
+        "53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+    ),
+    "image_id": (
+        "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+    ),
+    "image_platform": "linux/amd64",
+    "execution_topology": "owner_runner_sibling_dind_capacity_cgroup_v2",
     "start_args": [
         "--store=type=mem,size=2GiB",
         "--cache=128MiB",
@@ -57,8 +64,37 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
         "--max-tsdb-memory=64MiB",
         "--max-go-memory=3GiB",
     ],
-    "runner_memory_max_bytes": 4 * 1024**3,
-    "runner_cpu": {"quota_us": 150_000, "period_us": 100_000},
+    "capacity_boundary": {
+        "cgroup_version": 2,
+        "memory_max_bytes": 4 * 1024**3,
+        "memory_swap_max": "max",
+        "swap_devices": 0,
+        "cpu_quota_us": 150_000,
+        "cpu_period_us": 100_000,
+    },
+    "telemetry_probe": {
+        "image": (
+            "cockroachdb/cockroach@sha256:"
+            "53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+        ),
+        "image_id": (
+            "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+        ),
+        "image_platform": "linux/amd64",
+        "cgroup_namespace": "host",
+        "network": "none",
+        "read_only": True,
+        "user": "65534:65534",
+        "cap_drop": ["ALL"],
+        "no_new_privileges": True,
+        "privileged": False,
+        "workspace_mounts": 0,
+        "pids_limit": 16,
+        "memory_bytes": 32 * 1024**2,
+        "nano_cpus": 100_000_000,
+        "nominal_sample_sleep_seconds": 0.25,
+        "maximum_sample_gap_seconds": 1.0,
+    },
     "memory_bytes": {
         "store": 2 * 1024**3,
         "cache": 128 * 1024**2,
@@ -83,6 +119,9 @@ EXPECTED_LIVE_PROCESS_ARGS = [
     *EXPECTED_PROCESS_ARGS[1:],
 ]
 EXPECTED_EVENT_KEYS = frozenset({"low", "high", "max", "oom", "oom_kill"})
+EXPECTED_BOUNDARY_EVENT_KEYS = frozenset(
+    {"low", "high", "max", "oom", "oom_kill", "oom_group_kill"}
+)
 COMPOSE_PROJECT_PATTERN = re.compile(r"hindsight_capacity_[0-9]+_[0-9]+_(diagnostic|qualification)")
 EXECUTION_ID_PATTERN = re.compile(r"capacity_[0-9]+_1_(diagnostic|qualification)")
 MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES = int(3.25 * 1024**3)
@@ -333,6 +372,7 @@ def _validate_runtime(
     process = runtime.get("effective_process")
     container_cgroup = runtime.get("container_cgroup")
     cgroup = runtime.get("cgroup")
+    boundary = EXPECTED_RUNTIME_MEMORY_ENVELOPE["capacity_boundary"]
     if (
         runtime.get("schema_version") != RUNTIME_SCHEMA_VERSION
         or runtime.get("source_revision") != source_revision
@@ -354,6 +394,7 @@ def _validate_runtime(
             "args",
             "configured_command",
             "image",
+            "cgroup_namespace",
             "compose_project",
             "compose_service",
             "running",
@@ -364,6 +405,7 @@ def _validate_runtime(
         or process.get("args") != EXPECTED_PROCESS_ARGS
         or process.get("configured_command") != EXPECTED_PROCESS_ARGS
         or process.get("image") != EXPECTED_RUNTIME_MEMORY_ENVELOPE["image"]
+        or process.get("cgroup_namespace") != "private"
         or process.get("compose_project") != project
         or process.get("compose_service") != "crdb"
         or process.get("running") is not True
@@ -388,13 +430,15 @@ def _validate_runtime(
         }
         or container_cgroup.get("version") != 2
         or container_cgroup.get("memory_max")
-        not in {"max", EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_memory_max_bytes"]}
+        not in {"max", boundary["memory_max_bytes"]}
         or type(container_cgroup.get("memory_current_bytes")) is not int
         or container_cgroup["memory_current_bytes"] < 0
         or type(container_cgroup.get("memory_peak_bytes")) is not int
         or not 0
-        < container_cgroup["memory_peak_bytes"]
-        < EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_memory_max_bytes"]
+        <= container_cgroup["memory_current_bytes"]
+        <= container_cgroup["memory_peak_bytes"]
+        < boundary["memory_max_bytes"]
+        or container_cgroup["memory_peak_bytes"] == 0
         or not isinstance(container_events, dict)
         or not EXPECTED_EVENT_KEYS.issubset(container_events)
         or any(type(value) is not int or value != 0 for value in container_events.values())
@@ -402,13 +446,32 @@ def _validate_runtime(
         raise ValueError("capacity runtime container cgroup recorded memory pressure")
     expected_cgroup_keys = {
         "version",
+        "scope",
+        "source",
         "memory_max_bytes",
+        "memory_swap_max",
+        "memory_swap_current_before_bytes",
+        "memory_swap_current_after_bytes",
+        "swap_devices_before",
+        "swap_devices_after",
         "cpu_quota_us",
         "cpu_period_us",
         "memory_current_before_bytes",
         "memory_current_after_bytes",
         "kernel_memory_peak_before_bytes",
         "kernel_memory_peak_after_bytes",
+        "nominal_sample_sleep_seconds",
+        "maximum_sample_gap_seconds",
+        "observed_max_sample_gap_ns",
+        "sampling_elapsed_ns",
+        "baseline_sequence",
+        "baseline_monotonic_ns",
+        "workload_stop_observed_monotonic_ns",
+        "workload_last_sequence",
+        "workload_last_monotonic_ns",
+        "post_teardown_observed_monotonic_ns",
+        "post_teardown_sample_monotonic_ns",
+        "final_snapshot_monotonic_ns",
         "sample_count",
         "sampled_peak_bytes",
         "events_before",
@@ -424,26 +487,78 @@ def _validate_runtime(
         "memory_current_after_bytes",
         "kernel_memory_peak_before_bytes",
         "kernel_memory_peak_after_bytes",
+        "memory_swap_current_before_bytes",
+        "memory_swap_current_after_bytes",
+        "swap_devices_before",
+        "swap_devices_after",
         "sample_count",
         "sampled_peak_bytes",
+        "observed_max_sample_gap_ns",
+        "sampling_elapsed_ns",
+        "baseline_sequence",
+        "baseline_monotonic_ns",
+        "workload_stop_observed_monotonic_ns",
+        "workload_last_sequence",
+        "workload_last_monotonic_ns",
+        "post_teardown_observed_monotonic_ns",
+        "post_teardown_sample_monotonic_ns",
+        "final_snapshot_monotonic_ns",
     )
     if (
         set(cgroup) != expected_cgroup_keys
         or cgroup.get("version") != 2
-        or cgroup.get("memory_max_bytes")
-        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_memory_max_bytes"]
-        or cgroup.get("cpu_quota_us") != EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_cpu"]["quota_us"]
-        or cgroup.get("cpu_period_us")
-        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_cpu"]["period_us"]
+        or cgroup.get("scope") != "sibling_dind_daemon_and_descendants"
+        or cgroup.get("source") != "sandboxed_cgroupns_host_probe"
+        or cgroup.get("memory_max_bytes") != boundary["memory_max_bytes"]
+        or cgroup.get("memory_swap_max") != boundary["memory_swap_max"]
+        or cgroup.get("cpu_quota_us") != boundary["cpu_quota_us"]
+        or cgroup.get("cpu_period_us") != boundary["cpu_period_us"]
+        or cgroup.get("nominal_sample_sleep_seconds") != 0.25
+        or cgroup.get("maximum_sample_gap_seconds") != 1.0
         or any(type(cgroup.get(key)) is not int or cgroup[key] < 0 for key in integer_fields)
-        or cgroup["sample_count"] <= 0
+        or cgroup["memory_swap_current_before_bytes"] != 0
+        or cgroup["memory_swap_current_after_bytes"] != 0
+        or cgroup["swap_devices_before"] != boundary["swap_devices"]
+        or cgroup["swap_devices_after"] != boundary["swap_devices"]
+        or cgroup["memory_current_before_bytes"] > boundary["memory_max_bytes"]
+        or cgroup["memory_current_after_bytes"] > boundary["memory_max_bytes"]
+        or not 3 <= cgroup["sample_count"] <= 7_201
+        or cgroup["baseline_sequence"] != 0
+        or not 0 < cgroup["observed_max_sample_gap_ns"] <= 1_000_000_000
+        or cgroup["observed_max_sample_gap_ns"] > cgroup["sampling_elapsed_ns"]
+        or cgroup["sampling_elapsed_ns"]
+        > cgroup["observed_max_sample_gap_ns"] * (cgroup["sample_count"] - 1)
+        or cgroup["sampling_elapsed_ns"]
+        != cgroup["final_snapshot_monotonic_ns"] - cgroup["baseline_monotonic_ns"]
+        or not cgroup["baseline_monotonic_ns"]
+        <= cgroup["workload_stop_observed_monotonic_ns"]
+        <= cgroup["workload_last_monotonic_ns"]
+        < cgroup["post_teardown_observed_monotonic_ns"]
+        <= cgroup["post_teardown_sample_monotonic_ns"]
+        < cgroup["final_snapshot_monotonic_ns"]
+        or cgroup["workload_last_monotonic_ns"]
+        - cgroup["workload_stop_observed_monotonic_ns"]
+        > 1_000_000_000
+        or cgroup["post_teardown_sample_monotonic_ns"]
+        - cgroup["post_teardown_observed_monotonic_ns"]
+        > 1_000_000_000
+        or not 0 <= cgroup["workload_last_sequence"] < cgroup["sample_count"] - 2
         or not 0 < cgroup["sampled_peak_bytes"] < cgroup["memory_max_bytes"]
+        or cgroup["sampled_peak_bytes"] < cgroup["memory_current_before_bytes"]
+        or cgroup["sampled_peak_bytes"] < cgroup["memory_current_after_bytes"]
+        or cgroup["kernel_memory_peak_before_bytes"]
+        < cgroup["memory_current_before_bytes"]
+        or cgroup["kernel_memory_peak_after_bytes"]
+        < cgroup["kernel_memory_peak_before_bytes"]
+        or cgroup["kernel_memory_peak_after_bytes"]
+        < cgroup["memory_current_after_bytes"]
+        or cgroup["kernel_memory_peak_after_bytes"] < cgroup["sampled_peak_bytes"]
         or not isinstance(before, dict)
         or not isinstance(after, dict)
         or not isinstance(deltas, dict)
         or set(before) != set(after)
         or set(before) != set(deltas)
-        or not EXPECTED_EVENT_KEYS.issubset(before)
+        or set(before) != EXPECTED_BOUNDARY_EVENT_KEYS
     ):
         raise ValueError("capacity runtime cgroup telemetry is incomplete")
     if (
@@ -480,12 +595,16 @@ def _validate_infrastructure_cleanup(
             "execution_id",
             "compose_project",
             "down_status",
+            "runtime_finalize_status",
+            "probe_cleanup_status",
             "container_query_status",
             "volume_query_status",
             "network_query_status",
+            "probe_query_status",
             "remaining_containers",
             "remaining_volumes",
             "remaining_networks",
+            "remaining_probes",
             "compose_state_removed",
         }
         or cleanup.get("schema_version") != INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION
@@ -495,18 +614,26 @@ def _validate_infrastructure_cleanup(
         or cleanup.get("compose_project") != project
         or type(cleanup.get("down_status")) is not int
         or cleanup["down_status"] != 0
+        or type(cleanup.get("runtime_finalize_status")) is not int
+        or cleanup["runtime_finalize_status"] != 0
+        or type(cleanup.get("probe_cleanup_status")) is not int
+        or cleanup["probe_cleanup_status"] != 0
         or type(cleanup.get("container_query_status")) is not int
         or cleanup["container_query_status"] != 0
         or type(cleanup.get("volume_query_status")) is not int
         or cleanup["volume_query_status"] != 0
         or type(cleanup.get("network_query_status")) is not int
         or cleanup["network_query_status"] != 0
+        or type(cleanup.get("probe_query_status")) is not int
+        or cleanup["probe_query_status"] != 0
         or type(cleanup.get("remaining_containers")) is not int
         or cleanup["remaining_containers"] != 0
         or type(cleanup.get("remaining_volumes")) is not int
         or cleanup["remaining_volumes"] != 0
         or type(cleanup.get("remaining_networks")) is not int
         or cleanup["remaining_networks"] != 0
+        or type(cleanup.get("remaining_probes")) is not int
+        or cleanup["remaining_probes"] != 0
         or cleanup.get("compose_state_removed") is not True
     ):
         raise ValueError("capacity evidence requires verified Compose cleanup")
@@ -681,6 +808,11 @@ def validate(
         mode="qualification",
         execution_id=execution_id,
     )
+    if (
+        runtime["cgroup"]["sampling_elapsed_ns"]
+        < measured["total"]["duration_seconds"] * 1_000_000_000
+    ):
+        raise ValueError("capacity runtime sampling does not cover the measured workload")
     infrastructure_cleanup = _validate_infrastructure_cleanup(
         infrastructure_cleanup,
         source_revision=source_revision,

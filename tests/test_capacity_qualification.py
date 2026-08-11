@@ -213,6 +213,7 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
             "args": validator.EXPECTED_PROCESS_ARGS,
             "configured_command": validator.EXPECTED_PROCESS_ARGS,
             "image": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["image"],
+            "cgroup_namespace": "private",
             "compose_project": project,
             "compose_service": "crdb",
             "running": True,
@@ -232,14 +233,33 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
         },
         "cgroup": {
             "version": 2,
+            "scope": "sibling_dind_daemon_and_descendants",
+            "source": "sandboxed_cgroupns_host_probe",
             "memory_max_bytes": 4 * 1024**3,
+            "memory_swap_max": "max",
+            "memory_swap_current_before_bytes": 0,
+            "memory_swap_current_after_bytes": 0,
+            "swap_devices_before": 0,
+            "swap_devices_after": 0,
             "cpu_quota_us": 150_000,
             "cpu_period_us": 100_000,
             "memory_current_before_bytes": 100,
             "memory_current_after_bytes": 200,
             "kernel_memory_peak_before_bytes": 4 * 1024**3,
             "kernel_memory_peak_after_bytes": 4 * 1024**3,
-            "sample_count": 10,
+            "nominal_sample_sleep_seconds": 0.25,
+            "maximum_sample_gap_seconds": 1.0,
+            "observed_max_sample_gap_ns": 250_000_000,
+            "sampling_elapsed_ns": 10_500_000_000,
+            "baseline_sequence": 0,
+            "baseline_monotonic_ns": 1_000_000_000,
+            "workload_stop_observed_monotonic_ns": 10_000_000_000,
+            "workload_last_sequence": 40,
+            "workload_last_monotonic_ns": 10_250_000_000,
+            "post_teardown_observed_monotonic_ns": 11_000_000_000,
+            "post_teardown_sample_monotonic_ns": 11_250_000_000,
+            "final_snapshot_monotonic_ns": 11_500_000_000,
+            "sample_count": 50,
             "sampled_peak_bytes": peak_bytes,
             "events_before": before,
             "events_after": after,
@@ -257,12 +277,16 @@ def _infrastructure_cleanup(validator, *, mode="qualification"):
         "execution_id": _execution_id(mode),
         "compose_project": f"hindsight_capacity_123_1_{mode}",
         "down_status": 0,
+        "runtime_finalize_status": 0,
+        "probe_cleanup_status": 0,
         "container_query_status": 0,
         "volume_query_status": 0,
         "network_query_status": 0,
+        "probe_query_status": 0,
         "remaining_containers": 0,
         "remaining_volumes": 0,
         "remaining_networks": 0,
+        "remaining_probes": 0,
         "compose_state_removed": True,
     }
 
@@ -440,10 +464,30 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
         "runtime-pressure.json": "e" * 64,
         "infrastructure-cleanup.json": "f" * 64,
     }
+    runtime = _runtime(protocol, mode="diagnostic", peak_bytes=peak_bytes)
+    sampling_elapsed_ns = max(
+        10_500_000_000, int(duration * 1_000_000_000) + 500_000_000
+    )
+    sample_count = (sampling_elapsed_ns + 249_999_999) // 250_000_000 + 1
+    final_monotonic_ns = 1_000_000_000 + sampling_elapsed_ns
+    runtime["cgroup"].update(
+        {
+            "sampling_elapsed_ns": sampling_elapsed_ns,
+            "sample_count": sample_count,
+            "workload_stop_observed_monotonic_ns": final_monotonic_ns
+            - 1_250_000_000,
+            "workload_last_sequence": sample_count - 5,
+            "workload_last_monotonic_ns": final_monotonic_ns - 1_000_000_000,
+            "post_teardown_observed_monotonic_ns": final_monotonic_ns
+            - 500_000_000,
+            "post_teardown_sample_monotonic_ns": final_monotonic_ns - 250_000_000,
+            "final_snapshot_monotonic_ns": final_monotonic_ns,
+        }
+    )
     return (
         document,
         cleanup,
-        _runtime(protocol, mode="diagnostic", peak_bytes=peak_bytes),
+        runtime,
         _infrastructure_cleanup(protocol, mode="diagnostic"),
         artifacts,
     )
@@ -906,8 +950,14 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
 def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     producer = _script("run_capacity_qualification")
     validator = _script("validate_capacity_evidence")
+    capture = _script("capture_capacity_runtime")
 
     assert producer.SCHEMA_VERSION == validator.SCHEMA_VERSION
+    assert producer.DIAGNOSTIC_SCHEMA_VERSION == validator.DIAGNOSTIC_SCHEMA_VERSION
+    assert capture.CAPACITY_SCHEMA_VERSION == validator.SCHEMA_VERSION
+    assert capture.RUNTIME_SCHEMA_VERSION == validator.RUNTIME_SCHEMA_VERSION
+    assert capture._configured_envelope() == producer.RUNTIME_MEMORY_ENVELOPE
+    assert capture._configured_envelope() == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE
     assert producer.TARGETS == validator.TARGETS
     assert producer.MAX_DURATION_SECONDS == validator.EXPECTED_CEILINGS["duration_seconds"]
     assert producer.MAX_STORAGE_BYTES == validator.EXPECTED_CEILINGS["storage_bytes"]
@@ -2095,6 +2145,14 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     assert qualification["env"]["COCKROACH_START_ARGS"] == expected_args
     assert diagnostic["env"]["CAPACITY_MODE"] == "diagnostic"
     assert qualification["env"]["CAPACITY_MODE"] == "qualification"
+    expected_image_digest = (
+        "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+    )
+    for job in (diagnostic, qualification):
+        assert job["env"]["COCKROACH_IMAGE"] == (
+            f"cockroachdb/cockroach@{expected_image_digest}"
+        )
+        assert job["env"]["COCKROACH_IMAGE_ID"] == expected_image_digest
     compose = (ROOT / "docker-compose.yml").read_text()
     assert "start-single-node --insecure ${COCKROACH_START_ARGS:-}" in compose
     assert "--timeout-seconds 1200" in source
@@ -2103,19 +2161,44 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     assert "scripts/validate_capacity_diagnostic.py" in source
     assert "scripts/validate_capacity_evidence.py" in source
     assert source.index("validate_capacity_diagnostic.py") < source.index("qualify:")
+    for job in (diagnostic, qualification):
+        workload = next(
+            step
+            for step in job["steps"]
+            if step.get("name", "").startswith("Run the isolated")
+            and "monitored memory pressure" in step["name"]
+        )["run"]
+        assert workload.index('docker image inspect "$COCKROACH_IMAGE"') < workload.index(
+            "capture_capacity_runtime.py monitor"
+        )
+        assert 'docker pull "$COCKROACH_IMAGE"' in workload
+        assert "{{.Os}}/{{.Architecture}}" in workload
+        assert '"linux/amd64"' in workload
+        assert workload.index("capture_capacity_runtime.py monitor") < workload.index(
+            "docker compose up -d crdb"
+        )
     cleanup = next(
         step
         for step in qualification["steps"]
-        if step.get("name") == "Remove isolated CockroachDB and storage"
+        if step.get("name")
+        == "Remove isolated CockroachDB, finalize pressure, and verify storage cleanup"
     )
     assert cleanup["if"] == "always()"
     assert "docker compose down --volumes --remove-orphans" in cleanup["run"]
+    assert cleanup["run"].index("docker compose down") < cleanup["run"].index(
+        "capture_capacity_runtime.py finalize"
+    )
+    assert cleanup["run"].index("capture_capacity_runtime.py finalize") < cleanup[
+        "run"
+    ].index("capture_capacity_runtime.py cleanup-probe")
     assert "remaining_containers" in cleanup["run"]
     assert "remaining_volumes" in cleanup["run"]
     assert "remaining_networks" in cleanup["run"]
+    assert "remaining_probes" in cleanup["run"]
     assert "container_query_status" in cleanup["run"]
     assert "volume_query_status" in cleanup["run"]
     assert "network_query_status" in cleanup["run"]
+    assert "probe_query_status" in cleanup["run"]
     upload = qualification["steps"][-1]
     assert upload["if"] == "always()"
     assert upload["with"]["if-no-files-found"] == "error"
@@ -2360,9 +2443,63 @@ def test_runtime_rejects_peak_at_limit_missing_counter_and_cpu_change():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("scope", "runner_process"),
+        ("source", "host_meminfo"),
+        ("memory_swap_max", 0),
+        ("memory_swap_current_after_bytes", 1),
+        ("swap_devices_after", 1),
+        ("nominal_sample_sleep_seconds", 1),
+    ],
+)
+def test_runtime_rejects_wrong_boundary_scope_or_swap(field, value):
+    validator = _script("validate_capacity_evidence")
+    runtime = _runtime(validator)
+    runtime["cgroup"][field] = value
+    with pytest.raises(ValueError, match="cgroup telemetry"):
+        validator._validate_runtime(
+            runtime,
+            source_revision=SOURCE_SHA,
+            mode="qualification",
+            execution_id=_execution_id("qualification"),
+        )
+
+
+def test_runtime_rejects_impossible_peak_and_cadence_summaries():
+    validator = _script("validate_capacity_evidence")
+    mutations = (
+        lambda runtime: runtime["container_cgroup"].update(
+            {"memory_current_bytes": runtime["container_cgroup"]["memory_peak_bytes"] + 1}
+        ),
+        lambda runtime: runtime["cgroup"].update({"sampled_peak_bytes": 99}),
+        lambda runtime: runtime["cgroup"].update({"sample_count": 2}),
+        lambda runtime: runtime["cgroup"].update({"sampling_elapsed_ns": 100_000_000}),
+        lambda runtime: runtime["cgroup"].update(
+            {"sampling_elapsed_ns": 20_000_000_000, "sample_count": 50}
+        ),
+    )
+    for mutate in mutations:
+        runtime = _runtime(validator)
+        mutate(runtime)
+        with pytest.raises(ValueError, match="cgroup"):
+            validator._validate_runtime(
+                runtime,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+            )
+
+
 def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
     validator = _script("validate_capacity_evidence")
-    for field in ("remaining_containers", "remaining_volumes", "remaining_networks"):
+    for field in (
+        "remaining_containers",
+        "remaining_volumes",
+        "remaining_networks",
+        "remaining_probes",
+    ):
         cleanup = _infrastructure_cleanup(validator)
         cleanup[field] = 1
         cleanup["compose_state_removed"] = False
@@ -2374,7 +2511,14 @@ def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
                 execution_id=_execution_id("qualification"),
                 project="hindsight_capacity_123_1_qualification",
             )
-    for field in ("container_query_status", "volume_query_status", "network_query_status"):
+    for field in (
+        "runtime_finalize_status",
+        "probe_cleanup_status",
+        "container_query_status",
+        "volume_query_status",
+        "network_query_status",
+        "probe_query_status",
+    ):
         cleanup = _infrastructure_cleanup(validator)
         cleanup[field] = 1
         cleanup["compose_state_removed"] = False
@@ -2437,6 +2581,7 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     container_id = "a" * 64
     inspection = [
         {
+            "Image": capture.EXPECTED_IMAGE_ID,
             "Path": "/cockroach/cockroach.sh",
             "Args": list(capture.EXPECTED_PROCESS_ARGS),
             "Config": {
@@ -2448,6 +2593,7 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
                 },
             },
             "State": {"Running": True},
+            "HostConfig": {"CgroupnsMode": "private"},
         }
     ]
     pid_ready = False
@@ -2473,9 +2619,14 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     pid_ready = True
     process = capture._inspect_container("hindsight_capacity_123_1_diagnostic")
     assert process["path"] == "/cockroach/cockroach.sh"
+    assert process["cgroup_namespace"] == "private"
     assert process["args"] == list(capture.EXPECTED_PROCESS_ARGS)
     assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
     inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2GiB"
+    with pytest.raises(RuntimeError, match="reviewed envelope"):
+        capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=3GiB"
+    inspection[0]["HostConfig"]["CgroupnsMode"] = "host"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
 
@@ -2507,10 +2658,194 @@ def test_runtime_collector_retries_zero_effective_metric_and_requires_exact_valu
         capture._inspect_effective_memory()
 
 
-def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path, monkeypatch):
+def test_runtime_probe_command_is_sandboxed_and_has_no_mount_or_secret_channel():
+    capture = _script("capture_capacity_runtime")
+    execution_id = _execution_id("diagnostic")
+    project = "hindsight_capacity_123_1_diagnostic"
+    command = capture._probe_run_command(execution_id, project)
+    assert command[:3] == ["docker", "run", "--detach"]
+    assert command[command.index("--cgroupns") + 1] == "host"
+    assert command[command.index("--network") + 1] == "none"
+    assert command[command.index("--user") + 1] == "65534:65534"
+    assert command[command.index("--memory") + 1] == str(32 * 1024**2)
+    assert command[command.index("--memory-swap") + 1] == str(32 * 1024**2)
+    assert command[command.index("--pids-limit") + 1] == "16"
+    assert "--read-only" in command
+    assert command[command.index("--cap-drop") + 1] == "ALL"
+    assert command[command.index("--security-opt") + 1] == "no-new-privileges"
+    assert command[command.index("--log-driver") + 1] == "json-file"
+    assert "max-size=4m" in command
+    assert "max-file=1" in command
+    assert "--privileged" not in command
+    assert "--pid" not in command
+    assert "--mount" not in command
+    assert "-v" not in command
+    assert "--env" not in command
+    assert command[-3:] == [capture.EXPECTED_IMAGE, "-ec", capture.PROBE_LOOP_SCRIPT]
+
+
+def test_runtime_probe_requires_the_reviewed_linux_amd64_image(monkeypatch):
+    capture = _script("capture_capacity_runtime")
+    inspection = [
+        {
+            "Id": capture.EXPECTED_IMAGE_ID,
+            "Os": "linux",
+            "Architecture": "amd64",
+            "RepoDigests": [capture.EXPECTED_IMAGE],
+        }
+    ]
+    monkeypatch.setattr(
+        capture.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(inspection)),
+    )
+    capture._inspect_expected_image()
+    inspection[0]["Architecture"] = "arm64"
+    with pytest.raises(RuntimeError, match="linux/amd64 digest"):
+        capture._inspect_expected_image()
+
+
+def test_runtime_probe_parser_requires_the_exact_dind_boundary():
+    capture = _script("capture_capacity_runtime")
+    fields = [
+        capture.PROBE_RECORD_PREFIX,
+        "0",
+        "1000.00",
+        "30",
+        "380425",
+        str(4 * 1024**3),
+        "max",
+        "100",
+        str(4 * 1024**3),
+        "0",
+        "150000",
+        "100000",
+        "0",
+        "0",
+        "0",
+        "828396",
+        "0",
+        "0",
+        "0",
+    ]
+    sequence, snapshot = capture._parse_probe_record("\t".join(fields))
+    assert sequence == 0
+    assert snapshot["monotonic_ns"] == 1_000_000_000_000
+    assert snapshot["memory_max_bytes"] == 4 * 1024**3
+    assert snapshot["events"]["max"] == 828_396
+    for index, value in (
+        (5, str(4 * 1024**3 - 1)),
+        (9, "1"),
+        (10, "149999"),
+        (12, "1"),
+    ):
+        forged = list(fields)
+        forged[index] = value
+        with pytest.raises(RuntimeError, match="reviewed DinD boundary"):
+            capture._parse_probe_record("\t".join(forged))
+
+
+def test_runtime_probe_rejects_timestamp_gaps_and_counter_regressions():
+    capture = _script("capture_capacity_runtime")
+
+    def snapshot(monotonic_ns, *, peak=100, event_max=0):
+        return {
+            "monotonic_ns": monotonic_ns,
+            "identity": {"device": 1, "inode": 2},
+            "memory_max_bytes": 4 * 1024**3,
+            "memory_swap_max": "max",
+            "memory_current_bytes": 50,
+            "kernel_memory_peak_bytes": peak,
+            "memory_swap_current_bytes": 0,
+            "cpu_quota_us": 150_000,
+            "cpu_period_us": 100_000,
+            "swap_devices": 0,
+            "events": {
+                "low": 0,
+                "high": 0,
+                "max": event_max,
+                "oom": 0,
+                "oom_kill": 0,
+                "oom_group_kill": 0,
+            },
+        }
+
+    assert capture._validate_probe_series(
+        [(0, snapshot(1_000_000_000)), (1, snapshot(1_250_000_000))]
+    ) == (250_000_000, 250_000_000)
+    with pytest.raises(RuntimeError, match="sampling cadence"):
+        capture._validate_probe_series(
+            [(0, snapshot(1_000_000_000)), (1, snapshot(2_010_000_000))]
+        )
+    with pytest.raises(RuntimeError, match="memory peak"):
+        capture._validate_probe_series(
+            [
+                (0, snapshot(1_000_000_000, peak=101)),
+                (1, snapshot(1_250_000_000, peak=100)),
+            ]
+        )
+    with pytest.raises(RuntimeError, match="pressure counters"):
+        capture._validate_probe_series(
+            [
+                (0, snapshot(1_000_000_000, event_max=1)),
+                (1, snapshot(1_250_000_000, event_max=0)),
+            ]
+        )
+
+
+def test_runtime_probe_inspection_rejects_private_namespace(monkeypatch):
+    capture = _script("capture_capacity_runtime")
+    execution_id = _execution_id("diagnostic")
+    project = "hindsight_capacity_123_1_diagnostic"
+    identifier = "c" * 64
+    inspection = [
+        {
+            "Name": f"/{capture._probe_name(project)}",
+            "Id": identifier,
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Config": {
+                "Image": capture.EXPECTED_IMAGE,
+                "User": "65534:65534",
+                "Entrypoint": ["/bin/sh"],
+                "Cmd": ["-ec", capture.PROBE_LOOP_SCRIPT],
+                "Labels": capture._probe_labels(execution_id, project),
+            },
+            "HostConfig": {
+                "NetworkMode": "none",
+                "ReadonlyRootfs": True,
+                "Privileged": False,
+                "CgroupnsMode": "host",
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges"],
+                "PidsLimit": 16,
+                "Memory": 32 * 1024**2,
+                "MemorySwap": 32 * 1024**2,
+                "NanoCpus": 100_000_000,
+                "AutoRemove": True,
+                "LogConfig": capture.PROBE_LOG_CONFIG,
+            },
+            "State": {"Running": True},
+            "Mounts": [],
+        }
+    ]
+    monkeypatch.setattr(
+        capture.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(inspection)),
+    )
+    assert capture._inspect_probe(execution_id, project, require_running=True)["Id"] == identifier
+    inspection[0]["HostConfig"]["CgroupnsMode"] = "private"
+    with pytest.raises(RuntimeError, match="security profile"):
+        capture._inspect_probe(execution_id, project, require_running=True)
+
+
+def test_runtime_finalizer_uses_dind_probe_deltas_and_omits_local_identity(
+    tmp_path, monkeypatch
+):
     capture = _script("capture_capacity_runtime")
     project = "hindsight_capacity_123_1_diagnostic"
     configured = capture._configured_envelope()
+    probe_identifier = "b" * 64
     before_events = {
         "low": 0,
         "high": 0,
@@ -2519,6 +2854,22 @@ def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path,
         "oom_kill": 0,
         "oom_group_kill": 0,
     }
+
+    def snapshot(current, monotonic_ns, *, events=None):
+        return {
+            "monotonic_ns": monotonic_ns,
+            "identity": {"device": 1, "inode": 2},
+            "memory_max_bytes": 4 * 1024**3,
+            "memory_swap_max": "max",
+            "memory_current_bytes": current,
+            "kernel_memory_peak_bytes": 4 * 1024**3,
+            "memory_swap_current_bytes": 0,
+            "cpu_quota_us": 150_000,
+            "cpu_period_us": 100_000,
+            "swap_devices": 0,
+            "events": dict(events or before_events),
+        }
+
     baseline = {
         "schema_version": capture.BASELINE_SCHEMA_VERSION,
         "source_revision": SOURCE_SHA,
@@ -2526,15 +2877,9 @@ def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path,
         "execution_id": _execution_id("diagnostic"),
         "compose_project": project,
         "configured": configured,
-        "cgroup": {
-            "identity": {"device": 1, "inode": 2},
-            "memory_max_bytes": 4 * 1024**3,
-            "cpu_quota_us": 150_000,
-            "cpu_period_us": 100_000,
-            "memory_current_bytes": 100,
-            "kernel_memory_peak_bytes": 4 * 1024**3,
-            "events": before_events,
-        },
+        "probe_container_id": probe_identifier,
+        "baseline_sequence": 0,
+        "cgroup": snapshot(100, 1_000_000_000),
     }
     samples = {
         "schema_version": capture.SAMPLES_SCHEMA_VERSION,
@@ -2543,9 +2888,16 @@ def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path,
         "execution_id": _execution_id("diagnostic"),
         "compose_project": project,
         "configured": configured,
+        "probe_container_id": probe_identifier,
+        "baseline_sequence": 0,
         "cgroup_identity": {"device": 1, "inode": 2},
-        "sample_count": 5,
-        "sampled_peak_bytes": 3 * 1024**3,
+        "workload_stop_observed_monotonic_ns": 1_200_000_000,
+        "workload_sample_count": 2,
+        "workload_last_sequence": 1,
+        "workload_last_monotonic_ns": 1_250_000_000,
+        "workload_sampled_peak_bytes": 150,
+        "workload_observed_max_sample_gap_ns": 250_000_000,
+        "workload_sampling_elapsed_ns": 250_000_000,
         "effective_process": {"reviewed": True},
         "container_cgroup": {"version": 2},
         "error": None,
@@ -2553,20 +2905,32 @@ def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path,
     baseline_path = tmp_path / "baseline.json"
     samples_path = tmp_path / "samples.json"
     output_path = tmp_path / "runtime.json"
-    baseline_path.write_text(json.dumps(baseline))
-    samples_path.write_text(json.dumps(samples))
-    final_snapshot = {
-        "identity": {"device": 1, "inode": 2},
-        "memory_max_bytes": 4 * 1024**3,
-        "cpu_quota_us": 150_000,
-        "cpu_period_us": 100_000,
-        "memory_current_bytes": 200,
-        "kernel_memory_peak_bytes": 4 * 1024**3,
-        "events": dict(before_events),
-    }
+    capture._write_json(baseline_path, baseline)
+    capture._write_json(samples_path, samples)
+    final_snapshot = snapshot(200, 1_750_000_000)
+    records = [
+        (0, snapshot(100, 1_000_000_000)),
+        (1, snapshot(150, 1_250_000_000)),
+        (2, snapshot(180, 1_500_000_000)),
+    ]
+    calls = []
     monkeypatch.setattr(capture, "_validate_invocation", lambda *_args: None)
-    monkeypatch.setattr(capture, "_current_cgroup_directory", lambda: tmp_path)
-    monkeypatch.setattr(capture, "_snapshot", lambda _directory, **_kwargs: final_snapshot)
+    monkeypatch.setattr(
+        capture, "_read_monotonic_uptime_ns", lambda: 1_400_000_000
+    )
+    monkeypatch.setattr(
+        capture,
+        "_final_probe_snapshot",
+        lambda *_args: calls.append("final") or final_snapshot,
+    )
+    monkeypatch.setattr(
+        capture,
+        "_probe_records",
+        lambda *_args, **_kwargs: calls.append("records") or records,
+    )
+    monkeypatch.setattr(
+        capture, "_remove_probe", lambda *_args: calls.append("remove")
+    )
     args = SimpleNamespace(
         source_revision=SOURCE_SHA,
         mode="diagnostic",
@@ -2581,3 +2945,130 @@ def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path,
     assert "identity" not in runtime["cgroup"]
     assert runtime["cgroup"]["events_before"]["max"] == 828_396
     assert set(runtime["cgroup"]["event_deltas"].values()) == {0}
+    assert runtime["cgroup"]["scope"] == "sibling_dind_daemon_and_descendants"
+    assert runtime["cgroup"]["sample_count"] == 4
+    assert runtime["cgroup"]["sampled_peak_bytes"] == 200
+    assert runtime["cgroup"]["observed_max_sample_gap_ns"] == 250_000_000
+    assert runtime["cgroup"]["sampling_elapsed_ns"] == 750_000_000
+    assert calls == ["records", "final", "remove"]
+
+
+@pytest.mark.parametrize("failure", ["stale_baseline", "stale_final_snapshot"])
+def test_runtime_finalizer_rejects_unbridged_probe_boundaries(
+    tmp_path, monkeypatch, failure
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    identifier = "b" * 64
+    events = {
+        "low": 0,
+        "high": 0,
+        "max": 828_396,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+    }
+
+    def snapshot(current, monotonic_ns):
+        return {
+            "monotonic_ns": monotonic_ns,
+            "identity": {"device": 1, "inode": 2},
+            "memory_max_bytes": 4 * 1024**3,
+            "memory_swap_max": "max",
+            "memory_current_bytes": current,
+            "kernel_memory_peak_bytes": 4 * 1024**3,
+            "memory_swap_current_bytes": 0,
+            "cpu_quota_us": 150_000,
+            "cpu_period_us": 100_000,
+            "swap_devices": 0,
+            "events": dict(events),
+        }
+
+    records = [
+        (0, snapshot(100, 1_000_000_000)),
+        (1, snapshot(150, 1_250_000_000)),
+        (2, snapshot(180, 1_500_000_000)),
+    ]
+    baseline_cgroup = snapshot(100, 1_000_000_000)
+    if failure == "stale_baseline":
+        baseline_cgroup["memory_current_bytes"] = 101
+    configured = capture._configured_envelope()
+    baseline = {
+        "schema_version": capture.BASELINE_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": "diagnostic",
+        "execution_id": _execution_id("diagnostic"),
+        "compose_project": project,
+        "configured": configured,
+        "probe_container_id": identifier,
+        "baseline_sequence": 0,
+        "cgroup": baseline_cgroup,
+    }
+    samples = {
+        "schema_version": capture.SAMPLES_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": "diagnostic",
+        "execution_id": _execution_id("diagnostic"),
+        "compose_project": project,
+        "configured": configured,
+        "probe_container_id": identifier,
+        "baseline_sequence": 0,
+        "cgroup_identity": {"device": 1, "inode": 2},
+        "workload_stop_observed_monotonic_ns": 1_200_000_000,
+        "workload_sample_count": 2,
+        "workload_last_sequence": 1,
+        "workload_last_monotonic_ns": 1_250_000_000,
+        "workload_sampled_peak_bytes": 150,
+        "workload_observed_max_sample_gap_ns": 250_000_000,
+        "workload_sampling_elapsed_ns": 250_000_000,
+        "effective_process": {"reviewed": True},
+        "container_cgroup": {"version": 2},
+        "error": None,
+    }
+    baseline_path = tmp_path / "baseline.json"
+    samples_path = tmp_path / "samples.json"
+    documents = {baseline_path: baseline, samples_path: samples}
+    final_time = 1_500_000_000 if failure == "stale_final_snapshot" else 1_750_000_000
+    monkeypatch.setattr(capture, "_validate_invocation", lambda *_args: None)
+    monkeypatch.setattr(capture, "_read_json", lambda path: documents[path])
+    monkeypatch.setattr(capture, "_read_monotonic_uptime_ns", lambda: 1_400_000_000)
+    monkeypatch.setattr(capture, "_probe_records", lambda *_args, **_kwargs: records)
+    monkeypatch.setattr(
+        capture,
+        "_final_probe_snapshot",
+        lambda *_args: snapshot(200, final_time),
+    )
+    monkeypatch.setattr(capture, "_remove_probe", lambda *_args: None)
+    args = SimpleNamespace(
+        source_revision=SOURCE_SHA,
+        mode="diagnostic",
+        execution_id=_execution_id("diagnostic"),
+        compose_project=project,
+        baseline=baseline_path,
+        samples=samples_path,
+        output=tmp_path / "runtime.json",
+    )
+    with pytest.raises((RuntimeError, ValueError), match="cadence|continuity"):
+        capture._finalize(args)
+
+
+def test_runtime_finalizer_removes_probe_when_evidence_is_missing(tmp_path, monkeypatch):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    removed = []
+    monkeypatch.setattr(capture, "_validate_invocation", lambda *_args: None)
+    monkeypatch.setattr(
+        capture, "_remove_probe", lambda *args: removed.append(args)
+    )
+    args = SimpleNamespace(
+        source_revision=SOURCE_SHA,
+        mode="diagnostic",
+        execution_id=_execution_id("diagnostic"),
+        compose_project=project,
+        baseline=tmp_path / "missing-baseline.json",
+        samples=tmp_path / "missing-samples.json",
+        output=tmp_path / "runtime.json",
+    )
+    with pytest.raises(FileNotFoundError):
+        capture._finalize(args)
+    assert removed == [(_execution_id("diagnostic"), project)]

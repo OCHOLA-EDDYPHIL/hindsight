@@ -37,8 +37,8 @@ from hindsight.vector_index_qualification import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "hindsight.capacity_qualification.v4"
-DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v1"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v5"
+DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v2"
 ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v2"
 ATTEMPT_PROGRESS_FILENAME = "capacity-attempt-progress.json"
 MODES = frozenset({"diagnostic", "qualification"})
@@ -77,8 +77,15 @@ FIXTURE_VECTOR_INDEX_METHOD = (
 )
 DATABASE_METHOD = "disposable_local_single_node_cockroachdb_in_memory_2_gib_explicit_memory_budgets"
 RUNTIME_MEMORY_ENVELOPE = {
-    "image": "cockroachdb/cockroach:v25.4.5",
-    "runner_topology": "owner_runner_dind_inside_sampled_job_cgroup",
+    "image": (
+        "cockroachdb/cockroach@sha256:"
+        "53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+    ),
+    "image_id": (
+        "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+    ),
+    "image_platform": "linux/amd64",
+    "execution_topology": "owner_runner_sibling_dind_capacity_cgroup_v2",
     "start_args": [
         "--store=type=mem,size=2GiB",
         "--cache=128MiB",
@@ -86,8 +93,37 @@ RUNTIME_MEMORY_ENVELOPE = {
         "--max-tsdb-memory=64MiB",
         "--max-go-memory=3GiB",
     ],
-    "runner_memory_max_bytes": 4 * 1024**3,
-    "runner_cpu": {"quota_us": 150_000, "period_us": 100_000},
+    "capacity_boundary": {
+        "cgroup_version": 2,
+        "memory_max_bytes": 4 * 1024**3,
+        "memory_swap_max": "max",
+        "swap_devices": 0,
+        "cpu_quota_us": 150_000,
+        "cpu_period_us": 100_000,
+    },
+    "telemetry_probe": {
+        "image": (
+            "cockroachdb/cockroach@sha256:"
+            "53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+        ),
+        "image_id": (
+            "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
+        ),
+        "image_platform": "linux/amd64",
+        "cgroup_namespace": "host",
+        "network": "none",
+        "read_only": True,
+        "user": "65534:65534",
+        "cap_drop": ["ALL"],
+        "no_new_privileges": True,
+        "privileged": False,
+        "workspace_mounts": 0,
+        "pids_limit": 16,
+        "memory_bytes": 32 * 1024**2,
+        "nano_cpus": 100_000_000,
+        "nominal_sample_sleep_seconds": 0.25,
+        "maximum_sample_gap_seconds": 1.0,
+    },
     "memory_bytes": {
         "store": 2 * 1024**3,
         "cache": 128 * 1024**2,
@@ -139,9 +175,10 @@ LIMITATIONS = [
     "The measurements are benchmark evidence and are not production SLO claims.",
     "The 2 GiB in-memory store size is configured capacity, not a kernel allocation cap; "
     "the Go limit is soft, database budgets overlap, cache is outside the Go limit, and "
-    "the 4 GiB cgroup remains the hard memory boundary.",
-    "The reviewed owner-runner contract places its DinD instance inside the sampled job "
-    "cgroup; this evidence does not apply to an external socket-mounted Docker daemon.",
+    "the 4 GiB DinD cgroup remains the hard database execution boundary.",
+    "The sampled 4 GiB and 1.5 CPU cgroup contains the sibling DinD daemon and its database "
+    "descendants. The qualification producer runs in the owner-runner sibling, so this "
+    "evidence makes no whole-host or producer memory-envelope claim.",
     "In-memory SQL temporary storage retains CockroachDB 25.4.5's fixed 100 MiB default.",
 ]
 BULK_SEED_GUARDS = {
