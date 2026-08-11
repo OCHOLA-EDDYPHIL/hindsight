@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,8 @@ from ci_test_groups import MIGRATION_CASES  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 ROLE_SENSITIVE_CASES = ("agent_runtime_roles", "populated_roles")
 PARALLEL_CASES = tuple(case for case in MIGRATION_CASES if case not in ROLE_SENSITIVE_CASES)
+EVIDENCE_SCHEMA = "hindsight.migration_compatibility_history.v1"
+SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def _identifier(value: str) -> str:
@@ -74,7 +77,23 @@ def emit_result(result: tuple[str, int, str]) -> None:
     print(output, end="" if output.endswith("\n") else "\n", flush=True)
 
 
-def run_all(*, base_url: str, run_token: str, workers: int) -> int:
+def _write_evidence(output: Path, document: dict[str, object]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    temporary.replace(output)
+
+
+def run_all(
+    *,
+    base_url: str,
+    run_token: str,
+    workers: int,
+    evidence_output: Path | None = None,
+    source_revision: str = "",
+    workflow_run_id: int = 0,
+    workflow_run_attempt: int = 0,
+) -> int:
     cases = tuple(MIGRATION_CASES)
     create_case_databases(base_url, cases, run_token)
     results: list[tuple[str, int, str]] = []
@@ -101,10 +120,38 @@ def run_all(*, base_url: str, run_token: str, workers: int) -> int:
     for case, returncode, _output in results:
         if returncode:
             failures.append(case)
+    return_code = int(bool(failures))
     if failures:
         print(f"failed migration cases: {', '.join(sorted(failures))}", file=sys.stderr)
-        return 1
-    return 0
+    if evidence_output is not None:
+        if SOURCE_SHA_PATTERN.fullmatch(source_revision) is None:
+            raise ValueError("source revision must be a full lowercase Git SHA")
+        if workflow_run_id < 1 or workflow_run_attempt < 1:
+            raise ValueError("workflow run id and attempt must be positive integers")
+        by_name = {case: returncode for case, returncode, _output in results}
+        if set(by_name) != set(MIGRATION_CASES) or len(results) != len(MIGRATION_CASES):
+            raise RuntimeError("migration result set is incomplete or duplicated")
+        _write_evidence(
+            evidence_output,
+            {
+                "schema_version": EVIDENCE_SCHEMA,
+                "status": "failed" if return_code else "passed",
+                "source_revision": source_revision,
+                "workflow_run": {
+                    "id": workflow_run_id,
+                    "attempt": workflow_run_attempt,
+                },
+                "cases": [
+                    {
+                        "name": case,
+                        "return_code": by_name[case],
+                        "succeeded": by_name[case] == 0,
+                    }
+                    for case in sorted(MIGRATION_CASES)
+                ],
+            },
+        )
+    return return_code
 
 
 def main() -> int:
@@ -115,12 +162,32 @@ def main() -> int:
         default=f"{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
     )
     parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--source-revision", default=os.environ.get("SOURCE_SHA", ""))
+    parser.add_argument(
+        "--workflow-run-id",
+        type=int,
+        default=int(os.environ.get("GITHUB_RUN_ID", "0")),
+    )
+    parser.add_argument(
+        "--workflow-run-attempt",
+        type=int,
+        default=int(os.environ.get("GITHUB_RUN_ATTEMPT", "0")),
+    )
     args = parser.parse_args()
     if not args.base_url:
         parser.error("--base-url or DATABASE_URL is required")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
-    return run_all(base_url=args.base_url, run_token=args.run_token, workers=args.workers)
+    return run_all(
+        base_url=args.base_url,
+        run_token=args.run_token,
+        workers=args.workers,
+        evidence_output=args.output,
+        source_revision=args.source_revision,
+        workflow_run_id=args.workflow_run_id,
+        workflow_run_attempt=args.workflow_run_attempt,
+    )
 
 
 if __name__ == "__main__":

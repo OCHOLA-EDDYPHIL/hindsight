@@ -6,8 +6,42 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: hindsight-migration-compatibility
+  cancel-in-progress: false
+
 jobs:
+  authorize:
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    outputs:
+      source_sha: ${{ steps.authorization.outputs.source_sha }}
+    steps:
+      - id: authorization
+        name: Require repository owner on exact main
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/migration-compatibility.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Migration compatibility requires the repository owner on exact main." >&2
+            exit 1
+          }
+          echo "source_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+
   migration_compatibility:
+    needs: authorize
     timeout-minutes: 45
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     env:
@@ -15,13 +49,25 @@ jobs:
       COCKROACH_IMAGE: cockroachdb/cockroach:v25.4.5
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EXTENDED_DATABASE_URL: postgresql://root@localhost:26257/migration_extended_${{ github.run_id }}_${{ github.run_attempt }}?sslmode=disable
+      EVIDENCE_DIR: build/migration-compatibility
+      SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
+      - name: Create canonical Git input manifest
+        run: >-
+          uv run python scripts/evidence_reuse.py manifest
+          --revision "$SOURCE_SHA"
+          --output "$EVIDENCE_DIR/git-input-manifest.json"
       - run: docker compose up -d crdb
       - name: Wait for CockroachDB
         run: |
@@ -37,12 +83,78 @@ jobs:
           docker compose exec -T crdb cockroach sql --insecure \
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
       - name: Run isolated historical migration cases
-        run: uv run python scripts/run_migration_compatibility.py --workers 4
+        run: >-
+          uv run python scripts/run_migration_compatibility.py
+          --workers 4
+          --source-revision "$SOURCE_SHA"
+          --workflow-run-id "$GITHUB_RUN_ID"
+          --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+          --output "$RUNNER_TEMP/migration-compatibility-history.json"
       - name: Run extended database safeguards
         run: |
           DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/migrate.py
           DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/initialize_agent_storage.py
           DATABASE_URL="$EXTENDED_DATABASE_URL" uv run python scripts/ci_test_groups.py run main_extended
-      - name: Remove migration compatibility container
+          uv run python scripts/evidence_reuse.py complete-migration \
+            --historical "$RUNNER_TEMP/migration-compatibility-history.json" \
+            --source-revision "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$EVIDENCE_DIR/migration-compatibility.json"
+      - name: Remove migration compatibility container and storage
         if: always()
-        run: docker compose down --volumes --remove-orphans
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          set +e
+          timeout 120 docker compose down --volumes --remove-orphans
+          down_status=$?
+          container_ids="$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")"
+          container_query_status=$?
+          volume_ids="$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")"
+          volume_query_status=$?
+          containers="$(printf '%s\n' "$container_ids" | sed '/^$/d' | wc -l)"
+          volumes="$(printf '%s\n' "$volume_ids" | sed '/^$/d' | wc -l)"
+          set -e
+          jq -n \
+            --arg source_revision "$SOURCE_SHA" \
+            --argjson down_status "$down_status" \
+            --argjson container_query_status "$container_query_status" \
+            --argjson volume_query_status "$volume_query_status" \
+            --argjson remaining_containers "$containers" \
+            --argjson remaining_volumes "$volumes" \
+            '{source_revision: $source_revision, down_status: $down_status,
+              container_query_status: $container_query_status,
+              volume_query_status: $volume_query_status,
+              remaining_containers: $remaining_containers, remaining_volumes: $remaining_volumes,
+              compose_state_removed: ($down_status == 0 and $container_query_status == 0
+                and $volume_query_status == 0 and $remaining_containers == 0
+                and $remaining_volumes == 0)}' \
+            > "$EVIDENCE_DIR/infrastructure-cleanup.json"
+          test "$down_status" -eq 0
+          test "$container_query_status" -eq 0
+          test "$volume_query_status" -eq 0
+          test "$containers" -eq 0
+          test "$volumes" -eq 0
+      - name: Finalize validated migration receipt
+        run: >-
+          uv run python scripts/evidence_reuse.py finalize-domain
+          --domain migration
+          --evidence-dir "$EVIDENCE_DIR"
+          --repository "$GITHUB_REPOSITORY"
+          --source-revision "$SOURCE_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --actor "$GITHUB_ACTOR"
+          --triggering-actor "$GITHUB_TRIGGERING_ACTOR"
+          --event-name "$GITHUB_EVENT_NAME"
+          --ref-name "$GITHUB_REF"
+          --workflow-ref "$GITHUB_WORKFLOW_REF"
+      - name: Upload migration compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 30

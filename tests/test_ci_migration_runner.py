@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -42,3 +43,35 @@ def test_runner_executes_every_case_and_reports_any_failure(monkeypatch):
     assert created == [tuple(runner.MIGRATION_CASES)]
     assert set(executed) == set(runner.MIGRATION_CASES)
     assert executed.index("agent_runtime_roles") < executed.index("populated_roles")
+
+
+def test_runner_emits_exact_structured_case_evidence(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runner, "create_case_databases", lambda *_args: None)
+    monkeypatch.setattr(
+        runner,
+        "run_case",
+        lambda case, **_kwargs: (case, 0, f"{case}\n"),
+    )
+    output = tmp_path / "migration-history.json"
+
+    assert runner.run_all(
+        base_url="postgresql://unused",
+        run_token="test",
+        workers=2,
+        evidence_output=output,
+        source_revision="a" * 40,
+        workflow_run_id=123,
+        workflow_run_attempt=2,
+    ) == 0
+
+    document = json.loads(output.read_text())
+    assert document == {
+        "schema_version": runner.EVIDENCE_SCHEMA,
+        "status": "passed",
+        "source_revision": "a" * 40,
+        "workflow_run": {"id": 123, "attempt": 2},
+        "cases": [
+            {"name": case, "return_code": 0, "succeeded": True}
+            for case in sorted(runner.MIGRATION_CASES)
+        ],
+    }

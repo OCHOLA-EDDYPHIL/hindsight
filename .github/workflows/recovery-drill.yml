@@ -48,6 +48,7 @@ jobs:
       COMPOSE_PROJECT_NAME: hindsight_recovery_${{ github.run_id }}_${{ github.run_attempt }}
       COCKROACH_IMAGE: cockroachdb/cockroach:v25.4.5
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+      EVIDENCE_DIR: build/recovery-drill
       EVIDENCE_PATH: build/recovery-drill/recovery-drill.json
       SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
     steps:
@@ -62,6 +63,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
+      - name: Create canonical Git input manifest
+        run: >-
+          uv run python scripts/evidence_reuse.py manifest
+          --revision "$SOURCE_SHA"
+          --output "$EVIDENCE_DIR/git-input-manifest.json"
       - name: Start isolated CockroachDB
         run: docker compose up -d crdb
       - name: Wait for CockroachDB
@@ -90,14 +96,60 @@ jobs:
             --confirm-source-loss "drop:${source_database}" \
             --output "$EVIDENCE_PATH" \
             --timeout-seconds 900
+      - name: Remove isolated CockroachDB and storage
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          set +e
+          timeout 120 docker compose down --volumes --remove-orphans
+          down_status=$?
+          container_ids="$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")"
+          container_query_status=$?
+          volume_ids="$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")"
+          volume_query_status=$?
+          containers="$(printf '%s\n' "$container_ids" | sed '/^$/d' | wc -l)"
+          volumes="$(printf '%s\n' "$volume_ids" | sed '/^$/d' | wc -l)"
+          set -e
+          jq -n \
+            --arg source_revision "$SOURCE_SHA" \
+            --argjson down_status "$down_status" \
+            --argjson container_query_status "$container_query_status" \
+            --argjson volume_query_status "$volume_query_status" \
+            --argjson remaining_containers "$containers" \
+            --argjson remaining_volumes "$volumes" \
+            '{source_revision: $source_revision, down_status: $down_status,
+              container_query_status: $container_query_status,
+              volume_query_status: $volume_query_status,
+              remaining_containers: $remaining_containers, remaining_volumes: $remaining_volumes,
+              compose_state_removed: ($down_status == 0 and $container_query_status == 0
+                and $volume_query_status == 0 and $remaining_containers == 0
+                and $remaining_volumes == 0)}' \
+            > "$EVIDENCE_DIR/infrastructure-cleanup.json"
+          test "$down_status" -eq 0
+          test "$container_query_status" -eq 0
+          test "$volume_query_status" -eq 0
+          test "$containers" -eq 0
+          test "$volumes" -eq 0
+      - name: Finalize validated recovery receipt
+        run: >-
+          uv run python scripts/evidence_reuse.py finalize-domain
+          --domain recovery
+          --evidence-dir "$EVIDENCE_DIR"
+          --repository "$GITHUB_REPOSITORY"
+          --source-revision "$SOURCE_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --actor "$GITHUB_ACTOR"
+          --triggering-actor "$GITHUB_TRIGGERING_ACTOR"
+          --event-name "$GITHUB_EVENT_NAME"
+          --ref-name "$GITHUB_REF"
+          --workflow-ref "$GITHUB_WORKFLOW_REF"
       - name: Upload recovery evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: recovery-drill-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.EVIDENCE_PATH }}
+          path: ${{ env.EVIDENCE_DIR }}
           if-no-files-found: error
           retention-days: 30
-      - name: Remove isolated CockroachDB and storage
-        if: always()
-        run: docker compose down --volumes --remove-orphans
