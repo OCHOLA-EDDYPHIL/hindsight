@@ -90,6 +90,7 @@ def _purge_test_tenants(url: str, tenant_ids: tuple[object, ...]) -> None:
                     tenant_id=tenant_id,
                     operation_id=operation_id,
                     lease_owner=lease_owner,
+                    public_identity_sha256="e" * 64,
                 )
                 record_export(
                     connection,
@@ -116,6 +117,7 @@ def _purge_test_tenants(url: str, tenant_ids: tuple[object, ...]) -> None:
                     operation_id=operation_id,
                     confirmed_fingerprint=fingerprint,
                     lease_owner=lease_owner,
+                    public_identity_sha256="e" * 64,
                 )
                 record_principal_hashes(
                     connection,
@@ -131,6 +133,7 @@ def _purge_test_tenants(url: str, tenant_ids: tuple[object, ...]) -> None:
                     connection,
                     operation_id=operation_id,
                     lease_owner=lease_owner,
+                    public_identity_sha256="e" * 64,
                 )
     finally:
         if not already_member:
