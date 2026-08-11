@@ -365,6 +365,11 @@ def test_recovery_workflow_is_owner_main_only_and_uses_ephemeral_local_storage()
     assert "docker compose down --volumes --remove-orphans" in commands
     upload = next(step for step in job["steps"] if step.get("uses") == "actions/upload-artifact@v4")
     assert upload["if"] == "always()"
-    assert upload["with"]["path"] == "${{ env.EVIDENCE_PATH }}"
+    assert upload["with"]["path"] == "${{ env.EVIDENCE_DIR }}"
     assert upload["with"]["if-no-files-found"] == "error"
-    assert job["steps"][-1]["if"] == "always()"
+    assert job["steps"][-1] == upload
+    cleanup = next(
+        step for step in job["steps"] if "infrastructure-cleanup.json" in step.get("run", "")
+    )
+    assert cleanup["if"] == "always()"
+    assert job["steps"].index(cleanup) < job["steps"].index(upload)

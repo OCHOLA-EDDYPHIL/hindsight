@@ -52,6 +52,9 @@ WORKFLOW_COMPONENTS = {
     ".github/workflows/destroy-demo.yml": frozenset(
         {"lambda_artifacts", "terraform"}
     ),
+    ".github/workflows/evidence-reuse.yml": frozenset(
+        {"database", "main_qualification"}
+    ),
     ".github/workflows/live-acceptance.yml": frozenset(
         {"database", "main_qualification", "frontend", "lambda_artifacts", "terraform"}
     ),
@@ -75,6 +78,7 @@ MAIN_QUALIFICATION_SCRIPTS = frozenset(
         "apply_database_roles.py",
         "run_capacity_qualification.py",
         "drop_diagnostic_database.py",
+        "evidence_reuse.py",
         "initialize_agent_storage.py",
         "migrate.py",
         "populated_upgrade_fixture.py",

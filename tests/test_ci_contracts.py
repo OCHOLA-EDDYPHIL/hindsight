@@ -262,6 +262,7 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
         "ci.yml",
         "deploy-demo.yml",
         "destroy-demo.yml",
+        "evidence-reuse.yml",
         "live-acceptance.yml",
         "migration-compatibility.yml",
         "observability-evidence.yml",
@@ -276,6 +277,7 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
     for name in (
         "capacity-qualification.yml",
         "destroy-demo.yml",
+        "evidence-reuse.yml",
         "live-acceptance.yml",
         "migration-compatibility.yml",
         "observability-evidence.yml",
