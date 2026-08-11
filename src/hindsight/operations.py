@@ -299,7 +299,28 @@ def enqueue_operation(
     if not idempotency_key.strip():
         raise ValueError("idempotency_key is required")
     resolved_url = db_url or database_url()
-    with connect(resolved_url, application_name="hindsight-api") as conn:
+    for transaction_attempt in range(1, MAX_OPERATION_TRANSACTION_ATTEMPTS + 1):
+        try:
+            return _enqueue_operation_once(
+                preview_id=preview_id,
+                fingerprint=fingerprint,
+                idempotency_key=idempotency_key,
+                db_url=resolved_url,
+            )
+        except SerializationFailure:
+            if transaction_attempt == MAX_OPERATION_TRANSACTION_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable operation enqueue retry state")
+
+
+def _enqueue_operation_once(
+    *,
+    preview_id: str,
+    fingerprint: str,
+    idempotency_key: str,
+    db_url: str,
+) -> tuple[dict[str, Any], bool]:
+    with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -313,9 +334,10 @@ def enqueue_operation(
                 )
                 existing = cur.fetchone()
                 if existing is not None:
-                    if str(existing["preview_id"]) != preview_id or str(
-                        existing["preview_fingerprint"]
-                    ) != fingerprint:
+                    if (
+                        str(existing["preview_id"]) != preview_id
+                        or str(existing["preview_fingerprint"]) != fingerprint
+                    ):
                         raise OperationConflictError(
                             "idempotency key is already bound to another approved preview"
                         )
@@ -382,10 +404,13 @@ def enqueue_operation(
                     )
                     raced = cur.fetchone()
                     if raced is None:
-                        raise RuntimeError("idempotent operation insert lost without a winner")
-                    if str(raced["preview_id"]) != preview_id or str(
-                        raced["preview_fingerprint"]
-                    ) != fingerprint:
+                        raise SerializationFailure(
+                            "idempotent operation lost a concurrent unique-key race"
+                        )
+                    if (
+                        str(raced["preview_id"]) != preview_id
+                        or str(raced["preview_fingerprint"]) != fingerprint
+                    ):
                         raise OperationConflictError(
                             "idempotency key is already bound to another approved preview"
                         )

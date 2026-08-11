@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import os
 import hashlib
+import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import psycopg
@@ -141,7 +143,7 @@ def _purge_test_tenants(url: str, tenant_ids: tuple[object, ...]) -> None:
 
 
 @requires_db
-def test_governed_operation_idempotency_replays_within_tenant_and_isolates_tenants():
+def test_governed_operation_idempotency_converges_within_tenant_and_isolates_tenants():
     from hindsight.operations import OperationConflictError, enqueue_operation
 
     target_url = os.environ["DATABASE_URL"]
@@ -212,19 +214,30 @@ def test_governed_operation_idempotency_replays_within_tenant_and_isolates_tenan
                 ),
             )
 
+        barrier = Barrier(2)
+
+        def enqueue_first_tenant():
+            with tenant_scope(first_tenant):
+                barrier.wait(timeout=5)
+                return enqueue_operation(
+                    preview_id=str(first_preview),
+                    fingerprint=first_fingerprint,
+                    idempotency_key=idempotency_key,
+                    db_url=target_url,
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            concurrent_results = list(pool.map(lambda _index: enqueue_first_tenant(), range(2)))
+
+        created = [operation for operation, was_created in concurrent_results if was_created]
+        replayed = [operation for operation, was_created in concurrent_results if not was_created]
+        assert len(created) == 1
+        assert len(replayed) == 1
+        first = created[0]
+        replay = replayed[0]
+        assert replay["id"] == first["id"]
+
         with tenant_scope(first_tenant):
-            first, first_created = enqueue_operation(
-                preview_id=str(first_preview),
-                fingerprint=first_fingerprint,
-                idempotency_key=idempotency_key,
-                db_url=target_url,
-            )
-            replay, replay_created = enqueue_operation(
-                preview_id=str(first_preview),
-                fingerprint=first_fingerprint,
-                idempotency_key=idempotency_key,
-                db_url=target_url,
-            )
             with pytest.raises(
                 OperationConflictError,
                 match="idempotency key is already bound to another approved preview",
@@ -244,9 +257,6 @@ def test_governed_operation_idempotency_replays_within_tenant_and_isolates_tenan
                 db_url=target_url,
             )
 
-        assert first_created is True
-        assert replay_created is False
-        assert replay["id"] == first["id"]
         assert second_created is True
         assert second["id"] != first["id"]
 
@@ -260,6 +270,10 @@ def test_governed_operation_idempotency_replays_within_tenant_and_isolates_tenan
                 """,
                 (idempotency_key,),
             ).fetchall() == [(first["id"], first_tenant)]
+            assert connection.execute(
+                "SELECT count(*) FROM memory_operation_events WHERE operation_id = %s",
+                (first["id"],),
+            ).fetchone() == (1,)
             assert (
                 connection.execute(
                     """
