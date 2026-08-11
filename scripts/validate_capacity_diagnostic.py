@@ -208,6 +208,8 @@ def validate(
     ):
         raise ValueError("capacity diagnostic artifact digests are incomplete")
     duration = values["total"]["duration_seconds"]
+    if runtime["cgroup"]["sampling_elapsed_ns"] < duration * 1_000_000_000:
+        raise ValueError("capacity diagnostic sampling does not cover the measured workload")
     projected_duration = math.ceil(duration * 11 / 8)
     if projected_duration > MAX_PROJECTED_DURATION_SECONDS:
         raise ValueError("capacity diagnostic lacks the required timing headroom")
