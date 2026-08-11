@@ -2,6 +2,11 @@ name: plan bootstrap
 
 on:
   workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type plan-bootstrap-<exact main SHA>
+        required: true
+        type: string
 
 permissions: {}
 
@@ -20,6 +25,7 @@ jobs:
         name: Authorize exact-main bootstrap planning
         env:
           ACTOR: ${{ github.actor }}
+          CONFIRMATION: ${{ inputs.confirmation }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.sha }}
           PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
@@ -38,6 +44,7 @@ jobs:
             && "$PRIVATE_REPOSITORY" == "true" \
             && "$REF_NAME" == "refs/heads/main" \
             && "$REF_PROTECTED" == "true" \
+            && "$CONFIRMATION" == "plan-bootstrap-$EVENT_SHA" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/plan-bootstrap.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
             && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
@@ -62,12 +69,9 @@ jobs:
       AWS_REGION: us-east-1
       CONFIGURED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
       EXPECTED_AWS_ACCOUNT_ID: "762397612117"
-      PLAN_DIR: ${{ runner.temp }}/hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}
       PLAN_ROLE_ARN: ${{ vars.AWS_BOOTSTRAP_PLAN_ROLE_ARN }}
       SOURCE_REVISION: ${{ needs.authorize.outputs.source_revision }}
-      TF_DATA_DIR: ${{ runner.temp }}/hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}/terraform-data
       TF_IN_AUTOMATION: "true"
-      TF_PLUGIN_CACHE_DIR: ${{ runner.temp }}/hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}/plugin-cache
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_KEY: hindsight/bootstrap/terraform.tfstate
       TF_VAR_aws_region: us-east-1
@@ -106,6 +110,9 @@ jobs:
           test -n "$RUNNER_TEMP"
           test "$RUNNER_TEMP" != "/"
           test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"
+          PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TF_DATA_DIR="$PLAN_DIR/terraform-data"
+          TF_PLUGIN_CACHE_DIR="$PLAN_DIR/plugin-cache"
           test "$PLAN_DIR" = "$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           test "$TF_DATA_DIR" = "$PLAN_DIR/terraform-data"
           test "$TF_PLUGIN_CACHE_DIR" = "$PLAN_DIR/plugin-cache"
@@ -114,6 +121,11 @@ jobs:
           mkdir -m 0700 -- "$PLAN_DIR"
           mkdir -m 0700 -- "$PLAN_DIR/plugin-cache"
           mkdir -m 0700 -- "$PLAN_DIR/terraform-data"
+          {
+            printf 'PLAN_DIR=%s\n' "$PLAN_DIR"
+            printf 'TF_DATA_DIR=%s\n' "$TF_DATA_DIR"
+            printf 'TF_PLUGIN_CACHE_DIR=%s\n' "$TF_PLUGIN_CACHE_DIR"
+          } >> "$GITHUB_ENV"
       - name: Verify protected planning configuration
         shell: bash
         run: |
@@ -248,7 +260,8 @@ jobs:
           test "$RUNNER_TEMP" != "/"
           test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"
           EXPECTED_PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          test "$PLAN_DIR" = "$EXPECTED_PLAN_DIR"
+          ACTUAL_PLAN_DIR="${PLAN_DIR:-$EXPECTED_PLAN_DIR}"
+          test "$ACTUAL_PLAN_DIR" = "$EXPECTED_PLAN_DIR"
           test "$EXPECTED_PLAN_DIR" != "$RUNNER_TEMP"
           [[ "$EXPECTED_PLAN_DIR" == "$RUNNER_TEMP/hindsight-bootstrap-plan-"* ]]
           if [[ -e "$EXPECTED_PLAN_DIR" ]]; then

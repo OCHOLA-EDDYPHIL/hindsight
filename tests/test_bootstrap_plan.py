@@ -555,6 +555,10 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
     plan = jobs["plan"]
 
     assert workflow["permissions"] == {}
+    triggers = workflow.get("on", workflow.get(True))
+    confirmation = triggers["workflow_dispatch"]["inputs"]["confirmation"]
+    assert confirmation["required"] is True
+    assert confirmation["type"] == "string"
     assert workflow["concurrency"] == {
         "group": "hindsight-bootstrap-plan-demo",
         "cancel-in-progress": False,
@@ -568,6 +572,7 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
         '"$PRIVATE_REPOSITORY" == "true"',
         '"$REF_NAME" == "refs/heads/main"',
         '"$REF_PROTECTED" == "true"',
+        '"$CONFIRMATION" == "plan-bootstrap-$EVENT_SHA"',
         '"$ACTOR" == "$REPOSITORY_OWNER"',
         '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"',
     ):
@@ -629,13 +634,18 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
     assert "-destroy" not in text
     assert "-refresh=false" not in text
     assert text.count("secrets.CLOUDFLARE_API_TOKEN") == 1
-    assert "TF_DATA_DIR" in plan["env"]
-    assert plan["env"]["TF_DATA_DIR"].endswith("/terraform-data")
+    assert "PLAN_DIR" not in plan["env"]
+    assert "TF_DATA_DIR" not in plan["env"]
+    assert "TF_PLUGIN_CACHE_DIR" not in plan["env"]
+    assert all("runner.temp" not in str(value) for value in plan["env"].values())
     prepare = next(
         step for step in plan["steps"] if step.get("name") == "Prepare exact temporary workspace"
     )
+    assert 'PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-plan-' in prepare["run"]
     assert 'test "$TF_DATA_DIR" = "$PLAN_DIR/terraform-data"' in prepare["run"]
     assert 'mkdir -m 0700 -- "$PLAN_DIR/terraform-data"' in prepare["run"]
+    assert 'printf \'PLAN_DIR=%s\\n\'' in prepare["run"]
+    assert '>> "$GITHUB_ENV"' in prepare["run"]
 
     before = next(
         step for step in plan["steps"] if step.get("name") == "Record state provenance before planning"
@@ -670,6 +680,7 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
     assert 'test -n "$RUNNER_TEMP"' in cleanup["run"]
     assert 'test "$RUNNER_TEMP" != "/"' in cleanup["run"]
     assert 'test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"' in cleanup["run"]
-    assert 'test "$PLAN_DIR" = "$EXPECTED_PLAN_DIR"' in cleanup["run"]
+    assert 'ACTUAL_PLAN_DIR="${PLAN_DIR:-$EXPECTED_PLAN_DIR}"' in cleanup["run"]
+    assert 'test "$ACTUAL_PLAN_DIR" = "$EXPECTED_PLAN_DIR"' in cleanup["run"]
     assert 'rm -rf -- "$EXPECTED_PLAN_DIR"' in cleanup["run"]
     assert "sha256sum --check SHA256SUMS" in text
