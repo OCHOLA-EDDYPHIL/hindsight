@@ -37,18 +37,36 @@ from hindsight.vector_index_qualification import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "hindsight.capacity_qualification.v2"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v3"
 ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v1"
 ATTEMPT_PROGRESS_FILENAME = "capacity-attempt-progress.json"
 TARGETS = {"vectors": 100_000, "tenants": 20, "clients": 20, "backlog_messages": 1_000}
 VECTOR_DIMENSIONS = 1024
 ROWS_PER_TENANT = TARGETS["vectors"] // TARGETS["tenants"]
+VECTOR_CODE_BITS = 13
+VECTOR_CODE_OFFSET = TARGETS["tenants"]
+VECTOR_CODE_MULTIPLIER = 4051
+VECTOR_CODE_MAGNITUDE = "0.05"
+VECTOR_METHOD = "deterministic_tenant_anchored_13bit_1024d"
 MAX_DURATION_SECONDS = 1_200
 MAX_STORAGE_BYTES = 1_500_000_000
 MAX_EXTERNAL_COST_USD = 0
 MAX_CLIENTS = 20
-SEED_SHARDS = 5
+SEED_SHARDS = 1
+SEEDING_METHOD = (
+    "single_bounded_writer_twenty_atomic_per_tenant_copy_transactions_"
+    "between_exact_legacy_index_drop_and_restore"
+)
+FIXTURE_VECTOR_INDEX_METHOD = (
+    "legacy_only_before_seed_then_none_during_copy_then_legacy_restored_"
+    "before_populated_tenant_index_migration"
+)
+DATABASE_METHOD = "disposable_local_single_node_cockroachdb_in_memory_8_gib"
 MAX_CLEANUP_SECONDS = 120
+CLEANUP_JOB_SECONDS = 90
+CLEANUP_DROP_SECONDS = 25
+CLEANUP_VERIFY_SECONDS = 5
+CLEANUP_POLL_SECONDS = 0.5
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]{8,20}")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DATABASE_PREFIX = "hindsight_capacity_"
@@ -56,11 +74,31 @@ PROFILE_ID = "capacity-synthetic-v1"
 NAMESPACE_PREFIX = "capacity.synthetic"
 BASE_SCHEMA_THROUGH = "0029e_product_credential_locators.sql"
 LEGACY_VECTOR_INDEX = "semantic_memory_vectors_embedding_idx"
+LEGACY_VECTOR_MIGRATION = "0009_embedding_profiles_and_retrieval.sql"
+LEGACY_VECTOR_INDEX_CREATE_SQL = (
+    "CREATE VECTOR INDEX IF NOT EXISTS semantic_memory_vectors_embedding_idx "
+    "ON semantic_memory_vectors (embedding)"
+)
 TENANT_VECTOR_MIGRATION = "0030_tenant_vector_cosine_index.sql"
 QUALIFIED_VECTOR_INDEXES = frozenset({LEGACY_VECTOR_INDEX, TENANT_VECTOR_INDEX})
+CLEANUP_VECTOR_INDEX_JOB_TYPES = frozenset({"SCHEMA CHANGE", "NEW SCHEMA CHANGE"})
+CLEANUP_VECTOR_INDEX_CANCELLABLE_STATUSES = frozenset(
+    {"pending", "running", "retry-running", "paused", "pause-requested"}
+)
+CLEANUP_VECTOR_INDEX_WAIT_STATUSES = frozenset(
+    {
+        *CLEANUP_VECTOR_INDEX_CANCELLABLE_STATUSES,
+        "cancel-requested",
+        "reverting",
+        "retry-reverting",
+    }
+)
+CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "canceled"})
 LIMITATIONS = [
-    "This is a single-node local CockroachDB benchmark, not a production topology.",
+    "This is a single-node local in-memory CockroachDB benchmark, not a production topology.",
     "The deterministic synthetic vectors and in-process backlog do not model live traffic.",
+    "Fixture loading temporarily removes and exactly recreates the legacy vector index; "
+    "seed timing is not indexed-ingestion throughput.",
     "Synthetic fixture loading restores write triggers before qualification; it does not "
     "measure application ingestion throughput or realtime outbox load.",
     "The measurements are benchmark evidence and are not production SLO claims.",
@@ -307,18 +345,153 @@ def _drop_database(admin_url: str, database: str, deadline: Deadline) -> None:
         connect_timeout=min(5, deadline.remaining(MAX_CLEANUP_SECONDS)),
         application_name="hindsight-capacity-cleanup",
     ) as conn:
-        _refresh_cleanup_timeouts(conn, deadline)
+        cancel_deadline = Deadline(
+            min(
+                deadline.expires_at - CLEANUP_DROP_SECONDS - CLEANUP_VERIFY_SECONDS,
+                time.monotonic() + CLEANUP_JOB_SECONDS,
+            )
+        )
+        _cancel_disposable_vector_index_jobs(conn, database, cancel_deadline)
+        if deadline.remaining(MAX_CLEANUP_SECONDS) < (
+            CLEANUP_DROP_SECONDS + CLEANUP_VERIFY_SECONDS
+        ):
+            raise TimeoutError("capacity cleanup did not preserve database-drop headroom")
+        _set_cleanup_timeouts(conn, CLEANUP_DROP_SECONDS)
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database)))
-        _refresh_cleanup_timeouts(conn, deadline)
+        _set_cleanup_timeouts(conn, CLEANUP_VERIFY_SECONDS)
         remaining = {str(row[0]) for row in conn.execute("SHOW DATABASES").fetchall()}
     if database in remaining:
         raise RuntimeError("disposable capacity database still exists after cleanup")
 
 
 def _refresh_cleanup_timeouts(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
-    timeout = f"{deadline.remaining(MAX_CLEANUP_SECONDS) * 1000}ms"
+    _set_cleanup_timeouts(conn, deadline.remaining(MAX_CLEANUP_SECONDS))
+
+
+def _set_cleanup_timeouts(conn: psycopg.Connection[Any], seconds: int) -> None:
+    timeout = f"{seconds * 1000}ms"
     conn.execute("SELECT set_config('statement_timeout', %s, false)", (timeout,))
     conn.execute("SELECT set_config('lock_timeout', %s, false)", (timeout,))
+
+
+def _vector_index_job_prefixes(database: str) -> tuple[str, ...]:
+    if not _is_disposable(database):
+        raise RuntimeError("refusing to inspect jobs for a non-capacity database")
+    return tuple(
+        f"CREATE VECTOR INDEX IF NOT EXISTS {index} "
+        f"ON {database}.public.semantic_memory_vectors ("
+        for index in sorted(QUALIFIED_VECTOR_INDEXES)
+    )
+
+
+def _legacy_index_drop_job_description(database: str) -> str:
+    if not _is_disposable(database):
+        raise RuntimeError("refusing to inspect jobs for a non-capacity database")
+    return (
+        f"DROP INDEX {database}.public.semantic_memory_vectors@{LEGACY_VECTOR_INDEX}"
+    )
+
+
+def _vector_index_job_predicate(prefixes: tuple[str, ...]) -> str:
+    return " OR ".join(
+        "substring(description, 1, length(%s::STRING)) = %s::STRING"
+        for _prefix in prefixes
+    )
+
+
+def _vector_index_job_params(prefixes: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(value for prefix in prefixes for value in (prefix, prefix))
+
+
+def _cancel_disposable_vector_index_jobs(
+    conn: psycopg.Connection[Any], database: str, deadline: Deadline
+) -> None:
+    prefixes = _vector_index_job_prefixes(database)
+    drop_description = _legacy_index_drop_job_description(database)
+    predicate = _vector_index_job_predicate(prefixes)
+    prefix_params = _vector_index_job_params(prefixes)
+    _refresh_cleanup_timeouts(conn, deadline)
+    rows = conn.execute(
+        f"""
+        SELECT job_id, job_type, status, description
+        FROM crdb_internal.jobs
+        WHERE job_type IN ('SCHEMA CHANGE', 'NEW SCHEMA CHANGE')
+          AND status NOT IN ('succeeded', 'failed', 'canceled')
+          AND (({predicate}) OR description = %s::STRING)
+        ORDER BY job_id
+        """,
+        (*prefix_params, drop_description),
+    ).fetchall()
+    if not rows:
+        return
+
+    jobs = {
+        int(row[0]): (str(row[1]), str(row[2]), str(row[3]))
+        for row in rows
+    }
+    unexpected = {
+        job_id: {"job_type": job_type, "status": status, "description": description}
+        for job_id, (job_type, status, description) in jobs.items()
+        if job_type not in CLEANUP_VECTOR_INDEX_JOB_TYPES
+        or status not in CLEANUP_VECTOR_INDEX_WAIT_STATUSES
+        or not (
+            description == drop_description
+            or any(description.startswith(prefix) for prefix in prefixes)
+        )
+    }
+    if unexpected:
+        raise RuntimeError(f"refusing to cancel unexpected capacity jobs: {unexpected}")
+
+    cancellable_ids = sorted(
+        job_id
+        for job_id, (_job_type, status, description) in jobs.items()
+        if status in CLEANUP_VECTOR_INDEX_CANCELLABLE_STATUSES
+        and any(description.startswith(prefix) for prefix in prefixes)
+    )
+    if cancellable_ids:
+        _refresh_cleanup_timeouts(conn, deadline)
+        conn.execute(
+            f"""
+            CANCEL JOBS (
+                SELECT job_id
+                FROM crdb_internal.jobs
+                WHERE job_id = ANY(%s)
+                  AND job_type IN ('SCHEMA CHANGE', 'NEW SCHEMA CHANGE')
+                  AND status IN (
+                      'pending', 'running', 'retry-running', 'paused', 'pause-requested'
+                  )
+                  AND ({predicate})
+            )
+            """,
+            (cancellable_ids, *prefix_params),
+        )
+
+    job_ids = sorted(jobs)
+    while True:
+        _refresh_cleanup_timeouts(conn, deadline)
+        current_rows = conn.execute(
+            "SELECT job_id, status FROM crdb_internal.jobs "
+            "WHERE job_id = ANY(%s) ORDER BY job_id",
+            (job_ids,),
+        ).fetchall()
+        current = {int(row[0]): str(row[1]) for row in current_rows}
+        missing = sorted(set(job_ids) - set(current))
+        if missing:
+            raise RuntimeError(f"capacity cleanup jobs disappeared before terminal state: {missing}")
+        failed = {
+            job_id: status
+            for job_id, status in current.items()
+            if status not in (
+                CLEANUP_VECTOR_INDEX_WAIT_STATUSES | CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES
+            )
+        }
+        if failed:
+            raise RuntimeError(f"capacity cleanup jobs entered unsafe states: {failed}")
+        if all(
+            status in CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES for status in current.values()
+        ):
+            return
+        time.sleep(CLEANUP_POLL_SECONDS)
 
 
 def _migrate(
@@ -355,9 +528,25 @@ def _tenant_id(run_id: str, number: int) -> UUID:
     return uuid5(NAMESPACE_URL, f"hindsight-capacity:{run_id}:tenant:{number}")
 
 
-def _vector(number: int) -> str:
+def _vector_code(ordinal: int) -> int:
+    if type(ordinal) is not int or not 1 <= ordinal <= ROWS_PER_TENANT:
+        raise ValueError("capacity vector ordinal is outside the bounded fixture")
+    return (ordinal * VECTOR_CODE_MULTIPLIER) & ((1 << VECTOR_CODE_BITS) - 1)
+
+
+def _vector(number: int, ordinal: int = 0) -> str:
+    if type(number) is not int or not 1 <= number <= TARGETS["tenants"]:
+        raise ValueError("capacity vector tenant is outside the bounded fixture")
+    if type(ordinal) is not int or not 0 <= ordinal <= ROWS_PER_TENANT:
+        raise ValueError("capacity vector ordinal is outside the bounded fixture")
     values = ["0"] * VECTOR_DIMENSIONS
-    values[(number - 1) % VECTOR_DIMENSIONS] = "1"
+    values[number - 1] = "1"
+    if ordinal:
+        code = _vector_code(ordinal)
+        for bit in range(VECTOR_CODE_BITS):
+            values[VECTOR_CODE_OFFSET + bit] = (
+                VECTOR_CODE_MAGNITUDE if code & (1 << bit) else f"-{VECTOR_CODE_MAGNITUDE}"
+            )
     return "[" + ",".join(values) + "]"
 
 
@@ -481,57 +670,119 @@ def _prepare_seed_load(conn: psycopg.Connection[Any], deadline: Deadline) -> Non
     _remove_bulk_seed_memory_triggers(conn, deadline)
 
 
-def _load_seed_shard(database_url: str, deadline: Deadline, shard: int) -> None:
+def _require_atomic_copy(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
+    _refresh_qualification_timeout(conn, deadline)
+    conn.execute("SET copy_from_atomic_enabled = true")
+    row = conn.execute("SHOW copy_from_atomic_enabled").fetchone()
+    if row is None or str(row[0]).lower() not in {"on", "true"}:
+        raise RuntimeError("capacity vector COPY atomicity is not enabled")
+
+
+def _load_seed_shard(
+    database_url: str, deadline: Deadline, shard: int
+) -> tuple[int, int, list[dict[str, int]]]:
     with _connection(database_url, deadline) as conn:
-        shard_params = (SEED_SHARDS, shard)
-        _refresh_qualification_timeout(conn, deadline)
-        conn.execute(
-            """
-            INSERT INTO semantic_beliefs (tenant_id, id, namespace)
-            SELECT tenant.tenant_id, seed.memory_id, tenant.namespace
-            FROM capacity_seed AS seed
-            JOIN capacity_tenant_seed AS tenant USING (tenant_number)
-            WHERE mod(seed.tenant_number - 1, %s) = %s
-            """,
-            shard_params,
-        )
-        _refresh_qualification_timeout(conn, deadline)
-        conn.execute(
-            """
-            INSERT INTO semantic_memories (
-                tenant_id, id, belief_id, version_number, namespace, content, metadata,
-                writer, source_ref, justification, producer_decision_id, transition_kind,
-                content_schema, structured_payload, payload_digest, lineage_status,
-                trust_status, prompt_safety_status, prompt_safety_scanner_version,
-                prompt_safety_reason_codes
+        _require_atomic_copy(conn, deadline)
+        vector_inserts = 0
+        vector_transactions = 0
+        storage_checks: list[dict[str, int]] = []
+        for tenant_number in range(shard + 1, TARGETS["tenants"] + 1, SEED_SHARDS):
+            _refresh_qualification_timeout(conn, deadline)
+            tenant = conn.execute(
+                "SELECT tenant_id, namespace FROM capacity_tenant_seed "
+                "WHERE tenant_number = %s",
+                (tenant_number,),
+            ).fetchone()
+            if tenant is None:
+                raise RuntimeError("capacity vector staging tenant is missing")
+            staged_rows = conn.execute(
+                "SELECT ordinal, memory_id FROM capacity_seed "
+                "WHERE tenant_number = %s ORDER BY ordinal",
+                (tenant_number,),
+            ).fetchall()
+            if (
+                len(staged_rows) != ROWS_PER_TENANT
+                or [int(row[0]) for row in staged_rows]
+                != list(range(1, ROWS_PER_TENANT + 1))
+            ):
+                raise RuntimeError("capacity vector staging rows are not exact")
+            try:
+                with conn.transaction():
+                    _refresh_qualification_timeout(conn, deadline)
+                    conn.execute(
+                        """
+                        INSERT INTO semantic_beliefs (tenant_id, id, namespace)
+                        SELECT tenant.tenant_id, seed.memory_id, tenant.namespace
+                        FROM capacity_seed AS seed
+                        JOIN capacity_tenant_seed AS tenant USING (tenant_number)
+                        WHERE seed.tenant_number = %s
+                        """,
+                        (tenant_number,),
+                    )
+                    _refresh_qualification_timeout(conn, deadline)
+                    conn.execute(
+                        """
+                        INSERT INTO semantic_memories (
+                            tenant_id, id, belief_id, version_number, namespace, content,
+                            metadata, writer, source_ref, justification,
+                            producer_decision_id, transition_kind, content_schema,
+                            structured_payload, payload_digest, lineage_status, trust_status,
+                            prompt_safety_status, prompt_safety_scanner_version,
+                            prompt_safety_reason_codes
+                        )
+                        SELECT tenant.tenant_id, seed.memory_id, seed.memory_id, 1,
+                               tenant.namespace,
+                               'synthetic capacity row ' || seed.ordinal::STRING, '{}'::JSONB,
+                               'capacity.synthetic', 'capacity:' || seed.ordinal::STRING,
+                               'Bounded synthetic index qualification', tenant.decision_id,
+                               'assertion', 'capacity.synthetic.v1',
+                               jsonb_build_object('ordinal', seed.ordinal),
+                               sha256(('capacity:' || seed.ordinal::STRING)::BYTES),
+                               'complete', 'active', 'clear', 'capacity.synthetic.v1',
+                               '[]'::JSONB
+                        FROM capacity_seed AS seed
+                        JOIN capacity_tenant_seed AS tenant USING (tenant_number)
+                        WHERE seed.tenant_number = %s
+                        """,
+                        (tenant_number,),
+                    )
+                    with conn.cursor().copy(
+                        """
+                        COPY semantic_memory_vectors (
+                            tenant_id, memory_id, profile_id, namespace,
+                            content_digest, embedding
+                        ) FROM STDIN
+                        """
+                    ) as copy:
+                        for ordinal, memory_id in staged_rows:
+                            deadline.remaining()
+                            copy.write_row(
+                                (
+                                    tenant[0],
+                                    memory_id,
+                                    PROFILE_ID,
+                                    tenant[1],
+                                    hashlib.sha256(
+                                        f"capacity:{ordinal}".encode()
+                                    ).hexdigest(),
+                                    _vector(tenant_number, int(ordinal)),
+                                )
+                            )
+            except Exception as error:
+                raise RuntimeError(
+                    f"capacity vector copy failed at shard {shard}, tenant {tenant_number}"
+                ) from error
+            vector_inserts += len(staged_rows)
+            vector_transactions += 1
+            storage_checks.append(
+                _check_storage(
+                    database_url,
+                    deadline,
+                    completion_sequence=vector_transactions,
+                    completed_tenants=vector_transactions,
+                )
             )
-            SELECT tenant.tenant_id, seed.memory_id, seed.memory_id, 1, tenant.namespace,
-                   'synthetic capacity row ' || seed.ordinal::STRING, '{}'::JSONB,
-                   'capacity.synthetic', 'capacity:' || seed.ordinal::STRING,
-                   'Bounded synthetic index qualification', tenant.decision_id, 'assertion',
-                   'capacity.synthetic.v1', jsonb_build_object('ordinal', seed.ordinal),
-                   sha256(('capacity:' || seed.ordinal::STRING)::BYTES),
-                   'complete', 'active', 'clear', 'capacity.synthetic.v1', '[]'::JSONB
-            FROM capacity_seed AS seed
-            JOIN capacity_tenant_seed AS tenant USING (tenant_number)
-            WHERE mod(seed.tenant_number - 1, %s) = %s
-            """,
-            shard_params,
-        )
-        _refresh_qualification_timeout(conn, deadline)
-        conn.execute(
-            """
-            INSERT INTO semantic_memory_vectors (
-                tenant_id, memory_id, profile_id, namespace, content_digest, embedding
-            )
-            SELECT tenant.tenant_id, seed.memory_id, %s, tenant.namespace,
-                   sha256(('capacity:' || seed.ordinal::STRING)::BYTES), tenant.embedding
-            FROM capacity_seed AS seed
-            JOIN capacity_tenant_seed AS tenant USING (tenant_number)
-            WHERE mod(seed.tenant_number - 1, %s) = %s
-            """,
-            (PROFILE_ID, *shard_params),
-        )
+        return vector_inserts, vector_transactions, storage_checks
 
 
 def _seed_shard_worker(
@@ -541,12 +792,17 @@ def _seed_shard_worker(
     results: multiprocessing.Queue,
 ) -> None:
     try:
-        _load_seed_shard(database_url, Deadline(expires_at), shard)
+        vector_inserts, vector_transactions, storage_checks = _load_seed_shard(
+            database_url, Deadline(expires_at), shard
+        )
     except BaseException as error:
         detail = f"{type(error).__name__}: {error}"[:800]
+        vector_inserts = None
+        vector_transactions = None
+        storage_checks = None
     else:
         detail = None
-    results.put((shard, detail))
+    results.put((shard, vector_inserts, vector_transactions, storage_checks, detail))
 
 
 def _stop_seed_processes(processes: list[multiprocessing.Process], deadline: Deadline) -> None:
@@ -565,7 +821,9 @@ def _stop_seed_processes(processes: list[multiprocessing.Process], deadline: Dea
         raise RuntimeError("capacity seed processes did not terminate after cleanup")
 
 
-def _run_seed_shards(database_url: str, deadline: Deadline) -> None:
+def _run_seed_shards(
+    database_url: str, deadline: Deadline
+) -> tuple[int, int, list[dict[str, int]]]:
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     processes = [
@@ -578,6 +836,9 @@ def _run_seed_shards(database_url: str, deadline: Deadline) -> None:
     ]
     started: list[multiprocessing.Process] = []
     received: set[int] = set()
+    vector_inserts = 0
+    vector_transactions = 0
+    storage_checks: list[dict[str, int]] = []
     try:
         for process in processes:
             process.start()
@@ -585,7 +846,7 @@ def _run_seed_shards(database_url: str, deadline: Deadline) -> None:
         while len(received) < SEED_SHARDS:
             deadline.remaining()
             try:
-                shard, error = results.get(
+                result = results.get(
                     timeout=min(1.0, max(0.01, deadline.expires_at - time.monotonic()))
                 )
             except queue.Empty:
@@ -598,15 +859,55 @@ def _run_seed_shards(database_url: str, deadline: Deadline) -> None:
                 if missing:
                     raise RuntimeError(f"{missing[0].name} exited without delivering a result")
                 continue
-            if shard in received or shard not in range(SEED_SHARDS):
+            if not isinstance(result, tuple) or len(result) != 5:
+                raise RuntimeError("capacity seed shard returned an invalid result")
+            shard, inserted_rows, transactions, shard_storage_checks, error = result
+            if type(shard) is not int or shard in received or shard not in range(SEED_SHARDS):
                 raise RuntimeError("capacity seed shard returned an invalid duplicate result")
             received.add(shard)
             if error is not None:
                 raise RuntimeError(f"capacity seed shard {shard} failed: {error}")
+            expected_rows = ROWS_PER_TENANT * len(
+                range(shard + 1, TARGETS["tenants"] + 1, SEED_SHARDS)
+            )
+            if type(inserted_rows) is not int or inserted_rows != expected_rows:
+                raise RuntimeError("capacity seed shard returned an invalid vector row count")
+            expected_transactions = len(
+                range(shard + 1, TARGETS["tenants"] + 1, SEED_SHARDS)
+            )
+            if type(transactions) is not int or transactions != expected_transactions:
+                raise RuntimeError("capacity seed shard returned an invalid transaction count")
+            if (
+                not isinstance(shard_storage_checks, list)
+                or len(shard_storage_checks) != expected_transactions
+                or any(
+                    not isinstance(row, dict)
+                    or type(row.get("completion_sequence")) is not int
+                    or type(row.get("completed_tenants")) is not int
+                    or row["completed_tenants"] != row["completion_sequence"]
+                    or type(row.get("bytes")) is not int
+                    or not 0 < row["bytes"] <= MAX_STORAGE_BYTES
+                    for row in shard_storage_checks
+                )
+            ):
+                raise RuntimeError("capacity seed shard returned invalid storage checks")
+            vector_inserts += inserted_rows
+            vector_transactions += transactions
+            storage_checks.extend(shard_storage_checks)
         for process in processes:
             process.join(timeout=max(0.0, deadline.expires_at - time.monotonic()))
         if any(process.is_alive() or process.exitcode != 0 for process in processes):
             raise RuntimeError("capacity seed processes did not exit successfully")
+        if vector_inserts != TARGETS["vectors"]:
+            raise RuntimeError("capacity seed vector row count is not exact")
+        if vector_transactions != TARGETS["tenants"]:
+            raise RuntimeError("capacity seed vector transaction count is not exact")
+        storage_checks.sort(key=lambda row: row["completion_sequence"])
+        if [row["completion_sequence"] for row in storage_checks] != list(
+            range(1, TARGETS["tenants"] + 1)
+        ):
+            raise RuntimeError("capacity seed storage-check sequence is not exact")
+        return vector_inserts, vector_transactions, storage_checks
     except BaseException:
         _stop_seed_processes(started, Deadline.after(MAX_CLEANUP_SECONDS))
         raise
@@ -615,13 +916,12 @@ def _run_seed_shards(database_url: str, deadline: Deadline) -> None:
         results.join_thread()
 
 
-def _seal_and_measure(
+def _seal_seed_decision(
     database_url: str,
     run_id: str,
     number: int,
     deadline: Deadline,
-    completion_sequence: int,
-) -> dict[str, int]:
+) -> None:
     tenant_id = _tenant_id(run_id, number)
     with _connection(database_url, deadline) as conn:
         conn.execute("SELECT set_config('hindsight.tenant_id', %s, false)", (str(tenant_id),))
@@ -635,13 +935,6 @@ def _seal_and_measure(
         )
         if updated.rowcount != 1:
             raise RuntimeError(f"tenant {number} seed decision was not sealed exactly once")
-        return _check_storage(
-            database_url,
-            deadline,
-            completion_sequence=completion_sequence,
-            completed_tenants=completion_sequence,
-            conn=conn,
-        )
 
 
 def _verify_bulk_seed_provenance(conn: psycopg.Connection[Any], deadline: Deadline) -> None:
@@ -703,8 +996,9 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
             _insert_tenant_staging(conn, run_id=run_id, tenant_number=number)
             _insert_seed_staging(conn, tenant_number=number, row_count=ROWS_PER_TENANT)
         _prepare_seed_load(conn, deadline)
-    _run_seed_shards(database_url, deadline)
-    storage_checks: list[dict[str, int]] = []
+    vector_insert_rows, vector_insert_transactions, storage_checks = _run_seed_shards(
+        database_url, deadline
+    )
     with _connection(database_url, deadline) as conn:
         _refresh_qualification_timeout(conn, deadline)
         _restore_bulk_seed_guards(conn, deadline)
@@ -715,19 +1009,15 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
         _refresh_qualification_timeout(conn, deadline)
         conn.execute("ANALYZE semantic_memory_vectors")
     for number in range(1, TARGETS["tenants"] + 1):
-        storage_checks.append(
-            _seal_and_measure(
-                database_url,
-                run_id,
-                number,
-                deadline,
-                len(storage_checks) + 1,
-            )
-        )
+        _seal_seed_decision(database_url, run_id, number, deadline)
     return {
         "name": "vector_seed",
         "duration_seconds": round(time.monotonic() - started, 6),
         "batches": TARGETS["tenants"],
+        "vector_insert_rows": vector_insert_rows,
+        "vector_insert_transactions": vector_insert_transactions,
+        "vector_insert_workers": SEED_SHARDS,
+        "vector_insert_client_retries": 0,
         "storage_checks": storage_checks,
         "peak_storage_bytes": max(row["bytes"] for row in storage_checks),
     }
@@ -741,6 +1031,63 @@ def _vector_index_names(conn: psycopg.Connection[Any], deadline: Deadline) -> fr
         (sorted(QUALIFIED_VECTOR_INDEXES),),
     ).fetchall()
     return frozenset(str(row[0]) for row in rows)
+
+
+def _suspend_legacy_vector_index(database_url: str, deadline: Deadline) -> dict[str, Any]:
+    started = time.monotonic()
+    with _connection(database_url, deadline) as conn:
+        before = _vector_index_names(conn, deadline)
+        if before != frozenset({LEGACY_VECTOR_INDEX}):
+            raise RuntimeError("capacity seed requires only the exact legacy vector index")
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            sql.SQL("DROP INDEX {}@{}").format(
+                sql.Identifier("semantic_memory_vectors"),
+                sql.Identifier(LEGACY_VECTOR_INDEX),
+            )
+        )
+        after = _vector_index_names(conn, deadline)
+    if after:
+        raise RuntimeError("capacity seed vector index suspension was not exact")
+    return {
+        "name": "legacy_index_suspension",
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "removed_index": LEGACY_VECTOR_INDEX,
+        "before_indexes": sorted(before),
+        "after_indexes": sorted(after),
+    }
+
+
+def _restore_legacy_vector_index(database_url: str, deadline: Deadline) -> dict[str, Any]:
+    started = time.monotonic()
+    with _connection(database_url, deadline) as conn:
+        before = _vector_index_names(conn, deadline)
+        if before:
+            raise RuntimeError("legacy vector index restore requires an index-free seed table")
+        _refresh_qualification_timeout(conn, deadline)
+        vector_count = int(
+            conn.execute("SELECT count(*)::INT8 FROM semantic_memory_vectors").fetchone()[0]
+        )
+        if vector_count != TARGETS["vectors"]:
+            raise RuntimeError("legacy vector index restore input is not the exact populated target")
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(LEGACY_VECTOR_INDEX_CREATE_SQL)
+        after = _vector_index_names(conn, deadline)
+        storage_bytes = _storage_bytes(database_url, deadline, conn=conn)
+    if after != frozenset({LEGACY_VECTOR_INDEX}):
+        raise RuntimeError("legacy vector index was not restored exactly")
+    if storage_bytes > MAX_STORAGE_BYTES:
+        raise RuntimeError("legacy vector index restore exceeded the storage ceiling")
+    return {
+        "name": "legacy_index_restore",
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "vectors": vector_count,
+        "migration": LEGACY_VECTOR_MIGRATION,
+        "restored_index": LEGACY_VECTOR_INDEX,
+        "before_indexes": sorted(before),
+        "after_indexes": sorted(after),
+        "storage_bytes": storage_bytes,
+    }
 
 
 def _tenant_index_build_input(database_url: str, deadline: Deadline) -> dict[str, Any]:
@@ -766,11 +1113,15 @@ def _tenant_index_build_input(database_url: str, deadline: Deadline) -> dict[str
 def _qualified_vector_indexes(database_url: str, deadline: Deadline) -> dict[str, Any]:
     with _connection(database_url, deadline) as conn:
         indexes = _vector_index_names(conn, deadline)
+        storage_bytes = _storage_bytes(database_url, deadline, conn=conn)
     if indexes != QUALIFIED_VECTOR_INDEXES:
         raise RuntimeError("capacity qualification requires both live vector indexes")
+    if storage_bytes > MAX_STORAGE_BYTES:
+        raise RuntimeError("qualified vector indexes exceeded the storage ceiling")
     return {
         "name": "vector_indexes",
         "indexes": sorted(indexes),
+        "storage_bytes": storage_bytes,
     }
 
 
@@ -938,8 +1289,12 @@ def _run(
             name="base_migrations",
             through=BASE_SCHEMA_THROUGH,
         )
+    with progress.phase("legacy_index_suspension"):
+        legacy_index_suspension = _suspend_legacy_vector_index(database_url, deadline)
     with progress.phase("vector_seed"):
         seed = _seed(database_url, run_id, deadline)
+    with progress.phase("legacy_index_restore"):
+        legacy_index_restore = _restore_legacy_vector_index(database_url, deadline)
     with progress.phase("tenant_index_build_input"):
         index_build_input = _tenant_index_build_input(database_url, deadline)
     with progress.phase("post_seed_migrations"):
@@ -984,9 +1339,10 @@ def _run(
         "source_revision": source_sha,
         "targets": TARGETS,
         "method": {
-            "database": "disposable_local_single_node_cockroachdb",
-            "vectors": "deterministic_synthetic_one_hot_1024d",
-            "seeding": "five_set_based_shards_before_tenant_vector_index_build",
+            "database": DATABASE_METHOD,
+            "vectors": VECTOR_METHOD,
+            "seeding": SEEDING_METHOD,
+            "fixture_vector_indexes": FIXTURE_VECTOR_INDEX_METHOD,
             "fixture_write_triggers": "restored_and_catalog_verified_before_completion_checks",
             "clients": "twenty_bounded_parallel_index_queries",
             "backlog": "in_process_synthetic_accounting_without_live_worker",
@@ -1004,7 +1360,9 @@ def _run(
         },
         "raw_measurements": [
             base_migration,
+            legacy_index_suspension,
             seed,
+            legacy_index_restore,
             index_build_input,
             post_seed_migrations,
             vector_indexes,

@@ -45,6 +45,15 @@ def test_capacity_seed_staging_executes_on_cockroach_and_partitions_batches():
             ).fetchone()
             assert tenant[0:2] == (1, "capacity.synthetic.01")
             assert len(tenant[2].removeprefix("[").removesuffix("]").split(",")) == 1024
+            diversified = conn.execute(
+                "SELECT %s::VECTOR(1024)::STRING, %s::VECTOR(1024)::STRING",
+                (producer._vector(1, 1), producer._vector(1, 2)),
+            ).fetchone()
+            assert diversified[0] != diversified[1]
+            assert all(
+                len(value.removeprefix("[").removesuffix("]").split(",")) == 1024
+                for value in diversified
+            )
         finally:
             conn.execute("DROP TABLE IF EXISTS capacity_seed")
             conn.execute("DROP TABLE IF EXISTS capacity_tenant_seed")

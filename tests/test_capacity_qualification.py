@@ -13,6 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_SHA = "a" * 40
 
 
+def _tenant_uuid(number: int) -> str:
+    return f"00000000-0000-0000-0000-{number + 1:012d}"
+
+
 def _script(name: str):
     spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     assert spec and spec.loader
@@ -32,11 +36,12 @@ def _qualification(validator):
         "vector_count": 100_000,
         "tenant_count": 20,
         "per_tenant_counts": [
-            {"tenant_id": f"tenant-{number}", "vectors": 5_000} for number in range(20)
+            {"tenant_id": _tenant_uuid(number), "vectors": 5_000} for number in range(20)
         ],
         "plans": [
             {
                 "client": number,
+                "tenant_id": _tenant_uuid(number - 1),
                 "qualified_index": validator.EXPECTED_INDEX,
                 "prefix_spans": "[/tenant - /tenant]",
                 "plan": f"vector search table: semantic_memory_vectors@{validator.EXPECTED_INDEX}",
@@ -55,9 +60,15 @@ def _report(validator):
             "artifact_sha256": "b" * 64,
             "main_sha": SOURCE_SHA,
         },
+        "cleanup": {"database_removed": True, "artifact_sha256": "d" * 64},
         "targets": dict(validator.TARGETS),
         "ceilings": dict(validator.EXPECTED_CEILINGS),
-        "method": {"vectors": "deterministic synthetic"},
+        "method": {
+            "database": validator.EXPECTED_DATABASE_METHOD,
+            "vectors": validator.EXPECTED_VECTOR_METHOD,
+            "seeding": validator.EXPECTED_SEEDING_METHOD,
+            "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+        },
         "environment": {
             "isolation": "run_scoped_database_and_compose_project",
             "paid_model_calls": 0,
@@ -70,9 +81,20 @@ def _report(validator):
                 "through": validator.BASE_SCHEMA_THROUGH,
             },
             {
+                "name": "legacy_index_suspension",
+                "duration_seconds": 1,
+                "removed_index": validator.LEGACY_INDEX,
+                "before_indexes": [validator.LEGACY_INDEX],
+                "after_indexes": [],
+            },
+            {
                 "name": "vector_seed",
                 "duration_seconds": 1,
                 "batches": 20,
+                "vector_insert_rows": 100_000,
+                "vector_insert_transactions": 20,
+                "vector_insert_workers": validator.EXPECTED_VECTOR_INSERT_WORKERS,
+                "vector_insert_client_retries": 0,
                 "storage_checks": [
                     {
                         "completion_sequence": number,
@@ -82,6 +104,16 @@ def _report(validator):
                     for number in range(1, 21)
                 ],
                 "peak_storage_bytes": 20_000,
+            },
+            {
+                "name": "legacy_index_restore",
+                "duration_seconds": 1,
+                "vectors": 100_000,
+                "migration": validator.LEGACY_VECTOR_MIGRATION,
+                "restored_index": validator.LEGACY_INDEX,
+                "before_indexes": [],
+                "after_indexes": [validator.LEGACY_INDEX],
+                "storage_bytes": 500_000,
             },
             {
                 "name": "tenant_index_build_input",
@@ -95,12 +127,17 @@ def _report(validator):
                 "duration_seconds": 1,
                 "through": "latest",
             },
-            {"name": "vector_indexes", "indexes": validator.EXPECTED_INDEXES},
+            {
+                "name": "vector_indexes",
+                "indexes": validator.EXPECTED_INDEXES,
+                "storage_bytes": 800_000,
+            },
             {
                 "name": "vector_counts",
                 "total": 100_000,
                 "per_tenant": [
-                    {"tenant_id": f"tenant-{number}", "vectors": 5_000} for number in range(20)
+                    {"tenant_id": _tenant_uuid(number), "vectors": 5_000}
+                    for number in range(20)
                 ],
             },
             {"name": "bounded_clients", "clients": _qualification(validator)["plans"]},
@@ -117,6 +154,7 @@ def _report(validator):
                 "per_client_counts": [50] * 20,
                 "live_worker_invocations": 0,
                 "paid_model_calls": 0,
+                "duration_seconds": 1,
             },
             {"name": "storage", "bytes": 1_000_000},
             {"name": "total", "duration_seconds": 10},
@@ -136,19 +174,36 @@ def test_producer_is_exact_bounded_and_deterministic():
         "backlog_messages": 1_000,
     }
     assert producer.MAX_CLIENTS == 20
-    assert producer.SEED_SHARDS == 5
+    assert producer.SEED_SHARDS == 1
     assert {
         shard: sum(1 for number in range(1, 21) if (number - 1) % producer.SEED_SHARDS == shard)
         for shard in range(producer.SEED_SHARDS)
-    } == {shard: 4 for shard in range(producer.SEED_SHARDS)}
+    } == {0: 20}
     assert producer.MAX_DURATION_SECONDS == 1_200
     assert producer.MAX_STORAGE_BYTES == 1_500_000_000
     assert producer.MAX_EXTERNAL_COST_USD == 0
     assert producer._tenant_id("abcdefgh", 1) == producer._tenant_id("abcdefgh", 1)
     assert len({producer._namespace(number) for number in range(1, 21)}) == 20
     vector = producer._vector(20)
-    assert len(vector.removeprefix("[").removesuffix("]").split(",")) == 1024
-    assert vector.count("1") == 1
+    values = vector.removeprefix("[").removesuffix("]").split(",")
+    assert len(values) == 1024
+    assert values.count("1") == 1
+    assert values.count("0") == 1023
+    assert producer.VECTOR_CODE_OFFSET + producer.VECTOR_CODE_BITS <= producer.VECTOR_DIMENSIONS
+    assert producer.ROWS_PER_TENANT < 1 << producer.VECTOR_CODE_BITS
+    assert len(
+        {producer._vector_code(ordinal) for ordinal in range(1, producer.ROWS_PER_TENANT + 1)}
+    ) == producer.ROWS_PER_TENANT
+    first = producer._vector(1, 1).removeprefix("[").removesuffix("]").split(",")
+    second = producer._vector(1, 2).removeprefix("[").removesuffix("]").split(",")
+    assert first != second
+    assert first[0] == second[0] == "1"
+    assert set(first[producer.VECTOR_CODE_OFFSET : producer.VECTOR_CODE_OFFSET + 13]) == {
+        producer.VECTOR_CODE_MAGNITUDE,
+        f"-{producer.VECTOR_CODE_MAGNITUDE}",
+    }
+    assert sum(value != "0" for value in first) == 14
+    assert producer.VECTOR_METHOD == "deterministic_tenant_anchored_13bit_1024d"
     backlog = producer._exercise_backlog()
     assert backlog["messages_enqueued"] == backlog["messages_accounted_for"] == 1_000
     assert backlog["messages_drained"] == 1_000
@@ -160,7 +215,7 @@ def test_producer_is_exact_bounded_and_deterministic():
     assert "CREATE TEMP TABLE" not in source.upper()
     assert "encode(sha256" not in source
     assert "CREATE TABLE capacity_seed" in source
-    assert source.count("JOIN capacity_tenant_seed AS tenant USING (tenant_number)") == 3
+    assert source.count("JOIN capacity_tenant_seed AS tenant USING (tenant_number)") == 2
     assert "'Bounded synthetic index qualification', namespace, 'open'" in source
     assert "SET status = 'sealed', sealed_at = now()" in source
     assert "ANALYZE semantic_memory_vectors" in source
@@ -169,8 +224,20 @@ def test_producer_is_exact_bounded_and_deterministic():
     assert "_restore_bulk_seed_guards(conn, deadline)" in source
     assert "_restore_bulk_seed_memory_triggers(conn, deadline)" in source
     assert "_verify_bulk_seed_provenance(conn, deadline)" in source
-    assert "DROP INDEX" not in source
-    assert "five_set_based_shards_before_tenant_vector_index_build" in source
+    assert source.count('sql.SQL("DROP INDEX {}@{}")') == 1
+    assert "DROP INDEX IF EXISTS" not in source
+    suspension = source.split("def _suspend_legacy_vector_index", 1)[1].split(
+        "def _restore_legacy_vector_index", 1
+    )[0]
+    assert "LEGACY_VECTOR_INDEX" in suspension
+    assert "TENANT_VECTOR_INDEX" not in suspension
+    assert producer.SEEDING_METHOD == (
+        "single_bounded_writer_twenty_atomic_per_tenant_copy_transactions_"
+        "between_exact_legacy_index_drop_and_restore"
+    )
+    assert "COPY semantic_memory_vectors" in source
+    assert "copy.write_row" in source
+    assert "executemany" not in source
     assert 'multiprocessing.get_context("spawn")' in source
     assert "_stop_seed_processes(started" in source
 
@@ -188,6 +255,21 @@ def test_producer_refuses_remote_or_unbounded_targets():
         )
     assert producer._is_disposable("hindsight_capacity_abcdefgh") is True
     assert producer._is_disposable("defaultdb") is False
+
+
+@pytest.mark.parametrize(
+    ("tenant_number", "ordinal"),
+    [(0, 0), (21, 0), (True, 0), (1, -1), (1, 5_001), (1, True)],
+)
+def test_capacity_vector_refuses_out_of_bounds_identity(tenant_number, ordinal):
+    producer = _script("run_capacity_qualification")
+
+    with pytest.raises(ValueError, match="bounded fixture"):
+        producer._vector(tenant_number, ordinal)
+
+    if tenant_number == 1 and ordinal != 0:
+        with pytest.raises(ValueError, match="bounded fixture"):
+            producer._vector_code(ordinal)
 
 
 def test_migrations_stop_before_tenant_index_then_resume_latest(monkeypatch):
@@ -255,6 +337,56 @@ def test_tenant_index_build_requires_exact_populated_legacy_index(monkeypatch):
         producer._tenant_index_build_input("postgresql://db", producer.Deadline.after(10))
 
 
+def test_legacy_vector_index_is_suspended_and_restored_exactly(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    executed = []
+
+    class Result:
+        def fetchone(self):
+            return (producer.TARGETS["vectors"],)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            executed.append(
+                statement.as_string(None) if hasattr(statement, "as_string") else str(statement)
+            )
+            return Result()
+
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    states = iter((frozenset({producer.LEGACY_VECTOR_INDEX}), frozenset()))
+    monkeypatch.setattr(producer, "_vector_index_names", lambda *_args: next(states))
+    suspended = producer._suspend_legacy_vector_index(
+        "postgresql://db", producer.Deadline.after(10)
+    )
+    assert suspended["before_indexes"] == [producer.LEGACY_VECTOR_INDEX]
+    assert suspended["after_indexes"] == []
+    assert executed[-1] == (
+        'DROP INDEX "semantic_memory_vectors"@'
+        f'"{producer.LEGACY_VECTOR_INDEX}"'
+    )
+
+    states = iter((frozenset(), frozenset({producer.LEGACY_VECTOR_INDEX})))
+    monkeypatch.setattr(producer, "_vector_index_names", lambda *_args: next(states))
+    restored = producer._restore_legacy_vector_index(
+        "postgresql://db", producer.Deadline.after(10)
+    )
+    assert restored["vectors"] == producer.TARGETS["vectors"]
+    assert restored["before_indexes"] == []
+    assert restored["after_indexes"] == [producer.LEGACY_VECTOR_INDEX]
+    assert producer.LEGACY_VECTOR_INDEX_CREATE_SQL in executed
+
+    migration = " ".join(
+        (ROOT / "migrations" / producer.LEGACY_VECTOR_MIGRATION).read_text().split()
+    )
+    assert producer.LEGACY_VECTOR_INDEX_CREATE_SQL in migration
+
+
 def test_bulk_seed_lifecycle_guards_are_removed_and_restored_exactly():
     producer = _script("run_capacity_qualification")
     statements = []
@@ -304,6 +436,7 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
         "schema_version": validator.SCHEMA_VERSION,
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
+        "error": None,
         "source_revision": SOURCE_SHA,
         "timeout_seconds": 120,
     }
@@ -352,6 +485,7 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
                 "schema_version": validator.SCHEMA_VERSION,
                 "database": "hindsight_capacity_abcdefgh",
                 "database_removed": False,
+                "error": None,
                 "source_revision": SOURCE_SHA,
                 "timeout_seconds": 120,
             },
@@ -376,6 +510,117 @@ def test_validator_requires_bound_supplemental_artifacts():
         validator.validate(_report(validator), source_revision=SOURCE_SHA)
 
 
+def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
+    validator = _script("validate_capacity_evidence")
+    qualification = _qualification(validator)
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "error": None,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    digests = {
+        "index-qualification.json": "b" * 64,
+        "capacity-report.json": "c" * 64,
+        "cleanup.json": "d" * 64,
+    }
+
+    report = _report(validator)
+    counts = next(
+        row for row in report["raw_measurements"] if row["name"] == "vector_counts"
+    )["per_tenant"]
+    counts[1]["tenant_id"] = counts[0]["tenant_id"]
+    with pytest.raises(ValueError, match="exact vector and tenant counts"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    seed = next(row for row in report["raw_measurements"] if row["name"] == "vector_seed")
+    seed["duration_seconds"] = 1_201
+    with pytest.raises(ValueError, match="phase durations"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    report["raw_measurements"][-1]["duration_seconds"] = 5
+    with pytest.raises(ValueError, match="phase durations exceed"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    with pytest.raises(ValueError, match="cleanup"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup={**cleanup, "database": "hindsight_capacity_", "error": "failed"},
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    missing_error = dict(cleanup)
+    del missing_error["error"]
+    with pytest.raises(ValueError, match="cleanup"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=missing_error,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    report["cleanup"]["artifact_sha256"] = "e" * 64
+    with pytest.raises(ValueError, match="manifest"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+
+def test_capacity_schema_contract_is_shared_by_producer_and_validator():
+    producer = _script("run_capacity_qualification")
+    validator = _script("validate_capacity_evidence")
+
+    assert producer.SCHEMA_VERSION == validator.SCHEMA_VERSION
+    assert producer.TARGETS == validator.TARGETS
+    assert producer.MAX_DURATION_SECONDS == validator.EXPECTED_CEILINGS["duration_seconds"]
+    assert producer.MAX_STORAGE_BYTES == validator.EXPECTED_CEILINGS["storage_bytes"]
+    assert producer.MAX_CLIENTS == validator.EXPECTED_CEILINGS["clients"]
+    assert producer.MAX_EXTERNAL_COST_USD == validator.EXPECTED_CEILINGS["external_cost_usd"]
+    assert producer.SEED_SHARDS == validator.EXPECTED_VECTOR_INSERT_WORKERS
+    assert producer.VECTOR_METHOD == validator.EXPECTED_VECTOR_METHOD
+    assert producer.SEEDING_METHOD == validator.EXPECTED_SEEDING_METHOD
+    assert producer.FIXTURE_VECTOR_INDEX_METHOD == validator.EXPECTED_FIXTURE_VECTOR_INDEXES
+    assert producer.DATABASE_METHOD == validator.EXPECTED_DATABASE_METHOD
+    assert producer.BASE_SCHEMA_THROUGH == validator.BASE_SCHEMA_THROUGH
+    assert producer.LEGACY_VECTOR_INDEX == validator.LEGACY_INDEX
+    assert producer.TENANT_VECTOR_INDEX == validator.EXPECTED_INDEX
+    assert sorted(producer.QUALIFIED_VECTOR_INDEXES) == validator.EXPECTED_INDEXES
+    assert producer.LEGACY_VECTOR_MIGRATION == validator.LEGACY_VECTOR_MIGRATION
+    assert producer.TENANT_VECTOR_MIGRATION == validator.TENANT_VECTOR_MIGRATION
+
+
 def test_validator_requires_populated_index_build_and_both_live_indexes():
     validator = _script("validate_capacity_evidence")
     report = _report(validator)
@@ -384,6 +629,7 @@ def test_validator_requires_populated_index_build_and_both_live_indexes():
         "schema_version": validator.SCHEMA_VERSION,
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
+        "error": None,
         "source_revision": SOURCE_SHA,
         "timeout_seconds": 120,
     }
@@ -425,6 +671,7 @@ def test_validator_rejects_booleans_in_exact_numeric_evidence():
         "schema_version": validator.SCHEMA_VERSION,
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
+        "error": None,
         "source_revision": SOURCE_SHA,
         "timeout_seconds": 120,
     }
@@ -477,6 +724,7 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
         "schema_version": validator.SCHEMA_VERSION,
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
+        "error": None,
         "source_revision": SOURCE_SHA,
         "timeout_seconds": 120,
     }
@@ -502,6 +750,59 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     seed["storage_checks"][-1]["bytes"] = validator.EXPECTED_CEILINGS["storage_bytes"] + 1
     seed["peak_storage_bytes"] = seed["storage_checks"][-1]["bytes"]
     with pytest.raises(ValueError, match="enforced storage ceiling"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    for field, invalid in (
+        ("vector_insert_rows", 99_999),
+        ("vector_insert_rows", True),
+        ("vector_insert_transactions", 19),
+        ("vector_insert_transactions", True),
+        ("vector_insert_workers", 5),
+        ("vector_insert_client_retries", 1),
+    ):
+        report = _report(validator)
+        seed = next(row for row in report["raw_measurements"] if row["name"] == "vector_seed")
+        seed[field] = invalid
+        with pytest.raises(ValueError, match="exact bounded vector insertion"):
+            validator.validate(
+                report,
+                source_revision=SOURCE_SHA,
+                qualification=qualification,
+                cleanup=cleanup,
+                artifact_digests=digests,
+            )
+
+    report = _report(validator)
+    report["method"]["vectors"] = "twenty_repeated_vectors"
+    with pytest.raises(ValueError, match="deterministic vector fixture"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    report["method"]["seeding"] = "bulk_vector_insert"
+    with pytest.raises(ValueError, match="bounded vector seeding method"):
+        validator.validate(
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=qualification,
+            cleanup=cleanup,
+            artifact_digests=digests,
+        )
+
+    report = _report(validator)
+    report["method"] = ["truthy", "but", "not", "an", "object"]
+    with pytest.raises(ValueError, match="requires method and environment"):
         validator.validate(
             report,
             source_revision=SOURCE_SHA,
@@ -575,7 +876,7 @@ def test_storage_is_checked_during_seeding_and_fails_at_ceiling(monkeypatch):
         )
 
 
-def test_seed_completion_checks_are_serialized(monkeypatch):
+def test_seed_decision_seals_are_serialized(monkeypatch):
     producer = _script("run_capacity_qualification")
 
     events = []
@@ -592,20 +893,9 @@ def test_seed_completion_checks_are_serialized(monkeypatch):
             return SimpleNamespace(rowcount=1)
 
     monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
-    monkeypatch.setattr(
-        producer,
-        "_check_storage",
-        lambda _url, _deadline, *, completion_sequence, completed_tenants, conn: {
-            "completion_sequence": completion_sequence,
-            "completed_tenants": completed_tenants,
-            "bytes": completed_tenants,
-        },
-    )
-    assert producer._seal_and_measure("postgresql://db", "abcdefgh", 2, SimpleNamespace(), 1) == {
-        "completion_sequence": 1,
-        "completed_tenants": 1,
-        "bytes": 1,
-    }
+    assert producer._seal_seed_decision(
+        "postgresql://db", "abcdefgh", 2, SimpleNamespace()
+    ) is None
     assert "set_config('hindsight.tenant_id'" in events[0][0]
     assert "SET status = 'sealed', sealed_at = now()" in events[1][0]
     assert events[1][1][1] == "capacity:abcdefgh:2"
@@ -627,7 +917,7 @@ def test_seed_completion_fails_unless_decision_is_sealed_once(monkeypatch, rowco
 
     monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
     with pytest.raises(RuntimeError, match="not sealed exactly once"):
-        producer._seal_and_measure("postgresql://db", "abcdefgh", 1, SimpleNamespace(), 1)
+        producer._seal_seed_decision("postgresql://db", "abcdefgh", 1, SimpleNamespace())
 
 
 def test_seed_process_cleanup_terminates_then_kills():
@@ -662,9 +952,15 @@ def test_seed_shard_worker_reports_bounded_result(monkeypatch):
     producer = _script("run_capacity_qualification")
     rows = []
     results = SimpleNamespace(put=rows.append)
-    monkeypatch.setattr(producer, "_load_seed_shard", lambda *_args: None)
+    storage_checks = [
+        {"completion_sequence": number, "completed_tenants": number, "bytes": number}
+        for number in range(1, 6)
+    ]
+    monkeypatch.setattr(
+        producer, "_load_seed_shard", lambda *_args: (25_000, 5, storage_checks)
+    )
     producer._seed_shard_worker("postgresql://db", 123.0, 2, results)
-    assert rows == [(2, None)]
+    assert rows == [(2, 25_000, 5, storage_checks, None)]
 
     def fail(*_args):
         raise RuntimeError("x" * 2_000)
@@ -672,12 +968,189 @@ def test_seed_shard_worker_reports_bounded_result(monkeypatch):
     monkeypatch.setattr(producer, "_load_seed_shard", fail)
     producer._seed_shard_worker("postgresql://db", 123.0, 3, results)
     assert rows[-1][0] == 3
-    assert rows[-1][1].startswith("RuntimeError: ")
-    assert len(rows[-1][1]) == 800
+    assert rows[-1][1] is None
+    assert rows[-1][2] is None
+    assert rows[-1][3] is None
+    assert rows[-1][4].startswith("RuntimeError: ")
+    assert len(rows[-1][4]) == 800
+
+
+def test_seed_copy_atomicity_is_pinned_and_verified(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    calls = []
+
+    class Connection:
+        def execute(self, statement, _params=None):
+            calls.append(statement)
+            return SimpleNamespace(fetchone=lambda: ("off",))
+
+    monkeypatch.setattr(producer, "_refresh_qualification_timeout", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="COPY atomicity"):
+        producer._require_atomic_copy(Connection(), producer.Deadline.after(10))
+    assert calls == [
+        "SET copy_from_atomic_enabled = true",
+        "SHOW copy_from_atomic_enabled",
+    ]
+
+
+def test_seed_shard_uses_exact_per_tenant_vector_copy(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    calls = []
+    copied_rows = []
+
+    class Result:
+        rowcount = 1
+
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            statement = str(statement)
+            calls.append((statement, params))
+            if statement == "SHOW copy_from_atomic_enabled":
+                return Result([("on",)])
+            if statement.startswith("SELECT tenant_id, namespace"):
+                return Result([("tenant-id", "capacity.synthetic.01")])
+            if statement.startswith("SELECT ordinal, memory_id"):
+                return Result([(1, "memory-1"), (2, "memory-2")])
+            return Result()
+
+        def cursor(self):
+            return Cursor()
+
+        def transaction(self):
+            return self
+
+    class Cursor:
+        def copy(self, statement):
+            calls.append((statement, None))
+            return Copy()
+
+    class Copy:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def write_row(self, row):
+            copied_rows.append(row)
+
+    monkeypatch.setattr(producer, "TARGETS", {**producer.TARGETS, "tenants": 2, "vectors": 4})
+    monkeypatch.setattr(producer, "ROWS_PER_TENANT", 2)
+    monkeypatch.setattr(producer, "SEED_SHARDS", 2)
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    monkeypatch.setattr(producer, "_refresh_qualification_timeout", lambda *_args: None)
+    monkeypatch.setattr(
+        producer,
+        "_check_storage",
+        lambda *_args, **_kwargs: {
+            "completion_sequence": 1,
+            "completed_tenants": 1,
+            "bytes": 100,
+        },
+    )
+
+    assert producer._load_seed_shard("postgresql://db", producer.Deadline.after(10), 0) == (
+        2,
+        1,
+        [{"completion_sequence": 1, "completed_tenants": 1, "bytes": 100}],
+    )
+    vector_calls = [call for call in calls if "COPY semantic_memory_vectors" in call[0]]
+    assert len(vector_calls) == 1
+    assert [row[1] for row in copied_rows] == ["memory-1", "memory-2"]
+    assert [row[4] for row in copied_rows] == [
+        hashlib.sha256(b"capacity:1").hexdigest(),
+        hashlib.sha256(b"capacity:2").hexdigest(),
+    ]
+    assert [row[5] for row in copied_rows] == [
+        producer._vector(1, 1),
+        producer._vector(1, 2),
+    ]
+    assert copied_rows[0][5] != copied_rows[1][5]
+
+
+def test_seed_shard_does_not_retry_a_surfaced_vector_copy_error(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    vector_attempts = []
+
+    class Result:
+        rowcount = 1
+
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            statement = str(statement)
+            if statement == "SHOW copy_from_atomic_enabled":
+                return Result([("on",)])
+            if statement.startswith("SELECT tenant_id, namespace"):
+                return Result([("tenant-id", "capacity.synthetic.01")])
+            if statement.startswith("SELECT ordinal, memory_id"):
+                return Result([(1, "memory-1")])
+            return Result()
+
+        def cursor(self):
+            return Cursor()
+
+        def transaction(self):
+            return self
+
+    class Cursor:
+        def copy(self, _statement):
+            return Copy()
+
+    class Copy:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def write_row(self, row):
+            vector_attempts.append(row)
+            raise RuntimeError("database detail must remain chained")
+
+    monkeypatch.setattr(producer, "TARGETS", {**producer.TARGETS, "tenants": 1, "vectors": 1})
+    monkeypatch.setattr(producer, "ROWS_PER_TENANT", 1)
+    monkeypatch.setattr(producer, "SEED_SHARDS", 1)
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    monkeypatch.setattr(producer, "_refresh_qualification_timeout", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="shard 0, tenant 1"):
+        producer._load_seed_shard("postgresql://db", producer.Deadline.after(10), 0)
+    assert len(vector_attempts) == 1
 
 
 def test_seed_shard_partial_start_reaps_started_processes(monkeypatch):
     producer = _script("run_capacity_qualification")
+    monkeypatch.setattr(producer, "SEED_SHARDS", 2)
 
     class ResultQueue:
         def __init__(self):
@@ -717,13 +1190,73 @@ def test_seed_shard_partial_start_reaps_started_processes(monkeypatch):
     assert result_queue.closed is result_queue.joined is True
 
 
+def test_seed_shard_orchestrator_rejects_inexact_vector_count_and_reaps(monkeypatch):
+    producer = _script("run_capacity_qualification")
+
+    class ResultQueue:
+        def __init__(self):
+            storage_checks = [
+                {
+                    "completion_sequence": number,
+                    "completed_tenants": number,
+                    "bytes": number,
+                }
+                for number in range(1, 21)
+            ]
+            self.results = [(0, 99_999, 20, storage_checks, None)]
+            self.closed = False
+            self.joined = False
+
+        def get(self, timeout):
+            assert timeout > 0
+            return self.results.pop(0)
+
+        def close(self):
+            self.closed = True
+
+        def join_thread(self):
+            self.joined = True
+
+    class Process:
+        def __init__(self, *, name, **_kwargs):
+            self.name = name
+            self.exitcode = 0
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+    result_queue = ResultQueue()
+    context = SimpleNamespace(
+        Queue=lambda: result_queue,
+        Process=lambda **kwargs: Process(**kwargs),
+    )
+    reaped = []
+    monkeypatch.setattr(producer.multiprocessing, "get_context", lambda _method: context)
+    monkeypatch.setattr(
+        producer,
+        "_stop_seed_processes",
+        lambda processes, _deadline: reaped.extend(processes),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid vector row count"):
+        producer._run_seed_shards("postgresql://db", producer.Deadline.after(10))
+    assert len(reaped) == producer.SEED_SHARDS
+    assert result_queue.closed is result_queue.joined is True
+
+
 def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
     producer = _script("run_capacity_qualification")
     calls = []
 
     class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
         def fetchall(self):
-            return [("defaultdb",)]
+            return self.rows
 
     class Connection:
         def __enter__(self):
@@ -733,8 +1266,13 @@ def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
             return False
 
         def execute(self, query, params=None):
-            calls.append((str(query), params))
-            return Result()
+            statement = str(query)
+            calls.append((statement, params))
+            if "FROM crdb_internal.jobs" in statement:
+                return Result([])
+            if statement == "SHOW DATABASES":
+                return Result([("defaultdb",)])
+            return Result([])
 
     def connect(url, **kwargs):
         assert url == "postgresql://root@localhost/defaultdb"
@@ -743,15 +1281,164 @@ def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
         return Connection()
 
     monkeypatch.setattr(producer.psycopg, "connect", connect)
-    deadline = SimpleNamespace(remaining=lambda maximum: 7)
+    deadline = SimpleNamespace(
+        expires_at=producer.time.monotonic() + producer.MAX_CLEANUP_SECONDS,
+        remaining=lambda maximum: min(maximum, producer.MAX_CLEANUP_SECONDS),
+    )
     producer._drop_database(
         "postgresql://root@localhost/defaultdb",
         "hindsight_capacity_abcdefgh",
         deadline,
     )
 
-    assert ("SELECT set_config('statement_timeout', %s, false)", ("7000ms",)) in calls
-    assert ("SELECT set_config('lock_timeout', %s, false)", ("7000ms",)) in calls
+    for seconds in (
+        producer.CLEANUP_JOB_SECONDS,
+        producer.CLEANUP_DROP_SECONDS,
+        producer.CLEANUP_VERIFY_SECONDS,
+    ):
+        timeout = (f"{seconds * 1000}ms",)
+        assert ("SELECT set_config('statement_timeout', %s, false)", timeout) in calls
+        assert ("SELECT set_config('lock_timeout', %s, false)", timeout) in calls
+
+
+def test_cleanup_vector_job_prefixes_are_exact_and_disposable():
+    producer = _script("run_capacity_qualification")
+    database = "hindsight_capacity_abcdefgh"
+
+    prefixes = producer._vector_index_job_prefixes(database)
+
+    assert len(prefixes) == 2
+    assert all(
+        prefix.startswith("CREATE VECTOR INDEX IF NOT EXISTS semantic_memory_vectors_")
+        and f" ON {database}.public.semantic_memory_vectors (" in prefix
+        for prefix in prefixes
+    )
+    assert producer._legacy_index_drop_job_description(database) == (
+        f"DROP INDEX {database}.public.semantic_memory_vectors@{producer.LEGACY_VECTOR_INDEX}"
+    )
+    with pytest.raises(RuntimeError, match="non-capacity database"):
+        producer._vector_index_job_prefixes("hindsight")
+
+
+def test_cleanup_cancels_only_captured_exact_vector_jobs(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    database = "hindsight_capacity_abcdefgh"
+    calls = []
+    canceled = False
+
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def execute(self, query, params=None):
+            nonlocal canceled
+            statement = str(query)
+            calls.append((statement, params))
+            if "SELECT job_id, job_type, status" in statement:
+                return Result(
+                    [
+                        (
+                            42,
+                            "NEW SCHEMA CHANGE",
+                            "running",
+                            producer._vector_index_job_prefixes(database)[1] + "embedding)",
+                        )
+                    ]
+                )
+            if "CANCEL JOBS" in statement:
+                assert params[0] == [42]
+                canceled = True
+                return Result()
+            if "SELECT job_id, status" in statement:
+                assert canceled is True
+                return Result([(42, "canceled")])
+            return Result()
+
+    monkeypatch.setattr(producer.time, "sleep", lambda _seconds: None)
+    producer._cancel_disposable_vector_index_jobs(
+        Connection(),
+        database,
+        producer.Deadline.after(30),
+    )
+
+    selection = next(statement for statement, _params in calls if "job_type, status" in statement)
+    cancellation, params = next(
+        (statement, params) for statement, params in calls if "CANCEL JOBS" in statement
+    )
+    assert "substring(description, 1, length(%s::STRING)) = %s::STRING" in selection
+    assert " LIKE " not in selection
+    assert "job_id = ANY(%s)" in cancellation
+    assert all(database in prefix for prefix in params[1::2])
+
+
+def test_cleanup_waits_for_non_cancelable_exact_legacy_drop(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    database = "hindsight_capacity_abcdefgh"
+    calls = []
+
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class Connection:
+        def execute(self, query, params=None):
+            statement = str(query)
+            calls.append(statement)
+            if "SELECT job_id, job_type, status" in statement:
+                return Result(
+                    [
+                        (
+                            43,
+                            "NEW SCHEMA CHANGE",
+                            "running",
+                            producer._legacy_index_drop_job_description(database),
+                        )
+                    ]
+                )
+            if "SELECT job_id, status" in statement:
+                return Result([(43, "succeeded")])
+            return Result()
+
+    monkeypatch.setattr(producer.time, "sleep", lambda _seconds: None)
+    producer._cancel_disposable_vector_index_jobs(
+        Connection(), database, producer.Deadline.after(30)
+    )
+
+    assert not any("CANCEL JOBS" in statement for statement in calls)
+
+
+def test_cleanup_rejects_nonterminal_vector_job_state():
+    producer = _script("run_capacity_qualification")
+
+    class Result:
+        def fetchall(self):
+            return [
+                (
+                    42,
+                    "NEW SCHEMA CHANGE",
+                    "revert-failed",
+                    producer._vector_index_job_prefixes("hindsight_capacity_abcdefgh")[0]
+                    + "embedding)",
+                )
+            ]
+
+    class Connection:
+        def execute(self, _query, _params=None):
+            return Result()
+
+    with pytest.raises(RuntimeError, match="unexpected capacity jobs"):
+        producer._cancel_disposable_vector_index_jobs(
+            Connection(),
+            "hindsight_capacity_abcdefgh",
+            producer.Deadline.after(30),
+        )
 
 
 def test_primary_failure_preserves_bounded_cleanup_receipt(tmp_path, monkeypatch):
@@ -807,8 +1494,18 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
     monkeypatch.setattr(producer, "_migrate", migrate)
     monkeypatch.setattr(
         producer,
+        "_suspend_legacy_vector_index",
+        lambda *_args: {"name": "legacy_index_suspension", "duration_seconds": 1},
+    )
+    monkeypatch.setattr(
+        producer,
         "_seed",
         lambda *_args: {"name": "vector_seed", "duration_seconds": 1},
+    )
+    monkeypatch.setattr(
+        producer,
+        "_restore_legacy_vector_index",
+        lambda *_args: {"name": "legacy_index_restore", "duration_seconds": 1},
     )
     monkeypatch.setattr(
         producer,
@@ -844,7 +1541,9 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
     assert [row["name"] for row in progress["completed_phases"]] == [
         "database_create",
         "base_migrations",
+        "legacy_index_suspension",
         "vector_seed",
+        "legacy_index_restore",
         "tenant_index_build_input",
     ]
     assert all(row["duration_seconds"] > 0 for row in progress["completed_phases"])
@@ -945,6 +1644,7 @@ def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):
         "schema_version": validator.SCHEMA_VERSION,
         "database": "hindsight_capacity_abcdefgh",
         "database_removed": True,
+        "error": None,
         "source_revision": SOURCE_SHA,
         "timeout_seconds": 120,
     }
@@ -1024,6 +1724,9 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     assert qualification["env"]["COMPOSE_PROJECT_NAME"].endswith(
         "${{ github.run_id }}_${{ github.run_attempt }}"
     )
+    assert qualification["env"]["COCKROACH_START_ARGS"] == "--store=type=mem,size=8GiB"
+    compose = (ROOT / "docker-compose.yml").read_text()
+    assert "start-single-node --insecure ${COCKROACH_START_ARGS:-}" in compose
     assert "--timeout-seconds 1200" in source
     assert "scripts/run_capacity_qualification.py" in source
     assert "scripts/validate_capacity_evidence.py" in source
