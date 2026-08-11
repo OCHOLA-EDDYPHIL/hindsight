@@ -58,6 +58,67 @@ def test_operation_source_reads_close_before_document_embedding(monkeypatch):
     assert prepared == {"memory-1": [0.0]}
 
 
+def test_enqueue_operation_bounds_serialization_retries(monkeypatch):
+    import hindsight.operations as operations
+    from psycopg.errors import SerializationFailure
+
+    expected = ({"id": "winning-operation"}, False)
+    attempts = 0
+
+    def retry_once(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SerializationFailure("unique-key race")
+        return expected
+
+    monkeypatch.setattr(operations, "_enqueue_operation_once", retry_once)
+    assert (
+        operations.enqueue_operation(
+            preview_id="preview-1",
+            fingerprint="fingerprint-1",
+            idempotency_key="request-1",
+            db_url="postgresql://unused",
+        )
+        == expected
+    )
+    assert attempts == 2
+
+    attempts = 0
+
+    def always_retry(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise SerializationFailure("restart transaction")
+
+    monkeypatch.setattr(operations, "_enqueue_operation_once", always_retry)
+    with pytest.raises(SerializationFailure, match="restart transaction"):
+        operations.enqueue_operation(
+            preview_id="preview-1",
+            fingerprint="fingerprint-1",
+            idempotency_key="request-1",
+            db_url="postgresql://unused",
+        )
+    assert attempts == operations.MAX_OPERATION_TRANSACTION_ATTEMPTS
+
+    attempts = 0
+
+    def not_retryable(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("not retryable")
+
+    monkeypatch.setattr(operations, "_enqueue_operation_once", not_retryable)
+    with pytest.raises(RuntimeError, match="not retryable"):
+        operations.enqueue_operation(
+            preview_id="preview-1",
+            fingerprint="fingerprint-1",
+            idempotency_key="request-1",
+            db_url="postgresql://unused",
+        )
+    assert attempts == 1
+
+
 def _enqueue_supersession():
     from hindsight.db import database_url
     from tests.fakes import DeterministicEmbeddingProvider
