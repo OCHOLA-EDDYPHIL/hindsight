@@ -29,7 +29,31 @@ ALLOWED_OUTPUT_REMOVALS = frozenset(
     {
         "learning_corpus_kms_key_alias",
         "learning_corpus_kms_key_arn",
+        "tenant_lifecycle_export_bucket_arn",
     }
+)
+AWS_PROVIDER = "registry.terraform.io/hashicorp/aws"
+ALLOWED_NULL_SENSITIVE_RESOURCE_ATTRIBUTES = {
+    "aws_acm_certificate.demo": {
+        "attribute": "private_key",
+        "index": None,
+        "name": "demo",
+        "provider_name": AWS_PROVIDER,
+        "schema_version": 0,
+        "type": "aws_acm_certificate",
+    },
+    "aws_s3_bucket_object_lock_configuration.learning_evidence[0]": {
+        "attribute": "token",
+        "index": 0,
+        "name": "learning_evidence",
+        "provider_name": AWS_PROVIDER,
+        "schema_version": 0,
+        "type": "aws_s3_bucket_object_lock_configuration",
+    },
+}
+SENSITIVE_PLAN_ERROR = (
+    "Terraform plan contains non-null, unknown, malformed, or unapproved "
+    "sensitive values and cannot be retained"
 )
 VALID_ACTION_SEQUENCES = frozenset(
     {
@@ -94,30 +118,306 @@ def state_provenance(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _contains_true(value: Any) -> bool:
-    if value is True:
-        return True
-    if isinstance(value, dict):
-        return any(_contains_true(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_contains_true(child) for child in value)
-    return False
+JsonPath = tuple[str | int, ...]
 
 
-def _has_sensitive_marker(value: Any) -> bool:
+def _sensitive_marker_paths(
+    value: Any,
+    *,
+    path: JsonPath = (),
+    under_sensitive_marker: bool = False,
+) -> set[JsonPath]:
+    paths: set[JsonPath] = set()
+    if under_sensitive_marker:
+        if value is True:
+            paths.add(path)
+            return paths
+        if value is False:
+            return paths
+        if not isinstance(value, (dict, list)):
+            raise ValueError(SENSITIVE_PLAN_ERROR)
     if isinstance(value, dict):
         for key, child in value.items():
-            if (
+            child_under_sensitive_marker = under_sensitive_marker or (
                 key == "sensitive"
                 or key == "sensitive_values"
                 or key.endswith("_sensitive")
-            ) and _contains_true(child):
-                return True
-            if _has_sensitive_marker(child):
-                return True
+            )
+            paths.update(
+                _sensitive_marker_paths(
+                    child,
+                    path=(*path, key),
+                    under_sensitive_marker=child_under_sensitive_marker,
+                )
+            )
     elif isinstance(value, list):
-        return any(_has_sensitive_marker(child) for child in value)
-    return False
+        for index, child in enumerate(value):
+            paths.update(
+                _sensitive_marker_paths(
+                    child,
+                    path=(*path, index),
+                    under_sensitive_marker=under_sensitive_marker,
+                )
+            )
+    return paths
+
+
+def _validate_sensitive_resource_identity(
+    entry: dict[str, Any],
+    *,
+    address: str,
+    expected: dict[str, Any],
+    value_entry: bool,
+) -> None:
+    if (
+        entry.get("address") != address
+        or entry.get("mode") != "managed"
+        or entry.get("name") != expected["name"]
+        or entry.get("provider_name") != expected["provider_name"]
+        or entry.get("type") != expected["type"]
+        or any(
+            field in entry
+            for field in ("deposed", "module_address", "previous_address")
+        )
+    ):
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    expected_index = expected["index"]
+    if expected_index is None:
+        if "index" in entry:
+            raise ValueError(SENSITIVE_PLAN_ERROR)
+    elif (
+        isinstance(entry.get("index"), bool)
+        or not isinstance(entry.get("index"), int)
+        or entry["index"] != expected_index
+    ):
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    if value_entry:
+        if (
+            isinstance(entry.get("schema_version"), bool)
+            or not isinstance(entry.get("schema_version"), int)
+            or entry["schema_version"] != expected["schema_version"]
+        ):
+            raise ValueError(SENSITIVE_PLAN_ERROR)
+    elif "schema_version" in entry:
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+
+
+def _value_resource_entries(
+    values: Any,
+    *,
+    prefix: JsonPath,
+) -> list[tuple[dict[str, Any], JsonPath]]:
+    if not isinstance(values, dict) or not isinstance(values.get("root_module"), dict):
+        return []
+
+    entries: list[tuple[dict[str, Any], JsonPath]] = []
+
+    def walk(module: dict[str, Any], module_path: JsonPath) -> None:
+        resources = module.get("resources", [])
+        if isinstance(resources, list):
+            for index, resource in enumerate(resources):
+                if isinstance(resource, dict):
+                    entries.append((resource, (*module_path, "resources", index)))
+        child_modules = module.get("child_modules", [])
+        if isinstance(child_modules, list):
+            for index, child in enumerate(child_modules):
+                if isinstance(child, dict):
+                    walk(child, (*module_path, "child_modules", index))
+
+    walk(values["root_module"], (*prefix, "root_module"))
+    return entries
+
+
+def _single_sensitive_entry(
+    entries: list[tuple[dict[str, Any], JsonPath]],
+    *,
+    address: str,
+    parent_path: JsonPath,
+) -> tuple[dict[str, Any], JsonPath]:
+    matches = [(entry, path) for entry, path in entries if entry.get("address") == address]
+    if len(matches) != 1 or matches[0][1][:-1] != parent_path:
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    return matches[0]
+
+
+def _validate_null_value_marker(
+    entry: dict[str, Any],
+    *,
+    entry_path: JsonPath,
+    attribute: str,
+) -> JsonPath:
+    values = entry.get("values")
+    masks = entry.get("sensitive_values")
+    if (
+        not isinstance(values, dict)
+        or attribute not in values
+        or values[attribute] is not None
+        or not isinstance(masks, dict)
+        or masks.get(attribute) is not True
+    ):
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    return (*entry_path, "sensitive_values", attribute)
+
+
+def _validate_null_change_markers(
+    entry: dict[str, Any],
+    *,
+    entry_path: JsonPath,
+    attribute: str,
+) -> set[JsonPath]:
+    change = entry.get("change")
+    if not isinstance(change, dict):
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    paths: set[JsonPath] = set()
+    for marker_name, value_name in (
+        ("before_sensitive", "before"),
+        ("after_sensitive", "after"),
+    ):
+        values = change.get(value_name)
+        masks = change.get(marker_name)
+        if (
+            not isinstance(values, dict)
+            or attribute not in values
+            or values[attribute] is not None
+            or not isinstance(masks, dict)
+            or masks.get(attribute) is not True
+        ):
+            raise ValueError(SENSITIVE_PLAN_ERROR)
+        paths.add((*entry_path, "change", marker_name, attribute))
+
+    after_unknown = change.get("after_unknown")
+    if not isinstance(after_unknown, dict) or (
+        attribute in after_unknown and after_unknown[attribute] is not False
+    ):
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    return paths
+
+
+def _validate_sensitive_markers(plan: dict[str, Any]) -> list[dict[str, str]]:
+    observed_paths = _sensitive_marker_paths(plan)
+    planned_entries = _value_resource_entries(
+        plan.get("planned_values"), prefix=("planned_values",)
+    )
+    prior_state = plan.get("prior_state")
+    prior_entries = _value_resource_entries(
+        prior_state.get("values") if isinstance(prior_state, dict) else None,
+        prefix=("prior_state", "values"),
+    )
+    resource_changes = plan.get("resource_changes")
+    change_entries = (
+        [
+            (entry, ("resource_changes", index))
+            for index, entry in enumerate(resource_changes)
+            if isinstance(entry, dict)
+        ]
+        if isinstance(resource_changes, list)
+        else []
+    )
+    resource_drift = plan.get("resource_drift", [])
+    drift_entries = (
+        [
+            (entry, ("resource_drift", index))
+            for index, entry in enumerate(resource_drift)
+            if isinstance(entry, dict)
+        ]
+        if isinstance(resource_drift, list)
+        else []
+    )
+    drift_addresses = (
+        {entry.get("address") for entry, _ in drift_entries}
+    )
+
+    all_entries = [
+        *planned_entries,
+        *prior_entries,
+        *change_entries,
+        *drift_entries,
+    ]
+    sensitive_resource_types = {
+        expected["type"]
+        for expected in ALLOWED_NULL_SENSITIVE_RESOURCE_ATTRIBUTES.values()
+    }
+    for entry, _ in all_entries:
+        if (
+            entry.get("type") in sensitive_resource_types
+            and entry.get("address")
+            not in ALLOWED_NULL_SENSITIVE_RESOURCE_ATTRIBUTES
+        ):
+            raise ValueError(SENSITIVE_PLAN_ERROR)
+
+    allowed_paths: set[JsonPath] = set()
+    identities: list[dict[str, str]] = []
+    for address, expected in ALLOWED_NULL_SENSITIVE_RESOURCE_ATTRIBUTES.items():
+        address_occurs = any(
+            entry.get("address") == address
+            for entry, _ in [*planned_entries, *prior_entries, *change_entries]
+        ) or address in drift_addresses
+        if not address_occurs:
+            continue
+        if address in drift_addresses:
+            raise ValueError(SENSITIVE_PLAN_ERROR)
+
+        planned, planned_path = _single_sensitive_entry(
+            planned_entries,
+            address=address,
+            parent_path=("planned_values", "root_module", "resources"),
+        )
+        prior, prior_path = _single_sensitive_entry(
+            prior_entries,
+            address=address,
+            parent_path=("prior_state", "values", "root_module", "resources"),
+        )
+        change, change_path = _single_sensitive_entry(
+            change_entries,
+            address=address,
+            parent_path=("resource_changes",),
+        )
+        _validate_sensitive_resource_identity(
+            planned,
+            address=address,
+            expected=expected,
+            value_entry=True,
+        )
+        _validate_sensitive_resource_identity(
+            prior,
+            address=address,
+            expected=expected,
+            value_entry=True,
+        )
+        _validate_sensitive_resource_identity(
+            change,
+            address=address,
+            expected=expected,
+            value_entry=False,
+        )
+
+        attribute = expected["attribute"]
+        allowed_paths.add(
+            _validate_null_value_marker(
+                planned,
+                entry_path=planned_path,
+                attribute=attribute,
+            )
+        )
+        allowed_paths.add(
+            _validate_null_value_marker(
+                prior,
+                entry_path=prior_path,
+                attribute=attribute,
+            )
+        )
+        allowed_paths.update(
+            _validate_null_change_markers(
+                change,
+                entry_path=change_path,
+                attribute=attribute,
+            )
+        )
+        identities.append({"address": address, "attribute": attribute})
+
+    if observed_paths != allowed_paths:
+        raise ValueError(SENSITIVE_PLAN_ERROR)
+    return identities
 
 
 def _actions(change: Any, *, subject: str) -> list[str]:
@@ -385,8 +685,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     format_version = plan.get("format_version")
     if not isinstance(format_version, str) or re.fullmatch(r"1\.[0-9]+", format_version) is None:
         raise ValueError("Terraform plan JSON format is unsupported")
-    if _has_sensitive_marker(plan):
-        raise ValueError("Terraform plan contains sensitive values and cannot be retained")
+    null_sensitive_placeholders = _validate_sensitive_markers(plan)
 
     checks = _check_summaries(plan["checks"])
     changes = _resource_actions(plan["resource_changes"], kind="resource_changes")
@@ -410,6 +709,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "data_resources": observed_data_removals,
             "outputs": observed_output_removals,
         },
+        "null_sensitive_placeholders": null_sensitive_placeholders,
         "output_changes": outputs,
         "plan_format_version": format_version,
         "resource_changes": changes,
@@ -515,6 +815,7 @@ def build_manifest(
             "applyable": actions["applyable"],
             "complete": actions["complete"],
             "format_version": actions["plan_format_version"],
+            "null_sensitive_placeholders": actions["null_sensitive_placeholders"],
             "terraform_version": actions["terraform_version"],
             "totals": actions["totals"],
         },

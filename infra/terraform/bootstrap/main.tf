@@ -202,8 +202,8 @@ resource "cloudflare_dns_record" "acm_validation" {
   }
 
   zone_id = var.cloudflare_zone_id
-  name    = each.value.resource_record_name
-  content = each.value.resource_record_value
+  name    = trimsuffix(each.value.resource_record_name, ".")
+  content = trimsuffix(each.value.resource_record_value, ".")
   type    = each.value.resource_record_type
   ttl     = 1
   proxied = false
@@ -212,7 +212,7 @@ resource "cloudflare_dns_record" "acm_validation" {
 
 resource "aws_acm_certificate_validation" "demo" {
   certificate_arn         = aws_acm_certificate.demo.arn
-  validation_record_fqdns = [for record in cloudflare_dns_record.acm_validation : record.name]
+  validation_record_fqdns = [for record in cloudflare_dns_record.acm_validation : format("%s.", trimsuffix(record.name, "."))]
 }
 
 data "aws_iam_policy_document" "github_assume" {

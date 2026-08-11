@@ -51,6 +51,30 @@ def _resource(
     }
 
 
+def _value_resource(
+    address: str,
+    *,
+    resource_type: str,
+    values: dict,
+    sensitive_values: dict,
+    name: str | None = None,
+    index: int | None = None,
+):
+    resource = {
+        "address": address,
+        "mode": "managed",
+        "type": resource_type,
+        "name": name or address.rsplit(".", 1)[1],
+        "provider_name": "registry.terraform.io/hashicorp/aws",
+        "schema_version": 0,
+        "values": values,
+        "sensitive_values": sensitive_values,
+    }
+    if index is not None:
+        resource["index"] = index
+    return resource
+
+
 def _plan(validator):
     return {
         "format_version": "1.2",
@@ -112,6 +136,62 @@ def _plan(validator):
     }
 
 
+def _plan_with_null_sensitive_placeholders(validator):
+    plan = _plan(validator)
+    acm_values = _value_resource(
+        "aws_acm_certificate.demo",
+        resource_type="aws_acm_certificate",
+        values={"private_key": None},
+        sensitive_values={"private_key": True},
+    )
+    object_lock_values = _value_resource(
+        "aws_s3_bucket_object_lock_configuration.learning_evidence[0]",
+        resource_type="aws_s3_bucket_object_lock_configuration",
+        name="learning_evidence",
+        index=0,
+        values={"token": None},
+        sensitive_values={"token": True},
+    )
+    plan["planned_values"]["root_module"]["resources"] = [
+        acm_values,
+        object_lock_values,
+    ]
+    plan["prior_state"] = {
+        "values": {
+            "root_module": {
+                "resources": json.loads(json.dumps([acm_values, object_lock_values])),
+            }
+        }
+    }
+    acm_change = _resource(
+        "aws_acm_certificate.demo",
+        ["no-op"],
+        resource_type="aws_acm_certificate",
+        before={"private_key": None},
+        after={"private_key": None},
+        before_sensitive={"private_key": True},
+        after_sensitive={"private_key": True},
+        after_unknown={},
+    )
+    object_lock_change = _resource(
+        "aws_s3_bucket_object_lock_configuration.learning_evidence[0]",
+        ["no-op"],
+        resource_type="aws_s3_bucket_object_lock_configuration",
+        before={"token": None},
+        after={"token": None},
+        before_sensitive={"token": True},
+        after_sensitive={"token": True},
+        after_unknown={"token": False},
+    )
+    object_lock_change.update({"index": 0, "name": "learning_evidence"})
+    plan["resource_changes"].extend([acm_change, object_lock_change])
+    return plan
+
+
+def _resource_entry(plan, collection: str, address: str):
+    return next(entry for entry in plan[collection] if entry["address"] == address)
+
+
 def _provenance(*, serial: int = 25):
     return {
         "lineage": "9f1383b4-4dae-30e4-bdba-649bc9346bc3",
@@ -148,6 +228,7 @@ def test_validator_records_every_resource_drift_and_output_action():
         "data_resources": ["data.aws_s3_bucket.state"],
         "outputs": ["learning_corpus_kms_key_arn"],
     }
+    assert summary["null_sensitive_placeholders"] == []
     assert [row["to_display"] for row in summary["checks"]] == sorted(
         validator.REQUIRED_CHECKS
     )
@@ -345,11 +426,199 @@ def test_validator_rejects_incomplete_error_and_sensitive_plans():
         validator.validate_plan(errored)
 
     sensitive = _plan(validator)
+    sensitive["resource_changes"][0]["change"]["after"] = {
+        "policy": "must-never-appear-in-the-error"
+    }
     sensitive["resource_changes"][0]["change"]["after_sensitive"] = {
         "policy": True
     }
-    with pytest.raises(ValueError, match="sensitive"):
+    with pytest.raises(ValueError, match="sensitive") as raised:
         validator.validate_plan(sensitive)
+    assert "must-never-appear-in-the-error" not in str(raised.value)
+
+
+def test_validator_allows_only_exact_known_null_provider_placeholders():
+    validator = _validator()
+    summary = validator.validate_plan(
+        _plan_with_null_sensitive_placeholders(validator)
+    )
+
+    assert summary["null_sensitive_placeholders"] == [
+        {"address": "aws_acm_certificate.demo", "attribute": "private_key"},
+        {
+            "address": (
+                "aws_s3_bucket_object_lock_configuration.learning_evidence[0]"
+            ),
+            "attribute": "token",
+        },
+    ]
+
+
+def test_validator_rejects_non_null_and_unmarked_known_sensitive_values():
+    validator = _validator()
+    changed = _plan_with_null_sensitive_placeholders(validator)
+    _resource_entry(changed, "resource_changes", "aws_acm_certificate.demo")[
+        "change"
+    ]["after"]["private_key"] = "must-never-appear-in-the-error"
+    with pytest.raises(ValueError, match="sensitive") as raised:
+        validator.validate_plan(changed)
+    assert "must-never-appear-in-the-error" not in str(raised.value)
+
+    prior = _plan_with_null_sensitive_placeholders(validator)
+    prior_acm = next(
+        entry
+        for entry in prior["prior_state"]["values"]["root_module"]["resources"]
+        if entry["address"] == "aws_acm_certificate.demo"
+    )
+    prior_acm["values"]["private_key"] = "must-never-appear-in-the-error"
+    prior_acm["sensitive_values"]["private_key"] = False
+    with pytest.raises(ValueError, match="sensitive") as raised:
+        validator.validate_plan(prior)
+    assert "must-never-appear-in-the-error" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "after_unknown",
+    [
+        True,
+        "unknown",
+        [],
+        {"private_key": True},
+        {"private_key": "true"},
+    ],
+)
+def test_validator_rejects_unknown_or_malformed_sensitive_values(after_unknown):
+    validator = _validator()
+    plan = _plan_with_null_sensitive_placeholders(validator)
+    _resource_entry(plan, "resource_changes", "aws_acm_certificate.demo")[
+        "change"
+    ]["after_unknown"] = after_unknown
+
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(plan)
+
+
+def test_validator_correlates_root_value_and_change_evidence():
+    validator = _validator()
+    child_module = _plan_with_null_sensitive_placeholders(validator)
+    root = child_module["planned_values"]["root_module"]
+    acm = root["resources"].pop(0)
+    root["child_modules"] = [{"address": "module.unapproved", "resources": [acm]}]
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(child_module)
+
+    missing = _plan_with_null_sensitive_placeholders(validator)
+    missing["prior_state"]["values"]["root_module"]["resources"] = [
+        entry
+        for entry in missing["prior_state"]["values"]["root_module"]["resources"]
+        if entry["address"] != "aws_acm_certificate.demo"
+    ]
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(missing)
+
+    duplicate = _plan_with_null_sensitive_placeholders(validator)
+    duplicate["planned_values"]["root_module"]["resources"].append(
+        json.loads(
+            json.dumps(
+                next(
+                    entry
+                    for entry in duplicate["planned_values"]["root_module"][
+                        "resources"
+                    ]
+                    if entry["address"] == "aws_acm_certificate.demo"
+                )
+            )
+        )
+    )
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(duplicate)
+
+    mismatched = _plan_with_null_sensitive_placeholders(validator)
+    change = _resource_entry(
+        mismatched, "resource_changes", "aws_acm_certificate.demo"
+    )["change"]
+    change["after_sensitive"]["private_key"] = False
+    change["after_unknown"]["private_key"] = True
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(mismatched)
+
+
+def test_validator_rejects_module_deposed_name_and_index_variants():
+    validator = _validator()
+    variants = [
+        ("module_address", "module.unapproved"),
+        ("deposed", "deadbeef"),
+        ("previous_address", "aws_acm_certificate.previous"),
+        ("name", "not_demo"),
+        ("index", 0),
+    ]
+    for field, value in variants:
+        plan = _plan_with_null_sensitive_placeholders(validator)
+        _resource_entry(plan, "resource_changes", "aws_acm_certificate.demo")[
+            field
+        ] = value
+        with pytest.raises(ValueError, match="sensitive"):
+            validator.validate_plan(plan)
+
+
+def test_validator_rejects_other_known_sensitive_resource_addresses():
+    validator = _validator()
+    plan = _plan_with_null_sensitive_placeholders(validator)
+    plan["planned_values"]["root_module"]["resources"].append(
+        _value_resource(
+            "aws_acm_certificate.unapproved",
+            resource_type="aws_acm_certificate",
+            values={"private_key": "must-never-appear-in-the-error"},
+            sensitive_values={"private_key": False},
+        )
+    )
+
+    with pytest.raises(ValueError, match="sensitive") as raised:
+        validator.validate_plan(plan)
+    assert "must-never-appear-in-the-error" not in str(raised.value)
+
+
+def test_validator_requires_exact_sensitive_resource_schema_versions():
+    validator = _validator()
+    for schema_version in (None, "0", 999, True):
+        plan = _plan_with_null_sensitive_placeholders(validator)
+        acm = next(
+            entry
+            for entry in plan["planned_values"]["root_module"]["resources"]
+            if entry["address"] == "aws_acm_certificate.demo"
+        )
+        if schema_version is None:
+            acm.pop("schema_version")
+        else:
+            acm["schema_version"] = schema_version
+        with pytest.raises(ValueError, match="sensitive"):
+            validator.validate_plan(plan)
+
+    change_schema = _plan_with_null_sensitive_placeholders(validator)
+    _resource_entry(
+        change_schema, "resource_changes", "aws_acm_certificate.demo"
+    )["schema_version"] = 0
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(change_schema)
+
+
+def test_validator_rejects_malformed_and_unapproved_sensitivity_masks():
+    validator = _validator()
+    malformed = _plan(validator)
+    malformed["resource_changes"][0]["change"]["after"] = {
+        "policy": "must-never-appear-in-the-error"
+    }
+    malformed["resource_changes"][0]["change"]["after_sensitive"] = {
+        "policy": 1
+    }
+    with pytest.raises(ValueError, match="sensitive") as raised:
+        validator.validate_plan(malformed)
+    assert "must-never-appear-in-the-error" not in str(raised.value)
+
+    output = _plan(validator)
+    output["output_changes"]["github_deploy_role_arn"]["after_sensitive"] = True
+    with pytest.raises(ValueError, match="sensitive"):
+        validator.validate_plan(output)
 
 
 @pytest.mark.parametrize(
@@ -418,6 +687,37 @@ def test_validator_rejects_unapproved_output_removal():
         validator.validate_plan(plan)
 
 
+@pytest.mark.parametrize(
+    "output_name",
+    [
+        "learning_corpus_kms_key_alias",
+        "learning_corpus_kms_key_arn",
+        "tenant_lifecycle_export_bucket_arn",
+    ],
+)
+def test_validator_accepts_only_explicitly_retired_outputs(output_name):
+    validator = _validator()
+    assert validator.ALLOWED_OUTPUT_REMOVALS == {
+        "learning_corpus_kms_key_alias",
+        "learning_corpus_kms_key_arn",
+        "tenant_lifecycle_export_bucket_arn",
+    }
+    plan = _plan(validator)
+    plan["output_changes"] = {
+        output_name: {
+            "actions": ["delete"],
+            "before": "retired",
+            "after": None,
+            "before_sensitive": False,
+            "after_sensitive": False,
+        }
+    }
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["observed_allowed_removals"]["outputs"] == [output_name]
+
+
 def test_state_provenance_retains_only_lineage_serial_and_terraform_version():
     validator = _validator()
     state = {
@@ -474,6 +774,7 @@ def test_manifest_binds_exact_files_metadata_actions_and_unchanged_state(tmp_pat
         "role_arn": "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan",
     }
     assert manifest["environment"] == "demo"
+    assert manifest["plan"]["null_sensitive_placeholders"] == []
     assert manifest["state_provenance"] == {
         "before": _provenance(),
         "after": _provenance(),
@@ -513,6 +814,93 @@ def test_manifest_binds_exact_files_metadata_actions_and_unchanged_state(tmp_pat
             run_id="1234",
             run_attempt="2",
         )
+
+
+def test_manifest_records_only_correlated_null_placeholders_and_fails_before_writes(
+    tmp_path: Path,
+):
+    validator = _validator()
+
+    def inputs(directory: Path, plan: dict):
+        directory.mkdir()
+        paths = {
+            key: directory / name
+            for key, name in validator.EXPECTED_ARTIFACT_NAMES.items()
+        }
+        paths["plan"].write_bytes(b"saved terraform plan")
+        paths["plan_json"].write_text(json.dumps(plan), encoding="utf-8")
+        paths["lock"].write_text("provider lock", encoding="utf-8")
+        paths["state_before"].write_text(
+            json.dumps(_provenance()), encoding="utf-8"
+        )
+        paths["state_after"].write_text(
+            json.dumps(_provenance()), encoding="utf-8"
+        )
+        return paths
+
+    expected = [
+        {"address": "aws_acm_certificate.demo", "attribute": "private_key"},
+        {
+            "address": (
+                "aws_s3_bucket_object_lock_configuration.learning_evidence[0]"
+            ),
+            "attribute": "token",
+        },
+    ]
+    accepted = inputs(
+        tmp_path / "accepted",
+        _plan_with_null_sensitive_placeholders(validator),
+    )
+    manifest = validator.build_manifest(
+        plan_json=accepted["plan_json"],
+        plan_file=accepted["plan"],
+        lock_file=accepted["lock"],
+        state_before_file=accepted["state_before"],
+        state_after_file=accepted["state_after"],
+        actions_file=accepted["actions"],
+        manifest_file=accepted["manifest"],
+        source_revision=SOURCE_REVISION,
+        repository=validator.EXPECTED_REPOSITORY,
+        workflow_ref=WORKFLOW_REF,
+        aws_account_id="762397612117",
+        environment="demo",
+        role_arn="arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan",
+        run_id="1234",
+        run_attempt="2",
+    )
+    assert manifest["plan"]["null_sensitive_placeholders"] == expected
+    assert json.loads(accepted["actions"].read_text())[
+        "null_sensitive_placeholders"
+    ] == expected
+
+    blocked_plan = _plan_with_null_sensitive_placeholders(validator)
+    _resource_entry(
+        blocked_plan, "resource_changes", "aws_acm_certificate.demo"
+    )["change"]["after"]["private_key"] = "must-never-be-written"
+    blocked = inputs(tmp_path / "blocked", blocked_plan)
+    with pytest.raises(ValueError, match="sensitive") as raised:
+        validator.build_manifest(
+            plan_json=blocked["plan_json"],
+            plan_file=blocked["plan"],
+            lock_file=blocked["lock"],
+            state_before_file=blocked["state_before"],
+            state_after_file=blocked["state_after"],
+            actions_file=blocked["actions"],
+            manifest_file=blocked["manifest"],
+            source_revision=SOURCE_REVISION,
+            repository=validator.EXPECTED_REPOSITORY,
+            workflow_ref=WORKFLOW_REF,
+            aws_account_id="762397612117",
+            environment="demo",
+            role_arn=(
+                "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan"
+            ),
+            run_id="1234",
+            run_attempt="2",
+        )
+    assert "must-never-be-written" not in str(raised.value)
+    assert not blocked["actions"].exists()
+    assert not blocked["manifest"].exists()
 
 
 def test_manifest_refuses_a_different_well_formed_aws_account(tmp_path: Path):
