@@ -405,6 +405,108 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
     assert "iam:UpdateAssumeRolePolicy" in bootstrap
 
 
+def test_lifecycle_terraform_ownership_is_cloudflare_free_and_non_overlapping():
+    bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
+    bootstrap_outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
+    lifecycle = pathlib.Path("infra/terraform/lifecycle/main.tf").read_text()
+    lifecycle_outputs = pathlib.Path("infra/terraform/lifecycle/outputs.tf").read_text()
+    lifecycle_variables = pathlib.Path(
+        "infra/terraform/lifecycle/variables.tf"
+    ).read_text()
+    lifecycle_versions = pathlib.Path(
+        "infra/terraform/lifecycle/versions.tf"
+    ).read_text()
+    affected_runner = pathlib.Path("scripts/run_affected_ci.py").read_text()
+    ci = pathlib.Path(".github/workflows/ci.yml").read_text()
+
+    moved_resources = (
+        'resource "aws_s3_bucket" "tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_versioning" "tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_server_side_encryption_configuration" '
+        '"tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_public_access_block" '
+        '"tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_ownership_controls" '
+        '"tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_object_lock_configuration" '
+        '"tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_lifecycle_configuration" '
+        '"tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket" "tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_versioning" "tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_server_side_encryption_configuration" '
+        '"tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_public_access_block" '
+        '"tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_ownership_controls" '
+        '"tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_object_lock_configuration" '
+        '"tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_lifecycle_configuration" '
+        '"tenant_lifecycle_recovery"',
+        'resource "aws_iam_role" "github_lifecycle"',
+        'resource "aws_iam_role" "github_bootstrap_plan"',
+        'resource "aws_iam_role" "lifecycle_export_replication"',
+        'resource "aws_iam_role_policy" "lifecycle_export_replication"',
+        'resource "aws_iam_role_policy" "github_lifecycle"',
+        'resource "aws_iam_role_policy" "github_bootstrap_plan"',
+        'resource "aws_s3_bucket_policy" "tenant_lifecycle_exports"',
+        'resource "aws_s3_bucket_policy" "tenant_lifecycle_recovery"',
+        'resource "aws_s3_bucket_replication_configuration" '
+        '"tenant_lifecycle_exports"',
+    )
+    for declaration in moved_resources:
+        assert declaration in lifecycle
+        assert declaration not in bootstrap
+
+    assert 'resource "aws_acm_certificate" "demo"' in bootstrap
+    assert 'resource "cloudflare_dns_record" "acm_validation"' in bootstrap
+    assert 'resource "aws_acm_certificate" "demo"' not in lifecycle
+    assert "cloudflare" not in lifecycle_versions
+    assert "cloudflare" not in lifecycle
+    assert 'resource "aws_iam_openid_connect_provider"' not in lifecycle
+    assert 'variable "github_oidc_provider_arn"' in lifecycle_variables
+    assert 'output "github_oidc_provider_arn"' in bootstrap_outputs
+    assert 'variable "github_deploy_role_arn"' in lifecycle_variables
+    assert 'variable "bootstrap_state_bucket_name"' in lifecycle_variables
+    assert 'variable "bootstrap_certificate_arn"' in lifecycle_variables
+    assert 'variable "bootstrap_hmac_key_arn"' in lifecycle_variables
+    assert "aws_ssm_parameter" not in lifecycle
+    assert 'output "lifecycle_database_url_parameter_name"' in lifecycle_outputs
+    assert 'output "lifecycle_database_url_parameter_arn"' in lifecycle_outputs
+    assert 'output "github_bootstrap_plan_role_arn"' in lifecycle_outputs
+    assert 'name                 = "hindsight-github-bootstrap-plan"' in lifecycle
+    assert 'data "aws_iam_policy_document" "github_bootstrap_plan_assume"' in lifecycle
+    assert 'values   = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"]' in lifecycle
+    assert 'sid       = "BootstrapStateRead"' in lifecycle
+    assert 'sid = "BootstrapStateLock"' in lifecycle
+    assert "iam:PutRolePolicy" not in lifecycle
+    assert 'key          = "hindsight/demo/lifecycle/terraform.tfstate"' in (
+        lifecycle_versions
+    )
+    assert 'region       = "us-east-1"' in lifecycle_versions
+    assert "encrypt      = true" in lifecycle_versions
+    assert "use_lockfile = true" in lifecycle_versions
+    assert "lifecycle_state_key" not in lifecycle_variables
+    assert 'output "backend_config"' not in lifecycle_outputs
+
+    deploy_deny = bootstrap.split(
+        'sid     = "LifecycleArchiveMutationDenied"', 1
+    )[1].split("\n  statement {", 1)[0]
+    assert "local.lifecycle_export_bucket_arn" in deploy_deny
+    assert "local.lifecycle_recovery_bucket_arn" in deploy_deny
+    commands = (
+        "init -backend=false -input=false -lockfile=readonly",
+        "validate",
+        "test",
+    )
+    for command in commands:
+        assert f"terraform -chdir=infra/terraform/lifecycle {command}" in ci
+    assert 'for component in ("bootstrap", "lifecycle", "app", "edge")' in (
+        affected_runner
+    )
+
+
 def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
     outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
