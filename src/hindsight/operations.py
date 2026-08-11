@@ -299,31 +299,66 @@ def enqueue_operation(
 
     if not idempotency_key.strip():
         raise ValueError("idempotency_key is required")
-    if actor is not None and not actor.strip():
+    normalized_actor = actor.strip() if actor is not None else None
+    if actor is not None and not normalized_actor:
         raise ValueError("actor must not be blank")
     resolved_url = db_url or database_url()
-    with connect(resolved_url, application_name="hindsight-api") as conn:
+    for transaction_attempt in range(1, MAX_OPERATION_TRANSACTION_ATTEMPTS + 1):
+        try:
+            return _enqueue_operation_once(
+                preview_id=preview_id,
+                fingerprint=fingerprint,
+                idempotency_key=idempotency_key,
+                actor=normalized_actor,
+                db_url=resolved_url,
+            )
+        except SerializationFailure:
+            if transaction_attempt == MAX_OPERATION_TRANSACTION_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable operation enqueue retry state")
+
+
+def _enqueue_operation_once(
+    *,
+    preview_id: str,
+    fingerprint: str,
+    idempotency_key: str,
+    actor: str | None,
+    db_url: str,
+) -> tuple[dict[str, Any], bool]:
+    with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT * FROM memory_operations WHERE idempotency_key = %s",
+                    """
+                        SELECT *
+                        FROM memory_operations
+                        WHERE tenant_id = current_hindsight_tenant_id()
+                            AND idempotency_key = %s
+                    """,
                     (idempotency_key,),
                 )
                 existing = cur.fetchone()
                 if existing is not None:
-                    if str(existing["preview_id"]) != preview_id or str(
-                        existing["preview_fingerprint"]
-                    ) != fingerprint:
+                    if (
+                        str(existing["preview_id"]) != preview_id
+                        or str(existing["preview_fingerprint"]) != fingerprint
+                    ):
                         raise OperationConflictError(
                             "idempotency key is already bound to another approved preview"
                         )
-                    if actor is not None and str(existing["actor"]) != actor.strip():
+                    if actor is not None and str(existing["actor"]) != actor:
                         raise OperationConflictError(
                             "idempotency key is already bound to another approving actor"
                         )
                     return dict(existing), False
                 cur.execute(
-                    "SELECT * FROM memory_operation_previews WHERE id = %s",
+                    """
+                        SELECT *
+                        FROM memory_operation_previews
+                        WHERE tenant_id = current_hindsight_tenant_id()
+                            AND id = %s
+                    """,
                     (preview_id,),
                 )
                 preview = cur.fetchone()
@@ -334,19 +369,21 @@ def enqueue_operation(
                 if str(preview["fingerprint"]) != fingerprint:
                     raise OperationConflictError("preview fingerprint does not match")
                 request = dict(preview["request_payload"])
-                operation_actor = actor.strip() if actor is not None else str(preview["actor"])
+                operation_actor = actor if actor is not None else str(preview["actor"])
                 operation_id = str(uuid4())
                 cur.execute(
                     """
                         INSERT INTO memory_operations (
-                            id, operation_type, actor, reason, target_timestamp,
-                            namespace, idempotency_key, status, preview_id,
+                            id, tenant_id, operation_type, actor, reason,
+                            target_timestamp, namespace, idempotency_key, status, preview_id,
                             preview_fingerprint, root_memory_kind, root_memory_id,
                             expected_revisions, request_payload, attempt_count
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s,
-                                %s, %s, %s, %s, %s, 0)
-                        ON CONFLICT (idempotency_key) DO NOTHING
+                        VALUES (%s, current_hindsight_tenant_id(), %s, %s, %s, %s, %s,
+                                %s, 'queued', %s, %s, %s, %s, %s, %s, 0)
+                        ON CONFLICT (tenant_id, idempotency_key)
+                            WHERE idempotency_key IS NOT NULL
+                            DO NOTHING
                         RETURNING *
                     """,
                     (
@@ -368,15 +405,23 @@ def enqueue_operation(
                 inserted = cur.fetchone()
                 if inserted is None:
                     cur.execute(
-                        "SELECT * FROM memory_operations WHERE idempotency_key = %s",
+                        """
+                            SELECT *
+                            FROM memory_operations
+                            WHERE tenant_id = current_hindsight_tenant_id()
+                                AND idempotency_key = %s
+                        """,
                         (idempotency_key,),
                     )
                     raced = cur.fetchone()
                     if raced is None:
-                        raise RuntimeError("idempotent operation insert lost without a winner")
-                    if str(raced["preview_id"]) != preview_id or str(
-                        raced["preview_fingerprint"]
-                    ) != fingerprint:
+                        raise SerializationFailure(
+                            "idempotent operation lost a concurrent unique-key race"
+                        )
+                    if (
+                        str(raced["preview_id"]) != preview_id
+                        or str(raced["preview_fingerprint"]) != fingerprint
+                    ):
                         raise OperationConflictError(
                             "idempotency key is already bound to another approved preview"
                         )

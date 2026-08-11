@@ -51,14 +51,6 @@ output "learning_evidence_bucket" {
   value = try(aws_s3_bucket.learning_evidence[0].id, null)
 }
 
-output "learning_corpus_kms_key_arn" {
-  value = try(aws_kms_key.learning_corpus[0].arn, null)
-}
-
-output "learning_corpus_kms_key_alias" {
-  value = try(aws_kms_alias.learning_corpus[0].name, null)
-}
-
 output "learning_qualification_hmac_key_arn" {
   value = try(aws_kms_key.learning_qualification_hmac[0].arn, null)
 }

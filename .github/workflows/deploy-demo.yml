@@ -144,7 +144,7 @@ env:
 
 jobs:
   authorize:
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     outputs:
       authorized: ${{ steps.authorize.outputs.authorized }}
       should_apply: ${{ steps.authorize.outputs.should_apply }}
@@ -239,7 +239,7 @@ jobs:
   plan:
     needs: authorize
     if: needs.authorize.outputs.authorized == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
@@ -358,7 +358,7 @@ jobs:
       - authorize
       - plan
     if: needs.authorize.outputs.should_apply == 'true'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     timeout-minutes: 60
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     env:
