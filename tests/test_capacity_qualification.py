@@ -2859,7 +2859,7 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
                     "com.docker.compose.service": "crdb",
                 },
             },
-            "State": {"Running": True},
+            "State": {"Running": True, "Health": {"Status": "starting"}},
             "HostConfig": {"CgroupnsMode": "private"},
         }
     ]
@@ -2884,6 +2884,8 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     monkeypatch.setattr(capture.subprocess, "run", run)
     assert capture._inspect_container("hindsight_capacity_123_1_diagnostic") is None
     pid_ready = True
+    assert capture._inspect_container("hindsight_capacity_123_1_diagnostic") is None
+    inspection[0]["State"]["Health"]["Status"] = "healthy"
     process = capture._inspect_container("hindsight_capacity_123_1_diagnostic")
     assert process["path"] == "/cockroach/cockroach.sh"
     assert process["cgroup_namespace"] == "private"
@@ -2896,6 +2898,241 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     inspection[0]["HostConfig"]["CgroupnsMode"] = "host"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+
+
+def test_runtime_collector_retries_transient_live_argv_only_while_health_is_starting(
+    monkeypatch,
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "starting"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+    live_argv = ["/cockroach/cockroach", "mt", "start-sql", "--insecure"]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            assert command[-1] == "/proc/42/cmdline"
+            return SimpleNamespace(returncode=0, stdout="\0".join(live_argv))
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    assert capture._inspect_container(project) is None
+
+    live_argv[:] = capture.EXPECTED_LIVE_PROCESS_ARGS
+    inspection[0]["State"]["Health"]["Status"] = "healthy"
+    process = capture._inspect_container(project)
+    assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
+
+    live_argv[-1] = "--max-go-memory=2GiB"
+    with pytest.raises(RuntimeError, match="live argv"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize(
+    "health",
+    [None, {}, {"Status": ""}, {"Status": "unhealthy"}, {"Status": "unknown"}],
+)
+def test_runtime_collector_rejects_missing_malformed_or_nonready_health(
+    monkeypatch, health
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    state = {"Running": True}
+    if health is not None:
+        state["Health"] = health
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": state,
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            return SimpleNamespace(
+                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="health"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize("missing", ["pid", "cmdline"])
+def test_runtime_collector_rejects_missing_process_evidence_once_healthy(
+    monkeypatch, missing
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(
+                    returncode=1 if missing == "pid" else 0,
+                    stdout="" if missing == "pid" else "42\n",
+                )
+            assert command[-1] == "/proc/42/cmdline"
+            return SimpleNamespace(
+                returncode=1 if missing == "cmdline" else 0,
+                stdout="",
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="healthy|PID|argv"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize("pid", ["0\n", "not-a-pid\n"])
+def test_runtime_collector_rejects_invalid_pid_even_while_health_is_starting(
+    monkeypatch, pid
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "starting"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            assert command[-1] == "/cockroach/server_pid"
+            return SimpleNamespace(returncode=0, stdout=pid)
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises((RuntimeError, ValueError), match="PID|integer"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize(
+    ("health_status", "static_field", "value"),
+    [
+        ("starting", "configured_command", "--max-go-memory=2GiB"),
+        ("starting", "cgroup_namespace", "host"),
+    ],
+)
+def test_runtime_collector_never_retries_static_envelope_mismatch(
+    monkeypatch, health_status, static_field, value
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": health_status}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+    if static_field == "configured_command":
+        inspection[0]["Config"]["Cmd"][-1] = value
+    elif static_field == "cgroup_namespace":
+        inspection[0]["HostConfig"]["CgroupnsMode"] = value
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            return SimpleNamespace(
+                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="reviewed envelope|health"):
+        capture._inspect_container(project)
 
 
 def test_runtime_collector_retries_zero_effective_metric_and_requires_exact_values(

@@ -746,16 +746,30 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
         or process["running"] is not True
     ):
         raise RuntimeError("capacity CockroachDB process differs from the reviewed envelope")
+    health = state.get("Health")
+    health_status = health.get("Status") if isinstance(health, dict) else None
+    if (
+        not isinstance(health, dict)
+        or not isinstance(health_status, str)
+        or health_status not in {"starting", "healthy"}
+    ):
+        raise RuntimeError("capacity CockroachDB Docker health is invalid")
     pid_raw = _try_read_container_file("/cockroach/server_pid")
     if pid_raw is None:
-        return None
+        if health_status == "starting":
+            return None
+        raise RuntimeError("healthy capacity CockroachDB server PID is missing")
     pid = _parse_nonnegative_integer(pid_raw, name="CockroachDB server PID")
     if pid == 0:
         raise RuntimeError("capacity CockroachDB server PID is invalid")
     live_raw = _try_read_container_file(f"/proc/{pid}/cmdline")
     if not live_raw:
-        return None
+        if health_status == "starting":
+            return None
+        raise RuntimeError("healthy capacity CockroachDB live argv is missing")
     live_argv = [part for part in live_raw.split("\0") if part]
+    if health_status == "starting":
+        return None
     if live_argv != list(EXPECTED_LIVE_PROCESS_ARGS):
         raise RuntimeError("capacity CockroachDB live argv differs from the reviewed envelope")
     process["live_argv"] = live_argv
