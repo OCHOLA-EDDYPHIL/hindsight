@@ -22,6 +22,7 @@ from hindsight.aws import aws_client_config  # noqa: E402
 from hindsight.lifecycle import (  # noqa: E402
     LifecycleError,
     LifecycleOperation,
+    PublicIdentitySentinel,
     abort_operation,
     begin_export,
     begin_purge,
@@ -30,6 +31,7 @@ from hindsight.lifecycle import (  # noqa: E402
     get_operation,
     get_tombstone,
     heartbeat_lease,
+    public_demo_identity_sentinel,
     purge_database_tenant,
     record_principal_cleanup_targets,
     record_verified_export,
@@ -114,10 +116,12 @@ def _run_export(args: argparse.Namespace, *, database_url: str) -> None:
     session = _aws_session(args)
     s3_client = session.client("s3", config=aws_client_config(read_timeout=60))
     with connect_lifecycle(database_url) as state_connection:
+        public_identity = public_demo_identity_sentinel(state_connection)
         preparation = begin_export(
             state_connection,
             tenant_id=args.tenant_id,
             operation_id=operation_id,
+            public_identity_sha256=public_identity.sha256,
         )
         with connect_lifecycle(database_url) as read_connection:
             result = export_tenant_to_s3(
@@ -136,6 +140,8 @@ def _run_export(args: argparse.Namespace, *, database_url: str) -> None:
         {
             "export_fingerprint": result.fingerprint,
             "operation_id": preparation.operation.id,
+            "public_identity": asdict(public_identity),
+            "public_identity_baseline_sha256": public_identity.sha256,
             "status": "exported",
         }
     )
@@ -169,6 +175,7 @@ def _run_verify(args: argparse.Namespace, *, database_url: str) -> None:
 
 def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
     with connect_lifecycle(database_url) as connection:
+        public_identity_before = public_demo_identity_sentinel(connection)
         exported_operation = get_operation(connection, args.operation_id)
         if exported_operation is None:
             completed = get_tombstone(connection, args.operation_id)
@@ -178,10 +185,18 @@ def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
                 raise LifecycleError(
                     "confirmed fingerprint does not match the completed purge"
                 )
+            _assert_public_identity_matches_baseline(
+                baseline_sha256=completed["public_identity_sha256"],
+                current=public_identity_before,
+            )
             _print_json(
                 {
                     "operation_id": completed["purge_id"],
                     "purged_at": completed["purged_at"],
+                    "public_identity": asdict(public_identity_before),
+                    "public_identity_baseline_sha256": completed[
+                        "public_identity_sha256"
+                    ],
                     "status": "completed",
                     "tenant_identity_sha256": completed[
                         "tenant_identity_sha256"
@@ -189,6 +204,10 @@ def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
                 }
             )
             return
+        _assert_public_identity_matches_baseline(
+            baseline_sha256=exported_operation.public_identity_sha256,
+            current=public_identity_before,
+        )
         session = _aws_session(args)
         cleaner = _aws_cleaner(session)
         s3_client = session.client("s3", config=aws_client_config(read_timeout=60))
@@ -213,6 +232,7 @@ def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
             connection,
             operation_id=args.operation_id,
             confirmed_fingerprint=args.confirm_fingerprint,
+            public_identity_sha256=public_identity_before.sha256,
         )
         lease_owner = operation.lease_owner
         if lease_owner is None:
@@ -245,6 +265,11 @@ def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
                 cleanup_targets.cognito_credential_locators
             ),
         )
+        public_identity_after = public_demo_identity_sentinel(connection)
+        _assert_public_identity_matches_baseline(
+            baseline_sha256=operation.public_identity_sha256,
+            current=public_identity_after,
+        )
         heartbeat_lease(
             connection,
             operation_id=operation.id,
@@ -254,12 +279,17 @@ def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
             connection,
             operation_id=operation.id,
             lease_owner=lease_owner,
+            public_identity_sha256=public_identity_after.sha256,
         )
     _print_json(
         {
             "cleanup": asdict(cleanup),
             "operation_id": tombstone["purge_id"],
             "purged_at": tombstone["purged_at"],
+            "public_identity": asdict(public_identity_after),
+            "public_identity_baseline_sha256": tombstone[
+                "public_identity_sha256"
+            ],
             "status": "completed",
             "tenant_identity_sha256": tombstone["tenant_identity_sha256"],
         }
@@ -268,19 +298,37 @@ def _run_purge(args: argparse.Namespace, *, database_url: str) -> None:
 
 def _run_status(args: argparse.Namespace, *, database_url: str) -> None:
     with connect_lifecycle(database_url) as connection:
+        public_identity = public_demo_identity_sentinel(connection)
         operation = get_operation(connection, args.operation_id)
         if operation is not None:
-            _print_json(_operation_status(operation))
+            _assert_public_identity_matches_baseline(
+                baseline_sha256=operation.public_identity_sha256,
+                current=public_identity,
+            )
+            _print_json(
+                {
+                    **_operation_status(operation),
+                    "public_identity": asdict(public_identity),
+                }
+            )
             return
         tombstone = get_tombstone(connection, args.operation_id)
     if tombstone is None:
         raise LifecycleError("lifecycle operation does not exist")
+    _assert_public_identity_matches_baseline(
+        baseline_sha256=tombstone["public_identity_sha256"],
+        current=public_identity,
+    )
     _print_json(
         {
             "database_purged_at": tombstone["database_purged_at"],
             "export_fingerprint": tombstone["export_fingerprint"],
             "operation_id": tombstone["purge_id"],
             "purged_at": tombstone["purged_at"],
+            "public_identity": asdict(public_identity),
+            "public_identity_baseline_sha256": tombstone[
+                "public_identity_sha256"
+            ],
             "schema_identity_sha256": tombstone["schema_identity_sha256"],
             "status": "completed",
             "tenant_identity_sha256": tombstone["tenant_identity_sha256"],
@@ -338,10 +386,20 @@ def _operation_status(operation: LifecycleOperation) -> dict[str, Any]:
         "export_verified_at": _isoformat(operation.export_verified_at),
         "lease_expires_at": _isoformat(operation.lease_expires_at),
         "operation_id": operation.id,
+        "public_identity_baseline_sha256": operation.public_identity_sha256,
         "schema_identity_sha256": operation.schema_identity_sha256,
         "status": operation.status,
         "tenant_identity_sha256": operation.tenant_identity_sha256,
     }
+
+
+def _assert_public_identity_matches_baseline(
+    *,
+    baseline_sha256: str | None,
+    current: PublicIdentitySentinel,
+) -> None:
+    if baseline_sha256 is None or current.sha256 != baseline_sha256:
+        raise LifecycleError("public-demo identity does not match lifecycle baseline")
 
 
 def _required_environment(name: str) -> str:

@@ -42,6 +42,26 @@ def test_governed_operation_idempotency_is_tenant_scoped_and_restart_safe():
     assert "ON CONFLICT (tenant_id, idempotency_key)" in source
 
 
+def test_lifecycle_public_identity_baseline_is_additive_and_digest_only():
+    migration = (
+        ROOT / "migrations" / "0031a_lifecycle_public_identity_baseline.sql"
+    ).read_text()
+
+    assert migration.count("ADD COLUMN IF NOT EXISTS public_identity_sha256 STRING(64)") == 2
+    assert "tenant_lifecycle_operations_public_identity_hash" in migration
+    assert "tenant_purge_tombstones_public_identity_hash" in migration
+    assert migration.count("public_identity_sha256 IS NULL") == 2
+    assert migration.count("^[0-9a-f]{64}$") == 2
+    assert "CREATE OR REPLACE FUNCTION guard_lifecycle_public_identity_baseline" in migration
+    assert (
+        "(NEW).public_identity_sha256 IS DISTINCT FROM (OLD).public_identity_sha256"
+        in migration
+    )
+    assert "tenant lifecycle public identity baseline is immutable" in migration
+    assert "BEFORE UPDATE ON tenant_lifecycle_operations" in migration
+    assert "target_tenant_id" not in migration
+
+
 TENANT_TABLES = {
     "episodic_memories",
     "semantic_memories",

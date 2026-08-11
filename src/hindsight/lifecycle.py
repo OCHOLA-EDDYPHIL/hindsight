@@ -68,6 +68,7 @@ class LifecycleOperation:
     id: str
     target_tenant_id: str
     tenant_identity_sha256: str
+    public_identity_sha256: str | None
     status: str
     snapshot_hlc: str | None
     schema_identity_sha256: str | None
@@ -99,6 +100,14 @@ class CognitoCredentialLocator:
 class PrincipalCleanupTargets:
     principal_hashes: tuple[str, ...]
     cognito_credential_locators: tuple[CognitoCredentialLocator, ...]
+
+
+@dataclass(frozen=True)
+class PublicIdentitySentinel:
+    tenant_rows: int
+    principal_mapping_rows: int
+    credential_locator_rows: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -196,6 +205,87 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def manifest_fingerprint(manifest: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(manifest)).hexdigest()
+
+
+def public_demo_identity_sentinel(
+    connection: psycopg.Connection,
+) -> PublicIdentitySentinel:
+    """Digest the bounded public-demo identity surface without exposing it."""
+
+    with connection.transaction():
+        _set_tenant_context(connection, PUBLIC_DEMO_TENANT_ID)
+        tenants = connection.execute(
+            """
+                SELECT id, slug, tenant_kind, status
+                FROM tenants
+                WHERE id = %s
+                ORDER BY id
+            """,
+            (PUBLIC_DEMO_TENANT_ID,),
+        ).fetchall()
+        principals = connection.execute(
+            """
+                SELECT id, principal_hash, provisioning_key, tenant_id, role, status
+                FROM product_principal_roles
+                WHERE tenant_id = %s
+                ORDER BY provisioning_key, principal_hash, id
+            """,
+            (PUBLIC_DEMO_TENANT_ID,),
+        ).fetchall()
+        locators = connection.execute(
+            """
+                SELECT id, provisioning_key, tenant_id, user_pool_id,
+                       cognito_username, role, principal_hash, status
+                FROM product_credential_locators
+                WHERE tenant_id = %s
+                ORDER BY provisioning_key, user_pool_id, cognito_username, id
+            """,
+            (PUBLIC_DEMO_TENANT_ID,),
+        ).fetchall()
+
+    if len(tenants) != 1 or tuple(str(value) for value in tenants[0]) != (
+        PUBLIC_DEMO_TENANT_ID,
+        "public-demo",
+        "public_demo",
+        "active",
+    ):
+        raise LifecycleConflictError("public-demo tenant identity is unavailable")
+    if len(principals) != 2 or {str(row[4]) for row in principals} != {
+        "viewer",
+        "operator",
+    }:
+        raise LifecycleConflictError("public-demo principal mappings are incomplete")
+    if any(str(row[5]) != "active" for row in principals):
+        raise LifecycleConflictError("public-demo principal mapping is not active")
+
+    active_locators = {
+        (str(row[1]), str(row[6]), str(row[5]))
+        for row in locators
+        if str(row[7]) == "active" and row[6] is not None
+    }
+    expected_locators = {
+        (str(row[2]), str(row[1]), str(row[4])) for row in principals
+    }
+    if not expected_locators.issubset(active_locators):
+        raise LifecycleConflictError(
+            "public-demo principal mapping lacks an active credential locator"
+        )
+
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "credential_locators": locators,
+                "principal_mappings": principals,
+                "tenants": tenants,
+            }
+        )
+    ).hexdigest()
+    return PublicIdentitySentinel(
+        tenant_rows=len(tenants),
+        principal_mapping_rows=len(principals),
+        credential_locator_rows=len(locators),
+        sha256=digest,
+    )
 
 
 def connect_lifecycle(database_url: str) -> psycopg.Connection:
@@ -402,6 +492,7 @@ def begin_export(
     connection: psycopg.Connection,
     *,
     tenant_id: str,
+    public_identity_sha256: str,
     operation_id: str | None = None,
     lease_owner: str | None = None,
     now: datetime | None = None,
@@ -417,6 +508,10 @@ def begin_export(
     tables = lifecycle_tables(connection)
     schema_hash = schema_identity_sha256(tables)
     tenant_hash = tenant_identity_sha256(normalized_tenant)
+    public_identity_hash = _sha256_digest(
+        public_identity_sha256,
+        label="public identity baseline",
+    )
 
     with connection.transaction():
         _set_tenant_context(connection, normalized_tenant)
@@ -449,10 +544,11 @@ def begin_export(
         connection.execute(
             """
                 INSERT INTO tenant_lifecycle_operations (
-                    id, target_tenant_id, tenant_identity_sha256, status,
+                    id, target_tenant_id, tenant_identity_sha256,
+                    public_identity_sha256, status,
                     schema_identity_sha256, lease_owner, lease_expires_at,
                     attempt_count, updated_at
-                ) VALUES (%s, %s, %s, 'exporting', %s, %s, %s, 1, %s)
+                ) VALUES (%s, %s, %s, %s, 'exporting', %s, %s, %s, 1, %s)
                 ON CONFLICT (id) DO UPDATE
                 SET status = 'exporting',
                     schema_identity_sha256 = excluded.schema_identity_sha256,
@@ -464,6 +560,7 @@ def begin_export(
                     updated_at = excluded.updated_at
                 WHERE tenant_lifecycle_operations.target_tenant_id = excluded.target_tenant_id
                   AND tenant_lifecycle_operations.tenant_identity_sha256 = excluded.tenant_identity_sha256
+                  AND tenant_lifecycle_operations.public_identity_sha256 = excluded.public_identity_sha256
                   AND tenant_lifecycle_operations.status IN (
                       'pending_export', 'exporting', 'failed'
                   )
@@ -477,6 +574,7 @@ def begin_export(
                 operation,
                 normalized_tenant,
                 tenant_hash,
+                public_identity_hash,
                 schema_hash,
                 owner,
                 lease_expiry,
@@ -485,9 +583,14 @@ def begin_export(
             ),
         )
         claimed = connection.execute(
-            "SELECT lease_owner FROM tenant_lifecycle_operations WHERE id = %s",
+            """
+                SELECT lease_owner, public_identity_sha256
+                FROM tenant_lifecycle_operations WHERE id = %s
+            """,
             (operation,),
         ).fetchone()
+        if claimed is not None and str(claimed[1]) != public_identity_hash:
+            raise LifecycleConflictError("public identity baseline does not match export")
         if claimed is None or str(claimed[0]) != owner:
             raise LifecycleLeaseError("tenant export lease is held by another worker")
         _set_lifecycle_context(connection, operation_id=operation, lease_owner=owner)
@@ -655,6 +758,7 @@ def begin_purge(
     *,
     operation_id: str,
     confirmed_fingerprint: str,
+    public_identity_sha256: str,
     lease_owner: str | None = None,
     now: datetime | None = None,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
@@ -663,6 +767,10 @@ def begin_purge(
         character not in "0123456789abcdef" for character in confirmed_fingerprint
     ):
         raise ValueError("confirmed export fingerprint must be a SHA-256 digest")
+    public_identity_hash = _sha256_digest(
+        public_identity_sha256,
+        label="public identity baseline",
+    )
     owner = str(UUID(lease_owner)) if lease_owner else str(uuid4())
     current_time = (now or utc_now()).astimezone(timezone.utc)
     lease_expiry = current_time + timedelta(seconds=_lease_seconds(lease_seconds))
@@ -683,6 +791,7 @@ def begin_purge(
                   AND status IN ('verified', 'purging', 'database_purged')
                   AND export_verified_at IS NOT NULL
                   AND export_fingerprint = %s
+                  AND public_identity_sha256 = %s
                   AND (
                       status IN ('purging', 'database_purged')
                       OR export_retention_until > %s
@@ -700,6 +809,7 @@ def begin_purge(
                 current_time,
                 operation_id,
                 confirmed_fingerprint,
+                public_identity_hash,
                 current_time,
                 owner,
                 current_time,
@@ -871,6 +981,7 @@ def purge_database_tenant(
             or operation.lease_expires_at <= current_time
             or operation.export_fingerprint is None
             or operation.export_fingerprint != operation.confirmed_export_fingerprint
+            or operation.public_identity_sha256 is None
             or operation.export_verified_at is None
             or operation.cleanup_targets_captured_at is None
         ):
@@ -892,8 +1003,9 @@ def purge_database_tenant(
             """
                 INSERT INTO tenant_purge_tombstones (
                     purge_id, tenant_identity_sha256, export_fingerprint,
-                    schema_identity_sha256, database_purged_at, purged_at
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    schema_identity_sha256, public_identity_sha256,
+                    database_purged_at, purged_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (purge_id) DO NOTHING
             """,
             (
@@ -901,6 +1013,7 @@ def purge_database_tenant(
                 operation.tenant_identity_sha256,
                 operation.export_fingerprint,
                 operation.schema_identity_sha256,
+                operation.public_identity_sha256,
                 current_time,
                 current_time,
             ),
@@ -925,23 +1038,34 @@ def finalize_purge(
     *,
     operation_id: str,
     lease_owner: str,
+    public_identity_sha256: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     current_time = (now or utc_now()).astimezone(timezone.utc)
+    public_identity_hash = _sha256_digest(
+        public_identity_sha256,
+        label="public identity baseline",
+    )
     with connection.transaction():
         operation = get_operation(connection, operation_id, for_update=True)
         if operation is None:
             tombstone = connection.execute(
                 """
                     SELECT purge_id, tenant_identity_sha256, export_fingerprint,
-                           schema_identity_sha256, database_purged_at, purged_at
+                           schema_identity_sha256, public_identity_sha256,
+                           database_purged_at, purged_at
                     FROM tenant_purge_tombstones WHERE purge_id = %s
                 """,
                 (operation_id,),
             ).fetchone()
             if tombstone is None:
                 raise LifecycleConflictError("purge operation does not exist")
-            return _tombstone_payload(tombstone)
+            payload = _tombstone_payload(tombstone)
+            if payload["public_identity_sha256"] != public_identity_hash:
+                raise LifecycleConflictError("public identity baseline does not match purge")
+            return payload
+        if operation.public_identity_sha256 != public_identity_hash:
+            raise LifecycleConflictError("public identity baseline does not match purge")
         if (
             operation.status != "database_purged"
             or operation.lease_owner != lease_owner
@@ -956,8 +1080,9 @@ def finalize_purge(
             """
                 INSERT INTO tenant_purge_tombstones (
                     purge_id, tenant_identity_sha256, export_fingerprint,
-                    schema_identity_sha256, database_purged_at, purged_at
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    schema_identity_sha256, public_identity_sha256,
+                    database_purged_at, purged_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (purge_id) DO NOTHING
             """,
             (
@@ -965,6 +1090,7 @@ def finalize_purge(
                 operation.tenant_identity_sha256,
                 operation.export_fingerprint,
                 operation.schema_identity_sha256,
+                operation.public_identity_sha256,
                 operation.database_purged_at,
                 current_time,
             ),
@@ -976,14 +1102,18 @@ def finalize_purge(
         tombstone = connection.execute(
             """
                 SELECT purge_id, tenant_identity_sha256, export_fingerprint,
-                       schema_identity_sha256, database_purged_at, purged_at
+                       schema_identity_sha256, public_identity_sha256,
+                       database_purged_at, purged_at
                 FROM tenant_purge_tombstones WHERE purge_id = %s
             """,
             (operation_id,),
         ).fetchone()
     if tombstone is None:
         raise LifecycleConflictError("purge tombstone was not persisted")
-    return _tombstone_payload(tombstone)
+    payload = _tombstone_payload(tombstone)
+    if payload["public_identity_sha256"] != public_identity_hash:
+        raise LifecycleConflictError("public identity baseline does not match purge")
+    return payload
 
 
 def abort_operation(
@@ -1066,8 +1196,9 @@ def get_operation(
     row = connection.execute(
         sql.SQL(
             """
-                SELECT id, target_tenant_id, tenant_identity_sha256, status,
-                       snapshot_hlc, schema_identity_sha256,
+                SELECT id, target_tenant_id, tenant_identity_sha256,
+                       public_identity_sha256, status, snapshot_hlc,
+                       schema_identity_sha256,
                        export_content_sha256, export_fingerprint,
                        export_bucket, export_data_key, export_data_version_id,
                        export_manifest_key, export_manifest_version_id,
@@ -1084,31 +1215,32 @@ def get_operation(
     ).fetchone()
     if row is None:
         return None
-    principal_hashes = row[16] if isinstance(row[16], list) else []
-    credential_locators = _parse_cognito_credential_locators(row[17])
+    principal_hashes = row[17] if isinstance(row[17], list) else []
+    credential_locators = _parse_cognito_credential_locators(row[18])
     return LifecycleOperation(
         id=str(row[0]),
         target_tenant_id=str(row[1]),
         tenant_identity_sha256=str(row[2]),
-        status=str(row[3]),
-        snapshot_hlc=str(row[4]) if row[4] is not None else None,
-        schema_identity_sha256=str(row[5]) if row[5] is not None else None,
-        export_content_sha256=str(row[6]) if row[6] is not None else None,
-        export_fingerprint=str(row[7]) if row[7] is not None else None,
-        export_bucket=str(row[8]) if row[8] is not None else None,
-        export_data_key=str(row[9]) if row[9] is not None else None,
-        export_data_version_id=str(row[10]) if row[10] is not None else None,
-        export_manifest_key=str(row[11]) if row[11] is not None else None,
-        export_manifest_version_id=str(row[12]) if row[12] is not None else None,
-        export_retention_until=row[13],
-        export_verified_at=row[14],
-        confirmed_export_fingerprint=(str(row[15]) if row[15] is not None else None),
+        public_identity_sha256=(str(row[3]) if row[3] is not None else None),
+        status=str(row[4]),
+        snapshot_hlc=str(row[5]) if row[5] is not None else None,
+        schema_identity_sha256=str(row[6]) if row[6] is not None else None,
+        export_content_sha256=str(row[7]) if row[7] is not None else None,
+        export_fingerprint=str(row[8]) if row[8] is not None else None,
+        export_bucket=str(row[9]) if row[9] is not None else None,
+        export_data_key=str(row[10]) if row[10] is not None else None,
+        export_data_version_id=str(row[11]) if row[11] is not None else None,
+        export_manifest_key=str(row[12]) if row[12] is not None else None,
+        export_manifest_version_id=str(row[13]) if row[13] is not None else None,
+        export_retention_until=row[14],
+        export_verified_at=row[15],
+        confirmed_export_fingerprint=(str(row[16]) if row[16] is not None else None),
         principal_hashes=tuple(str(value) for value in principal_hashes),
         cognito_credential_locators=credential_locators,
-        cleanup_targets_captured_at=row[18],
-        lease_owner=str(row[19]) if row[19] is not None else None,
-        lease_expires_at=row[20],
-        database_purged_at=row[21],
+        cleanup_targets_captured_at=row[19],
+        lease_owner=str(row[20]) if row[20] is not None else None,
+        lease_expires_at=row[21],
+        database_purged_at=row[22],
     )
 
 
@@ -1118,7 +1250,8 @@ def get_tombstone(
     row = connection.execute(
         """
             SELECT purge_id, tenant_identity_sha256, export_fingerprint,
-                   schema_identity_sha256, database_purged_at, purged_at
+                   schema_identity_sha256, public_identity_sha256,
+                   database_purged_at, purged_at
             FROM tenant_purge_tombstones WHERE purge_id = %s
         """,
         (operation_id,),
@@ -1150,14 +1283,23 @@ def _lease_seconds(value: int) -> int:
     return value
 
 
+def _sha256_digest(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
 def _tombstone_payload(row: Sequence[Any]) -> dict[str, Any]:
     return {
         "purge_id": str(row[0]),
         "tenant_identity_sha256": str(row[1]),
         "export_fingerprint": str(row[2]),
         "schema_identity_sha256": str(row[3]),
-        "database_purged_at": row[4].isoformat(),
-        "purged_at": row[5].isoformat(),
+        "public_identity_sha256": str(row[4]) if row[4] is not None else None,
+        "database_purged_at": row[5].isoformat(),
+        "purged_at": row[6].isoformat(),
     }
 
 

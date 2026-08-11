@@ -43,6 +43,9 @@ jobs:
       DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM }}
       HINDSIGHT_COGNITO_USER_POOL_ID: ${{ vars.HINDSIGHT_COGNITO_USER_POOL_ID }}
       HINDSIGHT_COGNITO_ISSUER: ${{ vars.HINDSIGHT_COGNITO_ISSUER }}
+      HINDSIGHT_REALTIME_TICKET_TABLE: ${{ vars.HINDSIGHT_REALTIME_TICKET_TABLE }}
+      HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE: ${{ vars.HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE }}
+      HINDSIGHT_WEBSOCKET_CONNECTION_TABLE: ${{ vars.HINDSIGHT_WEBSOCKET_CONNECTION_TABLE }}
     steps:
       - name: Validate durable fixture identity
         shell: bash
@@ -90,6 +93,9 @@ jobs:
           test "$HINDSIGHT_COGNITO_ISSUER" = "https://cognito-idp.$AWS_REGION.amazonaws.com/$HINDSIGHT_COGNITO_USER_POOL_ID"
           ACTUAL_AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           test "$ACTUAL_AWS_ACCOUNT_ID" = "$EXPECTED_AWS_ACCOUNT_ID"
+          test "$HINDSIGHT_REALTIME_TICKET_TABLE" = "hindsight-$DEPLOYED_STAGE-realtime-tickets"
+          test "$HINDSIGHT_WEBSOCKET_SUBSCRIPTION_TABLE" = "hindsight-$DEPLOYED_STAGE-websocket-subscriptions"
+          test "$HINDSIGHT_WEBSOCKET_CONNECTION_TABLE" = "hindsight-$DEPLOYED_STAGE-websocket-connections"
       - run: uv sync --frozen
       - name: Provision isolated fixture
         shell: bash

@@ -121,6 +121,7 @@ def _operation(**overrides: Any) -> LifecycleOperation:
         "id": "22222222-2222-2222-2222-222222222222",
         "target_tenant_id": "11111111-1111-1111-1111-111111111111",
         "tenant_identity_sha256": "a" * 64,
+        "public_identity_sha256": "e" * 64,
         "status": "exporting",
         "snapshot_hlc": None,
         "schema_identity_sha256": None,
@@ -398,10 +399,35 @@ class FakeTable:
 
 def test_aws_cleanup_uses_strong_scan_and_directly_confirms_cognito_deletion():
     tenant_id = "11111111-1111-1111-1111-111111111111"
+    other_tenant_id = "22222222-2222-2222-2222-222222222222"
+    other_ticket = {
+        "ticket_digest": "other-ticket",
+        "tenant_id": other_tenant_id,
+        "access_class": "viewer",
+        "expires_at": 1_900_000_000,
+    }
+    other_subscription = {
+        "topic_key": f"tenant:{other_tenant_id}:namespace:preserved",
+        "connection_id": "other-connection",
+        "tenant_id": other_tenant_id,
+        "expires_at": 1_900_000_000,
+    }
+    other_connection = {
+        "connection_id": "other-connection",
+        "tenant_id": other_tenant_id,
+        "namespace": "preserved",
+        "expires_at": 1_900_000_000,
+    }
+    other_ticket_snapshot = dict(other_ticket)
+    other_subscription_snapshot = dict(other_subscription)
+    other_connection_snapshot = dict(other_connection)
     tickets = FakeTable(
         "tickets",
         ("ticket_digest",),
-        [{"ticket_digest": "ticket-1", "tenant_id": tenant_id}],
+        [
+            {"ticket_digest": "ticket-1", "tenant_id": tenant_id},
+            other_ticket,
+        ],
     )
     subscriptions = FakeTable(
         "subscriptions",
@@ -416,12 +442,16 @@ def test_aws_cleanup_uses_strong_scan_and_directly_confirms_cognito_deletion():
                 "topic_key": f"tenant:{tenant_id}:namespace:legacy",
                 "connection_id": "legacy-connection",
             },
+            other_subscription,
         ],
     )
     connections = FakeTable(
         "connections",
         ("connection_id",),
-        [{"connection_id": "connection-1", "tenant_id": tenant_id}],
+        [
+            {"connection_id": "connection-1", "tenant_id": tenant_id},
+            other_connection,
+        ],
     )
 
     class Cognito:
@@ -523,3 +553,27 @@ def test_aws_cleanup_uses_strong_scan_and_directly_confirms_cognito_deletion():
         "lifecycle_fence": True,
     }
     assert "tenant_id" not in fence
+    assert next(
+        item for item in tickets.items if item.get("tenant_id") == other_tenant_id
+    ) == other_ticket_snapshot
+    assert next(
+        item
+        for item in subscriptions.items
+        if item.get("tenant_id") == other_tenant_id
+    ) == other_subscription_snapshot
+    assert next(
+        item for item in connections.items if item.get("tenant_id") == other_tenant_id
+    ) == other_connection_snapshot
+    assert {tuple(sorted(key.items())) for key in tickets.deleted} == {
+        (("ticket_digest", "ticket-1"),)
+    }
+    assert {tuple(sorted(key.items())) for key in subscriptions.deleted} == {
+        (("connection_id", "connection-1"), ("topic_key", "tenant:one:run:run-1")),
+        (
+            ("connection_id", "legacy-connection"),
+            ("topic_key", f"tenant:{tenant_id}:namespace:legacy"),
+        ),
+    }
+    assert {tuple(sorted(key.items())) for key in connections.deleted} == {
+        (("connection_id", "connection-1"),)
+    }

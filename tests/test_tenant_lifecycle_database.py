@@ -19,15 +19,18 @@ from hindsight.lifecycle import (
     begin_export,
     begin_purge,
     finalize_purge,
+    public_demo_identity_sentinel,
     purge_database_tenant,
     record_export,
     record_principal_hashes,
     record_verified_export,
     utc_now,
 )
+from hindsight.server_tenants import PUBLIC_DEMO_TENANT_ID
 
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
+PUBLIC_IDENTITY_SHA256 = "e" * 64
 
 
 @pytest.fixture(scope="module")
@@ -187,6 +190,7 @@ def _complete_purge(
         tenant_id=tenant_id,
         operation_id=operation_id,
         lease_owner=lease_owner,
+        public_identity_sha256=PUBLIC_IDENTITY_SHA256,
     )
     _record_verified_fixture(
         connection,
@@ -200,6 +204,7 @@ def _complete_purge(
         operation_id=operation_id,
         confirmed_fingerprint=fingerprint,
         lease_owner=lease_owner,
+        public_identity_sha256=PUBLIC_IDENTITY_SHA256,
     )
     record_principal_hashes(
         connection,
@@ -215,7 +220,155 @@ def _complete_purge(
         connection,
         operation_id=operation_id,
         lease_owner=lease_owner,
+        public_identity_sha256=PUBLIC_IDENTITY_SHA256,
     )
+
+
+@requires_db
+def test_legacy_null_public_identity_baseline_cannot_be_backfilled(
+    lifecycle_database_url: str,
+):
+    operation_id = str(uuid4())
+    target_tenant_id = str(uuid4())
+    with psycopg.connect(lifecycle_database_url, autocommit=True) as connection:
+        connection.execute(
+            """
+                INSERT INTO tenant_lifecycle_operations (
+                    id, target_tenant_id, tenant_identity_sha256, status
+                ) VALUES (%s, %s, %s, 'failed')
+            """,
+            (operation_id, target_tenant_id, _digest(target_tenant_id)),
+        )
+        try:
+            assert connection.execute(
+                """
+                    SELECT public_identity_sha256
+                    FROM tenant_lifecycle_operations
+                    WHERE id = %s
+                """,
+                (operation_id,),
+            ).fetchone() == (None,)
+            with pytest.raises(
+                psycopg.errors.RaiseException,
+                match="public identity baseline is immutable",
+            ):
+                connection.execute(
+                    """
+                        UPDATE tenant_lifecycle_operations
+                        SET public_identity_sha256 = %s
+                        WHERE id = %s
+                    """,
+                    (PUBLIC_IDENTITY_SHA256, operation_id),
+                )
+            assert connection.execute(
+                """
+                    SELECT public_identity_sha256
+                    FROM tenant_lifecycle_operations
+                    WHERE id = %s
+                """,
+                (operation_id,),
+            ).fetchone() == (None,)
+        finally:
+            connection.execute(
+                "DELETE FROM tenant_lifecycle_operations WHERE id = %s",
+                (operation_id,),
+            )
+
+
+@requires_db
+def test_public_demo_identity_sentinel_is_stable_for_lifecycle_role(
+    lifecycle_database_url: str,
+):
+    admin_url = os.environ["DATABASE_URL"]
+    marker = uuid4().hex
+    pool_id = f"lifecycle-sentinel-{marker}"
+    mappings = tuple(
+        (
+            _digest(f"sentinel:{marker}:principal:{role}"),
+            _digest(f"sentinel:{marker}:provisioning:{role}"),
+            role,
+            f"sentinel-{marker}-{role}",
+        )
+        for role in ("operator", "viewer")
+    )
+    created_fixture = False
+    try:
+        with psycopg.connect(admin_url) as admin:
+            admin.execute(
+                "SELECT set_config('hindsight.tenant_id', %s, false)",
+                (PUBLIC_DEMO_TENANT_ID,),
+            )
+            existing = admin.execute(
+                """
+                    SELECT
+                        (SELECT count(*) FROM product_principal_roles
+                         WHERE tenant_id = %s),
+                        (SELECT count(*) FROM product_credential_locators
+                         WHERE tenant_id = %s)
+                """,
+                (PUBLIC_DEMO_TENANT_ID, PUBLIC_DEMO_TENANT_ID),
+            ).fetchone()
+            assert existing is not None
+            if existing == (0, 0):
+                for principal_hash, provisioning_key, role, username in mappings:
+                    admin.execute(
+                        """
+                            INSERT INTO product_principal_roles (
+                                principal_hash, provisioning_key, tenant_id, role
+                            ) VALUES (%s, %s, %s, %s)
+                        """,
+                        (
+                            principal_hash,
+                            provisioning_key,
+                            PUBLIC_DEMO_TENANT_ID,
+                            role,
+                        ),
+                    )
+                    admin.execute(
+                        """
+                            INSERT INTO product_credential_locators (
+                                provisioning_key, tenant_id, user_pool_id,
+                                cognito_username, role, principal_hash, status
+                            ) VALUES (%s, %s, %s, %s, %s, %s, 'active')
+                        """,
+                        (
+                            provisioning_key,
+                            PUBLIC_DEMO_TENANT_ID,
+                            pool_id,
+                            username,
+                            role,
+                            principal_hash,
+                        ),
+                    )
+                created_fixture = True
+
+        with psycopg.connect(lifecycle_database_url, autocommit=True) as connection:
+            first = public_demo_identity_sentinel(connection)
+            second = public_demo_identity_sentinel(connection)
+
+        assert first == second
+        assert first.tenant_rows == 1
+        assert first.principal_mapping_rows == 2
+        assert first.credential_locator_rows >= 2
+        assert len(first.sha256) == 64
+    finally:
+        if created_fixture:
+            with psycopg.connect(admin_url) as admin:
+                admin.execute(
+                    "SELECT set_config('hindsight.tenant_id', %s, false)",
+                    (PUBLIC_DEMO_TENANT_ID,),
+                )
+                admin.execute(
+                    "DELETE FROM product_credential_locators WHERE user_pool_id = %s",
+                    (pool_id,),
+                )
+                admin.execute(
+                    """
+                        DELETE FROM product_principal_roles
+                        WHERE provisioning_key IN (%s, %s)
+                    """,
+                    (mappings[0][1], mappings[1][1]),
+                )
 
 
 @requires_db
@@ -254,7 +407,21 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
             tenant_id=tenant_id,
             operation_id=operation_id,
             lease_owner=lease_owner,
+            public_identity_sha256=PUBLIC_IDENTITY_SHA256,
         )
+        assert preparation.operation.public_identity_sha256 == PUBLIC_IDENTITY_SHA256
+        with pytest.raises(
+            psycopg.errors.RaiseException,
+            match="public identity baseline is immutable",
+        ):
+            connection.execute(
+                """
+                    UPDATE tenant_lifecycle_operations
+                    SET public_identity_sha256 = %s
+                    WHERE id = %s
+                """,
+                ("f" * 64, operation_id),
+            )
         assert len(preparation.tables) == 52
         assert connection.execute(
             "SELECT count(*) FROM tenant_lifecycle_completeness_issues"
@@ -303,6 +470,7 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
             tenant_id=tenant_id,
             operation_id=operation_id,
             lease_owner=lease_owner,
+            public_identity_sha256=PUBLIC_IDENTITY_SHA256,
         )
         _record_verified_fixture(
             connection,
@@ -318,6 +486,7 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
                 operation_id=operation_id,
                 confirmed_fingerprint="f" * 64,
                 lease_owner=lease_owner,
+                public_identity_sha256=PUBLIC_IDENTITY_SHA256,
             )
 
         begin_purge(
@@ -325,6 +494,7 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
             operation_id=operation_id,
             confirmed_fingerprint=fingerprint,
             lease_owner=lease_owner,
+            public_identity_sha256=PUBLIC_IDENTITY_SHA256,
         )
         blocker = connection.execute(
             """
@@ -421,6 +591,7 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
             operation_id=operation_id,
             confirmed_fingerprint=fingerprint,
             lease_owner=lease_owner,
+            public_identity_sha256=PUBLIC_IDENTITY_SHA256,
         )
         assert resumed.status == "database_purged"
         assert (
@@ -436,12 +607,14 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
             connection,
             operation_id=operation_id,
             lease_owner=lease_owner,
+            public_identity_sha256=PUBLIC_IDENTITY_SHA256,
         )
         assert (
             finalize_purge(
                 connection,
                 operation_id=operation_id,
                 lease_owner=lease_owner,
+                public_identity_sha256=PUBLIC_IDENTITY_SHA256,
             )
             == tombstone
         )
@@ -492,7 +665,9 @@ def test_verified_fenced_purge_cascades_and_database_purged_retries(
             "schema_identity_sha256",
             "database_purged_at",
             "purged_at",
+            "public_identity_sha256",
         )
+        assert tombstone["public_identity_sha256"] == PUBLIC_IDENTITY_SHA256
         assert tenant_id not in repr(tombstone)
         with pytest.raises(
             psycopg.errors.RaiseException,
@@ -537,6 +712,7 @@ def test_abort_claims_a_fresh_lease_and_reactivates_archived_tenant(
             tenant_id=tenant_id,
             operation_id=operation_id,
             lease_owner=lease_owner,
+            public_identity_sha256=PUBLIC_IDENTITY_SHA256,
         )
         if prior_state == "verified":
             _record_verified_fixture(
