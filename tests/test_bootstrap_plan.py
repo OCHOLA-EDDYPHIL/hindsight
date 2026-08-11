@@ -555,6 +555,10 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
     plan = jobs["plan"]
 
     assert workflow["permissions"] == {}
+    triggers = workflow.get("on", workflow.get(True))
+    confirmation = triggers["workflow_dispatch"]["inputs"]["confirmation"]
+    assert confirmation["required"] is True
+    assert confirmation["type"] == "string"
     assert workflow["concurrency"] == {
         "group": "hindsight-bootstrap-plan-demo",
         "cancel-in-progress": False,
@@ -568,6 +572,7 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
         '"$PRIVATE_REPOSITORY" == "true"',
         '"$REF_NAME" == "refs/heads/main"',
         '"$REF_PROTECTED" == "true"',
+        '"$CONFIRMATION" == "plan-bootstrap-$EVENT_SHA"',
         '"$ACTOR" == "$REPOSITORY_OWNER"',
         '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"',
     ):

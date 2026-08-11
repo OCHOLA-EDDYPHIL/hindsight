@@ -2,6 +2,11 @@ name: plan bootstrap
 
 on:
   workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type plan-bootstrap-<exact main SHA>
+        required: true
+        type: string
 
 permissions: {}
 
@@ -20,6 +25,7 @@ jobs:
         name: Authorize exact-main bootstrap planning
         env:
           ACTOR: ${{ github.actor }}
+          CONFIRMATION: ${{ inputs.confirmation }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.sha }}
           PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
@@ -38,6 +44,7 @@ jobs:
             && "$PRIVATE_REPOSITORY" == "true" \
             && "$REF_NAME" == "refs/heads/main" \
             && "$REF_PROTECTED" == "true" \
+            && "$CONFIRMATION" == "plan-bootstrap-$EVENT_SHA" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/plan-bootstrap.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
             && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
