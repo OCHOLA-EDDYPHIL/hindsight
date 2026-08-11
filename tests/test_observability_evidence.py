@@ -351,6 +351,24 @@ def test_observability_browser_evidence_rejects_nested_values_in_scalar_projecti
                 }
             }
         },
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "decision_id": "Bearer actual-token",
+                }
+            }
+        },
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "decision_id": '{"reasoning_steps":["unrestricted"]}',
+                }
+            }
+        },
     ]
 
     for value in cases:

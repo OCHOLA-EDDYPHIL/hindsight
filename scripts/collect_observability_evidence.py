@@ -37,6 +37,7 @@ CLIENT_CONFIG = Config(
 )
 SECRET_KEY = re.compile(r"(?i)(authorization|cookie|credential|password|secret|token|api[_-]?key)")
 SECRET_VALUE = re.compile(r"(?i)(bearer\s+|api[_-]?key|password|secret|authorization:)")
+BROWSER_SAFE_SCALAR = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}")
 EVENT_FIELDS = {
     "api_request": {"event", "status", "tenant_id", "trace_id", "span_id"},
     "run_dispatch": {
@@ -311,8 +312,8 @@ def _validate_browser_string_field(
     field_value = value[field]
     if nullable and field_value is None:
         return
-    if not isinstance(field_value, str):
-        raise ValueError(f"{label} {field} must be a string")
+    if not _is_safe_browser_scalar(field_value):
+        raise ValueError(f"{label} {field} must be a bounded safe scalar")
 
 
 def _validate_browser_string_list(
@@ -322,9 +323,9 @@ def _validate_browser_string_list(
         return
     field_value = value[field]
     if not isinstance(field_value, list) or any(
-        not isinstance(item, str) for item in field_value
+        not _is_safe_browser_scalar(item) for item in field_value
     ):
-        raise ValueError(f"{label} {field} must contain only strings")
+        raise ValueError(f"{label} {field} must contain only bounded safe scalars")
 
 
 def _validate_browser_integer_field(
@@ -332,6 +333,14 @@ def _validate_browser_integer_field(
 ) -> None:
     if field in value and type(value[field]) is not int:
         raise ValueError(f"{label} {field} must be an integer")
+
+
+def _is_safe_browser_scalar(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and BROWSER_SAFE_SCALAR.fullmatch(value) is not None
+        and SECRET_VALUE.search(value) is None
+    )
 
 
 def validate_provenance(
