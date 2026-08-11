@@ -37,6 +37,7 @@ CLIENT_CONFIG = Config(
 )
 SECRET_KEY = re.compile(r"(?i)(authorization|cookie|credential|password|secret|token|api[_-]?key)")
 SECRET_VALUE = re.compile(r"(?i)(bearer\s+|api[_-]?key|password|secret|authorization:)")
+BROWSER_SAFE_SCALAR = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}")
 EVENT_FIELDS = {
     "api_request": {"event", "status", "tenant_id", "trace_id", "span_id"},
     "run_dispatch": {
@@ -80,6 +81,53 @@ EVENT_FIELDS = {
         "span_id",
     },
 }
+BROWSER_EVIDENCE_FIELDS = {
+    "operation_id",
+    "observed",
+    "persisted",
+    "signature",
+    "capture_errors",
+}
+BROWSER_OBSERVED_FIELDS = {"id", "operation_type", "status"}
+BROWSER_PERSISTED_FIELDS = {
+    "id",
+    "operation_type",
+    "status",
+    "invalidated_memory_ids",
+    "restored_memory_ids",
+    "events",
+    "effects",
+}
+BROWSER_EVENT_FIELDS = {"sequence", "status"}
+BROWSER_EFFECT_FIELDS = {
+    "sequence",
+    "effect_type",
+    "source_memory_id",
+    "result_memory_id",
+    "namespace",
+}
+BROWSER_SIGNATURE_FIELDS = {
+    "namespace",
+    "operation_id",
+    "invalidated_memory_ids",
+    "bad",
+    "corrected",
+}
+BROWSER_SIGNATURE_RUN_FIELDS = {
+    "run_id",
+    "decision_id",
+    "status",
+    "reflected_memory_id",
+    "selection_fingerprint",
+    "recommendation_id",
+    "approval_approved",
+    "execution_status",
+    "read_memory_ids",
+    "read_count",
+    "downstream_lineage_edge_count",
+}
+BROWSER_CAPTURE_ERROR_FIELDS = {"stage", "type"}
+BROWSER_CAPTURE_ERROR_STAGES = {"screenshot", "console", "operations", "database"}
 
 
 def _load_object(path: Path, label: str) -> dict[str, Any]:
@@ -94,6 +142,7 @@ def validate_browser_evidence(path: Path) -> tuple[str, str]:
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("browser operation evidence must be a JSON object")
+    _validate_browser_evidence_projection(value)
     signature = value.get("signature")
     corrected = signature.get("corrected") if isinstance(signature, dict) else None
     if not isinstance(corrected, dict):
@@ -104,6 +153,194 @@ def validate_browser_evidence(path: Path) -> tuple[str, str]:
     if corrected.get("status") != "completed":
         raise ValueError("browser operation evidence did not complete the corrected run")
     return run_id, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_browser_evidence_projection(value: dict[str, Any]) -> None:
+    _reject_unknown_browser_fields(value, BROWSER_EVIDENCE_FIELDS, "operation evidence")
+    _validate_browser_string_field(
+        value, "operation_id", "operation evidence", nullable=True
+    )
+    for item in _browser_object_list(value.get("observed", []), "observed operation"):
+        _reject_unknown_browser_fields(item, BROWSER_OBSERVED_FIELDS, "observed operation")
+        for field in BROWSER_OBSERVED_FIELDS:
+            _validate_browser_string_field(item, field, "observed operation")
+
+    persisted = value.get("persisted")
+    if persisted is not None:
+        if not isinstance(persisted, dict):
+            raise ValueError("persisted browser operation must be an object")
+        _reject_unknown_browser_fields(
+            persisted,
+            BROWSER_PERSISTED_FIELDS,
+            "persisted browser operation",
+        )
+        for field in ("id", "operation_type", "status"):
+            _validate_browser_string_field(
+                persisted, field, "persisted browser operation"
+            )
+        for field in ("invalidated_memory_ids", "restored_memory_ids"):
+            _validate_browser_string_list(
+                persisted, field, "persisted browser operation"
+            )
+        for event in _browser_object_list(
+            persisted.get("events", []), "persisted operation event"
+        ):
+            _reject_unknown_browser_fields(
+                event,
+                BROWSER_EVENT_FIELDS,
+                "persisted operation event",
+            )
+            _validate_browser_integer_field(
+                event, "sequence", "persisted operation event"
+            )
+            _validate_browser_string_field(
+                event, "status", "persisted operation event"
+            )
+        for effect in _browser_object_list(
+            persisted.get("effects", []), "persisted operation effect"
+        ):
+            _reject_unknown_browser_fields(
+                effect,
+                BROWSER_EFFECT_FIELDS,
+                "persisted operation effect",
+            )
+            _validate_browser_integer_field(
+                effect, "sequence", "persisted operation effect"
+            )
+            _validate_browser_string_field(
+                effect, "effect_type", "persisted operation effect"
+            )
+            for field in ("source_memory_id", "result_memory_id", "namespace"):
+                _validate_browser_string_field(
+                    effect,
+                    field,
+                    "persisted operation effect",
+                    nullable=True,
+                )
+
+    signature = value.get("signature")
+    if signature is not None:
+        if not isinstance(signature, dict):
+            raise ValueError("browser signature must be an object")
+        _reject_unknown_browser_fields(
+            signature,
+            BROWSER_SIGNATURE_FIELDS,
+            "browser signature",
+        )
+        for field in ("namespace", "operation_id"):
+            _validate_browser_string_field(signature, field, "browser signature")
+        _validate_browser_string_list(
+            signature, "invalidated_memory_ids", "browser signature"
+        )
+        for label in ("bad", "corrected"):
+            run = signature.get(label)
+            if run is None:
+                continue
+            if not isinstance(run, dict):
+                raise ValueError(f"browser signature {label} run must be an object")
+            _reject_unknown_browser_fields(
+                run,
+                BROWSER_SIGNATURE_RUN_FIELDS,
+                f"browser signature {label} run",
+            )
+            for field in (
+                "run_id",
+                "decision_id",
+                "status",
+                "selection_fingerprint",
+                "recommendation_id",
+                "execution_status",
+            ):
+                _validate_browser_string_field(
+                    run, field, f"browser signature {label} run"
+                )
+            _validate_browser_string_field(
+                run,
+                "reflected_memory_id",
+                f"browser signature {label} run",
+                nullable=True,
+            )
+            if "approval_approved" in run and type(run["approval_approved"]) is not bool:
+                raise ValueError(
+                    f"browser signature {label} run approval_approved must be a boolean"
+                )
+            _validate_browser_string_list(
+                run, "read_memory_ids", f"browser signature {label} run"
+            )
+            for field in ("read_count", "downstream_lineage_edge_count"):
+                _validate_browser_integer_field(
+                    run, field, f"browser signature {label} run"
+                )
+
+    for error in _browser_object_list(
+        value.get("capture_errors", []), "browser capture error"
+    ):
+        _reject_unknown_browser_fields(
+            error,
+            BROWSER_CAPTURE_ERROR_FIELDS,
+            "browser capture error",
+        )
+        if (
+            error.get("stage") not in BROWSER_CAPTURE_ERROR_STAGES
+            or error.get("type") != "capture_failed"
+        ):
+            raise ValueError("browser capture error is not a stable code")
+
+
+def _browser_object_list(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"{label} collection must contain only objects")
+    return value
+
+
+def _reject_unknown_browser_fields(
+    value: dict[str, Any], allowed: set[str], label: str
+) -> None:
+    if set(value) - allowed:
+        raise ValueError(f"{label} contains unexpected fields")
+
+
+def _validate_browser_string_field(
+    value: dict[str, Any],
+    field: str,
+    label: str,
+    *,
+    nullable: bool = False,
+) -> None:
+    if field not in value:
+        return
+    field_value = value[field]
+    if nullable and field_value is None:
+        return
+    if not _is_safe_browser_scalar(field_value):
+        raise ValueError(f"{label} {field} must be a bounded safe scalar")
+
+
+def _validate_browser_string_list(
+    value: dict[str, Any], field: str, label: str
+) -> None:
+    if field not in value:
+        return
+    field_value = value[field]
+    if not isinstance(field_value, list) or any(
+        not _is_safe_browser_scalar(item) for item in field_value
+    ):
+        raise ValueError(f"{label} {field} must contain only bounded safe scalars")
+
+
+def _validate_browser_integer_field(
+    value: dict[str, Any], field: str, label: str
+) -> None:
+    if field in value and type(value[field]) is not int:
+        raise ValueError(f"{label} {field} must be an integer")
+
+
+def _is_safe_browser_scalar(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and BROWSER_SAFE_SCALAR.fullmatch(value) is not None
+        and SECRET_VALUE.search(value) is None
+    )
 
 
 def validate_provenance(
