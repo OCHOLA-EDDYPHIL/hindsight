@@ -437,40 +437,47 @@ def test_learning_evidence_archive_is_object_locked_and_narrowly_writable():
     assert 'output "learning_evidence_bucket"' in outputs
 
 
-def test_protected_corpus_uses_rotating_kms_and_narrow_permissions():
+def test_learning_evidence_settings_exclude_unapplied_kms_authority():
     bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
     outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
     policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[1].split(
         'resource "aws_iam_role_policy" "github_evidence"', 1
     )[0]
 
-    assert 'resource "aws_kms_key" "learning_corpus"' in bootstrap
-    assert "enable_key_rotation     = true" in bootstrap
-    assert "prevent_destroy = true" in bootstrap
+    assert 'resource "aws_kms_key" "learning_corpus"' not in bootstrap
+    assert 'resource "aws_kms_alias" "learning_corpus"' not in bootstrap
     assert "gemini-api-keys" in bootstrap
     assert 'actions   = ["ssm:GetParameter", "ssm:GetParameters"]' in policy
-    assert 'sid = "ProtectedCorpusEncryption"' in policy
-    assert 'output "learning_corpus_kms_key_arn"' in outputs
+    assert 'sid = "ProtectedCorpusEncryption"' not in policy
+    assert 'sid = "QualificationOpaqueIdentifiers"' not in policy
+    assert "kms:" not in policy
+    assert 'output "learning_corpus_kms_key_arn"' not in outputs
+    assert 'output "learning_corpus_kms_key_alias"' not in outputs
 
 
-def test_qualification_hmac_key_is_non_exportable_and_evidence_role_scoped():
+def test_qualification_hmac_key_is_preserved_without_evidence_role_kms_access():
     bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
     outputs = pathlib.Path("infra/terraform/bootstrap/outputs.tf").read_text()
 
     key = bootstrap.split('resource "aws_kms_key" "learning_qualification_hmac"', 1)[1].split(
         'resource "aws_kms_alias" "learning_qualification_hmac"', 1
     )[0]
-    policy = bootstrap.split('sid = "QualificationOpaqueIdentifiers"', 1)[1].split(
-        "\n  statement {", 1
+    policy = bootstrap.split('data "aws_iam_policy_document" "github_evidence"', 1)[1].split(
+        'resource "aws_iam_role_policy" "github_evidence"', 1
     )[0]
 
     assert 'key_usage                = "GENERATE_VERIFY_MAC"' in key
     assert 'customer_master_key_spec = "HMAC_256"' in key
     assert "prevent_destroy = true" in key
-    assert "kms:GenerateMac" in policy
-    assert "kms:VerifyMac" in policy
-    assert "kms:Decrypt" not in policy
+    assert 'resource "aws_kms_alias" "learning_qualification_hmac"' in bootstrap
+    assert 'name          = "alias/hindsight-${var.stage}-learning-qualification-hmac"' in bootstrap
+    assert "kms:" not in policy
     assert 'output "learning_qualification_hmac_key_arn"' in outputs
+    assert 'output "learning_qualification_hmac_key_alias"' in outputs
+    assert "from = aws_kms_key.learning_qualification_hmac" in bootstrap
+    assert "to   = aws_kms_key.learning_qualification_hmac[0]" in bootstrap
+    assert "from = aws_kms_alias.learning_qualification_hmac" in bootstrap
+    assert "to   = aws_kms_alias.learning_qualification_hmac[0]" in bootstrap
 
 
 def test_deploy_preflights_dependencies_and_invalidates_cloudfront():

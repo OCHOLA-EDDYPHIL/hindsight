@@ -321,17 +321,6 @@ resource "aws_s3_bucket" "learning_evidence" {
   }
 }
 
-resource "aws_kms_key" "learning_corpus" {
-  count = var.enable_learning_infrastructure ? 1 : 0
-
-  description             = "Hindsight protected learning corpus packages"
-  deletion_window_in_days = 30
-  enable_key_rotation     = true
-  lifecycle {
-    prevent_destroy = true
-  }
-}
-
 resource "aws_kms_key" "learning_qualification_hmac" {
   count = var.enable_learning_infrastructure ? 1 : 0
 
@@ -344,13 +333,6 @@ resource "aws_kms_key" "learning_qualification_hmac" {
   lifecycle {
     prevent_destroy = true
   }
-}
-
-resource "aws_kms_alias" "learning_corpus" {
-  count = var.enable_learning_infrastructure ? 1 : 0
-
-  name          = "alias/hindsight-${var.stage}-learning-corpus"
-  target_key_id = aws_kms_key.learning_corpus[0].key_id
 }
 
 resource "aws_kms_alias" "learning_qualification_hmac" {
@@ -1110,27 +1092,6 @@ data "aws_iam_policy_document" "github_evidence" {
   }
 
   statement {
-    sid = "ProtectedCorpusEncryption"
-    actions = [
-      "kms:Decrypt",
-      "kms:DescribeKey",
-      "kms:Encrypt",
-      "kms:GenerateDataKey",
-    ]
-    resources = [aws_kms_key.learning_corpus[0].arn]
-  }
-
-  statement {
-    sid = "QualificationOpaqueIdentifiers"
-    actions = [
-      "kms:DescribeKey",
-      "kms:GenerateMac",
-      "kms:VerifyMac",
-    ]
-    resources = [aws_kms_key.learning_qualification_hmac[0].arn]
-  }
-
-  statement {
     sid = "EvidenceBucketMetadata"
     actions = [
       "s3:GetBucketLocation",
@@ -1445,18 +1406,8 @@ moved {
 }
 
 moved {
-  from = aws_kms_key.learning_corpus
-  to   = aws_kms_key.learning_corpus[0]
-}
-
-moved {
   from = aws_kms_key.learning_qualification_hmac
   to   = aws_kms_key.learning_qualification_hmac[0]
-}
-
-moved {
-  from = aws_kms_alias.learning_corpus
-  to   = aws_kms_alias.learning_corpus[0]
 }
 
 moved {
