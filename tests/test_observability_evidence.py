@@ -269,6 +269,114 @@ def test_observability_browser_evidence_binds_completed_product_run(tmp_path):
         module.validate_browser_evidence(operation)
 
 
+def test_observability_browser_evidence_rejects_unprojected_nested_fields(tmp_path):
+    module = _script("collect_observability_evidence")
+    operation = tmp_path / "operation.json"
+    base = {
+        "signature": {
+            "corrected": {
+                "run_id": "run-1",
+                "status": "completed",
+            }
+        }
+    }
+    cases = [
+        {**base, "raw_model_payload": {"reasoning_steps": []}},
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "reasoning_steps": [{"decision": "unrestricted"}],
+                }
+            }
+        },
+        {
+            **base,
+            "persisted": {
+                "events": [],
+                "effects": [{"metadata": {"request": "unrestricted"}}],
+            },
+        },
+        {
+            **base,
+            "capture_errors": [
+                {
+                    "stage": "database",
+                    "type": "capture_failed",
+                    "detail": "unrestricted exception",
+                }
+            ],
+        },
+    ]
+
+    for value in cases:
+        operation.write_text(json.dumps(value))
+        with pytest.raises(ValueError, match="unexpected fields"):
+            module.validate_browser_evidence(operation)
+
+
+def test_observability_browser_evidence_rejects_nested_values_in_scalar_projections(
+    tmp_path,
+):
+    module = _script("collect_observability_evidence")
+    operation = tmp_path / "operation.json"
+    cases = [
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "read_memory_ids": [
+                        {"reasoning_steps": [{"decision": "unrestricted"}]}
+                    ],
+                }
+            }
+        },
+        {
+            "signature": {
+                "corrected": {"run_id": "run-1", "status": "completed"}
+            },
+            "persisted": {
+                "invalidated_memory_ids": [{"credential": "unrestricted"}],
+                "events": [],
+                "effects": [],
+            },
+        },
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": {"prompt": "unrestricted"},
+                    "status": "completed",
+                }
+            }
+        },
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "decision_id": "Bearer actual-token",
+                }
+            }
+        },
+        {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "decision_id": '{"reasoning_steps":["unrestricted"]}',
+                }
+            }
+        },
+    ]
+
+    for value in cases:
+        operation.write_text(json.dumps(value))
+        with pytest.raises(ValueError, match="must"):
+            module.validate_browser_evidence(operation)
+
+
 def test_observability_correlation_requires_all_product_boundaries():
     module = _script("collect_observability_evidence")
     trace_id = "a" * 32
