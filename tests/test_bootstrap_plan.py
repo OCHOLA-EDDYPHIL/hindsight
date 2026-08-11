@@ -192,6 +192,52 @@ def _resource_entry(plan, collection: str, address: str):
     return next(entry for entry in plan[collection] if entry["address"] == address)
 
 
+def _plan_with_cloudflare_refresh_drift(validator):
+    plan = _plan(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    desired = _resource_entry(
+        plan, "resource_changes", "cloudflare_dns_record.acm_validation"
+    )
+    desired.update(
+        {
+            "address": address,
+            "index": "hindsight.strathmoreedu.qzz.io",
+            "name": "acm_validation",
+        }
+    )
+    refreshed = {
+        "content": "_validation.acm-validations.aws",
+        "name": "_validation.hindsight.strathmoreedu.qzz.io",
+        "type": "CNAME",
+    }
+    desired["change"].update(
+        {
+            "before": refreshed,
+            "after": json.loads(json.dumps(refreshed)),
+        }
+    )
+    drift = _resource(
+        address,
+        ["update"],
+        resource_type="cloudflare_dns_record",
+        provider=validator.CLOUDFLARE_PROVIDER,
+        before={
+            **refreshed,
+            "content": "_validation.acm-validations.aws.",
+            "name": "_validation.hindsight.strathmoreedu.qzz.io.",
+        },
+        after=json.loads(json.dumps(refreshed)),
+    )
+    drift.update(
+        {
+            "index": "hindsight.strathmoreedu.qzz.io",
+            "name": "acm_validation",
+        }
+    )
+    plan["resource_drift"].append(drift)
+    return plan
+
+
 def _provenance(*, serial: int = 25):
     return {
         "lineage": "9f1383b4-4dae-30e4-bdba-649bc9346bc3",
@@ -229,10 +275,251 @@ def test_validator_records_every_resource_drift_and_output_action():
         "outputs": ["learning_corpus_kms_key_arn"],
     }
     assert summary["null_sensitive_placeholders"] == []
+    assert summary["reconciled_refresh_drift"] == []
     assert [row["to_display"] for row in summary["checks"]] == sorted(
         validator.REQUIRED_CHECKS
     )
     assert all(row["status"] == "pass" for row in summary["checks"])
+
+
+def test_validator_records_only_exact_reconciled_cloudflare_refresh_drift():
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+
+    summary = validator.validate_plan(plan)
+
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    assert summary["reconciled_refresh_drift"] == [address]
+    cloudflare_drift = next(
+        row for row in summary["resource_drift"] if row["address"] == address
+    )
+    assert cloudflare_drift["actions"] == ["update"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "data"),
+        ("name", "different"),
+        ("provider_name", "registry.terraform.io/hashicorp/aws"),
+        ("type", "aws_route53_record"),
+        ("index", "different.example"),
+        ("deposed", "deadbeef"),
+        ("module_address", "module.unapproved"),
+        ("previous_address", "cloudflare_dns_record.previous"),
+        ("schema_version", 0),
+    ],
+)
+@pytest.mark.parametrize("collection", ["resource_changes", "resource_drift"])
+def test_validator_rejects_cloudflare_refresh_drift_identity_variants(
+    field, value, collection
+):
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    _resource_entry(plan, collection, address)[field] = value
+
+    with pytest.raises(ValueError, match="refresh drift identity"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_unapproved_or_uncorrelated_cloudflare_refresh_drift():
+    validator = _validator()
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+
+    unapproved = _plan_with_cloudflare_refresh_drift(validator)
+    drift = _resource_entry(unapproved, "resource_drift", address)
+    drift.update(
+        {
+            "address": 'cloudflare_dns_record.acm_validation["other.example"]',
+            "index": "other.example",
+        }
+    )
+    with pytest.raises(ValueError, match="unapproved Cloudflare refresh drift"):
+        validator.validate_plan(unapproved)
+
+    missing = _plan_with_cloudflare_refresh_drift(validator)
+    missing["resource_changes"] = [
+        entry for entry in missing["resource_changes"] if entry["address"] != address
+    ]
+    with pytest.raises(ValueError, match="not uniquely reconciled"):
+        validator.validate_plan(missing)
+
+    duplicate = _plan_with_cloudflare_refresh_drift(validator)
+    duplicate["resource_changes"].append(
+        json.loads(
+            json.dumps(_resource_entry(duplicate, "resource_changes", address))
+        )
+    )
+    with pytest.raises(ValueError, match="duplicate resource identities"):
+        validator.validate_plan(duplicate)
+
+
+def test_validator_rejects_cloudflare_drift_that_is_not_an_exact_noop():
+    validator = _validator()
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+
+    wrong_drift_action = _plan_with_cloudflare_refresh_drift(validator)
+    _resource_entry(wrong_drift_action, "resource_drift", address)["change"][
+        "actions"
+    ] = ["no-op"]
+    with pytest.raises(ValueError, match="not a no-op"):
+        validator.validate_plan(wrong_drift_action)
+
+    actual_change = _plan_with_cloudflare_refresh_drift(validator)
+    _resource_entry(actual_change, "resource_changes", address)["change"][
+        "actions"
+    ] = ["update"]
+    with pytest.raises(ValueError, match="Cloudflare managed changes"):
+        validator.validate_plan(actual_change)
+
+    unreconciled = _plan_with_cloudflare_refresh_drift(validator)
+    _resource_entry(unreconciled, "resource_changes", address)["change"]["before"][
+        "name"
+    ] = "different.example"
+    with pytest.raises(ValueError, match="not a no-op"):
+        validator.validate_plan(unreconciled)
+
+    forged_noop = _plan_with_cloudflare_refresh_drift(validator)
+    _resource_entry(forged_noop, "resource_changes", address)["change"]["after"][
+        "name"
+    ] = "different.example"
+    with pytest.raises(ValueError, match="not a no-op"):
+        validator.validate_plan(forged_noop)
+
+    type_confusion = _plan_with_cloudflare_refresh_drift(validator)
+    drift_after = _resource_entry(
+        type_confusion, "resource_drift", address
+    )["change"]["after"]
+    desired_change = _resource_entry(
+        type_confusion, "resource_changes", address
+    )["change"]
+    drift_after["proxied"] = True
+    desired_change["before"]["proxied"] = 1
+    desired_change["after"]["proxied"] = 1
+    with pytest.raises(ValueError, match="not a no-op"):
+        validator.validate_plan(type_confusion)
+
+    unchanged_actual = _plan_with_cloudflare_refresh_drift(validator)
+    drift_change = _resource_entry(
+        unchanged_actual, "resource_drift", address
+    )["change"]
+    drift_change["before"] = json.loads(json.dumps(drift_change["after"]))
+    with pytest.raises(ValueError, match="not a no-op"):
+        validator.validate_plan(unchanged_actual)
+
+
+@pytest.mark.parametrize("collection", ["resource_changes", "resource_drift"])
+@pytest.mark.parametrize(
+    ("location", "field", "value"),
+    [
+        ("entry", "action_reason", "replace_because_tainted"),
+        ("change", "action_reason", "replace_because_tainted"),
+        ("change", "importing", {"id": "unexpected"}),
+        ("change", "replace_paths", [["content"]]),
+        ("change", "after_unknown", {"content": True}),
+        ("change", "after_unknown", {"content": 1}),
+        ("change", "after_unknown", {"content": "false"}),
+    ],
+)
+def test_validator_rejects_additional_cloudflare_refresh_behavior(
+    collection, location, field, value
+):
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    entry = _resource_entry(plan, collection, address)
+    target = entry if location == "entry" else entry["change"]
+    target[field] = value
+
+    expected_error = (
+        "Cloudflare managed changes"
+        if collection == "resource_changes"
+        else "additional behavior"
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        validator.validate_plan(plan)
+
+
+def test_validator_allows_only_recursively_clear_unknown_masks():
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    for collection in ("resource_changes", "resource_drift"):
+        _resource_entry(plan, collection, address)["change"]["after_unknown"] = {
+            "records": [{"content": False}],
+        }
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["reconciled_refresh_drift"] == [address]
+
+
+def test_address_aware_guard_rejects_spoofed_cloudflare_action_identity():
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    plan["resource_drift"] = []
+    change = _resource_entry(plan, "resource_changes", address)
+    change.update(
+        {
+            "provider_name": "registry.terraform.io/hashicorp/aws",
+            "type": "aws_route53_record",
+        }
+    )
+    change["change"]["actions"] = ["update"]
+
+    with pytest.raises(ValueError, match="Cloudflare managed changes"):
+        validator.validate_plan(plan)
+
+    data_spoof = _plan_with_cloudflare_refresh_drift(validator)
+    data_spoof["resource_drift"] = []
+    data_change = _resource_entry(data_spoof, "resource_changes", address)
+    data_change.update(
+        {
+            "mode": "data",
+            "provider_name": "registry.terraform.io/hashicorp/aws",
+            "type": "aws_route53_record",
+        }
+    )
+    data_change["change"]["actions"] = ["update"]
+    with pytest.raises(ValueError, match="Cloudflare managed changes"):
+        validator.validate_plan(data_spoof)
+
+    hidden_import = _plan_with_cloudflare_refresh_drift(validator)
+    hidden_import["resource_drift"] = []
+    _resource_entry(hidden_import, "resource_changes", address)["change"][
+        "importing"
+    ] = {"id": "unexpected"}
+    with pytest.raises(ValueError, match="Cloudflare managed changes"):
+        validator.validate_plan(hidden_import)
+
+
+def test_cloudflare_refresh_drift_errors_do_not_disclose_values():
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    sentinel = "must-never-appear-in-the-error"
+    _resource_entry(plan, "resource_changes", address)["change"]["before"][
+        "content"
+    ] = sentinel
+
+    with pytest.raises(ValueError, match="not a no-op") as raised:
+        validator.validate_plan(plan)
+    assert sentinel not in str(raised.value)
+
+
+@pytest.mark.parametrize("non_json_number", [float("nan"), float("inf"), -float("inf")])
+def test_validator_rejects_non_json_cloudflare_refresh_values(non_json_number):
+    validator = _validator()
+    plan = _plan_with_cloudflare_refresh_drift(validator)
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    _resource_entry(plan, "resource_drift", address)["change"]["before"][
+        "ttl"
+    ] = non_json_number
+
+    with pytest.raises(ValueError, match="invalid JSON values"):
+        validator.validate_plan(plan)
 
 
 @pytest.mark.parametrize("status", ["fail", "error", "unknown"])
@@ -775,6 +1062,7 @@ def test_manifest_binds_exact_files_metadata_actions_and_unchanged_state(tmp_pat
     }
     assert manifest["environment"] == "demo"
     assert manifest["plan"]["null_sensitive_placeholders"] == []
+    assert manifest["plan"]["reconciled_refresh_drift"] == []
     assert manifest["state_provenance"] == {
         "before": _provenance(),
         "after": _provenance(),
@@ -794,6 +1082,31 @@ def test_manifest_binds_exact_files_metadata_actions_and_unchanged_state(tmp_pat
         "resource_drift": 1,
         "output_changes": 2,
     }
+
+    reconciled_plan = _plan_with_cloudflare_refresh_drift(validator)
+    paths["plan_json"].write_text(json.dumps(reconciled_plan), encoding="utf-8")
+    reconciled_manifest = validator.build_manifest(
+        plan_json=paths["plan_json"],
+        plan_file=paths["plan"],
+        lock_file=paths["lock"],
+        state_before_file=paths["state_before"],
+        state_after_file=paths["state_after"],
+        actions_file=paths["actions"],
+        manifest_file=paths["manifest"],
+        source_revision=SOURCE_REVISION,
+        repository=validator.EXPECTED_REPOSITORY,
+        workflow_ref=WORKFLOW_REF,
+        aws_account_id="762397612117",
+        environment="demo",
+        role_arn="arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan",
+        run_id="1234",
+        run_attempt="2",
+    )
+    address = next(iter(validator.ALLOWED_CLOUDFLARE_REFRESH_DRIFT))
+    assert reconciled_manifest["plan"]["reconciled_refresh_drift"] == [address]
+    assert json.loads(paths["actions"].read_text())[
+        "reconciled_refresh_drift"
+    ] == [address]
 
     paths["state_after"].write_text(json.dumps(_provenance(serial=26)), encoding="utf-8")
     with pytest.raises(ValueError, match="state changed"):

@@ -33,6 +33,15 @@ ALLOWED_OUTPUT_REMOVALS = frozenset(
     }
 )
 AWS_PROVIDER = "registry.terraform.io/hashicorp/aws"
+CLOUDFLARE_PROVIDER = "registry.terraform.io/cloudflare/cloudflare"
+ALLOWED_CLOUDFLARE_REFRESH_DRIFT = {
+    'cloudflare_dns_record.acm_validation["hindsight.strathmoreedu.qzz.io"]': {
+        "index": "hindsight.strathmoreedu.qzz.io",
+        "name": "acm_validation",
+        "provider_name": CLOUDFLARE_PROVIDER,
+        "type": "cloudflare_dns_record",
+    }
+}
 ALLOWED_NULL_SENSITIVE_RESOURCE_ATTRIBUTES = {
     "aws_acm_certificate.demo": {
         "attribute": "private_key",
@@ -466,12 +475,18 @@ def _resource_summary(entry: Any, *, kind: str) -> dict[str, Any]:
     ):
         raise ValueError(f"unexpected data resource removal: {address}")
 
-    cloudflare_managed = mode == "managed" and (
-        resource_type.startswith("cloudflare_")
-        or provider == "registry.terraform.io/cloudflare/cloudflare"
-    )
-    if cloudflare_managed and actions != ["no-op"]:
-        raise ValueError(f"Cloudflare managed changes are forbidden: {address}")
+    cloudflare_resource = _cloudflare_resource(entry)
+    if kind == "resource_changes" and cloudflare_resource:
+        managed_change = mode == "managed" and (
+            actions != ["no-op"]
+            or not _resource_entry_is_refresh_only(entry, change)
+        )
+        invalid_data_action = mode == "data" and actions not in (
+            ["no-op"],
+            ["read"],
+        )
+        if managed_change or invalid_data_action:
+            raise ValueError(f"Cloudflare managed changes are forbidden: {address}")
 
     summary: dict[str, Any] = {
         "actions": actions,
@@ -484,8 +499,8 @@ def _resource_summary(entry: Any, *, kind: str) -> dict[str, Any]:
     for key in ("module_address", "previous_address", "deposed", "index"):
         if key in entry:
             summary[key] = entry[key]
-    if change.get("action_reason") is not None:
-        summary["action_reason"] = change["action_reason"]
+    if entry.get("action_reason") is not None:
+        summary["action_reason"] = entry["action_reason"]
     if change.get("replace_paths"):
         summary["replace_paths"] = change["replace_paths"]
     if change.get("importing") is not None:
@@ -507,6 +522,153 @@ def _resource_actions(entries: Any, *, kind: str) -> list[dict[str, Any]]:
         summaries,
         key=lambda row: (row["address"], str(row.get("deposed", ""))),
     )
+
+
+def _cloudflare_resource(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    address = entry.get("address")
+    return (
+        (
+            isinstance(address, str)
+            and (
+                address in ALLOWED_CLOUDFLARE_REFRESH_DRIFT
+                or re.search(r"(?:^|\.)cloudflare_[^.]+\.", address) is not None
+            )
+        )
+        or str(entry.get("type", "")).startswith("cloudflare_")
+        or entry.get("provider_name") == CLOUDFLARE_PROVIDER
+    )
+
+
+def _canonical_json(value: Any) -> str:
+    try:
+        return json.dumps(
+            value, allow_nan=False, separators=(",", ":"), sort_keys=True
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Cloudflare refresh drift contains invalid JSON values"
+        ) from None
+
+
+def _unknown_values_clear(value: Any) -> bool:
+    if value is False:
+        return True
+    if isinstance(value, dict):
+        return all(_unknown_values_clear(child) for child in value.values())
+    if isinstance(value, list):
+        return all(_unknown_values_clear(child) for child in value)
+    return False
+
+
+def _change_is_refresh_only(change: dict[str, Any]) -> bool:
+    return (
+        change.get("action_reason") is None
+        and change.get("importing") is None
+        and change.get("replace_paths") in (None, [])
+        and _unknown_values_clear(change.get("after_unknown", {}))
+    )
+
+
+def _resource_entry_is_refresh_only(
+    entry: dict[str, Any], change: dict[str, Any]
+) -> bool:
+    return entry.get("action_reason") is None and _change_is_refresh_only(change)
+
+
+def _validate_cloudflare_refresh_drift(
+    resource_changes: list[Any],
+    resource_drift: list[Any],
+) -> list[str]:
+    observed: list[str] = []
+    for drift_entry in resource_drift:
+        if not _cloudflare_resource(drift_entry):
+            continue
+        address = drift_entry.get("address")
+        expected = ALLOWED_CLOUDFLARE_REFRESH_DRIFT.get(address)
+        if expected is None:
+            raise ValueError(f"unapproved Cloudflare refresh drift: {address}")
+        matching_changes = [
+            entry
+            for entry in resource_changes
+            if isinstance(entry, dict) and entry.get("address") == address
+        ]
+        if len(matching_changes) != 1:
+            raise ValueError(
+                f"Cloudflare refresh drift is not uniquely reconciled: {address}"
+            )
+        change_entry = matching_changes[0]
+        for entry in (drift_entry, change_entry):
+            if (
+                entry.get("mode") != "managed"
+                or entry.get("name") != expected["name"]
+                or entry.get("provider_name") != expected["provider_name"]
+                or entry.get("type") != expected["type"]
+                or entry.get("index") != expected["index"]
+                or any(
+                    field in entry
+                    for field in (
+                        "deposed",
+                        "module_address",
+                        "previous_address",
+                        "schema_version",
+                    )
+                )
+            ):
+                raise ValueError(
+                    f"Cloudflare refresh drift identity is invalid: {address}"
+                )
+
+        drift_change = drift_entry.get("change")
+        desired_change = change_entry.get("change")
+        if not isinstance(drift_change, dict) or not isinstance(desired_change, dict):
+            raise ValueError(f"Cloudflare refresh drift is incomplete: {address}")
+        if not _resource_entry_is_refresh_only(
+            drift_entry, drift_change
+        ) or not _resource_entry_is_refresh_only(change_entry, desired_change):
+            raise ValueError(
+                f"Cloudflare refresh drift contains additional behavior: {address}"
+            )
+        drift_before = drift_change.get("before")
+        refreshed = drift_change.get("after")
+        desired_before = desired_change.get("before")
+        desired_after = desired_change.get("after")
+        if (
+            _actions(drift_change, subject=f"Cloudflare refresh drift {address}")
+            != ["update"]
+            or _actions(
+                desired_change, subject=f"Cloudflare desired state {address}"
+            )
+            != ["no-op"]
+            or not all(
+                isinstance(value, dict)
+                for value in (
+                    drift_before,
+                    refreshed,
+                    desired_before,
+                    desired_after,
+                )
+            )
+        ):
+            raise ValueError(f"Cloudflare refresh drift is not a no-op: {address}")
+        canonical_values = tuple(
+            _canonical_json(value)
+            for value in (
+                drift_before,
+                refreshed,
+                desired_before,
+                desired_after,
+            )
+        )
+        if (
+            canonical_values[0] == canonical_values[1]
+            or canonical_values[1] != canonical_values[2]
+            or canonical_values[2] != canonical_values[3]
+        ):
+            raise ValueError(f"Cloudflare refresh drift is not a no-op: {address}")
+        observed.append(address)
+    return sorted(observed)
 
 
 def _output_actions(entries: Any) -> list[dict[str, Any]]:
@@ -690,6 +852,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     checks = _check_summaries(plan["checks"])
     changes = _resource_actions(plan["resource_changes"], kind="resource_changes")
     drift = _resource_actions(plan.get("resource_drift", []), kind="resource_drift")
+    reconciled_refresh_drift = _validate_cloudflare_refresh_drift(
+        plan["resource_changes"], plan.get("resource_drift", [])
+    )
     outputs = _output_actions(plan["output_changes"])
     all_entries = [*changes, *drift, *outputs]
     observed_data_removals = sorted(
@@ -710,6 +875,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "outputs": observed_output_removals,
         },
         "null_sensitive_placeholders": null_sensitive_placeholders,
+        "reconciled_refresh_drift": reconciled_refresh_drift,
         "output_changes": outputs,
         "plan_format_version": format_version,
         "resource_changes": changes,
@@ -816,6 +982,7 @@ def build_manifest(
             "complete": actions["complete"],
             "format_version": actions["plan_format_version"],
             "null_sensitive_placeholders": actions["null_sensitive_placeholders"],
+            "reconciled_refresh_drift": actions["reconciled_refresh_drift"],
             "terraform_version": actions["terraform_version"],
             "totals": actions["totals"],
         },
