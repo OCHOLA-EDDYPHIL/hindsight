@@ -13,6 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_SHA = "a" * 40
 
 
+def _execution_id(mode: str) -> str:
+    return f"capacity_123_1_{mode}"
+
+
+def _database_for(mode: str) -> str:
+    digest = hashlib.sha256(_execution_id(mode).encode()).hexdigest()[:16]
+    return f"hindsight_capacity_{digest}"
+
+
 def _tenant_uuid(number: int) -> str:
     return f"00000000-0000-0000-0000-{number + 1:012d}"
 
@@ -29,7 +38,11 @@ def _qualification(validator):
     return {
         "schema_version": validator.SCHEMA_VERSION,
         "qualified": True,
+        "observation_only": False,
+        "mode": "qualification",
+        "qualification_evidence": True,
         "main_sha": SOURCE_SHA,
+        "execution_id": _execution_id("qualification"),
         "index": validator.EXPECTED_INDEX,
         "indexes": validator.EXPECTED_INDEXES,
         "vector_dimensions": 1024,
@@ -55,24 +68,36 @@ def _report(validator):
     return {
         "schema_version": validator.SCHEMA_VERSION,
         "source_revision": SOURCE_SHA,
+        "execution_id": _execution_id("qualification"),
+        "kind": "bounded_capacity_evidence_source",
+        "mode": "qualification",
+        "qualification_evidence": True,
         "index_qualification": {
             "qualified": True,
             "artifact_sha256": "b" * 64,
             "main_sha": SOURCE_SHA,
+            "execution_id": _execution_id("qualification"),
         },
-        "cleanup": {"database_removed": True, "artifact_sha256": "d" * 64},
+        "cleanup": {
+            "database_removed": True,
+            "execution_id": _execution_id("qualification"),
+            "artifact_sha256": "d" * 64,
+        },
         "targets": dict(validator.TARGETS),
+        "final_targets": dict(validator.TARGETS),
         "ceilings": dict(validator.EXPECTED_CEILINGS),
         "method": {
             "database": validator.EXPECTED_DATABASE_METHOD,
             "vectors": validator.EXPECTED_VECTOR_METHOD,
             "seeding": validator.EXPECTED_SEEDING_METHOD,
             "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+            "clients": "20_bounded_parallel_index_queries",
         },
         "environment": {
             "isolation": "run_scoped_database_and_compose_project",
             "paid_model_calls": 0,
             "live_worker_invocations": 0,
+            "runtime_memory_envelope": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
         },
         "raw_measurements": [
             {
@@ -136,8 +161,7 @@ def _report(validator):
                 "name": "vector_counts",
                 "total": 100_000,
                 "per_tenant": [
-                    {"tenant_id": _tenant_uuid(number), "vectors": 5_000}
-                    for number in range(20)
+                    {"tenant_id": _tenant_uuid(number), "vectors": 5_000} for number in range(20)
                 ],
             },
             {"name": "bounded_clients", "clients": _qualification(validator)["plans"]},
@@ -161,6 +185,268 @@ def _report(validator):
         ],
         "limitations": ["Benchmark evidence; not production SLO claims."],
     }
+
+
+def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=None):
+    before = {
+        "low": 0,
+        "high": 0,
+        "max": 828_396,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+    }
+    event_deltas = {key: 0 for key in before}
+    if deltas is not None:
+        event_deltas.update(deltas)
+    after = {key: before[key] + event_deltas[key] for key in before}
+    project = f"hindsight_capacity_123_1_{mode}"
+    return {
+        "schema_version": validator.RUNTIME_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": mode,
+        "execution_id": _execution_id(mode),
+        "compose_project": project,
+        "configured": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
+        "effective_process": {
+            "path": "/cockroach/cockroach.sh",
+            "args": validator.EXPECTED_PROCESS_ARGS,
+            "configured_command": validator.EXPECTED_PROCESS_ARGS,
+            "image": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["image"],
+            "compose_project": project,
+            "compose_service": "crdb",
+            "running": True,
+            "live_argv": validator.EXPECTED_LIVE_PROCESS_ARGS,
+            "effective_memory": {
+                "go_limit_bytes": 3 * 1024**3,
+                "store_capacity_bytes": 2 * 1024**3,
+                "store_count": 1,
+            },
+        },
+        "container_cgroup": {
+            "version": 2,
+            "memory_max": "max",
+            "memory_current_bytes": 100,
+            "memory_peak_bytes": peak_bytes,
+            "events": {key: 0 for key in before},
+        },
+        "cgroup": {
+            "version": 2,
+            "memory_max_bytes": 4 * 1024**3,
+            "cpu_quota_us": 150_000,
+            "cpu_period_us": 100_000,
+            "memory_current_before_bytes": 100,
+            "memory_current_after_bytes": 200,
+            "kernel_memory_peak_before_bytes": 4 * 1024**3,
+            "kernel_memory_peak_after_bytes": 4 * 1024**3,
+            "sample_count": 10,
+            "sampled_peak_bytes": peak_bytes,
+            "events_before": before,
+            "events_after": after,
+            "event_deltas": event_deltas,
+            "pressure_events_zero": all(value == 0 for value in event_deltas.values()),
+        },
+    }
+
+
+def _infrastructure_cleanup(validator, *, mode="qualification"):
+    return {
+        "schema_version": validator.INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": mode,
+        "execution_id": _execution_id(mode),
+        "compose_project": f"hindsight_capacity_123_1_{mode}",
+        "down_status": 0,
+        "container_query_status": 0,
+        "volume_query_status": 0,
+        "network_query_status": 0,
+        "remaining_containers": 0,
+        "remaining_volumes": 0,
+        "remaining_networks": 0,
+        "compose_state_removed": True,
+    }
+
+
+def _validate(validator, document, **kwargs):
+    qualification = kwargs.get("qualification")
+    cleanup = kwargs.get("cleanup")
+    digests = kwargs.get("artifact_digests")
+    execution_id = kwargs.setdefault("execution_id", _execution_id("qualification"))
+    if isinstance(cleanup, dict):
+        cleanup.setdefault("mode", "qualification")
+        cleanup.setdefault("execution_id", execution_id)
+        if cleanup.get("database") == "hindsight_capacity_abcdefgh":
+            cleanup["database"] = _database_for("qualification")
+    if qualification is not None and cleanup is not None and digests is not None:
+        kwargs.setdefault("runtime", _runtime(validator))
+        kwargs.setdefault("infrastructure_cleanup", _infrastructure_cleanup(validator))
+        if isinstance(digests, dict):
+            digests.setdefault("runtime-pressure.json", "e" * 64)
+            digests.setdefault("infrastructure-cleanup.json", "f" * 64)
+    return validator.validate(document, **kwargs)
+
+
+def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
+    protocol = _script("validate_capacity_evidence")
+    tenant_ids = [_tenant_uuid(number) for number in range(15)]
+    plans = [
+        {
+            "client": number,
+            "tenant_id": tenant_ids[(number - 1) % len(tenant_ids)],
+            "qualified_index": validator.EXPECTED_INDEX,
+            "prefix_spans": "[/tenant - /tenant]",
+            "plan": (f"vector search table: semantic_memory_vectors@{validator.EXPECTED_INDEX}"),
+        }
+        for number in range(1, 21)
+    ]
+    per_tenant = [{"tenant_id": tenant_id, "vectors": 5_000} for tenant_id in tenant_ids]
+    measurements = [
+        {
+            "name": "base_migrations",
+            "duration_seconds": 1,
+            "through": protocol.BASE_SCHEMA_THROUGH,
+        },
+        {
+            "name": "legacy_index_suspension",
+            "duration_seconds": 1,
+            "removed_index": protocol.LEGACY_INDEX,
+            "before_indexes": [protocol.LEGACY_INDEX],
+            "after_indexes": [],
+        },
+        {
+            "name": "vector_seed",
+            "duration_seconds": 1,
+            "batches": 15,
+            "vector_insert_rows": 75_000,
+            "vector_insert_transactions": 15,
+            "vector_insert_workers": protocol.EXPECTED_VECTOR_INSERT_WORKERS,
+            "vector_insert_client_retries": 0,
+            "storage_checks": [
+                {
+                    "completion_sequence": number,
+                    "completed_tenants": number,
+                    "bytes": number * 1_000,
+                }
+                for number in range(1, 16)
+            ],
+            "peak_storage_bytes": 15_000,
+        },
+        {
+            "name": "legacy_index_restore",
+            "duration_seconds": 1,
+            "vectors": 75_000,
+            "migration": protocol.LEGACY_VECTOR_MIGRATION,
+            "restored_index": protocol.LEGACY_INDEX,
+            "before_indexes": [],
+            "after_indexes": [protocol.LEGACY_INDEX],
+            "storage_bytes": 500_000,
+        },
+        {
+            "name": "tenant_index_build_input",
+            "vectors": 75_000,
+            "present_indexes": [protocol.LEGACY_INDEX],
+            "absent_index": validator.EXPECTED_INDEX,
+            "next_migration": protocol.TENANT_VECTOR_MIGRATION,
+        },
+        {"name": "post_seed_migrations", "duration_seconds": 1, "through": "latest"},
+        {
+            "name": "vector_indexes",
+            "indexes": validator.EXPECTED_INDEXES,
+            "storage_bytes": 800_000,
+        },
+        {"name": "vector_counts", "total": 75_000, "per_tenant": per_tenant},
+        {"name": "bounded_clients", "clients": plans},
+        {
+            "name": "synthetic_backlog",
+            "messages_enqueued": 1_000,
+            "messages_drained": 1_000,
+            "messages_accounted_for": 1_000,
+            "queue_capacity": 1_000,
+            "pending_before_drain": 1_000,
+            "pending_after_drain": 0,
+            "observed_max_pending": 1_000,
+            "clients": 20,
+            "per_client_counts": [50] * 20,
+            "live_worker_invocations": 0,
+            "paid_model_calls": 0,
+            "duration_seconds": 1,
+        },
+        {"name": "storage", "bytes": 1_000_000},
+        {"name": "total", "duration_seconds": duration},
+    ]
+    cleanup_digest = "d" * 64
+    document = {
+        "schema_version": validator.DIAGNOSTIC_SCHEMA_VERSION,
+        "kind": "capacity_resource_diagnostic",
+        "mode": "diagnostic",
+        "acceptance_eligible": False,
+        "qualification_evidence": False,
+        "source_revision": SOURCE_SHA,
+        "execution_id": _execution_id("diagnostic"),
+        "targets": dict(validator.DIAGNOSTIC_TARGETS),
+        "final_targets": dict(validator.TARGETS),
+        "method": {
+            "database": validator.EXPECTED_DATABASE_METHOD,
+            "vectors": validator.EXPECTED_VECTOR_METHOD,
+            "seeding": validator.EXPECTED_SEEDING_METHOD,
+            "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+            "clients": "20_bounded_parallel_index_queries",
+        },
+        "environment": {
+            "isolation": "run_scoped_database_and_compose_project",
+            "paid_model_calls": 0,
+            "live_worker_invocations": 0,
+            "runtime_memory_envelope": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
+        },
+        "ceilings": dict(validator.EXPECTED_CEILINGS),
+        "raw_measurements": measurements,
+        "index_observation": {
+            "schema_version": validator.DIAGNOSTIC_SCHEMA_VERSION,
+            "main_sha": SOURCE_SHA,
+            "execution_id": _execution_id("diagnostic"),
+            "observation_only": True,
+            "mode": "diagnostic",
+            "index": validator.EXPECTED_INDEX,
+            "indexes": validator.EXPECTED_INDEXES,
+            "vector_dimensions": 1024,
+            "vector_count": 75_000,
+            "tenant_count": 15,
+            "per_tenant_counts": per_tenant,
+            "plans": plans,
+        },
+        "cleanup": {
+            "database_removed": True,
+            "execution_id": _execution_id("diagnostic"),
+            "artifact_sha256": cleanup_digest,
+        },
+        "limitations": [
+            "Benchmark evidence; not production SLO claims.",
+            "This diagnostic cannot be used as final capacity qualification evidence.",
+        ],
+    }
+    cleanup = {
+        "schema_version": validator.DIAGNOSTIC_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": "diagnostic",
+        "execution_id": _execution_id("diagnostic"),
+        "database": _database_for("diagnostic"),
+        "database_removed": True,
+        "error": None,
+        "timeout_seconds": 120,
+    }
+    artifacts = {
+        "capacity-diagnostic.json": "a" * 64,
+        "cleanup.json": cleanup_digest,
+        "runtime-pressure.json": "e" * 64,
+        "infrastructure-cleanup.json": "f" * 64,
+    }
+    return (
+        document,
+        cleanup,
+        _runtime(protocol, mode="diagnostic", peak_bytes=peak_bytes),
+        _infrastructure_cleanup(protocol, mode="diagnostic"),
+        artifacts,
+    )
 
 
 def test_producer_is_exact_bounded_and_deterministic():
@@ -191,9 +477,10 @@ def test_producer_is_exact_bounded_and_deterministic():
     assert values.count("0") == 1023
     assert producer.VECTOR_CODE_OFFSET + producer.VECTOR_CODE_BITS <= producer.VECTOR_DIMENSIONS
     assert producer.ROWS_PER_TENANT < 1 << producer.VECTOR_CODE_BITS
-    assert len(
-        {producer._vector_code(ordinal) for ordinal in range(1, producer.ROWS_PER_TENANT + 1)}
-    ) == producer.ROWS_PER_TENANT
+    assert (
+        len({producer._vector_code(ordinal) for ordinal in range(1, producer.ROWS_PER_TENANT + 1)})
+        == producer.ROWS_PER_TENANT
+    )
     first = producer._vector(1, 1).removeprefix("[").removesuffix("]").split(",")
     second = producer._vector(1, 2).removeprefix("[").removesuffix("]").split(",")
     assert first != second
@@ -232,7 +519,7 @@ def test_producer_is_exact_bounded_and_deterministic():
     assert "LEGACY_VECTOR_INDEX" in suspension
     assert "TENANT_VECTOR_INDEX" not in suspension
     assert producer.SEEDING_METHOD == (
-        "single_bounded_writer_twenty_atomic_per_tenant_copy_transactions_"
+        "single_bounded_writer_one_atomic_copy_transaction_per_tenant_"
         "between_exact_legacy_index_drop_and_restore"
     )
     assert "COPY semantic_memory_vectors" in source
@@ -247,11 +534,19 @@ def test_producer_refuses_remote_or_unbounded_targets():
 
     with pytest.raises(ValueError, match="loopback defaultdb"):
         producer._validate_inputs(
-            "postgresql://root@database.example/defaultdb", "abcdefgh", SOURCE_SHA, 600
+            "postgresql://root@database.example/defaultdb",
+            hashlib.sha256(_execution_id("qualification").encode()).hexdigest()[:16],
+            _execution_id("qualification"),
+            SOURCE_SHA,
+            600,
         )
     with pytest.raises(ValueError, match="between 60 and 1200"):
         producer._validate_inputs(
-            "postgresql://root@localhost/defaultdb", "abcdefgh", SOURCE_SHA, 1201
+            "postgresql://root@localhost/defaultdb",
+            hashlib.sha256(_execution_id("qualification").encode()).hexdigest()[:16],
+            _execution_id("qualification"),
+            SOURCE_SHA,
+            1201,
         )
     assert producer._is_disposable("hindsight_capacity_abcdefgh") is True
     assert producer._is_disposable("defaultdb") is False
@@ -367,15 +662,12 @@ def test_legacy_vector_index_is_suspended_and_restored_exactly(monkeypatch):
     assert suspended["before_indexes"] == [producer.LEGACY_VECTOR_INDEX]
     assert suspended["after_indexes"] == []
     assert executed[-1] == (
-        'DROP INDEX "semantic_memory_vectors"@'
-        f'"{producer.LEGACY_VECTOR_INDEX}"'
+        f'DROP INDEX "semantic_memory_vectors"@"{producer.LEGACY_VECTOR_INDEX}"'
     )
 
     states = iter((frozenset(), frozenset({producer.LEGACY_VECTOR_INDEX})))
     monkeypatch.setattr(producer, "_vector_index_names", lambda *_args: next(states))
-    restored = producer._restore_legacy_vector_index(
-        "postgresql://db", producer.Deadline.after(10)
-    )
+    restored = producer._restore_legacy_vector_index("postgresql://db", producer.Deadline.after(10))
     assert restored["vectors"] == producer.TARGETS["vectors"]
     assert restored["before_indexes"] == []
     assert restored["after_indexes"] == [producer.LEGACY_VECTOR_INDEX]
@@ -434,7 +726,9 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
     qualification = _qualification(validator)
     cleanup = {
         "schema_version": validator.SCHEMA_VERSION,
-        "database": "hindsight_capacity_abcdefgh",
+        "mode": "qualification",
+        "execution_id": _execution_id("qualification"),
+        "database": _database_for("qualification"),
         "database_removed": True,
         "error": None,
         "source_revision": SOURCE_SHA,
@@ -447,7 +741,8 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
     }
 
     assert (
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -459,7 +754,8 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
 
     qualification["vector_count"] = 99_999
     with pytest.raises(ValueError, match="exact populated target"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -469,7 +765,8 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
     qualification["vector_count"] = 100_000
     qualification["plans"].pop()
     with pytest.raises(ValueError, match="twenty bounded clients"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -478,7 +775,8 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
         )
     qualification = _qualification(validator)
     with pytest.raises(ValueError, match="cleanup"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             cleanup={
@@ -494,7 +792,8 @@ def test_validator_rejects_forged_counts_plans_cleanup_and_ceilings():
         )
     report["ceilings"] = {**validator.EXPECTED_CEILINGS, "clients": 21}
     with pytest.raises(ValueError, match="hard ceilings"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -507,7 +806,7 @@ def test_validator_requires_bound_supplemental_artifacts():
     validator = _script("validate_capacity_evidence")
 
     with pytest.raises(ValueError, match="requires qualification, cleanup, and artifact"):
-        validator.validate(_report(validator), source_revision=SOURCE_SHA)
+        _validate(validator, _report(validator), source_revision=SOURCE_SHA)
 
 
 def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
@@ -528,12 +827,13 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
     }
 
     report = _report(validator)
-    counts = next(
-        row for row in report["raw_measurements"] if row["name"] == "vector_counts"
-    )["per_tenant"]
+    counts = next(row for row in report["raw_measurements"] if row["name"] == "vector_counts")[
+        "per_tenant"
+    ]
     counts[1]["tenant_id"] = counts[0]["tenant_id"]
     with pytest.raises(ValueError, match="exact vector and tenant counts"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -545,7 +845,8 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
     seed = next(row for row in report["raw_measurements"] if row["name"] == "vector_seed")
     seed["duration_seconds"] = 1_201
     with pytest.raises(ValueError, match="phase durations"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -556,7 +857,8 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
     report = _report(validator)
     report["raw_measurements"][-1]["duration_seconds"] = 5
     with pytest.raises(ValueError, match="phase durations exceed"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -566,7 +868,8 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
 
     report = _report(validator)
     with pytest.raises(ValueError, match="cleanup"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -578,7 +881,8 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
     missing_error = dict(cleanup)
     del missing_error["error"]
     with pytest.raises(ValueError, match="cleanup"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -589,7 +893,8 @@ def test_validator_rejects_duplicate_tenants_phase_time_and_cleanup_forgery():
     report = _report(validator)
     report["cleanup"]["artifact_sha256"] = "e" * 64
     with pytest.raises(ValueError, match="manifest"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -644,7 +949,8 @@ def test_validator_requires_populated_index_build_and_both_live_indexes():
     )
     build_input["vectors"] = 99_999
     with pytest.raises(ValueError, match="populated tenant-index build"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -655,7 +961,8 @@ def test_validator_requires_populated_index_build_and_both_live_indexes():
     report = _report(validator)
     qualification["indexes"] = [validator.EXPECTED_INDEX]
     with pytest.raises(ValueError, match="exact populated target"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -684,7 +991,8 @@ def test_validator_rejects_booleans_in_exact_numeric_evidence():
     report = _report(validator)
     report["environment"]["paid_model_calls"] = False
     with pytest.raises(ValueError, match="environment"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -695,7 +1003,8 @@ def test_validator_rejects_booleans_in_exact_numeric_evidence():
     report = _report(validator)
     report["ceilings"]["external_cost_usd"] = False
     with pytest.raises(ValueError, match="hard ceilings"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -708,7 +1017,8 @@ def test_validator_rejects_booleans_in_exact_numeric_evidence():
     clients["clients"][0]["client"] = True
     qualification["plans"][0]["client"] = True
     with pytest.raises(ValueError, match="twenty qualified clients"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -737,7 +1047,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     backlog = next(row for row in report["raw_measurements"] if row["name"] == "synthetic_backlog")
     backlog["observed_max_pending"] = 999
     with pytest.raises(ValueError, match="synthetic backlog"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -750,7 +1061,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     seed["storage_checks"][-1]["bytes"] = validator.EXPECTED_CEILINGS["storage_bytes"] + 1
     seed["peak_storage_bytes"] = seed["storage_checks"][-1]["bytes"]
     with pytest.raises(ValueError, match="enforced storage ceiling"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -770,7 +1082,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
         seed = next(row for row in report["raw_measurements"] if row["name"] == "vector_seed")
         seed[field] = invalid
         with pytest.raises(ValueError, match="exact bounded vector insertion"):
-            validator.validate(
+            _validate(
+                validator,
                 report,
                 source_revision=SOURCE_SHA,
                 qualification=qualification,
@@ -781,7 +1094,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     report = _report(validator)
     report["method"]["vectors"] = "twenty_repeated_vectors"
     with pytest.raises(ValueError, match="deterministic vector fixture"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -792,7 +1106,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     report = _report(validator)
     report["method"]["seeding"] = "bulk_vector_insert"
     with pytest.raises(ValueError, match="bounded vector seeding method"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -803,7 +1118,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     report = _report(validator)
     report["method"] = ["truthy", "but", "not", "an", "object"]
     with pytest.raises(ValueError, match="requires method and environment"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -816,7 +1132,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     seed["storage_checks"] = [{**row, "bytes": True} for row in seed["storage_checks"]]
     seed["peak_storage_bytes"] = True
     with pytest.raises(ValueError, match="enforced storage ceiling"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -828,7 +1145,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
     seed = next(row for row in report["raw_measurements"] if row["name"] == "vector_seed")
     seed["storage_checks"][0]["completed_tenants"] = 20
     with pytest.raises(ValueError, match="enforced storage ceiling"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -842,7 +1160,8 @@ def test_validator_rejects_unobserved_backlog_and_seed_storage():
         {"completion_sequence": True, "completed_tenants": True, "bytes": True}
     )
     with pytest.raises(ValueError, match="enforced storage ceiling"):
-        validator.validate(
+        _validate(
+            validator,
             report,
             source_revision=SOURCE_SHA,
             qualification=qualification,
@@ -893,9 +1212,7 @@ def test_seed_decision_seals_are_serialized(monkeypatch):
             return SimpleNamespace(rowcount=1)
 
     monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
-    assert producer._seal_seed_decision(
-        "postgresql://db", "abcdefgh", 2, SimpleNamespace()
-    ) is None
+    assert producer._seal_seed_decision("postgresql://db", "abcdefgh", 2, SimpleNamespace()) is None
     assert "set_config('hindsight.tenant_id'" in events[0][0]
     assert "SET status = 'sealed', sealed_at = now()" in events[1][0]
     assert events[1][1][1] == "capacity:abcdefgh:2"
@@ -956,9 +1273,7 @@ def test_seed_shard_worker_reports_bounded_result(monkeypatch):
         {"completion_sequence": number, "completed_tenants": number, "bytes": number}
         for number in range(1, 6)
     ]
-    monkeypatch.setattr(
-        producer, "_load_seed_shard", lambda *_args: (25_000, 5, storage_checks)
-    )
+    monkeypatch.setattr(producer, "_load_seed_shard", lambda *_args: (25_000, 5, storage_checks))
     producer._seed_shard_worker("postgresql://db", 123.0, 2, results)
     assert rows == [(2, 25_000, 5, storage_checks, None)]
 
@@ -1462,13 +1777,17 @@ def test_primary_failure_preserves_bounded_cleanup_receipt(tmp_path, monkeypatch
             "--admin-url",
             "postgresql://root@localhost/defaultdb",
             "--run-id",
-            "abcdefgh",
+            hashlib.sha256(_execution_id("qualification").encode()).hexdigest()[:16],
+            "--execution-id",
+            _execution_id("qualification"),
             "--source-sha",
             SOURCE_SHA,
             "--output-dir",
             str(tmp_path),
             "--timeout-seconds",
             "60",
+            "--mode",
+            "qualification",
         ],
     )
 
@@ -1519,13 +1838,17 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
             "--admin-url",
             "postgresql://root@localhost/defaultdb",
             "--run-id",
-            "abcdefgh",
+            hashlib.sha256(_execution_id("qualification").encode()).hexdigest()[:16],
+            "--execution-id",
+            _execution_id("qualification"),
             "--source-sha",
             SOURCE_SHA,
             "--output-dir",
             str(tmp_path),
             "--timeout-seconds",
             "60",
+            "--mode",
+            "qualification",
         ],
     )
 
@@ -1578,13 +1901,17 @@ def test_attempt_progress_failure_write_does_not_mask_primary_error(tmp_path, mo
             "--admin-url",
             "postgresql://root@localhost/defaultdb",
             "--run-id",
-            "abcdefgh",
+            hashlib.sha256(_execution_id("qualification").encode()).hexdigest()[:16],
+            "--execution-id",
+            _execution_id("qualification"),
             "--source-sha",
             SOURCE_SHA,
             "--output-dir",
             str(tmp_path),
             "--timeout-seconds",
             "60",
+            "--mode",
+            "qualification",
         ],
     )
 
@@ -1613,13 +1940,17 @@ def test_attempt_progress_success_is_diagnostic_and_excluded_from_manifest(tmp_p
             "--admin-url",
             "postgresql://root@localhost/defaultdb",
             "--run-id",
-            "abcdefgh",
+            hashlib.sha256(_execution_id("qualification").encode()).hexdigest()[:16],
+            "--execution-id",
+            _execution_id("qualification"),
             "--source-sha",
             SOURCE_SHA,
             "--output-dir",
             str(tmp_path),
             "--timeout-seconds",
             "60",
+            "--mode",
+            "qualification",
         ],
     )
 
@@ -1642,7 +1973,9 @@ def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):
     qualification = _qualification(validator)
     cleanup = {
         "schema_version": validator.SCHEMA_VERSION,
-        "database": "hindsight_capacity_abcdefgh",
+        "mode": "qualification",
+        "execution_id": _execution_id("qualification"),
+        "database": _database_for("qualification"),
         "database_removed": True,
         "error": None,
         "source_revision": SOURCE_SHA,
@@ -1652,27 +1985,41 @@ def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):
     cleanup_path = tmp_path / "cleanup.json"
     report_path = tmp_path / "capacity-report.json"
     manifest_path = tmp_path / "artifact-manifest.json"
+    runtime_path = tmp_path / "runtime-pressure.json"
+    infrastructure_path = tmp_path / "infrastructure-cleanup.json"
     output_path = tmp_path / "validated.json"
     qualification_path.write_text(json.dumps(qualification))
     cleanup_path.write_text(json.dumps(cleanup))
+    runtime_path.write_text(json.dumps(_runtime(validator)))
+    infrastructure_path.write_text(json.dumps(_infrastructure_cleanup(validator)))
     report = _report(validator)
     report["index_qualification"]["artifact_sha256"] = hashlib.sha256(
         qualification_path.read_bytes()
     ).hexdigest()
     report["cleanup"] = {
         "database_removed": True,
+        "execution_id": _execution_id("qualification"),
         "artifact_sha256": hashlib.sha256(cleanup_path.read_bytes()).hexdigest(),
     }
     report_path.write_text(json.dumps(report))
     artifacts = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in (qualification_path, report_path, cleanup_path)
+        for path in (
+            qualification_path,
+            report_path,
+            cleanup_path,
+            runtime_path,
+            infrastructure_path,
+        )
     }
     manifest_path.write_text(
         json.dumps(
             {
                 "schema_version": validator.SCHEMA_VERSION,
                 "source_revision": SOURCE_SHA,
+                "execution_id": _execution_id("qualification"),
+                "mode": "qualification",
+                "kind": "capacity_artifact_manifest",
                 "artifacts": artifacts,
             }
         )
@@ -1689,8 +2036,14 @@ def test_artifact_manifest_hashes_exact_bytes(tmp_path, monkeypatch):
             str(cleanup_path),
             "--manifest",
             str(manifest_path),
+            "--runtime",
+            str(runtime_path),
+            "--infrastructure-cleanup",
+            str(infrastructure_path),
             "--source-revision",
             SOURCE_SHA,
+            "--execution-id",
+            _execution_id("qualification"),
             "--output",
             str(output_path),
         ],
@@ -1713,23 +2066,43 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
         "cancel-in-progress": False,
     }
     authorize = workflow["jobs"]["authorize"]
+    diagnostic = workflow["jobs"]["diagnostic"]
     qualification = workflow["jobs"]["qualify"]
     runner = "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
     assert authorize["runs-on"] == runner
+    assert diagnostic["runs-on"] == runner
     assert qualification["runs-on"] == runner
     assert "$ACTOR" in authorize["steps"][0]["run"]
     assert "$TRIGGERING_ACTOR" in authorize["steps"][0]["run"]
     assert "refs/heads/main" in authorize["steps"][0]["run"]
-    assert qualification["timeout-minutes"] == 25
+    assert '"$RUN_ATTEMPT" == "1"' in authorize["steps"][0]["run"]
+    assert qualification["needs"] == ["authorize", "diagnostic"]
+    assert diagnostic["timeout-minutes"] == 35
+    assert qualification["timeout-minutes"] == 35
+    for job in (diagnostic, qualification):
+        rerun_guard = job["steps"][0]
+        assert rerun_guard["name"] == "Reject downstream rerun attempts"
+        assert 'test "$RUN_ATTEMPT" = "1"' in rerun_guard["run"]
+        assert 'test "$COMPOSE_PROJECT_NAME" = "hindsight_$EXECUTION_ID"' in rerun_guard["run"]
     assert qualification["env"]["COMPOSE_PROJECT_NAME"].endswith(
-        "${{ github.run_id }}_${{ github.run_attempt }}"
+        "${{ github.run_id }}_${{ github.run_attempt }}_qualification"
     )
-    assert qualification["env"]["COCKROACH_START_ARGS"] == "--store=type=mem,size=8GiB"
+    expected_args = (
+        "--store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB "
+        "--max-tsdb-memory=64MiB --max-go-memory=3GiB"
+    )
+    assert diagnostic["env"]["COCKROACH_START_ARGS"] == expected_args
+    assert qualification["env"]["COCKROACH_START_ARGS"] == expected_args
+    assert diagnostic["env"]["CAPACITY_MODE"] == "diagnostic"
+    assert qualification["env"]["CAPACITY_MODE"] == "qualification"
     compose = (ROOT / "docker-compose.yml").read_text()
     assert "start-single-node --insecure ${COCKROACH_START_ARGS:-}" in compose
     assert "--timeout-seconds 1200" in source
     assert "scripts/run_capacity_qualification.py" in source
+    assert "scripts/capture_capacity_runtime.py" in source
+    assert "scripts/validate_capacity_diagnostic.py" in source
     assert "scripts/validate_capacity_evidence.py" in source
+    assert source.index("validate_capacity_diagnostic.py") < source.index("qualify:")
     cleanup = next(
         step
         for step in qualification["steps"]
@@ -1739,6 +2112,472 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     assert "docker compose down --volumes --remove-orphans" in cleanup["run"]
     assert "remaining_containers" in cleanup["run"]
     assert "remaining_volumes" in cleanup["run"]
+    assert "remaining_networks" in cleanup["run"]
+    assert "container_query_status" in cleanup["run"]
+    assert "volume_query_status" in cleanup["run"]
+    assert "network_query_status" in cleanup["run"]
     upload = qualification["steps"][-1]
     assert upload["if"] == "always()"
     assert upload["with"]["if-no-files-found"] == "error"
+
+
+def test_diagnostic_profile_is_exact_and_keeps_twenty_clients():
+    producer = _script("run_capacity_qualification")
+    producer._configure_mode("diagnostic")
+    assert producer.TARGETS == {
+        "vectors": 75_000,
+        "tenants": 15,
+        "clients": 20,
+        "backlog_messages": 1_000,
+    }
+    assert producer.ROWS_PER_TENANT == 5_000
+    assert producer.VECTOR_CODE_OFFSET == 15
+    producer._configure_mode("qualification")
+    assert producer.TARGETS == producer.QUALIFICATION_TARGETS
+
+
+def test_spawned_seed_worker_receives_the_diagnostic_profile(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    captured = []
+
+    class ResultQueue:
+        def close(self):
+            return None
+
+        def join_thread(self):
+            return None
+
+    class Process:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+            self.name = kwargs["name"]
+
+        def start(self):
+            raise RuntimeError("stop after inspecting spawn arguments")
+
+    context = SimpleNamespace(Queue=ResultQueue, Process=Process)
+    monkeypatch.setattr(producer.multiprocessing, "get_context", lambda _method: context)
+    monkeypatch.setattr(producer, "_stop_seed_processes", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="spawn arguments"):
+        producer._run_seed_shards("postgresql://db", producer.Deadline.after(10), mode="diagnostic")
+    assert captured[0]["target"] is producer._seed_shard_worker
+    assert captured[0]["args"][-1] == "diagnostic"
+
+
+def test_diagnostic_clients_probe_fifteen_tenants_round_robin(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    producer._configure_mode("diagnostic")
+
+    def probe(_url, _run_id, client, tenant, _timeout):
+        return {"client": client, "tenant": tenant}
+
+    monkeypatch.setattr(producer, "_client_probe", probe)
+    rows = producer._exercise_clients("postgresql://db", "abcdefgh", producer.Deadline.after(10))
+    assert [row["client"] for row in rows] == list(range(1, 21))
+    assert [row["tenant"] for row in rows] == [*range(1, 16), *range(1, 6)]
+
+
+def test_diagnostic_producer_never_writes_final_artifacts(tmp_path, monkeypatch):
+    producer = _script("run_capacity_qualification")
+    monkeypatch.setattr(producer, "_verify_checkout", lambda _source_sha: None)
+    monkeypatch.setattr(producer, "_create_database", lambda *_args: None)
+    monkeypatch.setattr(producer, "_drop_database", lambda *_args: None)
+    monkeypatch.setattr(
+        producer,
+        "_run",
+        lambda *_args: (
+            {
+                "schema_version": producer.DIAGNOSTIC_SCHEMA_VERSION,
+                "qualified": False,
+                "qualification_evidence": False,
+                "observation_only": True,
+                "mode": "diagnostic",
+            },
+            {
+                "method": {},
+                "environment": {},
+                "ceilings": {},
+                "raw_measurements": [],
+                "limitations": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_capacity_qualification.py",
+            "--admin-url",
+            "postgresql://root@localhost/defaultdb",
+            "--run-id",
+            hashlib.sha256(_execution_id("diagnostic").encode()).hexdigest()[:16],
+            "--execution-id",
+            _execution_id("diagnostic"),
+            "--source-sha",
+            SOURCE_SHA,
+            "--output-dir",
+            str(tmp_path),
+            "--timeout-seconds",
+            "60",
+            "--mode",
+            "diagnostic",
+        ],
+    )
+    assert producer.main() == 0
+    assert (tmp_path / "capacity-diagnostic.json").is_file()
+    for name in (
+        "index-qualification.json",
+        "capacity-report.json",
+        "artifact-manifest.json",
+        "validated-capacity-report.json",
+    ):
+        assert not (tmp_path / name).exists()
+    diagnostic = json.loads((tmp_path / "capacity-diagnostic.json").read_text())
+    assert diagnostic["qualification_evidence"] is False
+    assert diagnostic["acceptance_eligible"] is False
+    assert "qualified" not in diagnostic["index_observation"]
+
+
+def test_final_validator_rejects_diagnostic_identity_even_with_final_counts():
+    validator = _script("validate_capacity_evidence")
+    report = _report(validator)
+    report.update(
+        {
+            "schema_version": validator.DIAGNOSTIC_SCHEMA_VERSION,
+            "kind": "capacity_resource_diagnostic",
+            "mode": "diagnostic",
+            "qualification_evidence": False,
+        }
+    )
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "mode": "qualification",
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "error": None,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    with pytest.raises(ValueError, match="schema version"):
+        _validate(
+            validator,
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=_qualification(validator),
+            cleanup=cleanup,
+            artifact_digests={
+                "index-qualification.json": "b" * 64,
+                "capacity-report.json": "c" * 64,
+                "cleanup.json": "d" * 64,
+            },
+        )
+
+
+def test_runtime_rejects_every_memory_argument_mutation():
+    validator = _script("validate_capacity_evidence")
+    expected = list(validator.EXPECTED_PROCESS_ARGS)
+    mutations = [
+        expected[:-1],
+        [*expected, expected[-1]],
+        [*expected, "--max-disk-temp-storage=100MiB"],
+        [*expected[:2], expected[3], expected[2], *expected[4:]],
+        [*expected[:2], "--store=type=mem,size=2048MiB", *expected[3:]],
+        [*expected[:2], "--store=type=mem,size=50%", *expected[3:]],
+    ]
+    for mutation in mutations:
+        runtime = _runtime(validator)
+        runtime["effective_process"]["args"] = mutation
+        with pytest.raises(ValueError, match="reviewed memory arguments"):
+            validator._validate_runtime(
+                runtime,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+            )
+
+
+@pytest.mark.parametrize("event_key", ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"])
+def test_runtime_rejects_each_positive_pressure_delta(event_key):
+    validator = _script("validate_capacity_evidence")
+    runtime = _runtime(validator, deltas={event_key: 1})
+    with pytest.raises(ValueError, match="memory-pressure events"):
+        validator._validate_runtime(
+            runtime,
+            source_revision=SOURCE_SHA,
+            mode="qualification",
+            execution_id=_execution_id("qualification"),
+        )
+
+
+def test_runtime_accepts_nonzero_unchanged_history_and_rejects_counter_regression():
+    validator = _script("validate_capacity_evidence")
+    runtime = _runtime(validator)
+    assert runtime["cgroup"]["events_before"]["max"] == 828_396
+    validator._validate_runtime(
+        runtime,
+        source_revision=SOURCE_SHA,
+        mode="qualification",
+        execution_id=_execution_id("qualification"),
+    )
+    runtime["cgroup"]["events_after"]["max"] -= 1
+    runtime["cgroup"]["event_deltas"]["max"] = -1
+    with pytest.raises(ValueError, match="memory-pressure events"):
+        validator._validate_runtime(
+            runtime,
+            source_revision=SOURCE_SHA,
+            mode="qualification",
+            execution_id=_execution_id("qualification"),
+        )
+
+
+def test_runtime_rejects_peak_at_limit_missing_counter_and_cpu_change():
+    validator = _script("validate_capacity_evidence")
+    runtime = _runtime(validator, peak_bytes=4 * 1024**3)
+    with pytest.raises(ValueError, match="cgroup telemetry|container cgroup"):
+        validator._validate_runtime(
+            runtime,
+            source_revision=SOURCE_SHA,
+            mode="qualification",
+            execution_id=_execution_id("qualification"),
+        )
+    runtime = _runtime(validator)
+    for section in ("events_before", "events_after", "event_deltas"):
+        runtime["cgroup"][section].pop("oom_kill")
+    with pytest.raises(ValueError, match="cgroup telemetry"):
+        validator._validate_runtime(
+            runtime,
+            source_revision=SOURCE_SHA,
+            mode="qualification",
+            execution_id=_execution_id("qualification"),
+        )
+    runtime = _runtime(validator)
+    runtime["cgroup"]["cpu_quota_us"] = 200_000
+    with pytest.raises(ValueError, match="cgroup telemetry"):
+        validator._validate_runtime(
+            runtime,
+            source_revision=SOURCE_SHA,
+            mode="qualification",
+            execution_id=_execution_id("qualification"),
+        )
+
+
+def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
+    validator = _script("validate_capacity_evidence")
+    for field in ("remaining_containers", "remaining_volumes", "remaining_networks"):
+        cleanup = _infrastructure_cleanup(validator)
+        cleanup[field] = 1
+        cleanup["compose_state_removed"] = False
+        with pytest.raises(ValueError, match="Compose cleanup"):
+            validator._validate_infrastructure_cleanup(
+                cleanup,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+                project="hindsight_capacity_123_1_qualification",
+            )
+    for field in ("container_query_status", "volume_query_status", "network_query_status"):
+        cleanup = _infrastructure_cleanup(validator)
+        cleanup[field] = 1
+        cleanup["compose_state_removed"] = False
+        with pytest.raises(ValueError, match="Compose cleanup"):
+            validator._validate_infrastructure_cleanup(
+                cleanup,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+                project="hindsight_capacity_123_1_qualification",
+            )
+
+
+def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
+    validator = _script("validate_capacity_diagnostic")
+    bundle = _diagnostic_bundle(validator, duration=7680 / 11)
+    report = validator.validate(
+        bundle[0],
+        source_revision=SOURCE_SHA,
+        execution_id=_execution_id("diagnostic"),
+        cleanup=bundle[1],
+        runtime=bundle[2],
+        infrastructure_cleanup=bundle[3],
+        artifact_digests=bundle[4],
+    )
+    assert report["projection"]["projected_final_duration_seconds"] == 960
+    assert report["projection"]["minimum_headroom_seconds"] == 240
+    bundle = _diagnostic_bundle(validator, duration=699)
+    with pytest.raises(ValueError, match="timing headroom"):
+        validator.validate(
+            bundle[0],
+            source_revision=SOURCE_SHA,
+            execution_id=_execution_id("diagnostic"),
+            cleanup=bundle[1],
+            runtime=bundle[2],
+            infrastructure_cleanup=bundle[3],
+            artifact_digests=bundle[4],
+        )
+
+
+def test_diagnostic_rejects_memory_peak_above_its_headroom_gate():
+    validator = _script("validate_capacity_diagnostic")
+    bundle = _diagnostic_bundle(
+        validator, peak_bytes=validator.MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES + 1
+    )
+    with pytest.raises(ValueError, match="memory headroom"):
+        validator.validate(
+            bundle[0],
+            source_revision=SOURCE_SHA,
+            execution_id=_execution_id("diagnostic"),
+            cleanup=bundle[1],
+            runtime=bundle[2],
+            infrastructure_cleanup=bundle[3],
+            artifact_digests=bundle[4],
+        )
+
+
+def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch):
+    capture = _script("capture_capacity_runtime")
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Labels": {
+                    "com.docker.compose.project": ("hindsight_capacity_123_1_diagnostic"),
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True},
+        }
+    ]
+    pid_ready = False
+
+    def run(command, **_kwargs):
+        nonlocal pid_ready
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                if not pid_ready:
+                    return SimpleNamespace(returncode=1, stdout="")
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            assert command[-1] == "/proc/42/cmdline"
+            return SimpleNamespace(
+                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    assert capture._inspect_container("hindsight_capacity_123_1_diagnostic") is None
+    pid_ready = True
+    process = capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+    assert process["path"] == "/cockroach/cockroach.sh"
+    assert process["args"] == list(capture.EXPECTED_PROCESS_ARGS)
+    assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
+    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2GiB"
+    with pytest.raises(RuntimeError, match="reviewed envelope"):
+        capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+
+
+def test_runtime_collector_retries_zero_effective_metric_and_requires_exact_values(
+    monkeypatch,
+):
+    capture = _script("capture_capacity_runtime")
+    monkeypatch.setattr(capture, "_query_single_integer", lambda _statement: 0)
+    assert capture._inspect_effective_memory() is None
+
+    def exact(statement):
+        if "node_metrics" in statement:
+            return 3 * 1024**3
+        return 2 * 1024**3
+
+    monkeypatch.setattr(capture, "_query_single_integer", exact)
+    assert capture._inspect_effective_memory() == {
+        "go_limit_bytes": 3 * 1024**3,
+        "store_capacity_bytes": 2 * 1024**3,
+        "store_count": 1,
+    }
+    monkeypatch.setattr(
+        capture,
+        "_query_single_integer",
+        lambda statement: 2 * 1024**3 if "node_metrics" in statement else 2 * 1024**3,
+    )
+    with pytest.raises(RuntimeError, match="effective database memory"):
+        capture._inspect_effective_memory()
+
+
+def test_runtime_finalizer_uses_deltas_and_omits_local_cgroup_identity(tmp_path, monkeypatch):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    configured = capture._configured_envelope()
+    before_events = {
+        "low": 0,
+        "high": 0,
+        "max": 828_396,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+    }
+    baseline = {
+        "schema_version": capture.BASELINE_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": "diagnostic",
+        "execution_id": _execution_id("diagnostic"),
+        "compose_project": project,
+        "configured": configured,
+        "cgroup": {
+            "identity": {"device": 1, "inode": 2},
+            "memory_max_bytes": 4 * 1024**3,
+            "cpu_quota_us": 150_000,
+            "cpu_period_us": 100_000,
+            "memory_current_bytes": 100,
+            "kernel_memory_peak_bytes": 4 * 1024**3,
+            "events": before_events,
+        },
+    }
+    samples = {
+        "schema_version": capture.SAMPLES_SCHEMA_VERSION,
+        "source_revision": SOURCE_SHA,
+        "mode": "diagnostic",
+        "execution_id": _execution_id("diagnostic"),
+        "compose_project": project,
+        "configured": configured,
+        "cgroup_identity": {"device": 1, "inode": 2},
+        "sample_count": 5,
+        "sampled_peak_bytes": 3 * 1024**3,
+        "effective_process": {"reviewed": True},
+        "container_cgroup": {"version": 2},
+        "error": None,
+    }
+    baseline_path = tmp_path / "baseline.json"
+    samples_path = tmp_path / "samples.json"
+    output_path = tmp_path / "runtime.json"
+    baseline_path.write_text(json.dumps(baseline))
+    samples_path.write_text(json.dumps(samples))
+    final_snapshot = {
+        "identity": {"device": 1, "inode": 2},
+        "memory_max_bytes": 4 * 1024**3,
+        "cpu_quota_us": 150_000,
+        "cpu_period_us": 100_000,
+        "memory_current_bytes": 200,
+        "kernel_memory_peak_bytes": 4 * 1024**3,
+        "events": dict(before_events),
+    }
+    monkeypatch.setattr(capture, "_validate_invocation", lambda *_args: None)
+    monkeypatch.setattr(capture, "_current_cgroup_directory", lambda: tmp_path)
+    monkeypatch.setattr(capture, "_snapshot", lambda _directory, **_kwargs: final_snapshot)
+    args = SimpleNamespace(
+        source_revision=SOURCE_SHA,
+        mode="diagnostic",
+        execution_id=_execution_id("diagnostic"),
+        compose_project=project,
+        baseline=baseline_path,
+        samples=samples_path,
+        output=output_path,
+    )
+    assert capture._finalize(args) == 0
+    runtime = json.loads(output_path.read_text())
+    assert "identity" not in runtime["cgroup"]
+    assert runtime["cgroup"]["events_before"]["max"] == 828_396
+    assert set(runtime["cgroup"]["event_deltas"].values()) == {0}

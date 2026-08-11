@@ -12,6 +12,12 @@ from typing import Any
 from uuid import UUID
 
 TARGETS = {"vectors": 100_000, "tenants": 20, "clients": 20, "backlog_messages": 1_000}
+DIAGNOSTIC_TARGETS = {
+    "vectors": 75_000,
+    "tenants": 15,
+    "clients": 20,
+    "backlog_messages": 1_000,
+}
 EXPECTED_CEILINGS = {
     "duration_seconds": 1_200,
     "storage_bytes": 1_500_000_000,
@@ -27,20 +33,72 @@ TENANT_VECTOR_MIGRATION = "0030_tenant_vector_cosine_index.sql"
 EXPECTED_VECTOR_INSERT_WORKERS = 1
 EXPECTED_VECTOR_METHOD = "deterministic_tenant_anchored_13bit_1024d"
 EXPECTED_SEEDING_METHOD = (
-    "single_bounded_writer_twenty_atomic_per_tenant_copy_transactions_"
+    "single_bounded_writer_one_atomic_copy_transaction_per_tenant_"
     "between_exact_legacy_index_drop_and_restore"
 )
 EXPECTED_FIXTURE_VECTOR_INDEXES = (
     "legacy_only_before_seed_then_none_during_copy_then_legacy_restored_"
     "before_populated_tenant_index_migration"
 )
-EXPECTED_DATABASE_METHOD = "disposable_local_single_node_cockroachdb_in_memory_8_gib"
-SCHEMA_VERSION = "hindsight.capacity_qualification.v3"
+EXPECTED_DATABASE_METHOD = (
+    "disposable_local_single_node_cockroachdb_in_memory_2_gib_explicit_memory_budgets"
+)
+SCHEMA_VERSION = "hindsight.capacity_qualification.v4"
+DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v1"
+RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v1"
+INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION = "hindsight.capacity_infrastructure_cleanup.v1"
+EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
+    "image": "cockroachdb/cockroach:v25.4.5",
+    "runner_topology": "owner_runner_dind_inside_sampled_job_cgroup",
+    "start_args": [
+        "--store=type=mem,size=2GiB",
+        "--cache=128MiB",
+        "--max-sql-memory=128MiB",
+        "--max-tsdb-memory=64MiB",
+        "--max-go-memory=3GiB",
+    ],
+    "runner_memory_max_bytes": 4 * 1024**3,
+    "runner_cpu": {"quota_us": 150_000, "period_us": 100_000},
+    "memory_bytes": {
+        "store": 2 * 1024**3,
+        "cache": 128 * 1024**2,
+        "sql": 128 * 1024**2,
+        "tsdb": 64 * 1024**2,
+        "go": 3 * 1024**3,
+    },
+}
+EXPECTED_PROCESS_ARGS = [
+    "start-single-node",
+    "--insecure",
+    *EXPECTED_RUNTIME_MEMORY_ENVELOPE["start_args"],
+]
+EXPECTED_LIVE_PROCESS_ARGS = [
+    "/cockroach/cockroach",
+    EXPECTED_PROCESS_ARGS[0],
+    "--listening-url-file=server_fifo",
+    "--pid-file=server_pid",
+    "--advertise-addr=127.0.0.1:26257",
+    "--certs-dir=certs",
+    "--log=file-defaults: {dir: ./cockroach-data/logs}",
+    *EXPECTED_PROCESS_ARGS[1:],
+]
+EXPECTED_EVENT_KEYS = frozenset({"low", "high", "max", "oom", "oom_kill"})
+COMPOSE_PROJECT_PATTERN = re.compile(r"hindsight_capacity_[0-9]+_[0-9]+_(diagnostic|qualification)")
+EXECUTION_ID_PATTERN = re.compile(r"capacity_[0-9]+_1_(diagnostic|qualification)")
+MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES = int(3.25 * 1024**3)
+MAX_PROJECTED_DURATION_SECONDS = 960
 DATABASE_PATTERN = re.compile(r"hindsight_capacity_[a-z0-9]{8,20}")
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _validate_execution_id(execution_id: str, *, mode: str) -> None:
+    if EXECUTION_ID_PATTERN.fullmatch(execution_id) is None or not execution_id.endswith(
+        f"_{mode}"
+    ):
+        raise ValueError("capacity execution identity is invalid")
 
 
 def _matches_exact_integers(value: Any, expected: dict[str, int]) -> bool:
@@ -69,7 +127,9 @@ def _measurement_map(rows: list[Any]) -> dict[str, dict[str, Any]]:
     return values
 
 
-def _validate_measurements(rows: list[Any]) -> None:
+def _validate_measurements(
+    rows: list[Any], *, targets: dict[str, int] = TARGETS
+) -> dict[str, dict[str, Any]]:
     expected_names = [
         "base_migrations",
         "legacy_index_suspension",
@@ -120,13 +180,11 @@ def _validate_measurements(rows: list[Any]) -> None:
         or legacy_index_restore.get("before_indexes") != []
         or legacy_index_restore.get("after_indexes") != [LEGACY_INDEX]
         or type(legacy_index_restore.get("vectors")) is not int
-        or legacy_index_restore["vectors"] != TARGETS["vectors"]
+        or legacy_index_restore["vectors"] != targets["vectors"]
         or type(legacy_index_restore.get("storage_bytes")) is not int
-        or not 0
-        < legacy_index_restore["storage_bytes"]
-        <= EXPECTED_CEILINGS["storage_bytes"]
+        or not 0 < legacy_index_restore["storage_bytes"] <= EXPECTED_CEILINGS["storage_bytes"]
         or type(index_build_input.get("vectors")) is not int
-        or index_build_input["vectors"] != TARGETS["vectors"]
+        or index_build_input["vectors"] != targets["vectors"]
         or index_build_input.get("present_indexes") != [LEGACY_INDEX]
         or index_build_input.get("absent_index") != EXPECTED_INDEX
         or index_build_input.get("next_migration") != TENANT_VECTOR_MIGRATION
@@ -141,11 +199,11 @@ def _validate_measurements(rows: list[Any]) -> None:
     storage_checks = seed.get("storage_checks")
     if (
         type(seed.get("batches")) is not int
-        or seed["batches"] != TARGETS["tenants"]
+        or seed["batches"] != targets["tenants"]
         or type(seed.get("vector_insert_rows")) is not int
-        or seed["vector_insert_rows"] != TARGETS["vectors"]
+        or seed["vector_insert_rows"] != targets["vectors"]
         or type(seed.get("vector_insert_transactions")) is not int
-        or seed["vector_insert_transactions"] != TARGETS["tenants"]
+        or seed["vector_insert_transactions"] != targets["tenants"]
         or type(seed.get("vector_insert_workers")) is not int
         or seed["vector_insert_workers"] != EXPECTED_VECTOR_INSERT_WORKERS
         or type(seed.get("vector_insert_client_retries")) is not int
@@ -154,9 +212,9 @@ def _validate_measurements(rows: list[Any]) -> None:
         raise ValueError("capacity seeding does not prove exact bounded vector insertion")
     if (
         not isinstance(storage_checks, list)
-        or len(storage_checks) != TARGETS["tenants"]
+        or len(storage_checks) != targets["tenants"]
         or [row.get("completion_sequence") for row in storage_checks if isinstance(row, dict)]
-        != list(range(1, TARGETS["tenants"] + 1))
+        != list(range(1, targets["tenants"] + 1))
         or any(
             not isinstance(row, dict)
             or type(row.get("completion_sequence")) is not int
@@ -179,15 +237,15 @@ def _validate_measurements(rows: list[Any]) -> None:
     )
     if (
         type(counts.get("total")) is not int
-        or counts["total"] != TARGETS["vectors"]
+        or counts["total"] != targets["vectors"]
         or not isinstance(per_tenant, list)
-        or len(per_tenant) != TARGETS["tenants"]
-        or len(set(tenant_ids)) != TARGETS["tenants"]
+        or len(per_tenant) != targets["tenants"]
+        or len(set(tenant_ids)) != targets["tenants"]
         or any(
             not isinstance(row, dict)
             or not _is_canonical_uuid(row.get("tenant_id"))
             or type(row.get("vectors")) is not int
-            or row["vectors"] != 5_000
+            or row["vectors"] != targets["vectors"] // targets["tenants"]
             for row in per_tenant
         )
     ):
@@ -195,9 +253,11 @@ def _validate_measurements(rows: list[Any]) -> None:
     clients = values["bounded_clients"].get("clients")
     if (
         not isinstance(clients, list)
-        or len(clients) != TARGETS["clients"]
-        or {row.get("client") for row in clients if isinstance(row, dict)} != set(range(1, 21))
-        or [row.get("tenant_id") for row in clients if isinstance(row, dict)] != tenant_ids
+        or len(clients) != targets["clients"]
+        or {row.get("client") for row in clients if isinstance(row, dict)}
+        != set(range(1, targets["clients"] + 1))
+        or [row.get("tenant_id") for row in clients if isinstance(row, dict)]
+        != [tenant_ids[number % len(tenant_ids)] for number in range(targets["clients"])]
         or any(
             not isinstance(row, dict)
             or type(row.get("client")) is not int
@@ -229,22 +289,22 @@ def _validate_measurements(rows: list[Any]) -> None:
                 )
             },
             {
-                "messages_enqueued": TARGETS["backlog_messages"],
-                "messages_drained": TARGETS["backlog_messages"],
-                "messages_accounted_for": TARGETS["backlog_messages"],
-                "queue_capacity": TARGETS["backlog_messages"],
-                "pending_before_drain": TARGETS["backlog_messages"],
+                "messages_enqueued": targets["backlog_messages"],
+                "messages_drained": targets["backlog_messages"],
+                "messages_accounted_for": targets["backlog_messages"],
+                "queue_capacity": targets["backlog_messages"],
+                "pending_before_drain": targets["backlog_messages"],
                 "pending_after_drain": 0,
-                "observed_max_pending": TARGETS["backlog_messages"],
-                "clients": TARGETS["clients"],
+                "observed_max_pending": targets["backlog_messages"],
+                "clients": targets["clients"],
                 "live_worker_invocations": 0,
                 "paid_model_calls": 0,
             },
         )
         or not isinstance(per_client, list)
-        or len(per_client) != TARGETS["clients"]
+        or len(per_client) != targets["clients"]
         or any(type(count) is not int or count <= 0 for count in per_client)
-        or sum(per_client) != TARGETS["backlog_messages"]
+        or sum(per_client) != targets["backlog_messages"]
     ):
         raise ValueError("capacity measurements do not prove the isolated synthetic backlog")
     storage = values["storage"].get("bytes")
@@ -262,22 +322,222 @@ def _validate_measurements(rows: list[Any]) -> None:
         raise ValueError("capacity measurements exceed or omit the duration ceiling")
     if sum(row["duration_seconds"] for row in timed_rows) > duration + 0.01:
         raise ValueError("capacity phase durations exceed the measured total duration")
+    return values
+
+
+def _validate_runtime(
+    runtime: dict[str, Any], *, source_revision: str, mode: str, execution_id: str
+) -> dict[str, Any]:
+    project = runtime.get("compose_project")
+    configured = runtime.get("configured")
+    process = runtime.get("effective_process")
+    container_cgroup = runtime.get("container_cgroup")
+    cgroup = runtime.get("cgroup")
+    if (
+        runtime.get("schema_version") != RUNTIME_SCHEMA_VERSION
+        or runtime.get("source_revision") != source_revision
+        or runtime.get("mode") != mode
+        or runtime.get("execution_id") != execution_id
+        or not isinstance(project, str)
+        or COMPOSE_PROJECT_PATTERN.fullmatch(project) is None
+        or project != f"hindsight_{execution_id}"
+        or configured != EXPECTED_RUNTIME_MEMORY_ENVELOPE
+        or not isinstance(process, dict)
+        or not isinstance(container_cgroup, dict)
+        or not isinstance(cgroup, dict)
+    ):
+        raise ValueError("capacity runtime envelope identity is invalid")
+    if (
+        set(process)
+        != {
+            "path",
+            "args",
+            "configured_command",
+            "image",
+            "compose_project",
+            "compose_service",
+            "running",
+            "live_argv",
+            "effective_memory",
+        }
+        or process.get("path") != "/cockroach/cockroach.sh"
+        or process.get("args") != EXPECTED_PROCESS_ARGS
+        or process.get("configured_command") != EXPECTED_PROCESS_ARGS
+        or process.get("image") != EXPECTED_RUNTIME_MEMORY_ENVELOPE["image"]
+        or process.get("compose_project") != project
+        or process.get("compose_service") != "crdb"
+        or process.get("running") is not True
+        or process.get("live_argv") != EXPECTED_LIVE_PROCESS_ARGS
+        or process.get("effective_memory")
+        != {
+            "go_limit_bytes": EXPECTED_RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"],
+            "store_capacity_bytes": EXPECTED_RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["store"],
+            "store_count": 1,
+        }
+    ):
+        raise ValueError("capacity runtime process does not match the reviewed memory arguments")
+    container_events = container_cgroup.get("events")
+    if (
+        set(container_cgroup)
+        != {
+            "version",
+            "memory_max",
+            "memory_current_bytes",
+            "memory_peak_bytes",
+            "events",
+        }
+        or container_cgroup.get("version") != 2
+        or container_cgroup.get("memory_max")
+        not in {"max", EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_memory_max_bytes"]}
+        or type(container_cgroup.get("memory_current_bytes")) is not int
+        or container_cgroup["memory_current_bytes"] < 0
+        or type(container_cgroup.get("memory_peak_bytes")) is not int
+        or not 0
+        < container_cgroup["memory_peak_bytes"]
+        < EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_memory_max_bytes"]
+        or not isinstance(container_events, dict)
+        or not EXPECTED_EVENT_KEYS.issubset(container_events)
+        or any(type(value) is not int or value != 0 for value in container_events.values())
+    ):
+        raise ValueError("capacity runtime container cgroup recorded memory pressure")
+    expected_cgroup_keys = {
+        "version",
+        "memory_max_bytes",
+        "cpu_quota_us",
+        "cpu_period_us",
+        "memory_current_before_bytes",
+        "memory_current_after_bytes",
+        "kernel_memory_peak_before_bytes",
+        "kernel_memory_peak_after_bytes",
+        "sample_count",
+        "sampled_peak_bytes",
+        "events_before",
+        "events_after",
+        "event_deltas",
+        "pressure_events_zero",
+    }
+    before = cgroup.get("events_before")
+    after = cgroup.get("events_after")
+    deltas = cgroup.get("event_deltas")
+    integer_fields = (
+        "memory_current_before_bytes",
+        "memory_current_after_bytes",
+        "kernel_memory_peak_before_bytes",
+        "kernel_memory_peak_after_bytes",
+        "sample_count",
+        "sampled_peak_bytes",
+    )
+    if (
+        set(cgroup) != expected_cgroup_keys
+        or cgroup.get("version") != 2
+        or cgroup.get("memory_max_bytes")
+        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_memory_max_bytes"]
+        or cgroup.get("cpu_quota_us") != EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_cpu"]["quota_us"]
+        or cgroup.get("cpu_period_us")
+        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["runner_cpu"]["period_us"]
+        or any(type(cgroup.get(key)) is not int or cgroup[key] < 0 for key in integer_fields)
+        or cgroup["sample_count"] <= 0
+        or not 0 < cgroup["sampled_peak_bytes"] < cgroup["memory_max_bytes"]
+        or not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or not isinstance(deltas, dict)
+        or set(before) != set(after)
+        or set(before) != set(deltas)
+        or not EXPECTED_EVENT_KEYS.issubset(before)
+    ):
+        raise ValueError("capacity runtime cgroup telemetry is incomplete")
+    if (
+        any(
+            type(before[key]) is not int
+            or type(after[key]) is not int
+            or type(deltas[key]) is not int
+            or before[key] < 0
+            or after[key] < before[key]
+            or deltas[key] != after[key] - before[key]
+            or deltas[key] != 0
+            for key in before
+        )
+        or cgroup.get("pressure_events_zero") is not True
+    ):
+        raise ValueError("capacity runtime recorded memory-pressure events")
+    return runtime
+
+
+def _validate_infrastructure_cleanup(
+    cleanup: dict[str, Any],
+    *,
+    source_revision: str,
+    mode: str,
+    execution_id: str,
+    project: str,
+) -> dict[str, Any]:
+    if (
+        set(cleanup)
+        != {
+            "schema_version",
+            "source_revision",
+            "mode",
+            "execution_id",
+            "compose_project",
+            "down_status",
+            "container_query_status",
+            "volume_query_status",
+            "network_query_status",
+            "remaining_containers",
+            "remaining_volumes",
+            "remaining_networks",
+            "compose_state_removed",
+        }
+        or cleanup.get("schema_version") != INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION
+        or cleanup.get("source_revision") != source_revision
+        or cleanup.get("mode") != mode
+        or cleanup.get("execution_id") != execution_id
+        or cleanup.get("compose_project") != project
+        or type(cleanup.get("down_status")) is not int
+        or cleanup["down_status"] != 0
+        or type(cleanup.get("container_query_status")) is not int
+        or cleanup["container_query_status"] != 0
+        or type(cleanup.get("volume_query_status")) is not int
+        or cleanup["volume_query_status"] != 0
+        or type(cleanup.get("network_query_status")) is not int
+        or cleanup["network_query_status"] != 0
+        or type(cleanup.get("remaining_containers")) is not int
+        or cleanup["remaining_containers"] != 0
+        or type(cleanup.get("remaining_volumes")) is not int
+        or cleanup["remaining_volumes"] != 0
+        or type(cleanup.get("remaining_networks")) is not int
+        or cleanup["remaining_networks"] != 0
+        or cleanup.get("compose_state_removed") is not True
+    ):
+        raise ValueError("capacity evidence requires verified Compose cleanup")
+    return cleanup
 
 
 def validate(
     document: dict[str, Any],
     *,
     source_revision: str,
+    execution_id: str,
     qualification: dict[str, Any] | None = None,
     cleanup: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None,
+    infrastructure_cleanup: dict[str, Any] | None = None,
     artifact_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    if qualification is None or cleanup is None or artifact_digests is None:
+    if (
+        qualification is None
+        or cleanup is None
+        or runtime is None
+        or infrastructure_cleanup is None
+        or artifact_digests is None
+    ):
         raise ValueError(
-            "capacity validation requires qualification, cleanup, and artifact manifest evidence"
+            "capacity validation requires qualification, cleanup, and artifact manifest evidence "
+            "plus runtime and infrastructure cleanup"
         )
     if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
         raise ValueError("source revision must be a full lowercase Git SHA")
+    _validate_execution_id(execution_id, mode="qualification")
     qualification_link = document.get("index_qualification") or {}
     cleanup_link = document.get("cleanup") or {}
     if qualification_link.get("qualified") is not True:
@@ -286,18 +546,29 @@ def validate(
         raise ValueError("capacity evidence requires a full SHA-256 qualification artifact digest")
     if (
         cleanup_link.get("database_removed") is not True
-        or re.fullmatch(r"[0-9a-f]{64}", str(cleanup_link.get("artifact_sha256") or ""))
-        is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(cleanup_link.get("artifact_sha256") or "")) is None
     ):
         raise ValueError("capacity evidence requires a bound cleanup artifact")
     if qualification_link.get("main_sha") != source_revision:
         raise ValueError("index qualification must belong to the exact tested main revision")
-    if document.get("source_revision") != source_revision:
+    if (
+        document.get("source_revision") != source_revision
+        or document.get("execution_id") != execution_id
+        or qualification_link.get("execution_id") != execution_id
+        or cleanup_link.get("execution_id") != execution_id
+    ):
         raise ValueError("capacity evidence must belong to the exact tested main revision")
-    if document.get("schema_version") != SCHEMA_VERSION:
+    if (
+        document.get("schema_version") != SCHEMA_VERSION
+        or document.get("kind") != "bounded_capacity_evidence_source"
+        or document.get("mode") != "qualification"
+        or document.get("qualification_evidence") is not True
+    ):
         raise ValueError("capacity evidence schema version is unsupported")
     if not _matches_exact_integers(document.get("targets"), TARGETS):
         raise ValueError("capacity evidence does not match the bounded target shape")
+    if not _matches_exact_integers(document.get("final_targets"), TARGETS):
+        raise ValueError("capacity evidence does not preserve the final bounded target")
     if not _matches_exact_integers(document.get("ceilings"), EXPECTED_CEILINGS):
         raise ValueError("capacity evidence does not enforce the required hard ceilings")
     method = document.get("method")
@@ -311,6 +582,8 @@ def validate(
         raise ValueError("capacity evidence does not identify the bounded vector seeding method")
     if method.get("fixture_vector_indexes") != EXPECTED_FIXTURE_VECTOR_INDEXES:
         raise ValueError("capacity evidence does not identify the bounded index lifecycle")
+    if method.get("clients") != "20_bounded_parallel_index_queries":
+        raise ValueError("capacity evidence does not identify twenty bounded clients")
     environment = document["environment"]
     if (
         not isinstance(environment, dict)
@@ -319,6 +592,7 @@ def validate(
         or type(environment.get("live_worker_invocations")) is not int
         or environment["live_worker_invocations"] != 0
         or environment.get("isolation") != "run_scoped_database_and_compose_project"
+        or environment.get("runtime_memory_envelope") != EXPECTED_RUNTIME_MEMORY_ENVELOPE
     ):
         raise ValueError("capacity environment is not isolated from paid and live services")
     measurements = document.get("raw_measurements")
@@ -333,7 +607,11 @@ def validate(
     if (
         qualification.get("schema_version") != SCHEMA_VERSION
         or qualification.get("qualified") is not True
+        or qualification.get("observation_only") is not False
+        or qualification.get("mode") != "qualification"
+        or qualification.get("qualification_evidence") is not True
         or qualification.get("main_sha") != source_revision
+        or qualification.get("execution_id") != execution_id
         or qualification.get("index") != EXPECTED_INDEX
         or qualification.get("indexes") != EXPECTED_INDEXES
         or type(qualification.get("vector_dimensions")) is not int
@@ -385,7 +663,10 @@ def validate(
         raise ValueError("capacity report client plans differ from index qualification")
     if (
         cleanup.get("schema_version") != SCHEMA_VERSION
-        or DATABASE_PATTERN.fullmatch(str(cleanup.get("database", ""))) is None
+        or cleanup.get("mode") != "qualification"
+        or cleanup.get("execution_id") != execution_id
+        or cleanup.get("database")
+        != f"hindsight_capacity_{hashlib.sha256(execution_id.encode()).hexdigest()[:16]}"
         or cleanup.get("database_removed") is not True
         or "error" not in cleanup
         or cleanup.get("error") is not None
@@ -394,15 +675,33 @@ def validate(
         or cleanup["timeout_seconds"] != 120
     ):
         raise ValueError("capacity evidence requires verified disposable-state cleanup")
-    expected_names = {"index-qualification.json", "capacity-report.json", "cleanup.json"}
+    runtime = _validate_runtime(
+        runtime,
+        source_revision=source_revision,
+        mode="qualification",
+        execution_id=execution_id,
+    )
+    infrastructure_cleanup = _validate_infrastructure_cleanup(
+        infrastructure_cleanup,
+        source_revision=source_revision,
+        mode="qualification",
+        execution_id=execution_id,
+        project=runtime["compose_project"],
+    )
+    expected_names = {
+        "index-qualification.json",
+        "capacity-report.json",
+        "cleanup.json",
+        "runtime-pressure.json",
+        "infrastructure-cleanup.json",
+    }
     if (
         set(artifact_digests) != expected_names
         or any(
             re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
             for digest in artifact_digests.values()
         )
-        or artifact_digests["index-qualification.json"]
-        != qualification_link["artifact_sha256"]
+        or artifact_digests["index-qualification.json"] != qualification_link["artifact_sha256"]
         or artifact_digests["cleanup.json"] != cleanup_link["artifact_sha256"]
     ):
         raise ValueError("capacity artifact manifest is incomplete")
@@ -410,6 +709,8 @@ def validate(
         **document,
         "kind": "bounded_capacity_evidence",
         "claim_scope": "benchmark_evidence_not_production_slo",
+        "runtime_pressure": runtime,
+        "infrastructure_cleanup": infrastructure_cleanup,
     }
 
 
@@ -417,25 +718,35 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--execution-id", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qualification", type=Path, required=True)
     parser.add_argument("--cleanup", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--infrastructure-cleanup", type=Path, required=True)
     args = parser.parse_args()
     document = json.loads(args.input.read_text())
     qualification = json.loads(args.qualification.read_text())
     cleanup = json.loads(args.cleanup.read_text())
     manifest = json.loads(args.manifest.read_text())
+    runtime = json.loads(args.runtime.read_text())
+    infrastructure_cleanup = json.loads(args.infrastructure_cleanup.read_text())
     digests = manifest.get("artifacts") if isinstance(manifest, dict) else None
     actual = {
         "index-qualification.json": _sha256(args.qualification),
         "capacity-report.json": _sha256(args.input),
         "cleanup.json": _sha256(args.cleanup),
+        "runtime-pressure.json": _sha256(args.runtime),
+        "infrastructure-cleanup.json": _sha256(args.infrastructure_cleanup),
     }
     if (
         digests != actual
         or manifest.get("source_revision") != args.source_revision
+        or manifest.get("execution_id") != args.execution_id
         or manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("mode") != "qualification"
+        or manifest.get("kind") != "capacity_artifact_manifest"
     ):
         raise ValueError("capacity artifact hashes do not match the supplied files")
     if (
@@ -448,8 +759,11 @@ def main() -> int:
     report = validate(
         document,
         source_revision=args.source_revision,
+        execution_id=args.execution_id,
         qualification=qualification,
         cleanup=cleanup,
+        runtime=runtime,
+        infrastructure_cleanup=infrastructure_cleanup,
         artifact_digests=digests,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
