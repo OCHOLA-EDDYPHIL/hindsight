@@ -91,6 +91,9 @@ def _report(validator):
             "vectors": validator.EXPECTED_VECTOR_METHOD,
             "seeding": validator.EXPECTED_SEEDING_METHOD,
             "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+            "vector_backfill_merge_batch": (
+                validator.EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+            ),
             "clients": "20_bounded_parallel_index_queries",
         },
         "environment": {
@@ -104,6 +107,15 @@ def _report(validator):
                 "name": "base_migrations",
                 "duration_seconds": 1,
                 "through": validator.BASE_SCHEMA_THROUGH,
+            },
+            {
+                "name": "vector_backfill_merge_batch",
+                "duration_seconds": 1,
+                "setting": validator.VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+                "previous_value": validator.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE,
+                "configured_value": validator.VECTOR_BACKFILL_MERGE_BATCH_SIZE,
+                "scope": "run_scoped_disposable_cockroachdb_node",
+                "next_populated_index_phase": "legacy_index_restore",
             },
             {
                 "name": "legacy_index_suspension",
@@ -277,6 +289,7 @@ def _infrastructure_cleanup(validator, *, mode="qualification"):
         "execution_id": _execution_id(mode),
         "compose_project": f"hindsight_capacity_123_1_{mode}",
         "down_status": 0,
+        "runtime_evidence_capture_status": 0,
         "runtime_finalize_status": 0,
         "probe_cleanup_status": 0,
         "container_query_status": 0,
@@ -329,6 +342,15 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
             "name": "base_migrations",
             "duration_seconds": 1,
             "through": protocol.BASE_SCHEMA_THROUGH,
+        },
+        {
+            "name": "vector_backfill_merge_batch",
+            "duration_seconds": 1,
+            "setting": protocol.VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+            "previous_value": protocol.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE,
+            "configured_value": protocol.VECTOR_BACKFILL_MERGE_BATCH_SIZE,
+            "scope": "run_scoped_disposable_cockroachdb_node",
+            "next_populated_index_phase": "legacy_index_restore",
         },
         {
             "name": "legacy_index_suspension",
@@ -414,6 +436,9 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
             "vectors": validator.EXPECTED_VECTOR_METHOD,
             "seeding": validator.EXPECTED_SEEDING_METHOD,
             "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+            "vector_backfill_merge_batch": (
+                validator.EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+            ),
             "clients": "20_bounded_parallel_index_queries",
         },
         "environment": {
@@ -465,8 +490,10 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
         "infrastructure-cleanup.json": "f" * 64,
     }
     runtime = _runtime(protocol, mode="diagnostic", peak_bytes=peak_bytes)
+    required_elapsed_ns = int(duration * 1_000_000_000) + 500_000_000
     sampling_elapsed_ns = max(
-        10_500_000_000, int(duration * 1_000_000_000) + 500_000_000
+        10_500_000_000,
+        ((required_elapsed_ns + 9_999_999) // 10_000_000) * 10_000_000,
     )
     sample_count = (sampling_elapsed_ns + 249_999_999) // 250_000_000 + 1
     final_monotonic_ns = 1_000_000_000 + sampling_elapsed_ns
@@ -566,6 +593,16 @@ def test_producer_is_exact_bounded_and_deterministic():
         "single_bounded_writer_one_atomic_copy_transaction_per_tenant_"
         "between_exact_legacy_index_drop_and_restore"
     )
+    assert producer.FIXTURE_VECTOR_INDEX_METHOD == (
+        "legacy_only_before_seed_then_none_during_copy_then_legacy_restored_"
+        "before_populated_tenant_index_migration"
+    )
+    assert producer.VECTOR_BACKFILL_MERGE_BATCH_SETTING == (
+        "bulkio.index_backfill.vector_merge_batch_size"
+    )
+    assert producer.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE == 3
+    assert producer.VECTOR_BACKFILL_MERGE_BATCH_SIZE == 64
+    assert "SET CLUSTER SETTING" in source
     assert "COPY semantic_memory_vectors" in source
     assert "copy.write_row" in source
     assert "executemany" not in source
@@ -676,6 +713,78 @@ def test_tenant_index_build_requires_exact_populated_legacy_index(monkeypatch):
         producer._tenant_index_build_input("postgresql://db", producer.Deadline.after(10))
 
 
+def test_vector_backfill_merge_batch_requires_default_and_exact_readback(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    calls = []
+    show_values = iter((3, 64))
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            calls.append((str(statement), params))
+            if str(statement).startswith("SHOW CLUSTER SETTING"):
+                value = next(show_values)
+                return SimpleNamespace(fetchone=lambda: (value,))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    measurement = producer._configure_vector_backfill_merge_batch(
+        "postgresql://db", producer.Deadline.after(10)
+    )
+    assert measurement | {"duration_seconds": 1} == {
+        "name": "vector_backfill_merge_batch",
+        "duration_seconds": 1,
+        "setting": producer.VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+        "previous_value": 3,
+        "configured_value": 64,
+        "scope": "run_scoped_disposable_cockroachdb_node",
+        "next_populated_index_phase": "legacy_index_restore",
+    }
+    assert any(
+        statement
+        == "SET CLUSTER SETTING bulkio.index_backfill.vector_merge_batch_size = 64"
+        for statement, _params in calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("show_values", "message"),
+    [
+        ((4,), "reviewed default"),
+        ((3, 63), "configuration was not exact"),
+    ],
+)
+def test_vector_backfill_merge_batch_fails_closed_on_wrong_values(
+    monkeypatch, show_values, message
+):
+    producer = _script("run_capacity_qualification")
+    values = iter(show_values)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            if str(statement).startswith("SHOW CLUSTER SETTING"):
+                value = next(values)
+                return SimpleNamespace(fetchone=lambda: (value,))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    with pytest.raises(RuntimeError, match=message):
+        producer._configure_vector_backfill_merge_batch(
+            "postgresql://db", producer.Deadline.after(10)
+        )
+
+
 def test_legacy_vector_index_is_suspended_and_restored_exactly(monkeypatch):
     producer = _script("run_capacity_qualification")
     executed = []
@@ -711,7 +820,9 @@ def test_legacy_vector_index_is_suspended_and_restored_exactly(monkeypatch):
 
     states = iter((frozenset(), frozenset({producer.LEGACY_VECTOR_INDEX})))
     monkeypatch.setattr(producer, "_vector_index_names", lambda *_args: next(states))
-    restored = producer._restore_legacy_vector_index("postgresql://db", producer.Deadline.after(10))
+    restored = producer._restore_legacy_vector_index(
+        "postgresql://db", producer.Deadline.after(10)
+    )
     assert restored["vectors"] == producer.TARGETS["vectors"]
     assert restored["before_indexes"] == []
     assert restored["after_indexes"] == [producer.LEGACY_VECTOR_INDEX]
@@ -952,6 +1063,14 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     validator = _script("validate_capacity_evidence")
     capture = _script("capture_capacity_runtime")
 
+    assert producer.SCHEMA_VERSION == "hindsight.capacity_qualification.v6"
+    assert producer.DIAGNOSTIC_SCHEMA_VERSION == "hindsight.capacity_resource_diagnostic.v3"
+    assert producer.ATTEMPT_PROGRESS_SCHEMA_VERSION == "hindsight.capacity_attempt_progress.v3"
+    assert capture.RUNTIME_SCHEMA_VERSION == "hindsight.capacity_runtime.v3"
+    assert (
+        validator.INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION
+        == "hindsight.capacity_infrastructure_cleanup.v3"
+    )
     assert producer.SCHEMA_VERSION == validator.SCHEMA_VERSION
     assert producer.DIAGNOSTIC_SCHEMA_VERSION == validator.DIAGNOSTIC_SCHEMA_VERSION
     assert capture.CAPACITY_SCHEMA_VERSION == validator.SCHEMA_VERSION
@@ -967,6 +1086,21 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     assert producer.VECTOR_METHOD == validator.EXPECTED_VECTOR_METHOD
     assert producer.SEEDING_METHOD == validator.EXPECTED_SEEDING_METHOD
     assert producer.FIXTURE_VECTOR_INDEX_METHOD == validator.EXPECTED_FIXTURE_VECTOR_INDEXES
+    assert (
+        f"{producer.VECTOR_BACKFILL_MERGE_BATCH_SETTING}="
+        f"{producer.VECTOR_BACKFILL_MERGE_BATCH_SIZE}_run_scoped"
+        == validator.EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+    )
+    assert (
+        producer.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE
+        == validator.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE
+        == 3
+    )
+    assert (
+        producer.VECTOR_BACKFILL_MERGE_BATCH_SIZE
+        == validator.VECTOR_BACKFILL_MERGE_BATCH_SIZE
+        == 64
+    )
     assert producer.DATABASE_METHOD == validator.EXPECTED_DATABASE_METHOD
     assert producer.BASE_SCHEMA_THROUGH == validator.BASE_SCHEMA_THROUGH
     assert producer.LEGACY_VECTOR_INDEX == validator.LEGACY_INDEX
@@ -1020,6 +1154,75 @@ def test_validator_requires_populated_index_build_and_both_live_indexes():
             artifact_digests=digests,
         )
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("previous_value", 4),
+        ("configured_value", 63),
+        ("scope", "database_scoped"),
+        ("next_populated_index_phase", "tenant_index_build_input"),
+    ],
+)
+def test_validator_requires_exact_vector_backfill_merge_batch_measurement(field, value):
+    validator = _script("validate_capacity_evidence")
+    report = _report(validator)
+    measurement = next(
+        row
+        for row in report["raw_measurements"]
+        if row["name"] == "vector_backfill_merge_batch"
+    )
+    measurement[field] = value
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "error": None,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    with pytest.raises(ValueError, match="run-scoped backfill setting"):
+        _validate(
+            validator,
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=_qualification(validator),
+            cleanup=cleanup,
+            artifact_digests={
+                "index-qualification.json": "b" * 64,
+                "capacity-report.json": "c" * 64,
+                "cleanup.json": "d" * 64,
+            },
+        )
+
+
+def test_validator_requires_exact_vector_backfill_merge_batch_method():
+    validator = _script("validate_capacity_evidence")
+    report = _report(validator)
+    report["method"]["vector_backfill_merge_batch"] = (
+        "bulkio.index_backfill.vector_merge_batch_size=63_run_scoped"
+    )
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "error": None,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    with pytest.raises(ValueError, match="vector backfill method"):
+        _validate(
+            validator,
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=_qualification(validator),
+            cleanup=cleanup,
+            artifact_digests={
+                "index-qualification.json": "b" * 64,
+                "capacity-report.json": "c" * 64,
+                "cleanup.json": "d" * 64,
+            },
+        )
 
 def test_validator_rejects_booleans_in_exact_numeric_evidence():
     validator = _script("validate_capacity_evidence")
@@ -1612,7 +1815,7 @@ def test_seed_shard_orchestrator_rejects_inexact_vector_count_and_reaps(monkeypa
     assert result_queue.closed is result_queue.joined is True
 
 
-def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
+def test_drop_database_uses_dynamic_remaining_statement_and_lock_timeouts(monkeypatch):
     producer = _script("run_capacity_qualification")
     calls = []
 
@@ -1646,8 +1849,11 @@ def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
         return Connection()
 
     monkeypatch.setattr(producer.psycopg, "connect", connect)
+    monkeypatch.setattr(producer, "_cancel_disposable_vector_index_jobs", lambda *_args: None)
+    monotonic_values = iter((100.0, 101.25, 218.75))
+    monkeypatch.setattr(producer.time, "monotonic", lambda: next(monotonic_values))
     deadline = SimpleNamespace(
-        expires_at=producer.time.monotonic() + producer.MAX_CLEANUP_SECONDS,
+        expires_at=220.0,
         remaining=lambda maximum: min(maximum, producer.MAX_CLEANUP_SECONDS),
     )
     producer._drop_database(
@@ -1656,14 +1862,13 @@ def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
         deadline,
     )
 
-    for seconds in (
-        producer.CLEANUP_JOB_SECONDS,
-        producer.CLEANUP_DROP_SECONDS,
-        producer.CLEANUP_VERIFY_SECONDS,
-    ):
-        timeout = (f"{seconds * 1000}ms",)
+    for timeout in (("113750ms",), ("1250ms",)):
         assert ("SELECT set_config('statement_timeout', %s, false)", timeout) in calls
         assert ("SELECT set_config('lock_timeout', %s, false)", timeout) in calls
+    assert not hasattr(producer, "CLEANUP_DROP_SECONDS")
+
+    with pytest.raises(TimeoutError, match="timeout is exhausted"):
+        producer._set_cleanup_timeouts(Connection(), 0.0001)
 
 
 def test_cleanup_vector_job_prefixes_are_exact_and_disposable():
@@ -1863,6 +2068,11 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
     monkeypatch.setattr(producer, "_migrate", migrate)
     monkeypatch.setattr(
         producer,
+        "_configure_vector_backfill_merge_batch",
+        lambda *_args: {"name": "vector_backfill_merge_batch", "duration_seconds": 1},
+    )
+    monkeypatch.setattr(
+        producer,
         "_suspend_legacy_vector_index",
         lambda *_args: {"name": "legacy_index_suspension", "duration_seconds": 1},
     )
@@ -1914,6 +2124,7 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
     assert [row["name"] for row in progress["completed_phases"]] == [
         "database_create",
         "base_migrations",
+        "vector_backfill_merge_batch",
         "legacy_index_suspension",
         "vector_seed",
         "legacy_index_restore",
@@ -2177,28 +2388,48 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
         assert workload.index("capture_capacity_runtime.py monitor") < workload.index(
             "docker compose up -d crdb"
         )
-    cleanup = next(
-        step
-        for step in qualification["steps"]
-        if step.get("name")
-        == "Remove isolated CockroachDB, finalize pressure, and verify storage cleanup"
-    )
-    assert cleanup["if"] == "always()"
-    assert "docker compose down --volumes --remove-orphans" in cleanup["run"]
-    assert cleanup["run"].index("docker compose down") < cleanup["run"].index(
-        "capture_capacity_runtime.py finalize"
-    )
-    assert cleanup["run"].index("capture_capacity_runtime.py finalize") < cleanup[
-        "run"
-    ].index("capture_capacity_runtime.py cleanup-probe")
-    assert "remaining_containers" in cleanup["run"]
-    assert "remaining_volumes" in cleanup["run"]
-    assert "remaining_networks" in cleanup["run"]
-    assert "remaining_probes" in cleanup["run"]
-    assert "container_query_status" in cleanup["run"]
-    assert "volume_query_status" in cleanup["run"]
-    assert "network_query_status" in cleanup["run"]
-    assert "probe_query_status" in cleanup["run"]
+    for job in (diagnostic, qualification):
+        cleanup = next(
+            step
+            for step in job["steps"]
+            if step.get("name")
+            == "Remove isolated CockroachDB, finalize pressure, and verify storage cleanup"
+        )
+        cleanup_run = cleanup["run"]
+        assert cleanup["if"] == "always()"
+        assert "docker compose down --volumes --remove-orphans" in cleanup_run
+        assert cleanup_run.index("docker compose down") < cleanup_run.index(
+            "capture_capacity_runtime.py finalize"
+        )
+        for evidence_name in (
+            "runtime-pressure-baseline.json",
+            "runtime-pressure-samples.json",
+            "runtime-pressure-probe.tsv",
+        ):
+            assert evidence_name in cleanup_run
+            assert cleanup_run.index(evidence_name) < cleanup_run.index(
+                "capture_capacity_runtime.py finalize"
+            )
+        assert 'cp "${runtime_prefix}.baseline.json"' in cleanup_run
+        assert 'cp "${runtime_prefix}.samples.json"' in cleanup_run
+        assert "docker logs --tail 7200" in cleanup_run
+        assert "runtime_evidence_capture_status" in cleanup_run
+        assert cleanup_run.index("capture_capacity_runtime.py finalize") < cleanup_run.index(
+            "capture_capacity_runtime.py cleanup-probe"
+        )
+        compose_truth = cleanup_run.split("compose_state_removed:", 1)[1].split(
+            "> \"$EVIDENCE_DIR/infrastructure-cleanup.json\"", 1
+        )[0]
+        assert "runtime_finalize_status" not in compose_truth
+        assert "runtime_evidence_capture_status" not in compose_truth
+        assert "remaining_containers" in cleanup_run
+        assert "remaining_volumes" in cleanup_run
+        assert "remaining_networks" in cleanup_run
+        assert "remaining_probes" in cleanup_run
+        assert "container_query_status" in cleanup_run
+        assert "volume_query_status" in cleanup_run
+        assert "network_query_status" in cleanup_run
+        assert "probe_query_status" in cleanup_run
     upload = qualification["steps"][-1]
     assert upload["if"] == "always()"
     assert upload["with"]["if-no-files-found"] == "error"
@@ -2492,6 +2723,29 @@ def test_runtime_rejects_impossible_peak_and_cadence_summaries():
             )
 
 
+def test_runtime_accepts_990ms_recorded_gap_and_rejects_claimed_or_unquantized_gap():
+    validator = _script("validate_capacity_evidence")
+    runtime = _runtime(validator)
+    runtime["cgroup"]["observed_max_sample_gap_ns"] = 990_000_000
+    validator._validate_runtime(
+        runtime,
+        source_revision=SOURCE_SHA,
+        mode="qualification",
+        execution_id=_execution_id("qualification"),
+    )
+
+    for gap_ns in (1_000_000_000, 995_000_000):
+        forged = _runtime(validator)
+        forged["cgroup"]["observed_max_sample_gap_ns"] = gap_ns
+        with pytest.raises(ValueError, match="cgroup telemetry"):
+            validator._validate_runtime(
+                forged,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+            )
+
+
 def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
     validator = _script("validate_capacity_evidence")
     for field in (
@@ -2512,7 +2766,7 @@ def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
                 project="hindsight_capacity_123_1_qualification",
             )
     for field in (
-        "runtime_finalize_status",
+        "down_status",
         "probe_cleanup_status",
         "container_query_status",
         "volume_query_status",
@@ -2522,6 +2776,19 @@ def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
         cleanup = _infrastructure_cleanup(validator)
         cleanup[field] = 1
         cleanup["compose_state_removed"] = False
+        with pytest.raises(ValueError, match="Compose cleanup"):
+            validator._validate_infrastructure_cleanup(
+                cleanup,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+                project="hindsight_capacity_123_1_qualification",
+            )
+
+    for field in ("runtime_evidence_capture_status", "runtime_finalize_status"):
+        cleanup = _infrastructure_cleanup(validator)
+        cleanup[field] = 1
+        assert cleanup["compose_state_removed"] is True
         with pytest.raises(ValueError, match="Compose cleanup"):
             validator._validate_infrastructure_cleanup(
                 cleanup,
@@ -2669,6 +2936,7 @@ def test_runtime_probe_command_is_sandboxed_and_has_no_mount_or_secret_channel()
     assert command[command.index("--user") + 1] == "65534:65534"
     assert command[command.index("--memory") + 1] == str(32 * 1024**2)
     assert command[command.index("--memory-swap") + 1] == str(32 * 1024**2)
+    assert command[command.index("--cpus") + 1] == "0.50"
     assert command[command.index("--pids-limit") + 1] == "16"
     assert "--read-only" in command
     assert command[command.index("--cap-drop") + 1] == "ALL"
@@ -2681,6 +2949,16 @@ def test_runtime_probe_command_is_sandboxed_and_has_no_mount_or_secret_channel()
     assert "--mount" not in command
     assert "-v" not in command
     assert "--env" not in command
+    assert "cat " not in capture.PROBE_LOOP_SCRIPT
+    assert "awk " not in capture.PROBE_LOOP_SCRIPT
+    assert capture.PROBE_NANO_CPUS == 500_000_000
+    assert capture.UPTIME_QUANTUM_NS == 10_000_000
+    assert capture.MAX_REAL_SAMPLE_GAP_SECONDS == 1.0
+    assert capture.MAX_RECORDED_SAMPLE_GAP_NS == 990_000_000
+    assert (
+        capture._configured_envelope()["telemetry_probe"]["maximum_sample_gap_seconds"]
+        == 1.0
+    )
     assert command[-3:] == [capture.EXPECTED_IMAGE, "-ec", capture.PROBE_LOOP_SCRIPT]
 
 
@@ -2773,9 +3051,16 @@ def test_runtime_probe_rejects_timestamp_gaps_and_counter_regressions():
     assert capture._validate_probe_series(
         [(0, snapshot(1_000_000_000)), (1, snapshot(1_250_000_000))]
     ) == (250_000_000, 250_000_000)
+    assert capture._validate_probe_series(
+        [(0, snapshot(1_000_000_000)), (1, snapshot(1_990_000_000))]
+    ) == (990_000_000, 990_000_000)
     with pytest.raises(RuntimeError, match="sampling cadence"):
         capture._validate_probe_series(
-            [(0, snapshot(1_000_000_000)), (1, snapshot(2_010_000_000))]
+            [(0, snapshot(1_000_000_000)), (1, snapshot(2_000_000_000))]
+        )
+    with pytest.raises(RuntimeError, match="quantized uptime"):
+        capture._validate_probe_series(
+            [(0, snapshot(1_000_000_000)), (1, snapshot(1_995_000_000))]
         )
     with pytest.raises(RuntimeError, match="memory peak"):
         capture._validate_probe_series(
@@ -2790,6 +3075,30 @@ def test_runtime_probe_rejects_timestamp_gaps_and_counter_regressions():
                 (0, snapshot(1_000_000_000, event_max=1)),
                 (1, snapshot(1_250_000_000, event_max=0)),
             ]
+        )
+
+
+def test_runtime_probe_boundary_bridge_uses_conservative_quantized_limit():
+    capture = _script("capture_capacity_runtime")
+    assert capture._validate_boundary_bridge(
+        name="workload boundary",
+        observed_monotonic_ns=1_000_000_000,
+        sample_sequence=4,
+        sample_monotonic_ns=1_990_000_000,
+    ) == 990_000_000
+    with pytest.raises(RuntimeError, match="gap_ns=1000000000"):
+        capture._validate_boundary_bridge(
+            name="workload boundary",
+            observed_monotonic_ns=1_000_000_000,
+            sample_sequence=4,
+            sample_monotonic_ns=2_000_000_000,
+        )
+    with pytest.raises(RuntimeError, match="quantized uptime"):
+        capture._validate_boundary_bridge(
+            name="workload boundary",
+            observed_monotonic_ns=1_000_000_000,
+            sample_sequence=4,
+            sample_monotonic_ns=1_995_000_000,
         )
 
 
@@ -2820,7 +3129,7 @@ def test_runtime_probe_inspection_rejects_private_namespace(monkeypatch):
                 "PidsLimit": 16,
                 "Memory": 32 * 1024**2,
                 "MemorySwap": 32 * 1024**2,
-                "NanoCpus": 100_000_000,
+                "NanoCpus": 500_000_000,
                 "AutoRemove": True,
                 "LogConfig": capture.PROBE_LOG_CONFIG,
             },

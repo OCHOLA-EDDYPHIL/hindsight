@@ -23,6 +23,7 @@ from validate_capacity_evidence import (  # noqa: E402
     EXPECTED_INDEXES,
     EXPECTED_RUNTIME_MEMORY_ENVELOPE,
     EXPECTED_SEEDING_METHOD,
+    EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD,
     EXPECTED_VECTOR_METHOD,
     MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES,
     MAX_PROJECTED_DURATION_SECONDS,
@@ -102,6 +103,8 @@ def validate(
         or method.get("vectors") != EXPECTED_VECTOR_METHOD
         or method.get("seeding") != EXPECTED_SEEDING_METHOD
         or method.get("fixture_vector_indexes") != EXPECTED_FIXTURE_VECTOR_INDEXES
+        or method.get("vector_backfill_merge_batch")
+        != EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
         or method.get("clients") != "20_bounded_parallel_index_queries"
         or not isinstance(environment, dict)
         or environment.get("isolation") != "run_scoped_database_and_compose_project"
