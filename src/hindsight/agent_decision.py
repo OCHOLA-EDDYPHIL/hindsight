@@ -22,12 +22,18 @@ class AgentDecisionError(RuntimeError):
     """Raised when a model response cannot be accepted safely."""
 
 
-class MemoryCitation(BaseModel):
-    """A claim tied to one recalled memory version."""
+class LegacyMemoryCitation(BaseModel):
+    """A citation accepted from a durable AgentDecisionV1 checkpoint."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     memory_id: str = Field(min_length=1, max_length=200)
+    quote: str = Field(min_length=1, max_length=2_000)
+
+
+class MemoryCitation(LegacyMemoryCitation):
+    """A claim tied to one recalled memory version."""
+
     quote: str = Field(
         min_length=MIN_CITATION_QUOTE_LENGTH,
         max_length=2_000,
@@ -68,7 +74,7 @@ class AgentDecisionV1(BaseModel):
 
     schema_version: Literal[1]
     diagnosis: str = Field(min_length=1, max_length=4_000)
-    recalled_memory_citations: list[MemoryCitation] = Field(max_length=8)
+    recalled_memory_citations: list[LegacyMemoryCitation] = Field(max_length=8)
     next_step_kind: Literal["diagnostic_tool", "recommendation"]
     tool_call: DiagnosticToolCall | None
     recommendation: str | None = Field(max_length=4_000)
@@ -308,10 +314,16 @@ def agent_decision_from_payload(payload: Mapping[str, Any]) -> AgentDecisionV2:
     if payload.get("schema_version") == 2:
         return AgentDecisionV2.model_validate(payload)
     legacy = AgentDecisionV1.model_validate(payload)
-    return AgentDecisionV2(
+    # The V1 payload is already validated against its durable contract. Construct
+    # only the nested V2 citation adapters so legacy short quotes remain resumable.
+    citations = [
+        MemoryCitation.model_construct(memory_id=item.memory_id, quote=item.quote)
+        for item in legacy.recalled_memory_citations
+    ]
+    return AgentDecisionV2.model_construct(
         schema_version=2,
         diagnosis=legacy.diagnosis,
-        recalled_memory_citations=legacy.recalled_memory_citations,
+        recalled_memory_citations=citations,
         next_step_kind=legacy.next_step_kind,
         tool_call=legacy.tool_call,
         recommendation=legacy.recommendation,
@@ -404,4 +416,4 @@ def _json_value(value: Any) -> Any:
 
 
 def _normalized_text(value: str) -> str:
-    return " ".join(value.casefold().split())
+    return " ".join(value.split())

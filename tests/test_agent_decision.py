@@ -9,6 +9,7 @@ from hindsight.agent_decision import (
     MAX_MODEL_TURNS,
     AgentDecisionError,
     AgentDecisionV2,
+    agent_decision_from_payload,
     agent_decision_provider_schema,
     memory_selection_fingerprint,
     parse_agent_decision,
@@ -365,11 +366,28 @@ def test_memory_citation_must_quote_the_recalled_version():
             model_turn=1,
         )
 
+    with pytest.raises(AgentDecisionError, match="not a quote"):
+        parse_agent_decision(
+            json.dumps(
+                _payload(
+                    recalled_memory_citations=[
+                        {"memory_id": "memory-1", "quote": "checking saturation"}
+                    ]
+                )
+            ),
+            recalled_memory_ids={"memory-1"},
+            recalled_memory_text={"memory-1": "Throttle retries only after Checking saturation."},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
     decision = parse_agent_decision(
         json.dumps(
             _payload(
                 recalled_memory_citations=[
-                    {"memory_id": "memory-1", "quote": "checking saturation"}
+                    {"memory_id": "memory-1", "quote": "checking  \n  saturation"}
                 ]
             )
         ),
@@ -381,6 +399,37 @@ def test_memory_citation_must_quote_the_recalled_version():
         model_turn=1,
     )
     assert decision.recalled_memory_citations[0].memory_id == "memory-1"
+    assert decision.recalled_memory_citations[0].quote == "checking  \n  saturation"
+
+
+def test_legacy_short_citation_resumes_without_weakening_current_schema():
+    legacy_payload = _payload(
+        schema_version=1,
+        recalled_memory_citations=[{"memory_id": "memory-1", "quote": "short quote"}],
+    )
+    legacy_payload.pop("remediation_action")
+
+    resumed = agent_decision_from_payload(legacy_payload)
+
+    assert resumed.schema_version == 2
+    assert resumed.recalled_memory_citations[0].quote == "short quote"
+
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            json.dumps(
+                _payload(
+                    recalled_memory_citations=[
+                        {"memory_id": "memory-1", "quote": "short quote"}
+                    ]
+                )
+            ),
+            recalled_memory_ids={"memory-1"},
+            recalled_memory_text={"memory-1": "A short quote from a legacy memory."},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
 
 
 def test_memory_selection_fingerprint_tracks_order_and_governance():
