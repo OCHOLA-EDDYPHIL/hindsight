@@ -1,7 +1,7 @@
 services:
   crdb:
     image: ${COCKROACH_IMAGE:-cockroachdb/cockroach:v25.4.5}
-    command: start-single-node --insecure
+    command: start-single-node --insecure ${COCKROACH_START_ARGS:-}
     ports:
       - "26257:26257"
       - "8080:8080"

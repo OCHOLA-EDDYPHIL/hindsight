@@ -47,6 +47,7 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: hindsight_capacity_${{ github.run_id }}_${{ github.run_attempt }}
       COCKROACH_IMAGE: cockroachdb/cockroach:v25.4.5
+      COCKROACH_START_ARGS: --store=type=mem,size=8GiB
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EVIDENCE_DIR: build/capacity-qualification
       SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
