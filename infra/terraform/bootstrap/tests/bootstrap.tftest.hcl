@@ -20,13 +20,6 @@ mock_provider "aws" {
     }
   }
 
-  mock_data "aws_s3_bucket" {
-    defaults = {
-      id  = "existing-state-bucket"
-      arn = "arn:aws:s3:::existing-state-bucket"
-    }
-  }
-
   mock_resource "aws_acm_certificate" {
     defaults = {
       arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
@@ -58,14 +51,17 @@ run "isolated_bootstrap" {
 
   variables {
     expected_aws_account_id = "123456789012"
-    state_bucket_name       = "existing-state-bucket"
+    state_bucket_name       = "home-in-cloud-terraform-state-123456789012-us-east-1"
     cloudflare_zone_id      = "00000000000000000000000000000000"
     domain_name             = "hindsight.example.com"
   }
 
   assert {
-    condition     = data.aws_s3_bucket.state.id == "existing-state-bucket"
-    error_message = "Bootstrap must reuse the configured state bucket."
+    condition = (
+      var.state_bucket_name == "home-in-cloud-terraform-state-123456789012-us-east-1" &&
+      local.state_bucket_arn == "arn:aws:s3:::home-in-cloud-terraform-state-123456789012-us-east-1"
+    )
+    error_message = "Bootstrap must derive the validated state bucket identity without a provider read."
   }
 
   assert {
@@ -463,7 +459,7 @@ run "product_only_bootstrap" {
 
   variables {
     expected_aws_account_id        = "123456789012"
-    state_bucket_name              = "target-state-bucket"
+    state_bucket_name              = "home-in-cloud-terraform-state-123456789012-us-east-1"
     application_state_key          = "hindsight/demo-candidate/terraform.tfstate"
     cloudflare_zone_id             = "00000000000000000000000000000000"
     domain_name                    = "candidate.hindsight.example.com"

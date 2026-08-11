@@ -297,7 +297,9 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
 
     assert "prevent_destroy = true" in bootstrap
     assert "aws_ssm_parameter" not in bootstrap
-    assert 'data "aws_s3_bucket" "state"' in bootstrap
+    assert 'data "aws_s3_bucket" "state"' not in bootstrap
+    assert 'state_bucket_arn               = "arn:${data.aws_partition.current.partition}:s3:::${var.state_bucket_name}"' in bootstrap
+    assert 'check "state_bucket_scope"' in bootstrap
     assert 'test     = "StringEquals"' in bootstrap
     assert "cloudfront:*" not in bootstrap
     assert "dynamodb:*" not in bootstrap
