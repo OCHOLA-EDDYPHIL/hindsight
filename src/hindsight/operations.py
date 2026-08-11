@@ -292,12 +292,16 @@ def enqueue_operation(
     preview_id: str,
     fingerprint: str,
     idempotency_key: str,
+    actor: str | None = None,
     db_url: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Create one queued operation from an approved immutable preview."""
 
     if not idempotency_key.strip():
         raise ValueError("idempotency_key is required")
+    normalized_actor = actor.strip() if actor is not None else None
+    if actor is not None and not normalized_actor:
+        raise ValueError("actor must not be blank")
     resolved_url = db_url or database_url()
     for transaction_attempt in range(1, MAX_OPERATION_TRANSACTION_ATTEMPTS + 1):
         try:
@@ -305,6 +309,7 @@ def enqueue_operation(
                 preview_id=preview_id,
                 fingerprint=fingerprint,
                 idempotency_key=idempotency_key,
+                actor=normalized_actor,
                 db_url=resolved_url,
             )
         except SerializationFailure:
@@ -318,6 +323,7 @@ def _enqueue_operation_once(
     preview_id: str,
     fingerprint: str,
     idempotency_key: str,
+    actor: str | None,
     db_url: str,
 ) -> tuple[dict[str, Any], bool]:
     with connect(db_url, application_name="hindsight-api") as conn:
@@ -341,6 +347,10 @@ def _enqueue_operation_once(
                         raise OperationConflictError(
                             "idempotency key is already bound to another approved preview"
                         )
+                    if actor is not None and str(existing["actor"]) != actor:
+                        raise OperationConflictError(
+                            "idempotency key is already bound to another approving actor"
+                        )
                     return dict(existing), False
                 cur.execute(
                     """
@@ -359,6 +369,7 @@ def _enqueue_operation_once(
                 if str(preview["fingerprint"]) != fingerprint:
                     raise OperationConflictError("preview fingerprint does not match")
                 request = dict(preview["request_payload"])
+                operation_actor = actor if actor is not None else str(preview["actor"])
                 operation_id = str(uuid4())
                 cur.execute(
                     """
@@ -378,7 +389,7 @@ def _enqueue_operation_once(
                     (
                         operation_id,
                         preview["operation_type"],
-                        preview["actor"],
+                        operation_actor,
                         request.get("reason") or "Approved governed-memory operation",
                         request.get("target_timestamp"),
                         request.get("namespace"),
@@ -413,6 +424,10 @@ def _enqueue_operation_once(
                     ):
                         raise OperationConflictError(
                             "idempotency key is already bound to another approved preview"
+                        )
+                    if str(raced["actor"]) != operation_actor:
+                        raise OperationConflictError(
+                            "idempotency key is already bound to another approving actor"
                         )
                     return dict(raced), False
                 operation = dict(inserted)

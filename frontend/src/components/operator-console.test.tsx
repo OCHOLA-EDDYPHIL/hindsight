@@ -252,4 +252,55 @@ describe("operator console", () => {
     fireEvent.click(approve);
     expect(props.onDecision).toHaveBeenCalledWith(true);
   });
+
+  it("shows the bounded retraction preview before enabling action approval", () => {
+    render(
+      <OperatorConsole
+        {...props}
+        run={{
+          id: "run-action",
+          status: "awaiting_approval",
+          action_trace: {
+            schema_version: 3,
+            mode: "governed_memory_remediation",
+            selection: { fingerprint: "b".repeat(64) },
+            observation_fingerprint: "c".repeat(64),
+            remediation_action: {
+              id: `remediation_action:${"a".repeat(64)}`,
+              name: "retract_recalled_memory",
+              target_memory_id: "memory-unsafe",
+              target_excerpt: "Increase retry fanout during saturation.",
+            },
+            preview: {
+              id: "preview-1",
+              fingerprint: "d".repeat(64),
+              expires_at: "2026-08-10T23:15:00Z",
+              effect_count: 2,
+              effects: {
+                close_memory_ids: ["memory-unsafe"],
+                review_resolutions: [
+                  {
+                    id: "review-unsafe",
+                    semantic_memory_id: "memory-unsafe",
+                    status: "superseded",
+                  },
+                ],
+              },
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Increase retry fanout during saturation.")).toBeVisible();
+    expect(screen.getByText(/2 bounded mutations/)).toHaveTextContent("dddddddddddd");
+    expect(screen.getByText("Close memory memory-unsafe")).toBeVisible();
+    expect(
+      screen.getByText("Resolve review review-unsafe for memory memory-unsafe as superseded"),
+    ).toBeVisible();
+    const approve = screen.getByRole("button", { name: "Approve retraction" });
+    expect(approve).toBeEnabled();
+    fireEvent.click(approve);
+    expect(props.onDecision).toHaveBeenCalledWith(true);
+  });
 });

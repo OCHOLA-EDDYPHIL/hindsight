@@ -157,6 +157,8 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
     first_fingerprint = f"first:{suffix}"
     mismatched_fingerprint = f"mismatched:{suffix}"
     second_fingerprint = f"second:{suffix}"
+    approving_actor = "pytest.approver"
+    other_actor = "pytest.other-approver"
 
     try:
         with psycopg.connect(target_url, autocommit=True) as admin:
@@ -216,18 +218,24 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
 
         barrier = Barrier(2)
 
-        def enqueue_first_tenant():
+        def enqueue_first_tenant(actor: str):
             with tenant_scope(first_tenant):
                 barrier.wait(timeout=5)
                 return enqueue_operation(
                     preview_id=str(first_preview),
                     fingerprint=first_fingerprint,
                     idempotency_key=idempotency_key,
+                    actor=actor,
                     db_url=target_url,
                 )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            concurrent_results = list(pool.map(lambda _index: enqueue_first_tenant(), range(2)))
+            concurrent_results = list(
+                pool.map(
+                    enqueue_first_tenant,
+                    (f"  {approving_actor}  ", approving_actor),
+                )
+            )
 
         created = [operation for operation, was_created in concurrent_results if was_created]
         replayed = [operation for operation, was_created in concurrent_results if not was_created]
@@ -236,8 +244,31 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
         first = created[0]
         replay = replayed[0]
         assert replay["id"] == first["id"]
+        assert first["actor"] == approving_actor
 
         with tenant_scope(first_tenant):
+            same_actor_replay, same_actor_created = enqueue_operation(
+                preview_id=str(first_preview),
+                fingerprint=first_fingerprint,
+                idempotency_key=idempotency_key,
+                actor=approving_actor,
+                db_url=target_url,
+            )
+            assert same_actor_created is False
+            assert same_actor_replay["id"] == first["id"]
+
+            with pytest.raises(
+                OperationConflictError,
+                match="idempotency key is already bound to another approving actor",
+            ):
+                enqueue_operation(
+                    preview_id=str(first_preview),
+                    fingerprint=first_fingerprint,
+                    idempotency_key=idempotency_key,
+                    actor=other_actor,
+                    db_url=target_url,
+                )
+
             with pytest.raises(
                 OperationConflictError,
                 match="idempotency key is already bound to another approved preview",
@@ -246,6 +277,7 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
                     preview_id=str(mismatched_preview),
                     fingerprint=mismatched_fingerprint,
                     idempotency_key=idempotency_key,
+                    actor=approving_actor,
                     db_url=target_url,
                 )
 
@@ -254,6 +286,7 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
                 preview_id=str(second_preview),
                 fingerprint=second_fingerprint,
                 idempotency_key=idempotency_key,
+                actor=other_actor,
                 db_url=target_url,
             )
 
@@ -274,6 +307,10 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
                 "SELECT count(*) FROM memory_operation_events WHERE operation_id = %s",
                 (first["id"],),
             ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT count(*) FROM memory_operation_events WHERE operation_id = %s",
+                (second["id"],),
+            ).fetchone() == (0,)
             assert (
                 connection.execute(
                     """
@@ -295,6 +332,14 @@ def test_governed_operation_idempotency_converges_within_tenant_and_isolates_ten
                 """,
                 (idempotency_key,),
             ).fetchall() == [(second["id"], second_tenant)]
+            assert connection.execute(
+                "SELECT count(*) FROM memory_operation_events WHERE operation_id = %s",
+                (second["id"],),
+            ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT count(*) FROM memory_operation_events WHERE operation_id = %s",
+                (first["id"],),
+            ).fetchone() == (0,)
         finally:
             connection.close()
     finally:

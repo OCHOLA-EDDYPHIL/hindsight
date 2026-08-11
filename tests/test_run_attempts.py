@@ -19,6 +19,34 @@ APPROVAL_METADATA = {
         "selection": {"fingerprint": APPROVAL_SELECTION_FINGERPRINT},
     }
 }
+ACTION_ID = "remediation_action:test"
+ACTION_OBSERVATION_FINGERPRINT = "observation:test"
+ACTION_PREVIEW_ID = "preview:test"
+ACTION_PREVIEW_FINGERPRINT = "preview-fingerprint:test"
+ACTION_APPROVAL_ACTOR = "product:operator:test"
+ACTION_APPROVAL_METADATA = {
+    "action_trace": {
+        "mode": "governed_memory_remediation",
+        "selection": {"fingerprint": APPROVAL_SELECTION_FINGERPRINT},
+        "observation_fingerprint": ACTION_OBSERVATION_FINGERPRINT,
+        "remediation_action": {"id": ACTION_ID},
+        "preview": {
+            "id": ACTION_PREVIEW_ID,
+            "fingerprint": ACTION_PREVIEW_FINGERPRINT,
+            "effect_count": 2,
+            "effects": {
+                "close_memory_ids": ["memory:unsafe"],
+                "review_resolutions": [
+                    {
+                        "id": "review:unsafe",
+                        "semantic_memory_id": "memory:unsafe",
+                        "status": "superseded",
+                    }
+                ],
+            },
+        },
+    }
+}
 
 
 def test_delivery_identity_validation_fails_before_database_access():
@@ -367,6 +395,96 @@ def test_finishing_start_releases_lease_and_resume_uses_a_fresh_attempt_count():
         max_attempts=3,
     )
     assert terminal_duplicate.outcome == "duplicate"
+
+
+@requires_db
+@pytest.mark.parametrize(
+    ("terminal_status", "approved"),
+    [("completed", True), ("rejected", False)],
+)
+def test_terminal_remediation_seals_decision_without_semantic_reflection(terminal_status, approved):
+    from hindsight.runs import (
+        claim_run_attempt,
+        create_run,
+        finish_run_attempt,
+        get_run,
+        prepare_approval,
+    )
+
+    suffix = uuid4().hex
+    run, _ = create_run(
+        incident_slug=f"remediation-seal-{suffix}",
+        namespace=f"remediation-seal-{suffix}",
+        user_input="unsafe recalled guidance",
+    )
+    start = claim_run_attempt(
+        run_id=run["id"],
+        command="start",
+        command_generation=0,
+        lease_ttl=LEASE_TTL,
+        max_attempts=3,
+    )
+    finish_run_attempt(
+        run_id=run["id"],
+        attempt_id=start.attempt_id,
+        command="start",
+        status="awaiting_approval",
+        phase="approval",
+        summary="Governed-memory retraction awaits approval",
+        metadata=ACTION_APPROVAL_METADATA,
+    )
+    prepare_approval(
+        run_id=run["id"],
+        approved=approved,
+        recommendation_id=None,
+        selection_fingerprint=APPROVAL_SELECTION_FINGERPRINT,
+        remediation_action_id=ACTION_ID,
+        observation_fingerprint=ACTION_OBSERVATION_FINGERPRINT,
+        preview_id=ACTION_PREVIEW_ID,
+        preview_fingerprint=ACTION_PREVIEW_FINGERPRINT,
+        approval_actor=ACTION_APPROVAL_ACTOR,
+    )
+    resume = claim_run_attempt(
+        run_id=run["id"],
+        command="resume",
+        command_generation=1,
+        lease_ttl=LEASE_TTL,
+        max_attempts=3,
+    )
+    finish_run_attempt(
+        run_id=run["id"],
+        attempt_id=resume.attempt_id,
+        command="resume",
+        status=terminal_status,
+        phase="completion",
+        summary="Governed-memory remediation reached a terminal disposition",
+        metadata=ACTION_APPROVAL_METADATA,
+    )
+
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        decision = conn.execute(
+            "SELECT status, sealed_at IS NOT NULL FROM memory_decisions WHERE id = %s",
+            (run["decision_id"],),
+        ).fetchone()
+        reflection_count = conn.execute(
+            "SELECT count(*) FROM semantic_memories WHERE producer_decision_id = %s",
+            (run["decision_id"],),
+        ).fetchone()[0]
+
+    assert decision == ("sealed", True)
+    assert reflection_count == 0
+    persisted = get_run(run_id=run["id"])
+    assert persisted is not None
+    assert persisted["action_trace"]["preview"]["effects"] == {
+        "close_memory_ids": ["memory:unsafe"],
+        "review_resolutions": [
+            {
+                "id": "review:unsafe",
+                "semantic_memory_id": "memory:unsafe",
+                "status": "superseded",
+            }
+        ],
+    }
 
 
 @requires_db

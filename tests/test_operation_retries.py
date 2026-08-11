@@ -64,10 +64,12 @@ def test_enqueue_operation_bounds_serialization_retries(monkeypatch):
 
     expected = ({"id": "winning-operation"}, False)
     attempts = 0
+    actors = []
 
-    def retry_once(**_kwargs):
+    def retry_once(**kwargs):
         nonlocal attempts
         attempts += 1
+        actors.append(kwargs["actor"])
         if attempts == 1:
             raise SerializationFailure("unique-key race")
         return expected
@@ -78,11 +80,13 @@ def test_enqueue_operation_bounds_serialization_retries(monkeypatch):
             preview_id="preview-1",
             fingerprint="fingerprint-1",
             idempotency_key="request-1",
+            actor="  pytest.approver  ",
             db_url="postgresql://unused",
         )
         == expected
     )
     assert attempts == 2
+    assert actors == ["pytest.approver", "pytest.approver"]
 
     attempts = 0
 
