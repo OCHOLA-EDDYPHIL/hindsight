@@ -53,7 +53,7 @@ jobs:
       COCKROACH_IMAGE: cockroachdb/cockroach@sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
       COCKROACH_IMAGE_ID: sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
       COCKROACH_GOMAXPROCS: "2"
-      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=3GiB
+      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=2304MiB
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EVIDENCE_DIR: build/capacity-diagnostic
       SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
@@ -281,7 +281,7 @@ jobs:
       COCKROACH_IMAGE: cockroachdb/cockroach@sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
       COCKROACH_IMAGE_ID: sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
       COCKROACH_GOMAXPROCS: "2"
-      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=3GiB
+      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=2304MiB
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EVIDENCE_DIR: build/capacity-qualification
       SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}

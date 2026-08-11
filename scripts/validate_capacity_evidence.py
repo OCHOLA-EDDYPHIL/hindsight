@@ -71,7 +71,7 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
         "--cache=128MiB",
         "--max-sql-memory=128MiB",
         "--max-tsdb-memory=64MiB",
-        "--max-go-memory=3GiB",
+        "--max-go-memory=2304MiB",
     ],
     "capacity_boundary": {
         "cgroup_version": 2,
@@ -109,7 +109,7 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
         "cache": 128 * 1024**2,
         "sql": 128 * 1024**2,
         "tsdb": 64 * 1024**2,
-        "go": 3 * 1024**3,
+        "go": 2304 * 1024**2,
     },
 }
 EXPECTED_PROCESS_ARGS = [
@@ -133,8 +133,6 @@ EXPECTED_BOUNDARY_EVENT_KEYS = frozenset(
 )
 COMPOSE_PROJECT_PATTERN = re.compile(r"hindsight_capacity_[0-9]+_[0-9]+_(diagnostic|qualification)")
 EXECUTION_ID_PATTERN = re.compile(r"capacity_[0-9]+_1_(diagnostic|qualification)")
-MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES = int(3.25 * 1024**3)
-MAX_PROJECTED_DURATION_SECONDS = 960
 DATABASE_PATTERN = re.compile(r"hindsight_capacity_[a-z0-9]{8,20}")
 
 

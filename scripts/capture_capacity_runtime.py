@@ -31,7 +31,7 @@ EXPECTED_START_ARGS = (
     "--cache=128MiB",
     "--max-sql-memory=128MiB",
     "--max-tsdb-memory=64MiB",
-    "--max-go-memory=3GiB",
+    "--max-go-memory=2304MiB",
 )
 EXPECTED_START_ARGS_TEXT = " ".join(EXPECTED_START_ARGS)
 EXPECTED_PROCESS_ARGS = ("start-single-node", "--insecure", *EXPECTED_START_ARGS)
@@ -56,7 +56,7 @@ EXPECTED_MEMORY_BYTES = {
     "cache": 128 * 1024**2,
     "sql": 128 * 1024**2,
     "tsdb": 64 * 1024**2,
-    "go": 3 * 1024**3,
+    "go": 2304 * 1024**2,
 }
 REQUIRED_EVENT_KEYS = frozenset({"low", "high", "max", "oom", "oom_kill"})
 PROBE_EVENT_KEYS = ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")

@@ -256,7 +256,7 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
                 "go_max_procs"
             ],
             "effective_memory": {
-                "go_limit_bytes": 3 * 1024**3,
+                "go_limit_bytes": 2_415_919_104,
                 "store_capacity_bytes": 2 * 1024**3,
                 "store_count": 1,
             },
@@ -1107,6 +1107,18 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
         == producer.RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
         == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
         == 2
+    )
+    assert (
+        capture.EXPECTED_START_ARGS[-1]
+        == producer.RUNTIME_MEMORY_ENVELOPE["start_args"][-1]
+        == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["start_args"][-1]
+        == "--max-go-memory=2304MiB"
+    )
+    assert (
+        capture.EXPECTED_MEMORY_BYTES["go"]
+        == producer.RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"]
+        == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"]
+        == 2_415_919_104
     )
     assert producer.TARGETS == validator.TARGETS
     assert producer.MAX_DURATION_SECONDS == validator.EXPECTED_CEILINGS["duration_seconds"]
@@ -2409,10 +2421,13 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     )
     expected_args = (
         "--store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB "
-        "--max-tsdb-memory=64MiB --max-go-memory=3GiB"
+        "--max-tsdb-memory=64MiB --max-go-memory=2304MiB"
     )
     assert diagnostic["env"]["COCKROACH_START_ARGS"] == expected_args
     assert qualification["env"]["COCKROACH_START_ARGS"] == expected_args
+    assert "--max-go-memory=1920MiB" not in source
+    assert "--max-go-memory=2176MiB" not in source
+    assert "--max-go-memory=3GiB" not in source
     assert diagnostic["env"]["COCKROACH_GOMAXPROCS"] == "2"
     assert qualification["env"]["COCKROACH_GOMAXPROCS"] == "2"
     assert diagnostic["env"]["CAPACITY_MODE"] == "diagnostic"
@@ -2658,6 +2673,9 @@ def test_runtime_rejects_every_memory_argument_mutation():
         [*expected[:2], expected[3], expected[2], *expected[4:]],
         [*expected[:2], "--store=type=mem,size=2048MiB", *expected[3:]],
         [*expected[:2], "--store=type=mem,size=50%", *expected[3:]],
+        [*expected[:-1], "--max-go-memory=1920MiB"],
+        [*expected[:-1], "--max-go-memory=2176MiB"],
+        [*expected[:-1], "--max-go-memory=3GiB"],
     ]
     for mutation in mutations:
         runtime = _runtime(validator)
@@ -2884,9 +2902,9 @@ def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
             )
 
 
-def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
+def test_diagnostic_uses_the_direct_duration_ceiling():
     validator = _script("validate_capacity_diagnostic")
-    bundle = _diagnostic_bundle(validator, duration=7680 / 11)
+    bundle = _diagnostic_bundle(validator, duration=1_200)
     report = validator.validate(
         bundle[0],
         source_revision=SOURCE_SHA,
@@ -2896,10 +2914,9 @@ def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
         infrastructure_cleanup=bundle[3],
         artifact_digests=bundle[4],
     )
-    assert report["projection"]["projected_final_duration_seconds"] == 960
-    assert report["projection"]["minimum_headroom_seconds"] == 240
-    bundle = _diagnostic_bundle(validator, duration=699)
-    with pytest.raises(ValueError, match="timing headroom"):
+    assert "projection" not in report
+    bundle = _diagnostic_bundle(validator, duration=1_200.001)
+    with pytest.raises(ValueError, match="duration ceiling"):
         validator.validate(
             bundle[0],
             source_revision=SOURCE_SHA,
@@ -2911,12 +2928,23 @@ def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
         )
 
 
-def test_diagnostic_rejects_memory_peak_above_its_headroom_gate():
+def test_diagnostic_uses_the_configured_capacity_boundary():
     validator = _script("validate_capacity_diagnostic")
-    bundle = _diagnostic_bundle(
-        validator, peak_bytes=validator.MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES + 1
+    boundary = validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["capacity_boundary"][
+        "memory_max_bytes"
+    ]
+    bundle = _diagnostic_bundle(validator, peak_bytes=boundary - 1)
+    validator.validate(
+        bundle[0],
+        source_revision=SOURCE_SHA,
+        execution_id=_execution_id("diagnostic"),
+        cleanup=bundle[1],
+        runtime=bundle[2],
+        infrastructure_cleanup=bundle[3],
+        artifact_digests=bundle[4],
     )
-    with pytest.raises(ValueError, match="memory headroom"):
+    bundle = _diagnostic_bundle(validator, peak_bytes=boundary)
+    with pytest.raises(ValueError, match="container cgroup recorded memory pressure"):
         validator.validate(
             bundle[0],
             source_revision=SOURCE_SHA,
@@ -2983,10 +3011,10 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     assert process["configured_go_max_procs"] == 2
     assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
     assert process["live_go_max_procs"] == 2
-    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2GiB"
+    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2176MiB"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
-    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=3GiB"
+    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2304MiB"
     inspection[0]["HostConfig"]["CgroupnsMode"] = "host"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
@@ -3111,7 +3139,7 @@ def test_runtime_collector_retries_transient_live_argv_only_while_health_is_star
     process = capture._inspect_container(project)
     assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
 
-    live_argv[-1] = "--max-go-memory=2GiB"
+    live_argv[-1] = "--max-go-memory=3GiB"
     with pytest.raises(RuntimeError, match="live argv"):
         capture._inspect_container(project)
 
@@ -3256,7 +3284,7 @@ def test_runtime_collector_rejects_invalid_pid_even_while_health_is_starting(
 @pytest.mark.parametrize(
     ("health_status", "static_field", "value"),
     [
-        ("starting", "configured_command", "--max-go-memory=2GiB"),
+        ("starting", "configured_command", "--max-go-memory=3GiB"),
         ("starting", "cgroup_namespace", "host"),
     ],
 )
@@ -3307,19 +3335,19 @@ def test_runtime_collector_retries_zero_effective_metric_and_requires_exact_valu
 
     def exact(statement):
         if "node_metrics" in statement:
-            return 3 * 1024**3
+            return 2_415_919_104
         return 2 * 1024**3
 
     monkeypatch.setattr(capture, "_query_single_integer", exact)
     assert capture._inspect_effective_memory() == {
-        "go_limit_bytes": 3 * 1024**3,
+        "go_limit_bytes": 2_415_919_104,
         "store_capacity_bytes": 2 * 1024**3,
         "store_count": 1,
     }
     monkeypatch.setattr(
         capture,
         "_query_single_integer",
-        lambda statement: 2 * 1024**3 if "node_metrics" in statement else 2 * 1024**3,
+        lambda statement: 3 * 1024**3 if "node_metrics" in statement else 2 * 1024**3,
     )
     with pytest.raises(RuntimeError, match="effective database memory"):
         capture._inspect_effective_memory()
