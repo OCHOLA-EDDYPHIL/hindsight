@@ -169,8 +169,9 @@ def process_message(
         for key in ("tenant_id", "run_id", "dispatch_id", "dispatch_attempt_id")
         if (value := message.get(key))
     }
-    with tenant_scope(tenant_id), start_span(
-        "hindsight.worker.message", attributes, context=extract(carrier)
+    with (
+        tenant_scope(tenant_id),
+        start_span("hindsight.worker.message", attributes, context=extract(carrier)),
     ):
         observer = _RECORD_OBSERVER.get()
         try:
@@ -266,9 +267,7 @@ def _process_tenant_message(
         raise ValueError("dispatch_id and dispatch_attempt_id are required")
     if type(dispatch_sequence) is not int or dispatch_sequence < 1:
         raise ValueError("dispatch_sequence must be a positive integer")
-    resolved_worker_message_id = str(
-        worker_message_id or f"direct:{dispatch_attempt_id}"
-    ).strip()
+    resolved_worker_message_id = str(worker_message_id or f"direct:{dispatch_attempt_id}").strip()
     if not resolved_worker_message_id:
         raise ValueError("worker_message_id must not be blank")
 
@@ -432,8 +431,33 @@ def _process_tenant_message(
             result = resume_incident_agent(
                 thread_id=run["thread_id"],
                 approved=bool(message.get("approved")),
-                recommendation_id=str(message.get("recommendation_id") or ""),
+                recommendation_id=(
+                    str(message["recommendation_id"])
+                    if message.get("recommendation_id") is not None
+                    else None
+                ),
                 selection_fingerprint=str(message.get("selection_fingerprint") or ""),
+                remediation_action_id=(
+                    str(message["remediation_action_id"])
+                    if message.get("remediation_action_id") is not None
+                    else None
+                ),
+                observation_fingerprint=(
+                    str(message["observation_fingerprint"])
+                    if message.get("observation_fingerprint") is not None
+                    else None
+                ),
+                preview_id=(
+                    str(message["preview_id"]) if message.get("preview_id") is not None else None
+                ),
+                preview_fingerprint=(
+                    str(message["preview_fingerprint"])
+                    if message.get("preview_fingerprint") is not None
+                    else None
+                ),
+                approval_actor=(
+                    str(message["actor"]) if message.get("actor") is not None else None
+                ),
                 db_url=db_url,
                 reasoning_provider=provider,
                 embedding_provider=embedding_provider,
@@ -481,11 +505,21 @@ def _process_tenant_message(
     reasoning = result.state.get("reasoning") or {}
     approved = bool(result.state.get("action_approved", False))
     guidance_eligible = bool(result.state.get("guidance_eligible", False))
+    action_trace = result.state.get("action_trace") or {}
+    remediation = action_trace.get("mode") == "governed_memory_remediation"
     status = "completed" if approved else "rejected"
     if not approved:
-        summary = "Agent recommendation was rejected"
+        summary = (
+            "Governed-memory remediation was rejected"
+            if remediation
+            else "Agent recommendation was rejected"
+        )
     else:
-        summary = "Agent recommendation was approved and retained as audit-only"
+        summary = (
+            "Governed-memory remediation completed"
+            if remediation
+            else "Agent recommendation was approved and retained as audit-only"
+        )
     return finish_run_attempt(
         run_id=run_id,
         attempt_id=attempt_id,
@@ -504,7 +538,7 @@ def _process_tenant_message(
         },
         metadata=(
             {
-                "action_trace": result.state["action_trace"],
+                "action_trace": action_trace,
                 "guidance_eligible": guidance_eligible,
                 "plan_payload": result.state.get("plan_payload") or {},
                 "reasoning_steps": result.state.get("reasoning_steps") or [],
@@ -526,7 +560,7 @@ def _phase_summary(phase: str, status: str) -> str:
         "plan": "Agent plan generated",
         "diagnostic": "Read-only diagnostic started",
         "approval": "Plan is waiting for operator review",
-        "action": "Approved bounded action started",
+        "action": "Approved governed-memory action completed",
         "observation": "Read-only diagnostic observation recorded",
         "reflection": "Outcome reflected into long-term memory",
     }

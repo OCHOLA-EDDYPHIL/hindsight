@@ -400,10 +400,24 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
   );
 }
 
+function outcomeHeading(run: Run | null | undefined, historical: boolean) {
+  if (!run) return "Recommendation unavailable";
+  const remediation = Boolean(run.action_trace?.remediation_action);
+  const decisionKind = remediation ? "governed-memory retraction" : "recommendation";
+  if (run.status === "rejected") return `Rejected ${decisionKind}`;
+  if (run.status === "completed") {
+    if (remediation) return "Completed governed-memory retraction";
+    return historical ? "Completed recommendation" : "Recovered recommendation";
+  }
+  return `${historical ? "Historical" : "Current"} ${decisionKind}`;
+}
+
 function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "current" }) {
   const historical = mode === "historical";
   const actionTrace = run?.action_trace;
   const recommendation = actionTrace?.recommendation;
+  const remediationAction = actionTrace?.remediation_action;
+  const remediationPreview = actionTrace?.preview;
   const execution = actionTrace?.execution;
   const selection = actionTrace?.selection;
   const latestToolCall = actionTrace?.tool_calls?.at(-1);
@@ -417,15 +431,7 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
           <Badge tone={historical ? "historical" : "current"}>
             {historical ? "Historical outcome" : "Current outcome"}
           </Badge>
-          <h3>
-            {run
-              ? historical
-                ? "Rejected recommendation"
-                : run.status === "completed"
-                  ? "Recovered recommendation"
-                  : "Current recommendation"
-              : "Recommendation unavailable"}
-          </h3>
+          <h3>{outcomeHeading(run, historical)}</h3>
         </div>
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
@@ -441,6 +447,33 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
             {selection?.provider || run?.provider || "Unavailable"} /{" "}
             {selection?.model || run?.model || "Unavailable"}
           </span>
+        </div>
+      ) : null}
+      {remediationAction ? (
+        <div
+          className="action-execution"
+          data-execution-status={execution?.status || "awaiting_approval"}
+        >
+          <span>Governed-memory retraction</span>
+          <strong>{humanStatus(execution?.status || "awaiting_approval")}</strong>
+          <span>{remediationAction.target_excerpt || "Target excerpt unavailable"}</span>
+          <span>
+            {`${remediationPreview?.effect_count ?? 0} bounded mutation${remediationPreview?.effect_count === 1 ? "" : "s"} · expires ${formatTime(remediationPreview?.expires_at)}`}
+          </span>
+          <span>{`Preview ${remediationPreview?.fingerprint || "unavailable"}`}</span>
+          <ul aria-label="Approval-bound retraction effects">
+            {(remediationPreview?.effects?.close_memory_ids || []).map((memoryId) => (
+              <li key={`close:${memoryId}`}>{`Close memory ${memoryId}`}</li>
+            ))}
+            {(remediationPreview?.effects?.review_resolutions || []).map((resolution) => (
+              <li key={`review:${resolution.id || resolution.semantic_memory_id}`}>
+                {`Resolve review ${resolution.id || "unavailable"} for memory ${resolution.semantic_memory_id || "unavailable"} as ${resolution.status || "unavailable"}`}
+              </li>
+            ))}
+          </ul>
+          {execution?.operation_id ? (
+            <span>{`Operation ${execution.operation_id}: ${humanStatus(execution.operation_status)}`}</span>
+          ) : null}
         </div>
       ) : null}
       {latestToolCall || latestObservation ? (
