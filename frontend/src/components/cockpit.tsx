@@ -400,6 +400,18 @@ function PlanSections({ run, primary = false }: { run?: Run | null; primary?: bo
   );
 }
 
+function outcomeHeading(run: Run | null | undefined, historical: boolean) {
+  if (!run) return "Recommendation unavailable";
+  const remediation = Boolean(run.action_trace?.remediation_action);
+  const decisionKind = remediation ? "governed-memory retraction" : "recommendation";
+  if (run.status === "rejected") return `Rejected ${decisionKind}`;
+  if (run.status === "completed") {
+    if (remediation) return "Completed governed-memory retraction";
+    return historical ? "Completed recommendation" : "Recovered recommendation";
+  }
+  return `${historical ? "Historical" : "Current"} ${decisionKind}`;
+}
+
 function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "current" }) {
   const historical = mode === "historical";
   const actionTrace = run?.action_trace;
@@ -419,17 +431,7 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
           <Badge tone={historical ? "historical" : "current"}>
             {historical ? "Historical outcome" : "Current outcome"}
           </Badge>
-          <h3>
-            {run
-              ? historical
-                ? "Rejected recommendation"
-                : run.status === "completed"
-                  ? remediationAction
-                    ? "Completed governed-memory retraction"
-                    : "Recovered recommendation"
-                  : "Current recommendation"
-              : "Recommendation unavailable"}
-          </h3>
+          <h3>{outcomeHeading(run, historical)}</h3>
         </div>
         <span className="outcome-status">{humanStatus(run?.status)}</span>
       </header>
