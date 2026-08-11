@@ -40,9 +40,7 @@ def test_local_acceptance_refuses_non_loopback_and_existing_databases(monkeypatc
 
     monkeypatch.setattr(acceptance.psycopg, "connect", lambda *_args, **_kwargs: Connection())
     with pytest.raises(ValueError, match="new database"):
-        acceptance._create_local_database(
-            "postgresql://root@localhost:26257/pilot?sslmode=disable"
-        )
+        acceptance._create_local_database("postgresql://root@localhost:26257/pilot?sslmode=disable")
 
 
 def test_product_provider_verification_uses_only_product_sanity_checks(monkeypatch):
@@ -68,6 +66,7 @@ def test_product_provider_verification_uses_only_product_sanity_checks(monkeypat
     assert calls[0][1]["RUN_LIVE_GEMINI_EMBEDDINGS"] == "1"
     assert calls[0][1]["GEMINI_API_KEY"] == "opaque-material"
     assert calls[0][2:] == ("providers", artifact_dir)
+
 
 def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(monkeypatch):
     database_url = "postgresql://root@localhost:26257/db?sslmode=disable"
@@ -308,8 +307,7 @@ def test_browser_revision_mismatch_stops_before_changefeed_or_pytest(monkeypatch
             SimpleNamespace(
                 phase="browser",
                 database_url=(
-                    "postgresql://runtime@cluster.example:26257/"
-                    "hindsight?sslmode=verify-full"
+                    "postgresql://runtime@cluster.example:26257/hindsight?sslmode=verify-full"
                 ),
             )
         )
@@ -336,12 +334,8 @@ def test_hosted_plan_rejects_noncanonical_requested_sha(tmp_path, revision):
         ("browser", acceptance.PUBLIC_DEMO_TENANT_ID),
     ),
 )
-def test_hosted_product_binds_server_owned_phase_tenant(
-    monkeypatch, phase, expected_tenant
-):
-    database_url = (
-        "postgresql://runtime@cluster.example:26257/hindsight?sslmode=verify-full"
-    )
+def test_hosted_product_binds_server_owned_phase_tenant(monkeypatch, phase, expected_tenant):
+    database_url = "postgresql://runtime@cluster.example:26257/hindsight?sslmode=verify-full"
     monkeypatch.setenv("PGOPTIONS", "-c hindsight.tenant_id=untrusted")
     monkeypatch.setattr(acceptance, "_require_gemini_credentials", lambda: None)
     monkeypatch.setattr(acceptance, "_verify_hosted_endpoints", lambda: None)
@@ -355,9 +349,7 @@ def test_hosted_product_binds_server_owned_phase_tenant(
         lambda selectors, *, env, phase: calls.append((selectors, env, phase)),
     )
 
-    acceptance._run_hosted_product(
-        SimpleNamespace(phase=phase, database_url=database_url)
-    )
+    acceptance._run_hosted_product(SimpleNamespace(phase=phase, database_url=database_url))
 
     selectors, env, selected_phase = calls[0]
     assert selectors == acceptance.HOSTED_PHASE_SELECTORS[phase]
@@ -377,27 +369,32 @@ def test_browser_contract_inventories_have_explicit_local_hosted_parity():
         "tests/test_hosted_acceptance.py::"
         "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe",
     )
+    expected_hosted_browser = (
+        "tests/test_browser_ui.py::"
+        "test_operator_can_approve_model_selected_governed_memory_retraction",
+        expected_infrastructure[1],
+    )
 
     assert acceptance.SHARED_BROWSER_CONTRACT_SELECTORS == expected_shared
     assert acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS == expected_infrastructure
+    assert acceptance.HOSTED_ONLY_BROWSER_CONTRACT_SELECTORS == expected_hosted_browser
+    assert acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS[0] == expected_hosted_browser[0]
     assert set(expected_shared).issubset(acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS)
     assert set(expected_shared).issubset(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
-    assert set(expected_shared).isdisjoint(expected_infrastructure)
-    assert (
-        set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
-        - set(acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS)
-        == set(acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"])
-    )
-    assert (
-        set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
-        - set(acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"])
-        == set(expected_shared)
+    assert set(expected_shared).isdisjoint(expected_hosted_browser)
+    assert set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS) - set(
+        acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS
+    ) == set(expected_hosted_browser)
+    assert set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS) - set(expected_hosted_browser) == set(
+        expected_shared
     )
 
 
 def test_hosted_pytest_rejects_skipped_gates(monkeypatch, tmp_path):
     def fake_run(command, **_kwargs):
-        report = pathlib.Path(next(part.split("=", 1)[1] for part in command if part.startswith("--junitxml=")))
+        report = pathlib.Path(
+            next(part.split("=", 1)[1] for part in command if part.startswith("--junitxml="))
+        )
         report.write_text('<testsuites><testsuite tests="1" skipped="1"/></testsuites>')
         return SimpleNamespace(returncode=0)
 
@@ -413,15 +410,9 @@ def test_hosted_pytest_rejects_skipped_gates(monkeypatch, tmp_path):
 def test_local_browser_rejects_skipped_shared_contract(monkeypatch, tmp_path):
     def fake_run(command, **_kwargs):
         report = pathlib.Path(
-            next(
-                part.split("=", 1)[1]
-                for part in command
-                if part.startswith("--junitxml=")
-            )
+            next(part.split("=", 1)[1] for part in command if part.startswith("--junitxml="))
         )
-        report.write_text(
-            '<testsuites><testsuite tests="2" skipped="1"/></testsuites>'
-        )
+        report.write_text('<testsuites><testsuite tests="2" skipped="1"/></testsuites>')
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(acceptance.subprocess, "run", fake_run)
