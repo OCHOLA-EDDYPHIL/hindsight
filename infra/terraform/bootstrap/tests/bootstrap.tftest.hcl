@@ -124,11 +124,6 @@ run "isolated_bootstrap" {
   }
 
   assert {
-    condition     = aws_kms_key.learning_corpus[0].enable_key_rotation && aws_kms_alias.learning_corpus[0].name == "alias/hindsight-demo-learning-corpus"
-    error_message = "Protected corpus packages must use the stable rotating KMS key."
-  }
-
-  assert {
     condition     = aws_kms_key.learning_qualification_hmac[0].key_usage == "GENERATE_VERIFY_MAC" && aws_kms_key.learning_qualification_hmac[0].customer_master_key_spec == "HMAC_256"
     error_message = "Qualification identifiers must use a non-exportable HMAC-SHA256 KMS key."
   }
@@ -150,12 +145,11 @@ run "isolated_bootstrap" {
   assert {
     condition = length([
       for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
-      if statement.sid == "QualificationOpaqueIdentifiers"
-      ]) == 1 && toset(one([
-        for statement in data.aws_iam_policy_document.github_evidence[0].statement : statement
-        if statement.sid == "QualificationOpaqueIdentifiers"
-    ]).actions) == toset(["kms:DescribeKey", "kms:GenerateMac", "kms:VerifyMac"])
-    error_message = "The evidence role must have only the required qualification HMAC operations."
+      if anytrue([
+        for action in statement.actions : startswith(action, "kms:")
+      ])
+    ]) == 0
+    error_message = "The evidence role must not retain unused KMS authority."
   }
 
   assert {
@@ -485,7 +479,6 @@ run "product_only_bootstrap" {
   assert {
     condition = (
       length(aws_s3_bucket.learning_evidence) == 0 &&
-      length(aws_kms_key.learning_corpus) == 0 &&
       length(aws_kms_key.learning_qualification_hmac) == 0 &&
       length(aws_iam_role.github_evidence) == 0
     )

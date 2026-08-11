@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from mangum import Mangum
 from psycopg import errors as psycopg_errors
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hindsight.db import connect
 from hindsight.demo_state import (
@@ -92,9 +92,7 @@ from hindsight.tracing import configure_tracing_from_env, start_span
 API_PREFIX = "/v1"
 V2_PREFIX = "/v2"
 PUBLIC_REALTIME_SESSION_SECONDS = 60 * 60
-TENANT_SELECTOR_HEADERS = frozenset(
-    {"x-tenant-id", "x-hindsight-tenant", "x-hindsight-tenant-id"}
-)
+TENANT_SELECTOR_HEADERS = frozenset({"x-tenant-id", "x-hindsight-tenant", "x-hindsight-tenant-id"})
 TENANT_SELECTOR_QUERY_KEYS = frozenset({"tenant", "tenant_id"})
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.INFO)
@@ -248,7 +246,6 @@ class StrictRequestModel(BaseModel):
 
 
 class IncidentCreate(StrictRequestModel):
-
     slug: str = Field(min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9:-]*$")
     title: str = Field(min_length=1, max_length=300)
     severity: Literal["sev1", "sev2", "sev3"]
@@ -257,7 +254,6 @@ class IncidentCreate(StrictRequestModel):
 
 
 class RunCreate(StrictRequestModel):
-
     user_input: str = Field(min_length=1, max_length=20_000)
     namespace: str = Field(min_length=1, max_length=500)
     thread_id: str | None = Field(default=None, max_length=500)
@@ -266,12 +262,41 @@ class RunCreate(StrictRequestModel):
 
 class ApprovalRequest(StrictRequestModel):
     approved: bool
-    recommendation_id: str = Field(
+    recommendation_id: str | None = Field(
+        default=None,
         min_length=79,
         max_length=79,
         pattern=r"^recommendation:[a-f0-9]{64}$",
     )
     selection_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    remediation_action_id: str | None = Field(
+        default=None,
+        min_length=83,
+        max_length=83,
+        pattern=r"^remediation_action:[a-f0-9]{64}$",
+    )
+    observation_fingerprint: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$"
+    )
+    preview_id: str | None = Field(default=None, min_length=1, max_length=100)
+    preview_fingerprint: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def validate_approval_identity(self) -> ApprovalRequest:
+        action_values = (
+            self.remediation_action_id,
+            self.observation_fingerprint,
+            self.preview_id,
+            self.preview_fingerprint,
+        )
+        if self.recommendation_id is not None:
+            if any(value is not None for value in action_values):
+                raise ValueError("recommendation approval forbids remediation bindings")
+        elif any(value is None for value in action_values):
+            raise ValueError("remediation approval requires every action binding")
+        return self
 
 
 class IncidentResolutionRequest(StrictRequestModel):
@@ -529,6 +554,7 @@ def incidents_resolve(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="incident not found") from exc
 
+
 @app.post(
     f"{V2_PREFIX}/incidents/{{slug}}/runs",
     tags=["v2"],
@@ -590,15 +616,28 @@ def runs_get(run_id: str) -> dict[str, Any]:
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(_v2_scope("write"))],
 )
-def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
+def runs_approve(run_id: str, payload: ApprovalRequest, request: Request) -> dict[str, Any]:
     db_url = _api_database_url()
     try:
+        approval_fields: dict[str, Any] = {
+            "run_id": run_id,
+            "approved": payload.approved,
+            "recommendation_id": payload.recommendation_id,
+            "selection_fingerprint": payload.selection_fingerprint,
+            "db_url": db_url,
+        }
+        if payload.remediation_action_id is not None:
+            approval_fields.update(
+                {
+                    "remediation_action_id": payload.remediation_action_id,
+                    "observation_fingerprint": payload.observation_fingerprint,
+                    "preview_id": payload.preview_id,
+                    "preview_fingerprint": payload.preview_fingerprint,
+                    "approval_actor": _current_identity(request).actor,
+                }
+            )
         prepare_approval(
-            run_id=run_id,
-            approved=payload.approved,
-            recommendation_id=payload.recommendation_id,
-            selection_fingerprint=payload.selection_fingerprint,
-            db_url=db_url,
+            **approval_fields,
         )
     except RunNotFoundError as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
@@ -610,13 +649,24 @@ def runs_approve(run_id: str, payload: ApprovalRequest) -> dict[str, Any]:
         command="resume",
         limit=1,
     )
-    return {
+    response = {
         "run_id": run_id,
         "status": "resuming",
         "approved": payload.approved,
-        "recommendation_id": payload.recommendation_id,
         "selection_fingerprint": payload.selection_fingerprint,
     }
+    if payload.recommendation_id is not None:
+        response["recommendation_id"] = payload.recommendation_id
+    else:
+        response.update(
+            {
+                "remediation_action_id": payload.remediation_action_id,
+                "observation_fingerprint": payload.observation_fingerprint,
+                "preview_id": payload.preview_id,
+                "preview_fingerprint": payload.preview_fingerprint,
+            }
+        )
+    return response
 
 
 @app.get(
@@ -685,9 +735,7 @@ def memories_get(memory_kind: Literal["episodic", "semantic"], memory_id: str) -
 )
 @app.get(f"{API_PREFIX}/decisions/{{decision_id}}/influence", tags=["memory"])
 def decisions_influence(decision_id: str) -> dict[str, Any]:
-    return _jsonable(
-        decision_influence(decision_id=decision_id, db_url=_api_database_url())
-    )
+    return _jsonable(decision_influence(decision_id=decision_id, db_url=_api_database_url()))
 
 
 @app.get(

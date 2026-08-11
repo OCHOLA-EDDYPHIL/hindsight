@@ -9,7 +9,7 @@ permissions:
 jobs:
   migration_compatibility:
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     env:
       COMPOSE_PROJECT_NAME: hindsight_migrations_${{ github.run_id }}_${{ github.run_attempt }}
       COCKROACH_IMAGE: cockroachdb/cockroach:v25.4.5

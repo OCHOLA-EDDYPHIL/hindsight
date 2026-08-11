@@ -58,6 +58,9 @@ WORKFLOW_COMPONENTS = {
     ".github/workflows/migration-compatibility.yml": frozenset(
         {"database", "main_qualification"}
     ),
+    ".github/workflows/provision-lifecycle-fixture.yml": frozenset(
+        {"database", "main_qualification", "terraform"}
+    ),
     ".github/workflows/recovery-drill.yml": frozenset(
         {"database", "main_qualification"}
     ),
@@ -82,6 +85,8 @@ DATABASE_SCRIPTS = frozenset(
     {
         *MAIN_QUALIFICATION_SCRIPTS,
         "configure_changefeed.py",
+        "provision_lifecycle_database_credential.py",
+        "provision_lifecycle_fixture.py",
         "reembed_memories.py",
         "run_incident_agent.py",
     }

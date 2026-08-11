@@ -54,6 +54,46 @@ function approvalScenario(withIdentity = true): SignatureScenario {
   };
 }
 
+function remediationApprovalScenario(): SignatureScenario {
+  const scenario = approvalScenario();
+  return {
+    ...scenario,
+    runs: [
+      {
+        id: "run-approval",
+        status: "awaiting_approval",
+        action_trace: {
+          schema_version: 3,
+          mode: "governed_memory_remediation",
+          selection: { fingerprint: "b".repeat(64) },
+          observation_fingerprint: "c".repeat(64),
+          remediation_action: {
+            id: `remediation_action:${"a".repeat(64)}`,
+            name: "retract_recalled_memory",
+            target_memory_id: "memory-unsafe",
+            target_excerpt: "Increase retry fanout during saturation.",
+          },
+          preview: {
+            id: "preview-1",
+            fingerprint: "d".repeat(64),
+            effect_count: 2,
+            effects: {
+              close_memory_ids: ["memory-unsafe"],
+              review_resolutions: [
+                {
+                  id: "review-unsafe",
+                  semantic_memory_id: "memory-unsafe",
+                  status: "superseded",
+                },
+              ],
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -577,6 +617,56 @@ describe("cockpit historical snapshot selection", () => {
         approved: true,
         recommendation_id: `recommendation:${"a".repeat(64)}`,
         selection_fingerprint: "b".repeat(64),
+      },
+    ]);
+  });
+
+  it("binds remediation approval to action, observations, selection, and preview", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      productApiBase: "/v2",
+      defaultNamespace: currentSnapshot.namespace,
+      pollIntervalMs: 60_000,
+    };
+    const approvalBodies: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity()));
+        }
+        if (url.pathname === "/v2/signature-scenarios") {
+          return Promise.resolve(jsonResponse(remediationApprovalScenario()));
+        }
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v2/runs/run-approval/approval") {
+          approvalBodies.push(JSON.parse(String(init?.body)));
+          return Promise.resolve(jsonResponse({ status: "resuming" }));
+        }
+        if (url.pathname === "/v2/runs/run-approval") {
+          return Promise.resolve(
+            jsonResponse({ ...remediationApprovalScenario().runs[0], status: "completed" }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit({ authAdapter: signedInAdapter() }));
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await act(async () => result.current.decideRun(true));
+
+    expect(approvalBodies).toEqual([
+      {
+        approved: true,
+        remediation_action_id: `remediation_action:${"a".repeat(64)}`,
+        selection_fingerprint: "b".repeat(64),
+        observation_fingerprint: "c".repeat(64),
+        preview_id: "preview-1",
+        preview_fingerprint: "d".repeat(64),
       },
     ]);
   });

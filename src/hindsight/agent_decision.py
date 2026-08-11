@@ -8,30 +8,44 @@ from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
-AGENT_DECISION_SCHEMA_VERSION = 1
+AGENT_DECISION_SCHEMA_VERSION = 2
 MAX_MODEL_TURNS = 4
 MAX_DIAGNOSTIC_CALLS = 3
 CLOUDWATCH_DIAGNOSTIC_TOOL = "aws_cloudwatch_diagnostics"
+MIN_CITATION_QUOTE_LENGTH = 12
 
 
 class AgentDecisionError(RuntimeError):
     """Raised when a model response cannot be accepted safely."""
 
 
-class MemoryCitation(BaseModel):
-    """A claim tied to one recalled memory version."""
+class LegacyMemoryCitation(BaseModel):
+    """A citation accepted from a durable AgentDecisionV1 checkpoint."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     memory_id: str = Field(min_length=1, max_length=200)
+    quote: str = Field(min_length=1, max_length=2_000)
+
+
+class MemoryCitation(LegacyMemoryCitation):
+    """A claim tied to one recalled memory version."""
+
     quote: str = Field(
-        min_length=1,
+        min_length=MIN_CITATION_QUOTE_LENGTH,
         max_length=2_000,
-        description="A verbatim excerpt from the recalled memory version.",
+        description="A meaningful verbatim excerpt from the recalled memory version.",
     )
+
+    @field_validator("quote")
+    @classmethod
+    def validate_meaningful_quote(cls, value: str) -> str:
+        if len(" ".join(value.split())) < MIN_CITATION_QUOTE_LENGTH:
+            raise ValueError("citation quote is too short after whitespace normalization")
+        return value
 
 
 class DiagnosticToolCall(BaseModel):
@@ -43,14 +57,24 @@ class DiagnosticToolCall(BaseModel):
     query_key: str = Field(min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9_.:-]*$")
 
 
+class RetractRecalledMemoryAction(BaseModel):
+    """The only model-selected mutation supported by the incident agent."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: Literal["retract_recalled_memory"]
+    target_memory_id: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class AgentDecisionV1(BaseModel):
-    """One bounded reasoning step produced by the configured model."""
+    """Legacy recommendation decision retained for checkpoint compatibility."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     schema_version: Literal[1]
     diagnosis: str = Field(min_length=1, max_length=4_000)
-    recalled_memory_citations: list[MemoryCitation] = Field(max_length=8)
+    recalled_memory_citations: list[LegacyMemoryCitation] = Field(max_length=8)
     next_step_kind: Literal["diagnostic_tool", "recommendation"]
     tool_call: DiagnosticToolCall | None
     recommendation: str | None = Field(max_length=4_000)
@@ -73,7 +97,57 @@ class AgentDecisionV1(BaseModel):
         return self
 
 
-AGENT_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV1.model_json_schema()
+class AgentDecisionV2(BaseModel):
+    """One bounded, mutually exclusive reasoning step from the configured model."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    schema_version: Literal[2]
+    diagnosis: str = Field(min_length=1, max_length=4_000)
+    recalled_memory_citations: list[MemoryCitation] = Field(max_length=8)
+    next_step_kind: Literal["diagnostic_tool", "recommendation", "remediation_action"]
+    tool_call: DiagnosticToolCall | None
+    recommendation: str | None = Field(max_length=4_000)
+    remediation_action: RetractRecalledMemoryAction | None
+    rationale: str = Field(min_length=1, max_length=4_000)
+    rollback: str = Field(min_length=1, max_length=2_000)
+    verification: list[str] = Field(min_length=1, max_length=8)
+    safety_constraints: list[str] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_next_step(self) -> AgentDecisionV2:
+        if any(not item.strip() for item in self.verification):
+            raise ValueError("verification entries must not be empty")
+        if any(not item.strip() for item in self.safety_constraints):
+            raise ValueError("safety constraint entries must not be empty")
+        if self.next_step_kind == "diagnostic_tool":
+            if (
+                self.tool_call is None
+                or self.recommendation is not None
+                or self.remediation_action is not None
+            ):
+                raise ValueError(
+                    "diagnostic_tool requires tool_call and forbids terminal decisions"
+                )
+        elif self.next_step_kind == "recommendation":
+            if (
+                self.tool_call is not None
+                or not (self.recommendation or "").strip()
+                or self.remediation_action is not None
+            ):
+                raise ValueError(
+                    "recommendation requires recommendation text and forbids other branches"
+                )
+        elif (
+            self.tool_call is not None
+            or self.recommendation is not None
+            or self.remediation_action is None
+        ):
+            raise ValueError("remediation_action requires one action and forbids other branches")
+        return self
+
+
+AGENT_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV2.model_json_schema()
 
 
 def agent_decision_provider_schema(
@@ -114,39 +188,72 @@ def agent_decision_provider_schema(
         and diagnostic_calls_used < MAX_DIAGNOSTIC_CALLS
         and model_turn < MAX_MODEL_TURNS
     )
+    action_available = bool(recalled_ids) and (not query_keys or diagnostic_observation_available)
+    terminal_branches = [
+        {
+            "properties": {
+                "next_step_kind": {"const": "recommendation"},
+                "tool_call": {"type": "null"},
+                "recommendation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4_000,
+                },
+                "remediation_action": {"type": "null"},
+            }
+        }
+    ]
+    if action_available:
+        definitions["RetractRecalledMemoryAction"]["properties"]["target_memory_id"]["enum"] = (
+            recalled_ids
+        )
+        terminal_branches.append(
+            {
+                "properties": {
+                    "next_step_kind": {"const": "remediation_action"},
+                    "tool_call": {"type": "null"},
+                    "recommendation": {"type": "null"},
+                    "remediation_action": {"$ref": "#/$defs/RetractRecalledMemoryAction"},
+                }
+            }
+        )
+
     if diagnostic_available and not diagnostic_observation_available:
         properties["next_step_kind"]["enum"] = ["diagnostic_tool"]
         properties["tool_call"] = {"$ref": "#/$defs/DiagnosticToolCall"}
         properties["recommendation"] = {"type": "null"}
+        properties["remediation_action"] = {"type": "null"}
     elif diagnostic_available and diagnostic_observation_available:
+        properties["next_step_kind"]["enum"] = [
+            "diagnostic_tool",
+            "recommendation",
+            *(["remediation_action"] if action_available else []),
+        ]
         schema["anyOf"] = [
             {
                 "properties": {
                     "next_step_kind": {"const": "diagnostic_tool"},
                     "tool_call": {"$ref": "#/$defs/DiagnosticToolCall"},
                     "recommendation": {"type": "null"},
+                    "remediation_action": {"type": "null"},
                 }
             },
-            {
-                "properties": {
-                    "next_step_kind": {"const": "recommendation"},
-                    "tool_call": {"type": "null"},
-                    "recommendation": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 4_000,
-                    },
-                }
-            },
+            *terminal_branches,
         ]
     else:
-        properties["next_step_kind"]["enum"] = ["recommendation"]
-        properties["tool_call"] = {"type": "null"}
-        properties["recommendation"] = {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 4_000,
-        }
+        properties["next_step_kind"]["enum"] = [
+            "recommendation",
+            *(["remediation_action"] if action_available else []),
+        ]
+        if not action_available:
+            properties["tool_call"] = {"type": "null"}
+            properties["recommendation"] = {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4_000,
+            }
+            properties["remediation_action"] = {"type": "null"}
+        schema["anyOf"] = terminal_branches
     return schema
 
 
@@ -159,14 +266,14 @@ def parse_agent_decision(
     diagnostic_calls_used: int,
     diagnostic_observation_available: bool,
     model_turn: int,
-) -> AgentDecisionV1:
+) -> AgentDecisionV2:
     """Parse and enforce constraints that cannot be represented in JSON Schema."""
 
     try:
         payload = json.loads(text)
-        decision = AgentDecisionV1.model_validate(payload)
+        decision = AgentDecisionV2.model_validate(payload)
     except (json.JSONDecodeError, ValidationError, TypeError) as exc:
-        raise AgentDecisionError("model response did not satisfy AgentDecisionV1") from exc
+        raise AgentDecisionError("model response did not satisfy AgentDecisionV2") from exc
 
     cited_ids = [citation.memory_id for citation in decision.recalled_memory_citations]
     if len(cited_ids) != len(set(cited_ids)):
@@ -183,17 +290,49 @@ def parse_agent_decision(
     if decision.next_step_kind == "diagnostic_tool":
         assert decision.tool_call is not None
         if model_turn >= MAX_MODEL_TURNS:
-            raise AgentDecisionError("final model turn must produce a recommendation")
+            raise AgentDecisionError("final model turn must produce a terminal decision")
         if diagnostic_calls_used >= MAX_DIAGNOSTIC_CALLS:
             raise AgentDecisionError("diagnostic call budget is exhausted")
         if decision.tool_call.query_key not in allowed_query_keys:
             raise AgentDecisionError("model selected a diagnostic query outside the allowlist")
     elif allowed_query_keys and not diagnostic_observation_available:
         raise AgentDecisionError(
-            "a current diagnostic observation is required before recommendation"
+            "a current diagnostic observation is required before a terminal decision"
         )
+    if decision.next_step_kind == "remediation_action":
+        assert decision.remediation_action is not None
+        cited = {citation.memory_id for citation in decision.recalled_memory_citations}
+        if decision.remediation_action.target_memory_id not in cited:
+            raise AgentDecisionError("remediation target must be cited verbatim")
 
     return decision
+
+
+def agent_decision_from_payload(payload: Mapping[str, Any]) -> AgentDecisionV2:
+    """Load current decisions while preserving resumability of V1 checkpoints."""
+
+    if payload.get("schema_version") == 2:
+        return AgentDecisionV2.model_validate(payload)
+    legacy = AgentDecisionV1.model_validate(payload)
+    # The V1 payload is already validated against its durable contract. Construct
+    # only the nested V2 citation adapters so legacy short quotes remain resumable.
+    citations = [
+        MemoryCitation.model_construct(memory_id=item.memory_id, quote=item.quote)
+        for item in legacy.recalled_memory_citations
+    ]
+    return AgentDecisionV2.model_construct(
+        schema_version=2,
+        diagnosis=legacy.diagnosis,
+        recalled_memory_citations=citations,
+        next_step_kind=legacy.next_step_kind,
+        tool_call=legacy.tool_call,
+        recommendation=legacy.recommendation,
+        remediation_action=None,
+        rationale=legacy.rationale,
+        rollback=legacy.rollback,
+        verification=legacy.verification,
+        safety_constraints=legacy.safety_constraints,
+    )
 
 
 def memory_selection_fingerprint(memories: list[dict[str, Any]]) -> str:
@@ -225,7 +364,7 @@ def memory_selection_fingerprint(memories: list[dict[str, Any]]) -> str:
 def recommendation_id(
     *,
     run_id: str,
-    decision: AgentDecisionV1,
+    decision: AgentDecisionV1 | AgentDecisionV2,
     selection_fingerprint: str,
 ) -> str:
     """Return a stable content identity for an approval-bound recommendation."""
@@ -240,6 +379,32 @@ def recommendation_id(
     return f"recommendation:{digest}"
 
 
+def remediation_action_id(
+    *,
+    run_id: str,
+    decision: AgentDecisionV2,
+    selection_fingerprint: str,
+    observation_fingerprint: str,
+) -> str:
+    """Return a stable identity for one approval-bound remediation proposal."""
+
+    digest = _digest(
+        {
+            "run_id": run_id,
+            "decision": decision.model_dump(mode="json"),
+            "selection_fingerprint": selection_fingerprint,
+            "observation_fingerprint": observation_fingerprint,
+        }
+    )
+    return f"remediation_action:{digest}"
+
+
+def diagnostic_observation_fingerprint(observations: list[dict[str, Any]]) -> str:
+    """Hash the exact diagnostic observations considered by a decision."""
+
+    return _digest(observations)
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -251,4 +416,4 @@ def _json_value(value: Any) -> Any:
 
 
 def _normalized_text(value: str) -> str:
-    return " ".join(value.casefold().split())
+    return " ".join(value.split())
