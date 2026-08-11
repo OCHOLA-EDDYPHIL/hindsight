@@ -76,6 +76,7 @@ WORKFLOW_COMPONENTS = {
 MAIN_QUALIFICATION_SCRIPTS = frozenset(
     {
         "apply_database_roles.py",
+        "capture_capacity_runtime.py",
         "run_capacity_qualification.py",
         "drop_diagnostic_database.py",
         "evidence_reuse.py",
@@ -84,6 +85,7 @@ MAIN_QUALIFICATION_SCRIPTS = frozenset(
         "populated_upgrade_fixture.py",
         "schema_manifest.py",
         "validate_capacity_evidence.py",
+        "validate_capacity_diagnostic.py",
     }
 )
 DATABASE_SCRIPTS = frozenset(

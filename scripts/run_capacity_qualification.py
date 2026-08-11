@@ -37,10 +37,24 @@ from hindsight.vector_index_qualification import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "hindsight.capacity_qualification.v3"
-ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v1"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v4"
+DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v1"
+ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v2"
 ATTEMPT_PROGRESS_FILENAME = "capacity-attempt-progress.json"
-TARGETS = {"vectors": 100_000, "tenants": 20, "clients": 20, "backlog_messages": 1_000}
+MODES = frozenset({"diagnostic", "qualification"})
+QUALIFICATION_TARGETS = {
+    "vectors": 100_000,
+    "tenants": 20,
+    "clients": 20,
+    "backlog_messages": 1_000,
+}
+DIAGNOSTIC_TARGETS = {
+    "vectors": 75_000,
+    "tenants": 15,
+    "clients": 20,
+    "backlog_messages": 1_000,
+}
+TARGETS = dict(QUALIFICATION_TARGETS)
 VECTOR_DIMENSIONS = 1024
 ROWS_PER_TENANT = TARGETS["vectors"] // TARGETS["tenants"]
 VECTOR_CODE_BITS = 13
@@ -54,20 +68,41 @@ MAX_EXTERNAL_COST_USD = 0
 MAX_CLIENTS = 20
 SEED_SHARDS = 1
 SEEDING_METHOD = (
-    "single_bounded_writer_twenty_atomic_per_tenant_copy_transactions_"
+    "single_bounded_writer_one_atomic_copy_transaction_per_tenant_"
     "between_exact_legacy_index_drop_and_restore"
 )
 FIXTURE_VECTOR_INDEX_METHOD = (
     "legacy_only_before_seed_then_none_during_copy_then_legacy_restored_"
     "before_populated_tenant_index_migration"
 )
-DATABASE_METHOD = "disposable_local_single_node_cockroachdb_in_memory_8_gib"
+DATABASE_METHOD = "disposable_local_single_node_cockroachdb_in_memory_2_gib_explicit_memory_budgets"
+RUNTIME_MEMORY_ENVELOPE = {
+    "image": "cockroachdb/cockroach:v25.4.5",
+    "runner_topology": "owner_runner_dind_inside_sampled_job_cgroup",
+    "start_args": [
+        "--store=type=mem,size=2GiB",
+        "--cache=128MiB",
+        "--max-sql-memory=128MiB",
+        "--max-tsdb-memory=64MiB",
+        "--max-go-memory=3GiB",
+    ],
+    "runner_memory_max_bytes": 4 * 1024**3,
+    "runner_cpu": {"quota_us": 150_000, "period_us": 100_000},
+    "memory_bytes": {
+        "store": 2 * 1024**3,
+        "cache": 128 * 1024**2,
+        "sql": 128 * 1024**2,
+        "tsdb": 64 * 1024**2,
+        "go": 3 * 1024**3,
+    },
+}
 MAX_CLEANUP_SECONDS = 120
 CLEANUP_JOB_SECONDS = 90
 CLEANUP_DROP_SECONDS = 25
 CLEANUP_VERIFY_SECONDS = 5
 CLEANUP_POLL_SECONDS = 0.5
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]{8,20}")
+EXECUTION_ID_PATTERN = re.compile(r"capacity_[0-9]+_1_(diagnostic|qualification)")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DATABASE_PREFIX = "hindsight_capacity_"
 PROFILE_ID = "capacity-synthetic-v1"
@@ -102,6 +137,12 @@ LIMITATIONS = [
     "Synthetic fixture loading restores write triggers before qualification; it does not "
     "measure application ingestion throughput or realtime outbox load.",
     "The measurements are benchmark evidence and are not production SLO claims.",
+    "The 2 GiB in-memory store size is configured capacity, not a kernel allocation cap; "
+    "the Go limit is soft, database budgets overlap, cache is outside the Go limit, and "
+    "the 4 GiB cgroup remains the hard memory boundary.",
+    "The reviewed owner-runner contract places its DinD instance inside the sampled job "
+    "cgroup; this evidence does not apply to an external socket-mounted Docker daemon.",
+    "In-memory SQL temporary storage retains CockroachDB 25.4.5's fixed 100 MiB default.",
 ]
 BULK_SEED_GUARDS = {
     "semantic_beliefs": "semantic_beliefs_tenant_lifecycle_state",
@@ -145,6 +186,14 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def _require_empty_output_directory(path: Path) -> None:
+    if path.exists():
+        if not path.is_dir() or any(path.iterdir()):
+            raise RuntimeError("capacity output directory must be an empty directory")
+    else:
+        path.mkdir(parents=True)
+
+
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -169,7 +218,17 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 class CapacityAttemptProgress:
-    def __init__(self, path: Path, *, source_revision: str, run_id: str, database: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        source_revision: str,
+        run_id: str,
+        execution_id: str,
+        database: str,
+        mode: str,
+        targets: dict[str, int],
+    ) -> None:
         started_at = _timestamp()
         self.path = path
         self._started_monotonic = time.monotonic()
@@ -180,7 +239,10 @@ class CapacityAttemptProgress:
             "qualification_evidence": False,
             "source_revision": source_revision,
             "run_id": run_id,
+            "execution_id": execution_id,
             "database": database,
+            "mode": mode,
+            "targets": dict(targets),
             "status": "running",
             "started_at": started_at,
             "updated_at": started_at,
@@ -264,7 +326,29 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _validate_inputs(admin_url: str, run_id: str, source_sha: str, timeout_seconds: int) -> str:
+def _configure_mode(mode: str) -> None:
+    global ROWS_PER_TENANT, TARGETS, VECTOR_CODE_OFFSET
+    if mode == "qualification":
+        targets = QUALIFICATION_TARGETS
+    elif mode == "diagnostic":
+        targets = DIAGNOSTIC_TARGETS
+    else:
+        raise ValueError("capacity mode is unsupported")
+    if targets["vectors"] % targets["tenants"] != 0:
+        raise RuntimeError("capacity target vectors must divide evenly across tenants")
+    TARGETS = dict(targets)
+    ROWS_PER_TENANT = TARGETS["vectors"] // TARGETS["tenants"]
+    VECTOR_CODE_OFFSET = TARGETS["tenants"]
+
+
+def _validate_inputs(
+    admin_url: str,
+    run_id: str,
+    execution_id: str,
+    source_sha: str,
+    timeout_seconds: int,
+    mode: str = "qualification",
+) -> str:
     parts = urlsplit(admin_url)
     if (
         parts.scheme not in {"postgres", "postgresql"}
@@ -275,10 +359,18 @@ def _validate_inputs(admin_url: str, run_id: str, source_sha: str, timeout_secon
         raise ValueError("capacity qualification requires root on loopback defaultdb")
     if RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError("run id must contain 8-20 lowercase letters or digits")
+    if (
+        EXECUTION_ID_PATTERN.fullmatch(execution_id) is None
+        or not execution_id.endswith(f"_{mode}")
+        or run_id != hashlib.sha256(execution_id.encode()).hexdigest()[:16]
+    ):
+        raise ValueError("run id must be derived from the original workflow execution identity")
     if SHA_PATTERN.fullmatch(source_sha) is None:
         raise ValueError("source SHA must be a full lowercase Git SHA")
     if not 60 <= timeout_seconds <= MAX_DURATION_SECONDS:
         raise ValueError(f"timeout must be between 60 and {MAX_DURATION_SECONDS} seconds")
+    if mode not in MODES:
+        raise ValueError("capacity mode is unsupported")
     return admin_url
 
 
@@ -378,8 +470,7 @@ def _vector_index_job_prefixes(database: str) -> tuple[str, ...]:
     if not _is_disposable(database):
         raise RuntimeError("refusing to inspect jobs for a non-capacity database")
     return tuple(
-        f"CREATE VECTOR INDEX IF NOT EXISTS {index} "
-        f"ON {database}.public.semantic_memory_vectors ("
+        f"CREATE VECTOR INDEX IF NOT EXISTS {index} ON {database}.public.semantic_memory_vectors ("
         for index in sorted(QUALIFIED_VECTOR_INDEXES)
     )
 
@@ -387,15 +478,12 @@ def _vector_index_job_prefixes(database: str) -> tuple[str, ...]:
 def _legacy_index_drop_job_description(database: str) -> str:
     if not _is_disposable(database):
         raise RuntimeError("refusing to inspect jobs for a non-capacity database")
-    return (
-        f"DROP INDEX {database}.public.semantic_memory_vectors@{LEGACY_VECTOR_INDEX}"
-    )
+    return f"DROP INDEX {database}.public.semantic_memory_vectors@{LEGACY_VECTOR_INDEX}"
 
 
 def _vector_index_job_predicate(prefixes: tuple[str, ...]) -> str:
     return " OR ".join(
-        "substring(description, 1, length(%s::STRING)) = %s::STRING"
-        for _prefix in prefixes
+        "substring(description, 1, length(%s::STRING)) = %s::STRING" for _prefix in prefixes
     )
 
 
@@ -425,10 +513,7 @@ def _cancel_disposable_vector_index_jobs(
     if not rows:
         return
 
-    jobs = {
-        int(row[0]): (str(row[1]), str(row[2]), str(row[3]))
-        for row in rows
-    }
+    jobs = {int(row[0]): (str(row[1]), str(row[2]), str(row[3])) for row in rows}
     unexpected = {
         job_id: {"job_type": job_type, "status": status, "description": description}
         for job_id, (job_type, status, description) in jobs.items()
@@ -470,26 +555,24 @@ def _cancel_disposable_vector_index_jobs(
     while True:
         _refresh_cleanup_timeouts(conn, deadline)
         current_rows = conn.execute(
-            "SELECT job_id, status FROM crdb_internal.jobs "
-            "WHERE job_id = ANY(%s) ORDER BY job_id",
+            "SELECT job_id, status FROM crdb_internal.jobs WHERE job_id = ANY(%s) ORDER BY job_id",
             (job_ids,),
         ).fetchall()
         current = {int(row[0]): str(row[1]) for row in current_rows}
         missing = sorted(set(job_ids) - set(current))
         if missing:
-            raise RuntimeError(f"capacity cleanup jobs disappeared before terminal state: {missing}")
+            raise RuntimeError(
+                f"capacity cleanup jobs disappeared before terminal state: {missing}"
+            )
         failed = {
             job_id: status
             for job_id, status in current.items()
-            if status not in (
-                CLEANUP_VECTOR_INDEX_WAIT_STATUSES | CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES
-            )
+            if status
+            not in (CLEANUP_VECTOR_INDEX_WAIT_STATUSES | CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES)
         }
         if failed:
             raise RuntimeError(f"capacity cleanup jobs entered unsafe states: {failed}")
-        if all(
-            status in CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES for status in current.values()
-        ):
+        if all(status in CLEANUP_VECTOR_INDEX_TERMINAL_STATUSES for status in current.values()):
             return
         time.sleep(CLEANUP_POLL_SECONDS)
 
@@ -679,8 +762,10 @@ def _require_atomic_copy(conn: psycopg.Connection[Any], deadline: Deadline) -> N
 
 
 def _load_seed_shard(
-    database_url: str, deadline: Deadline, shard: int
+    database_url: str, deadline: Deadline, shard: int, mode: str | None = None
 ) -> tuple[int, int, list[dict[str, int]]]:
+    if mode is not None:
+        _configure_mode(mode)
     with _connection(database_url, deadline) as conn:
         _require_atomic_copy(conn, deadline)
         vector_inserts = 0
@@ -689,8 +774,7 @@ def _load_seed_shard(
         for tenant_number in range(shard + 1, TARGETS["tenants"] + 1, SEED_SHARDS):
             _refresh_qualification_timeout(conn, deadline)
             tenant = conn.execute(
-                "SELECT tenant_id, namespace FROM capacity_tenant_seed "
-                "WHERE tenant_number = %s",
+                "SELECT tenant_id, namespace FROM capacity_tenant_seed WHERE tenant_number = %s",
                 (tenant_number,),
             ).fetchone()
             if tenant is None:
@@ -700,10 +784,8 @@ def _load_seed_shard(
                 "WHERE tenant_number = %s ORDER BY ordinal",
                 (tenant_number,),
             ).fetchall()
-            if (
-                len(staged_rows) != ROWS_PER_TENANT
-                or [int(row[0]) for row in staged_rows]
-                != list(range(1, ROWS_PER_TENANT + 1))
+            if len(staged_rows) != ROWS_PER_TENANT or [int(row[0]) for row in staged_rows] != list(
+                range(1, ROWS_PER_TENANT + 1)
             ):
                 raise RuntimeError("capacity vector staging rows are not exact")
             try:
@@ -762,9 +844,7 @@ def _load_seed_shard(
                                     memory_id,
                                     PROFILE_ID,
                                     tenant[1],
-                                    hashlib.sha256(
-                                        f"capacity:{ordinal}".encode()
-                                    ).hexdigest(),
+                                    hashlib.sha256(f"capacity:{ordinal}".encode()).hexdigest(),
                                     _vector(tenant_number, int(ordinal)),
                                 )
                             )
@@ -790,10 +870,11 @@ def _seed_shard_worker(
     expires_at: float,
     shard: int,
     results: multiprocessing.Queue,
+    mode: str = "qualification",
 ) -> None:
     try:
         vector_inserts, vector_transactions, storage_checks = _load_seed_shard(
-            database_url, Deadline(expires_at), shard
+            database_url, Deadline(expires_at), shard, mode
         )
     except BaseException as error:
         detail = f"{type(error).__name__}: {error}"[:800]
@@ -822,14 +903,14 @@ def _stop_seed_processes(processes: list[multiprocessing.Process], deadline: Dea
 
 
 def _run_seed_shards(
-    database_url: str, deadline: Deadline
+    database_url: str, deadline: Deadline, mode: str = "qualification"
 ) -> tuple[int, int, list[dict[str, int]]]:
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     processes = [
         context.Process(
             target=_seed_shard_worker,
-            args=(database_url, deadline.expires_at, shard, results),
+            args=(database_url, deadline.expires_at, shard, results, mode),
             name=f"capacity-seed-shard-{shard}",
         )
         for shard in range(SEED_SHARDS)
@@ -872,9 +953,7 @@ def _run_seed_shards(
             )
             if type(inserted_rows) is not int or inserted_rows != expected_rows:
                 raise RuntimeError("capacity seed shard returned an invalid vector row count")
-            expected_transactions = len(
-                range(shard + 1, TARGETS["tenants"] + 1, SEED_SHARDS)
-            )
+            expected_transactions = len(range(shard + 1, TARGETS["tenants"] + 1, SEED_SHARDS))
             if type(transactions) is not int or transactions != expected_transactions:
                 raise RuntimeError("capacity seed shard returned an invalid transaction count")
             if (
@@ -972,7 +1051,12 @@ def _verify_bulk_seed_provenance(conn: psycopg.Connection[Any], deadline: Deadli
         raise RuntimeError("capacity fixture unexpectedly emitted semantic memory outbox rows")
 
 
-def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
+def _seed(
+    database_url: str,
+    run_id: str,
+    deadline: Deadline,
+    mode: str = "qualification",
+) -> dict[str, Any]:
     started = time.monotonic()
     with _connection(database_url, deadline) as conn:
         conn.execute(
@@ -997,7 +1081,7 @@ def _seed(database_url: str, run_id: str, deadline: Deadline) -> dict[str, Any]:
             _insert_seed_staging(conn, tenant_number=number, row_count=ROWS_PER_TENANT)
         _prepare_seed_load(conn, deadline)
     vector_insert_rows, vector_insert_transactions, storage_checks = _run_seed_shards(
-        database_url, deadline
+        database_url, deadline, mode
     )
     with _connection(database_url, deadline) as conn:
         _refresh_qualification_timeout(conn, deadline)
@@ -1069,7 +1153,9 @@ def _restore_legacy_vector_index(database_url: str, deadline: Deadline) -> dict[
             conn.execute("SELECT count(*)::INT8 FROM semantic_memory_vectors").fetchone()[0]
         )
         if vector_count != TARGETS["vectors"]:
-            raise RuntimeError("legacy vector index restore input is not the exact populated target")
+            raise RuntimeError(
+                "legacy vector index restore input is not the exact populated target"
+            )
         _refresh_qualification_timeout(conn, deadline)
         conn.execute(LEGACY_VECTOR_INDEX_CREATE_SQL)
         after = _vector_index_names(conn, deadline)
@@ -1144,10 +1230,14 @@ def _counts(database_url: str, run_id: str, deadline: Deadline) -> tuple[int, li
 
 
 def _client_probe(
-    database_url: str, run_id: str, number: int, statement_timeout_seconds: int
+    database_url: str,
+    run_id: str,
+    client_number: int,
+    tenant_number: int,
+    statement_timeout_seconds: int,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    tenant_id = str(_tenant_id(run_id, number))
+    tenant_id = str(_tenant_id(run_id, tenant_number))
     with psycopg.connect(database_url, autocommit=True, connect_timeout=5) as conn:
         conn.execute(
             "SELECT set_config('statement_timeout', %s, false)",
@@ -1157,14 +1247,14 @@ def _client_probe(
         plan = explain_semantic_vector_search(
             conn,
             tenant_id=tenant_id,
-            namespace=_namespace(number),
+            namespace=_namespace(tenant_number),
             profile_id=PROFILE_ID,
-            query_vector=[1.0 if i == number - 1 else 0.0 for i in range(VECTOR_DIMENSIONS)],
+            query_vector=[1.0 if i == tenant_number - 1 else 0.0 for i in range(VECTOR_DIMENSIONS)],
             limit=5,
         )
         spans = qualify_semantic_vector_plan(plan)
     return {
-        "client": number,
+        "client": client_number,
         "tenant_id": tenant_id,
         "latency_ms": round((time.monotonic() - started) * 1000, 6),
         "qualified_index": TENANT_VECTOR_INDEX,
@@ -1176,12 +1266,20 @@ def _client_probe(
 def _exercise_clients(database_url: str, run_id: str, deadline: Deadline) -> list[dict[str, Any]]:
     statement_timeout_seconds = deadline.remaining()
     with ThreadPoolExecutor(max_workers=MAX_CLIENTS) as executor:
+        probes = [
+            (client_number, ((client_number - 1) % TARGETS["tenants"]) + 1)
+            for client_number in range(1, TARGETS["clients"] + 1)
+        ]
         rows = list(
             executor.map(
-                lambda number: _client_probe(
-                    database_url, run_id, number, statement_timeout_seconds
+                lambda probe: _client_probe(
+                    database_url,
+                    run_id,
+                    probe[0],
+                    probe[1],
+                    statement_timeout_seconds,
                 ),
-                range(1, 21),
+                probes,
             )
         )
     deadline.remaining()
@@ -1190,14 +1288,15 @@ def _exercise_clients(database_url: str, run_id: str, deadline: Deadline) -> lis
 
 def _exercise_backlog() -> dict[str, Any]:
     started = time.monotonic()
+    client_count = TARGETS["clients"]
     backlog: queue.Queue[int] = queue.Queue(maxsize=TARGETS["backlog_messages"])
     observed_max_pending = 0
     for message_id in range(TARGETS["backlog_messages"]):
         backlog.put_nowait(message_id)
         observed_max_pending = max(observed_max_pending, backlog.qsize())
     pending_before_drain = backlog.qsize()
-    ready = threading.Barrier(MAX_CLIENTS)
-    initial_reads = threading.Barrier(MAX_CLIENTS)
+    ready = threading.Barrier(client_count)
+    initial_reads = threading.Barrier(client_count)
 
     def drain() -> int:
         ready.wait(timeout=10)
@@ -1214,7 +1313,7 @@ def _exercise_backlog() -> dict[str, Any]:
             count += 1
 
     with ThreadPoolExecutor(max_workers=MAX_CLIENTS) as executor:
-        counts = list(executor.map(lambda _client: drain(), range(MAX_CLIENTS)))
+        counts = list(executor.map(lambda _client: drain(), range(client_count)))
     backlog.join()
     pending_after_drain = backlog.qsize()
     return {
@@ -1277,10 +1376,13 @@ def _check_storage(
 def _run(
     database_url: str,
     run_id: str,
+    execution_id: str,
     source_sha: str,
     deadline: Deadline,
     progress: CapacityAttemptProgress,
+    mode: str = "qualification",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    _configure_mode(mode)
     started = time.monotonic()
     with progress.phase("base_migrations"):
         base_migration = _migrate(
@@ -1292,7 +1394,7 @@ def _run(
     with progress.phase("legacy_index_suspension"):
         legacy_index_suspension = _suspend_legacy_vector_index(database_url, deadline)
     with progress.phase("vector_seed"):
-        seed = _seed(database_url, run_id, deadline)
+        seed = _seed(database_url, run_id, deadline, mode)
     with progress.phase("legacy_index_restore"):
         legacy_index_restore = _restore_legacy_vector_index(database_url, deadline)
     with progress.phase("tenant_index_build_input"):
@@ -1323,9 +1425,13 @@ def _run(
     if duration > MAX_DURATION_SECONDS:
         raise RuntimeError("capacity qualification exceeded its duration ceiling")
     qualification = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if mode == "qualification" else DIAGNOSTIC_SCHEMA_VERSION,
         "main_sha": source_sha,
-        "qualified": True,
+        "execution_id": execution_id,
+        "qualified": mode == "qualification",
+        "observation_only": mode == "diagnostic",
+        "mode": mode,
+        "qualification_evidence": mode == "qualification",
         "index": TENANT_VECTOR_INDEX,
         "indexes": vector_indexes["indexes"],
         "vector_dimensions": VECTOR_DIMENSIONS,
@@ -1335,22 +1441,28 @@ def _run(
         "plans": clients,
     }
     capacity = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if mode == "qualification" else DIAGNOSTIC_SCHEMA_VERSION,
         "source_revision": source_sha,
-        "targets": TARGETS,
+        "execution_id": execution_id,
+        "mode": mode,
+        "kind": "bounded_capacity_evidence_source",
+        "qualification_evidence": mode == "qualification",
+        "targets": dict(TARGETS),
+        "final_targets": dict(QUALIFICATION_TARGETS),
         "method": {
             "database": DATABASE_METHOD,
             "vectors": VECTOR_METHOD,
             "seeding": SEEDING_METHOD,
             "fixture_vector_indexes": FIXTURE_VECTOR_INDEX_METHOD,
             "fixture_write_triggers": "restored_and_catalog_verified_before_completion_checks",
-            "clients": "twenty_bounded_parallel_index_queries",
+            "clients": f"{TARGETS['clients']}_bounded_parallel_index_queries",
             "backlog": "in_process_synthetic_accounting_without_live_worker",
         },
         "environment": {
             "isolation": "run_scoped_database_and_compose_project",
             "paid_model_calls": 0,
             "live_worker_invocations": 0,
+            "runtime_memory_envelope": RUNTIME_MEMORY_ENVELOPE,
         },
         "ceilings": {
             "duration_seconds": MAX_DURATION_SECONDS,
@@ -1381,12 +1493,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--admin-url", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--execution-id", required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=MAX_DURATION_SECONDS)
+    parser.add_argument("--mode", choices=sorted(MODES), required=True)
     args = parser.parse_args()
-    admin_url = _validate_inputs(args.admin_url, args.run_id, args.source_sha, args.timeout_seconds)
+    admin_url = _validate_inputs(
+        args.admin_url,
+        args.run_id,
+        args.execution_id,
+        args.source_sha,
+        args.timeout_seconds,
+        args.mode,
+    )
+    _configure_mode(args.mode)
     _verify_checkout(args.source_sha)
+    _require_empty_output_directory(args.output_dir)
     database = f"{DATABASE_PREFIX}{args.run_id}"
     database_url = _database_url(admin_url, database)
     deadline = Deadline.after(args.timeout_seconds)
@@ -1394,7 +1517,10 @@ def main() -> int:
         args.output_dir / ATTEMPT_PROGRESS_FILENAME,
         source_revision=args.source_sha,
         run_id=args.run_id,
+        execution_id=args.execution_id,
         database=database,
+        mode=args.mode,
+        targets=TARGETS,
     )
     qualification: dict[str, Any] | None = None
     capacity: dict[str, Any] | None = None
@@ -1407,9 +1533,11 @@ def main() -> int:
         qualification, capacity = _run(
             database_url,
             args.run_id,
+            args.execution_id,
             args.source_sha,
             deadline,
             progress,
+            args.mode,
         )
         progress.mark_workload_completed()
     except BaseException as error:
@@ -1424,8 +1552,12 @@ def main() -> int:
         except Exception as error:  # cleanup evidence must survive the primary failure
             cleanup_error = f"{type(error).__name__}: {error}"
         cleanup = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                SCHEMA_VERSION if args.mode == "qualification" else DIAGNOSTIC_SCHEMA_VERSION
+            ),
             "source_revision": args.source_sha,
+            "mode": args.mode,
+            "execution_id": args.execution_id,
             "database": database,
             "started_at": cleanup_started,
             "completed_at": _timestamp(),
@@ -1437,16 +1569,50 @@ def main() -> int:
     if cleanup["database_removed"] is not True:
         raise RuntimeError("disposable database cleanup was not verified")
     assert qualification is not None and capacity is not None
-    qualification_path = args.output_dir / "index-qualification.json"
     cleanup_path = args.output_dir / "cleanup.json"
+    if args.mode == "diagnostic":
+        diagnostic = {
+            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "kind": "capacity_resource_diagnostic",
+            "mode": "diagnostic",
+            "acceptance_eligible": False,
+            "qualification_evidence": False,
+            "source_revision": args.source_sha,
+            "execution_id": args.execution_id,
+            "targets": dict(TARGETS),
+            "final_targets": dict(QUALIFICATION_TARGETS),
+            "method": capacity["method"],
+            "environment": capacity["environment"],
+            "ceilings": capacity["ceilings"],
+            "raw_measurements": capacity["raw_measurements"],
+            "index_observation": {
+                key: value
+                for key, value in qualification.items()
+                if key not in {"qualified", "qualification_evidence"}
+            },
+            "cleanup": {
+                "database_removed": True,
+                "execution_id": args.execution_id,
+                "artifact_sha256": _sha256(cleanup_path),
+            },
+            "limitations": [
+                *capacity["limitations"],
+                "This diagnostic cannot be used as final capacity qualification evidence.",
+            ],
+        }
+        _write_json(args.output_dir / "capacity-diagnostic.json", diagnostic)
+        return 0
+    qualification_path = args.output_dir / "index-qualification.json"
     _write_json(qualification_path, qualification)
     capacity["index_qualification"] = {
         "qualified": True,
         "main_sha": args.source_sha,
+        "execution_id": args.execution_id,
         "artifact_sha256": _sha256(qualification_path),
     }
     capacity["cleanup"] = {
         "database_removed": True,
+        "execution_id": args.execution_id,
         "artifact_sha256": _sha256(cleanup_path),
     }
     report_path = args.output_dir / "capacity-report.json"
@@ -1454,6 +1620,9 @@ def main() -> int:
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "source_revision": args.source_sha,
+        "execution_id": args.execution_id,
+        "mode": "qualification",
+        "kind": "capacity_artifact_manifest",
         "artifacts": {
             path.name: _sha256(path) for path in (qualification_path, report_path, cleanup_path)
         },
