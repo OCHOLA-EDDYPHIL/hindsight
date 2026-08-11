@@ -58,6 +58,7 @@ WORKFLOW_COMPONENTS = {
     ".github/workflows/migration-compatibility.yml": frozenset(
         {"database", "main_qualification"}
     ),
+    ".github/workflows/plan-bootstrap.yml": frozenset({"terraform"}),
     ".github/workflows/provision-lifecycle-fixture.yml": frozenset(
         {"database", "main_qualification", "terraform"}
     ),
@@ -94,6 +95,7 @@ DATABASE_SCRIPTS = frozenset(
 LAMBDA_SCRIPTS = frozenset(
     {"build_lambda_artifacts.py", "smoke_lambda_artifacts.py"}
 )
+TERRAFORM_SCRIPTS = frozenset({"validate_bootstrap_plan.py"})
 
 
 def _none_selected() -> dict[str, bool]:
@@ -187,7 +189,13 @@ def classify_paths(paths: Iterable[str], *, event_name: str) -> dict[str, bool]:
                 _select(selected, "main_qualification")
             if name in LAMBDA_SCRIPTS:
                 _select(selected, "lambda_artifacts")
-            if name in DATABASE_SCRIPTS or name in LAMBDA_SCRIPTS:
+            if name in TERRAFORM_SCRIPTS:
+                _select(selected, "terraform")
+            if (
+                name in DATABASE_SCRIPTS
+                or name in LAMBDA_SCRIPTS
+                or name in TERRAFORM_SCRIPTS
+            ):
                 continue
             _select(selected, *ALL_COMPONENTS)
             continue

@@ -6,6 +6,11 @@ variable "aws_region" {
 variable "state_bucket_name" {
   description = "Existing versioned S3 bucket shared for Terraform state."
   type        = string
+
+  validation {
+    condition     = can(regex("^home-in-cloud-terraform-state-[0-9]{12}-us-east-1$", var.state_bucket_name))
+    error_message = "state_bucket_name must identify the fixed us-east-1 account state bucket."
+  }
 }
 
 variable "expected_aws_account_id" {

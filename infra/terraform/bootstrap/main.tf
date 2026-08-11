@@ -1,5 +1,5 @@
 locals {
-  state_bucket_arn               = data.aws_s3_bucket.state.arn
+  state_bucket_arn               = "arn:${data.aws_partition.current.partition}:s3:::${var.state_bucket_name}"
   evidence_bucket_name           = "hindsight-${var.stage}-learning-evidence-${data.aws_caller_identity.current.account_id}"
   lifecycle_export_bucket_name   = "hindsight-${var.stage}-lifecycle-exports-${data.aws_caller_identity.current.account_id}"
   lifecycle_recovery_bucket_name = "hindsight-${var.stage}-recovery-${data.aws_caller_identity.current.account_id}"
@@ -88,8 +88,11 @@ check "expected_aws_account" {
   }
 }
 
-data "aws_s3_bucket" "state" {
-  bucket = var.state_bucket_name
+check "state_bucket_scope" {
+  assert {
+    condition     = var.state_bucket_name == "home-in-cloud-terraform-state-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
+    error_message = "state_bucket_name must use the fixed account and region state-bucket convention."
+  }
 }
 
 resource "aws_s3_bucket" "learning_evidence" {

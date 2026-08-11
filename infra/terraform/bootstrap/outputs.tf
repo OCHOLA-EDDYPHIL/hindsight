@@ -1,5 +1,5 @@
 output "state_bucket" {
-  value = data.aws_s3_bucket.state.id
+  value = var.state_bucket_name
 }
 
 output "github_deploy_role_arn" {
@@ -32,7 +32,7 @@ output "learning_qualification_hmac_key_alias" {
 
 output "backend_config" {
   value = {
-    bucket       = data.aws_s3_bucket.state.id
+    bucket       = var.state_bucket_name
     key          = var.application_state_key
     region       = var.aws_region
     use_lockfile = true
@@ -42,7 +42,7 @@ output "backend_config" {
 
 output "edge_backend_config" {
   value = {
-    bucket       = data.aws_s3_bucket.state.id
+    bucket       = var.state_bucket_name
     key          = var.edge_state_key
     region       = var.aws_region
     use_lockfile = true
