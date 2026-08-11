@@ -65,6 +65,7 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
     ),
     "image_platform": "linux/amd64",
     "execution_topology": "owner_runner_sibling_dind_capacity_cgroup_v2",
+    "go_max_procs": 2,
     "start_args": [
         "--store=type=mem,size=2GiB",
         "--cache=128MiB",
@@ -424,7 +425,9 @@ def _validate_runtime(
             "compose_project",
             "compose_service",
             "running",
+            "configured_go_max_procs",
             "live_argv",
+            "live_go_max_procs",
             "effective_memory",
         }
         or process.get("path") != "/cockroach/cockroach.sh"
@@ -435,7 +438,13 @@ def _validate_runtime(
         or process.get("compose_project") != project
         or process.get("compose_service") != "crdb"
         or process.get("running") is not True
+        or type(process.get("configured_go_max_procs")) is not int
+        or process.get("configured_go_max_procs")
+        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
         or process.get("live_argv") != EXPECTED_LIVE_PROCESS_ARGS
+        or type(process.get("live_go_max_procs")) is not int
+        or process.get("live_go_max_procs")
+        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
         or process.get("effective_memory")
         != {
             "go_limit_bytes": EXPECTED_RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"],

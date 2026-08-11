@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -32,6 +33,22 @@ def _script(name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _crdb_container_config(capture, project: str) -> dict:
+    return {
+        "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+        "Image": capture.EXPECTED_IMAGE,
+        "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+        "Labels": {
+            "com.docker.compose.project": project,
+            "com.docker.compose.service": "crdb",
+        },
+    }
+
+
+def _live_crdb_environment(capture) -> str:
+    return f"PATH=/usr/bin\0{capture.EXPECTED_GOMAXPROCS_ENV}"
 
 
 def _qualification(validator):
@@ -100,7 +117,9 @@ def _report(validator):
             "isolation": "run_scoped_database_and_compose_project",
             "paid_model_calls": 0,
             "live_worker_invocations": 0,
-            "runtime_memory_envelope": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
+            "runtime_memory_envelope": deepcopy(
+                validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE
+            ),
         },
         "raw_measurements": [
             {
@@ -219,7 +238,7 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
         "mode": mode,
         "execution_id": _execution_id(mode),
         "compose_project": project,
-        "configured": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
+        "configured": deepcopy(validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE),
         "effective_process": {
             "path": "/cockroach/cockroach.sh",
             "args": validator.EXPECTED_PROCESS_ARGS,
@@ -229,7 +248,13 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
             "compose_project": project,
             "compose_service": "crdb",
             "running": True,
+            "configured_go_max_procs": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE[
+                "go_max_procs"
+            ],
             "live_argv": validator.EXPECTED_LIVE_PROCESS_ARGS,
+            "live_go_max_procs": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE[
+                "go_max_procs"
+            ],
             "effective_memory": {
                 "go_limit_bytes": 3 * 1024**3,
                 "store_capacity_bytes": 2 * 1024**3,
@@ -1077,6 +1102,12 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     assert capture.RUNTIME_SCHEMA_VERSION == validator.RUNTIME_SCHEMA_VERSION
     assert capture._configured_envelope() == producer.RUNTIME_MEMORY_ENVELOPE
     assert capture._configured_envelope() == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE
+    assert (
+        capture.EXPECTED_GO_MAX_PROCS
+        == producer.RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
+        == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
+        == 2
+    )
     assert producer.TARGETS == validator.TARGETS
     assert producer.MAX_DURATION_SECONDS == validator.EXPECTED_CEILINGS["duration_seconds"]
     assert producer.MAX_STORAGE_BYTES == validator.EXPECTED_CEILINGS["storage_bytes"]
@@ -1108,6 +1139,34 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     assert sorted(producer.QUALIFIED_VECTOR_INDEXES) == validator.EXPECTED_INDEXES
     assert producer.LEGACY_VECTOR_MIGRATION == validator.LEGACY_VECTOR_MIGRATION
     assert producer.TENANT_VECTOR_MIGRATION == validator.TENANT_VECTOR_MIGRATION
+
+
+@pytest.mark.parametrize("processor_budget", [None, "", "1", "02"])
+def test_runtime_invocation_requires_exact_go_processor_budget(
+    monkeypatch, processor_budget
+):
+    capture = _script("capture_capacity_runtime")
+    mode = "diagnostic"
+    execution_id = _execution_id(mode)
+    project = f"hindsight_{execution_id}"
+    environment = {
+        "EXECUTION_ID": execution_id,
+        "COMPOSE_PROJECT_NAME": project,
+        "COCKROACH_IMAGE": capture.EXPECTED_IMAGE,
+        "COCKROACH_IMAGE_ID": capture.EXPECTED_IMAGE_ID,
+        "COCKROACH_START_ARGS": capture.EXPECTED_START_ARGS_TEXT,
+        "COCKROACH_GOMAXPROCS": str(capture.EXPECTED_GO_MAX_PROCS),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    capture._validate_invocation(SOURCE_SHA, mode, execution_id, project)
+    if processor_budget is None:
+        monkeypatch.delenv("COCKROACH_GOMAXPROCS")
+    else:
+        monkeypatch.setenv("COCKROACH_GOMAXPROCS", processor_budget)
+    with pytest.raises(ValueError, match="processor budget"):
+        capture._validate_invocation(SOURCE_SHA, mode, execution_id, project)
 
 
 def test_validator_requires_populated_index_build_and_both_live_indexes():
@@ -2354,6 +2413,8 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     )
     assert diagnostic["env"]["COCKROACH_START_ARGS"] == expected_args
     assert qualification["env"]["COCKROACH_START_ARGS"] == expected_args
+    assert diagnostic["env"]["COCKROACH_GOMAXPROCS"] == "2"
+    assert qualification["env"]["COCKROACH_GOMAXPROCS"] == "2"
     assert diagnostic["env"]["CAPACITY_MODE"] == "diagnostic"
     assert qualification["env"]["CAPACITY_MODE"] == "qualification"
     expected_image_digest = (
@@ -2366,6 +2427,7 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
         assert job["env"]["COCKROACH_IMAGE_ID"] == expected_image_digest
     compose = (ROOT / "docker-compose.yml").read_text()
     assert "start-single-node --insecure ${COCKROACH_START_ARGS:-}" in compose
+    assert "GOMAXPROCS: ${COCKROACH_GOMAXPROCS:-}" in compose
     assert "--timeout-seconds 1200" in source
     assert "scripts/run_capacity_qualification.py" in source
     assert "scripts/capture_capacity_runtime.py" in source
@@ -2601,6 +2663,29 @@ def test_runtime_rejects_every_memory_argument_mutation():
         runtime = _runtime(validator)
         runtime["effective_process"]["args"] = mutation
         with pytest.raises(ValueError, match="reviewed memory arguments"):
+            validator._validate_runtime(
+                runtime,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+            )
+
+
+def test_runtime_validator_rejects_every_altered_go_processor_budget():
+    validator = _script("validate_capacity_evidence")
+    mutations = (
+        lambda runtime: runtime["configured"].update({"go_max_procs": 1}),
+        lambda runtime: runtime["effective_process"].update(
+            {"configured_go_max_procs": 1}
+        ),
+        lambda runtime: runtime["effective_process"].update(
+            {"live_go_max_procs": 1}
+        ),
+    )
+    for mutate in mutations:
+        runtime = _runtime(validator)
+        mutate(runtime)
+        with pytest.raises(ValueError, match="runtime envelope|runtime process"):
             validator._validate_runtime(
                 runtime,
                 source_revision=SOURCE_SHA,
@@ -2854,6 +2939,7 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
             "Config": {
                 "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
                 "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
                 "Labels": {
                     "com.docker.compose.project": ("hindsight_capacity_123_1_diagnostic"),
                     "com.docker.compose.service": "crdb",
@@ -2874,9 +2960,13 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
                 if not pid_ready:
                     return SimpleNamespace(returncode=1, stdout="")
                 return SimpleNamespace(returncode=0, stdout="42\n")
-            assert command[-1] == "/proc/42/cmdline"
+            if command[-1] == "/proc/42/cmdline":
+                return SimpleNamespace(
+                    returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+                )
+            assert command[-1] == "/proc/42/environ"
             return SimpleNamespace(
-                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+                returncode=0, stdout=_live_crdb_environment(capture)
             )
         assert command == ["docker", "inspect", container_id]
         return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
@@ -2890,7 +2980,9 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     assert process["path"] == "/cockroach/cockroach.sh"
     assert process["cgroup_namespace"] == "private"
     assert process["args"] == list(capture.EXPECTED_PROCESS_ARGS)
+    assert process["configured_go_max_procs"] == 2
     assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
+    assert process["live_go_max_procs"] == 2
     inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2GiB"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
@@ -2898,6 +2990,76 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     inspection[0]["HostConfig"]["CgroupnsMode"] = "host"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+    inspection[0]["HostConfig"]["CgroupnsMode"] = "private"
+    valid_environment = list(inspection[0]["Config"]["Env"])
+    invalid_environments = (
+        [entry for entry in valid_environment if not entry.startswith("GOMAXPROCS=")],
+        [*valid_environment[:-1], "GOMAXPROCS=1"],
+        [*valid_environment, capture.EXPECTED_GOMAXPROCS_ENV],
+    )
+    for invalid_environment in invalid_environments:
+        inspection[0]["Config"]["Env"] = invalid_environment
+        with pytest.raises(RuntimeError, match="Docker configuration"):
+            capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+    inspection[0]["Config"]["Env"] = valid_environment
+
+
+@pytest.mark.parametrize("live_environment_case", ["missing", "wrong", "duplicate"])
+def test_runtime_collector_rejects_invalid_live_go_processor_budget(
+    monkeypatch, live_environment_case
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            if command[-1] == "/proc/42/cmdline":
+                return SimpleNamespace(
+                    returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+                )
+            assert command[-1] == "/proc/42/environ"
+            if live_environment_case == "missing":
+                return SimpleNamespace(returncode=1, stdout="")
+            if live_environment_case == "wrong":
+                return SimpleNamespace(returncode=0, stdout="GOMAXPROCS=1")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"{capture.EXPECTED_GOMAXPROCS_ENV}\0"
+                    f"{capture.EXPECTED_GOMAXPROCS_ENV}"
+                ),
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(
+        RuntimeError, match="live environment|live CockroachDB process"
+    ):
+        capture._inspect_container(project)
 
 
 def test_runtime_collector_retries_transient_live_argv_only_while_health_is_starting(
@@ -2914,6 +3076,7 @@ def test_runtime_collector_retries_transient_live_argv_only_while_health_is_star
             "Config": {
                 "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
                 "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
                 "Labels": {
                     "com.docker.compose.project": project,
                     "com.docker.compose.service": "crdb",
@@ -2931,8 +3094,12 @@ def test_runtime_collector_retries_transient_live_argv_only_while_health_is_star
         if command[:4] == ["docker", "compose", "exec", "-T"]:
             if command[-1] == "/cockroach/server_pid":
                 return SimpleNamespace(returncode=0, stdout="42\n")
-            assert command[-1] == "/proc/42/cmdline"
-            return SimpleNamespace(returncode=0, stdout="\0".join(live_argv))
+            if command[-1] == "/proc/42/cmdline":
+                return SimpleNamespace(returncode=0, stdout="\0".join(live_argv))
+            assert command[-1] == "/proc/42/environ"
+            return SimpleNamespace(
+                returncode=0, stdout=_live_crdb_environment(capture)
+            )
         assert command == ["docker", "inspect", container_id]
         return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
 
@@ -2970,6 +3137,7 @@ def test_runtime_collector_rejects_missing_malformed_or_nonready_health(
             "Config": {
                 "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
                 "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
                 "Labels": {
                     "com.docker.compose.project": project,
                     "com.docker.compose.service": "crdb",
@@ -3012,6 +3180,7 @@ def test_runtime_collector_rejects_missing_process_evidence_once_healthy(
             "Config": {
                 "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
                 "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
                 "Labels": {
                     "com.docker.compose.project": project,
                     "com.docker.compose.service": "crdb",
@@ -3059,6 +3228,7 @@ def test_runtime_collector_rejects_invalid_pid_even_while_health_is_starting(
             "Config": {
                 "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
                 "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
                 "Labels": {
                     "com.docker.compose.project": project,
                     "com.docker.compose.service": "crdb",
@@ -3101,14 +3271,7 @@ def test_runtime_collector_never_retries_static_envelope_mismatch(
             "Image": capture.EXPECTED_IMAGE_ID,
             "Path": "/cockroach/cockroach.sh",
             "Args": list(capture.EXPECTED_PROCESS_ARGS),
-            "Config": {
-                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
-                "Image": capture.EXPECTED_IMAGE,
-                "Labels": {
-                    "com.docker.compose.project": project,
-                    "com.docker.compose.service": "crdb",
-                },
-            },
+            "Config": _crdb_container_config(capture, project),
             "State": {"Running": True, "Health": {"Status": health_status}},
             "HostConfig": {"CgroupnsMode": "private"},
         }

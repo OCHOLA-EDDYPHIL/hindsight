@@ -85,6 +85,7 @@ RUNTIME_MEMORY_ENVELOPE = {
         "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
     ),
     "image_platform": "linux/amd64",
+    "go_max_procs": 2,
     "execution_topology": "owner_runner_sibling_dind_capacity_cgroup_v2",
     "start_args": [
         "--store=type=mem,size=2GiB",
@@ -177,6 +178,8 @@ LIMITATIONS = [
     "Synthetic fixture loading restores write triggers before qualification; it does not "
     "measure application ingestion throughput or realtime outbox load.",
     "The measurements are benchmark evidence and are not production SLO claims.",
+    "The capacity container fixes GOMAXPROCS at 2 to align database concurrency with the "
+    "1.5-CPU DinD quota; timings are not unbounded-production concurrency claims.",
     "The 2 GiB in-memory store size is configured capacity, not a kernel allocation cap; "
     "the Go limit is soft, database budgets overlap, cache is outside the Go limit, and "
     "the 4 GiB DinD cgroup remains the hard database execution boundary.",

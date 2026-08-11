@@ -49,6 +49,8 @@ EXPECTED_BOUNDARY_MEMORY_BYTES = 4 * 1024**3
 EXPECTED_BOUNDARY_SWAP_MAX = "max"
 EXPECTED_CPU_QUOTA_US = 150_000
 EXPECTED_CPU_PERIOD_US = 100_000
+EXPECTED_GO_MAX_PROCS = 2
+EXPECTED_GOMAXPROCS_ENV = f"GOMAXPROCS={EXPECTED_GO_MAX_PROCS}"
 EXPECTED_MEMORY_BYTES = {
     "store": 2 * 1024**3,
     "cache": 128 * 1024**2,
@@ -198,6 +200,7 @@ def _configured_envelope() -> dict[str, Any]:
         "image_id": EXPECTED_IMAGE_ID,
         "image_platform": EXPECTED_IMAGE_PLATFORM,
         "execution_topology": EXPECTED_EXECUTION_TOPOLOGY,
+        "go_max_procs": EXPECTED_GO_MAX_PROCS,
         "start_args": list(EXPECTED_START_ARGS),
         "capacity_boundary": {
             "cgroup_version": 2,
@@ -271,6 +274,8 @@ def _validate_invocation(source_revision: str, mode: str, execution_id: str, pro
         raise ValueError("capacity runtime CockroachDB image ID differs from the reviewed image")
     if os.environ.get("COCKROACH_START_ARGS") != EXPECTED_START_ARGS_TEXT:
         raise ValueError("capacity runtime memory arguments differ from the reviewed envelope")
+    if os.environ.get("COCKROACH_GOMAXPROCS") != str(EXPECTED_GO_MAX_PROCS):
+        raise ValueError("capacity runtime Go processor budget differs from the reviewed envelope")
 
 
 def _probe_name(project: str) -> str:
@@ -720,6 +725,9 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
     ):
         raise RuntimeError("capacity runtime Docker inspection is incomplete")
     labels = config.get("Labels")
+    configured_go_max_procs = _go_max_procs_from_environment(
+        config.get("Env"), source="Docker configuration"
+    )
     process = {
         "path": row.get("Path"),
         "args": row.get("Args"),
@@ -733,6 +741,7 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
         if isinstance(labels, dict)
         else None,
         "running": state.get("Running"),
+        "configured_go_max_procs": configured_go_max_procs,
     }
     if (
         process["path"] != "/cockroach/cockroach.sh"
@@ -772,8 +781,29 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
         return None
     if live_argv != list(EXPECTED_LIVE_PROCESS_ARGS):
         raise RuntimeError("capacity CockroachDB live argv differs from the reviewed envelope")
+    live_environment_raw = _try_read_container_file(f"/proc/{pid}/environ")
+    if not live_environment_raw:
+        raise RuntimeError("healthy capacity CockroachDB live environment is missing")
+    live_go_max_procs = _go_max_procs_from_environment(
+        [part for part in live_environment_raw.split("\0") if part],
+        source="live CockroachDB process",
+    )
     process["live_argv"] = live_argv
+    process["live_go_max_procs"] = live_go_max_procs
     return process
+
+
+def _go_max_procs_from_environment(entries: object, *, source: str) -> int:
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, str) for entry in entries
+    ):
+        raise RuntimeError(f"capacity {source} environment is malformed")
+    matches = [entry for entry in entries if entry.partition("=")[0] == "GOMAXPROCS"]
+    if len(matches) != 1 or matches[0] != EXPECTED_GOMAXPROCS_ENV:
+        raise RuntimeError(
+            f"capacity {source} must contain exactly {EXPECTED_GOMAXPROCS_ENV}"
+        )
+    return EXPECTED_GO_MAX_PROCS
 
 
 def _query_single_integer(statement: str) -> int | None:
