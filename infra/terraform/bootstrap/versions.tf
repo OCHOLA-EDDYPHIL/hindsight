@@ -28,18 +28,5 @@ provider "aws" {
   }
 }
 
-provider "aws" {
-  alias  = "cold_region_recovery"
-  region = var.cold_region_recovery_region
-
-  default_tags {
-    tags = {
-      Project     = "hindsight"
-      Environment = var.stage
-      ManagedBy   = "terraform-bootstrap-recovery"
-    }
-  }
-}
-
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}

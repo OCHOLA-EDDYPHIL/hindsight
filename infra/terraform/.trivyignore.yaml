@@ -7,4 +7,5 @@ misconfigurations:
     paths:
       - app/main.tf
       - bootstrap/main.tf
+      - lifecycle/main.tf
     statement: Cost-bounded buckets use provider-managed S3 encryption instead of paid customer keys.

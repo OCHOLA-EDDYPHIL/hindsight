@@ -227,7 +227,7 @@ def run_lambda(env: dict[str, str]) -> None:
 
 def run_terraform(env: dict[str, str]) -> None:
     run(["terraform", "fmt", "-check", "-recursive", "infra/terraform"], env=env)
-    for component in ("bootstrap", "app", "edge"):
+    for component in ("bootstrap", "lifecycle", "app", "edge"):
         directory = f"infra/terraform/{component}"
         run(["terraform", f"-chdir={directory}", "init", "-backend=false", "-input=false"], env=env)
         run(["terraform", f"-chdir={directory}", "validate"], env=env)

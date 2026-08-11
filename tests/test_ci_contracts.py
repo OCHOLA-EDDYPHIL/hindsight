@@ -133,6 +133,7 @@ def test_security_audits_use_writable_cache_and_repo_scoped_exceptions():
     assert ignored_paths == {
         "app/main.tf",
         "bootstrap/main.tf",
+        "lifecycle/main.tf",
     }
     assert {entry["id"] for entry in ignore["misconfigurations"]} == {
         "AWS-0095",

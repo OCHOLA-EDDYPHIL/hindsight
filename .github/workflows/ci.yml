@@ -224,6 +224,9 @@ jobs:
       - run: terraform -chdir=infra/terraform/bootstrap init -backend=false -input=false -lockfile=readonly
       - run: terraform -chdir=infra/terraform/bootstrap validate
       - run: terraform -chdir=infra/terraform/bootstrap test
+      - run: terraform -chdir=infra/terraform/lifecycle init -backend=false -input=false -lockfile=readonly
+      - run: terraform -chdir=infra/terraform/lifecycle validate
+      - run: terraform -chdir=infra/terraform/lifecycle test
       - run: terraform -chdir=infra/terraform/app init -backend=false -input=false -lockfile=readonly
       - run: terraform -chdir=infra/terraform/app validate
       - run: terraform -chdir=infra/terraform/app test
