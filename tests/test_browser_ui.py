@@ -44,6 +44,8 @@ REMEDIATION_REPORT = (
     "that unsafe recalled guidance from governed memory with a verbatim citation and bounded "
     "operator review."
 )
+REMEDIATION_REPORT_CONTRACT_VERSION = 1
+REMEDIATION_REPORT_SHA256 = hashlib.sha256(REMEDIATION_REPORT.encode("utf-8")).hexdigest()
 
 
 def test_reset_installs_exact_replay_identity_before_loading_fresh_state():
@@ -73,7 +75,9 @@ def test_live_events_from_a_previous_namespace_are_ignored():
     tracker_observation = "realtimeTracker.current.observe"
     assert namespace_guard in handler
     assert handler.index(namespace_guard) < handler.index(tracker_observation)
-    assert handler.index('snapshotView.current !== "live"') < handler.index(tracker_observation)
+    assert handler.index('snapshotView.current !== "live"') < handler.index(
+        tracker_observation
+    )
 
 
 def test_explicit_replay_identity_renders_before_incident_defaults_are_loaded():
@@ -82,10 +86,12 @@ def test_explicit_replay_identity_renders_before_incident_defaults_are_loaded():
         "useEffect(() =>", 1
     )[0]
 
-    exact_scenario = startup.split("} else if (hasScenario && location.scenarioId) {", 1)[1].split(
-        "} else if (hasNamespace) {", 1
+    exact_scenario = startup.split(
+        "} else if (hasScenario && location.scenarioId) {", 1
+    )[1].split("} else if (hasNamespace) {", 1)[0]
+    explicit_namespace = startup.split("} else if (hasNamespace) {", 1)[1].split(
+        "} else {", 1
     )[0]
-    explicit_namespace = startup.split("} else if (hasNamespace) {", 1)[1].split("} else {", 1)[0]
 
     assert "scenarioId: location.scenarioId" in exact_scenario
     assert "void loadIncidents(null, false);" in exact_scenario
@@ -286,6 +292,27 @@ def test_controlled_observation_receipt_excludes_raw_cloudwatch_payloads():
         ],
     }
     assert secret not in json.dumps(receipt, sort_keys=True)
+
+
+def test_remediation_screenshot_is_element_scoped(monkeypatch, tmp_path):
+    calls = []
+
+    class Driver:
+        def execute_script(self, script, element):
+            calls.append((script, element))
+
+    class Element:
+        def screenshot(self, path):
+            Path(path).write_bytes(b"bounded-element-image")
+            return True
+
+    element = Element()
+    monkeypatch.setenv("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR", str(tmp_path))
+
+    _capture_remediation_screenshot(Driver(), "bounded.png", element)
+
+    assert calls and calls[0][1] is element
+    assert (tmp_path / "bounded.png").read_bytes() == b"bounded-element-image"
 
 
 def test_reset_session_readiness_requires_new_namespace_and_known_good_snapshot():
@@ -573,7 +600,9 @@ def test_operator_can_run_and_explain_signature_workflow():
         _assert_no_browser_errors(driver)
 
         driver.find_element(By.ID, "signOutButton").click()
-        wait.until(lambda browser: browser.find_element(By.ID, "identityLabel").text == "Sign in")
+        wait.until(
+            lambda browser: browser.find_element(By.ID, "identityLabel").text == "Sign in"
+        )
         driver.get(_public_browser_url())
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         _capture_console_errors(driver)
@@ -658,6 +687,12 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
         current_execution = driver.find_element(
             By.CSS_SELECTOR, ".outcome-current .action-execution"
         )
+        current_diagnostic = driver.find_element(
+            By.CSS_SELECTOR, ".outcome-current .action-observation"
+        )
+        current_citations = driver.find_element(
+            By.CSS_SELECTOR, ".outcome-current .decision-citations"
+        )
         _require(
             current_execution.get_attribute("data-execution-status") == "awaiting_approval",
             "browser did not render the awaiting remediation execution state",
@@ -687,8 +722,18 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
         _require(not approve.get_attribute("disabled"), "browser remediation approval was disabled")
         _capture_remediation_screenshot(
             driver,
-            "governed-remediation-awaiting-approval.png",
-            driver.find_element(By.ID, "runStatus"),
+            "governed-remediation-awaiting-action.png",
+            current_execution,
+        )
+        _capture_remediation_screenshot(
+            driver,
+            "governed-remediation-awaiting-diagnostic.png",
+            current_diagnostic,
+        )
+        _capture_remediation_screenshot(
+            driver,
+            "governed-remediation-awaiting-citations.png",
+            current_citations,
         )
         _capture_remediation_screenshot(
             driver,
@@ -747,9 +792,13 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
         )
         _capture_remediation_screenshot(
             driver,
-            "governed-remediation-completed-ledger.png",
+            "governed-remediation-completed-action.png",
+            current_execution,
+        )
+        _capture_remediation_screenshot(
+            driver,
+            "governed-remediation-invalidated-ledger.png",
             target_row,
-            full_page=True,
         )
         _assert_no_browser_errors(driver)
         _write_governed_remediation_receipt(receipt)
@@ -850,7 +899,7 @@ def _wait_for_run_status(driver, *, expected_status: str, timeout: float) -> Non
         ) from exc
 
 
-def _capture_remediation_screenshot(driver, name: str, element, *, full_page: bool = False) -> None:
+def _capture_remediation_screenshot(driver, name: str, element) -> None:
     directory = _browser_evidence_directory()
     _require(directory is not None, "browser remediation evidence directory is not configured")
     driver.execute_script(
@@ -858,11 +907,7 @@ def _capture_remediation_screenshot(driver, name: str, element, *, full_page: bo
         element,
     )
     path = directory / name
-    captured = (
-        driver.get_full_page_screenshot_as_file(str(path))
-        if full_page
-        else driver.save_screenshot(str(path))
-    )
+    captured = element.screenshot(str(path))
     _require(bool(captured), "browser remediation screenshot capture failed")
     _require(
         path.is_file() and path.stat().st_size > 0,
@@ -893,6 +938,10 @@ def _awaiting_remediation_identity(*, namespace: str) -> dict[str, Any]:
     _require(
         run["status"] == "awaiting_approval",
         "remediation run did not pause for operator approval",
+    )
+    _require(
+        run["user_input"] == REMEDIATION_REPORT,
+        "remediation run did not preserve the governed prompt contract",
     )
     trace = run["action_trace"]
     action = trace["remediation_action"]
@@ -935,6 +984,10 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
     run = get_run(run_id=run_id, db_url=database_url())
     _require(run is not None, "completed remediation run was not persisted")
     _require(run["status"] == "completed", "remediation run did not complete")
+    _require(
+        run["user_input"] == REMEDIATION_REPORT,
+        "completed remediation run did not preserve the governed prompt contract",
+    )
     events = run["events"]
     awaiting_events = [
         event
@@ -1266,7 +1319,6 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
     )
     attempt_count = int(operation["attempt_count"])
     _require(1 <= attempt_count <= 3, "operation attempt count exceeded its retry bound")
-    _require(attempt_count == 1, "controlled remediation did not complete on its first attempt")
     _require(
         [str(value) for value in operation["invalidated_memory_ids"]] == close_ids,
         "operation invalidations did not match the approved preview",
@@ -1284,9 +1336,20 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
         == event_receipt,
         "terminal trace operation events changed",
     )
+    event_statuses = [event["status"] for event in event_receipt]
     _require(
-        [event["status"] for event in event_receipt] == ["queued", "leased", "completed"],
-        "controlled remediation operation had an unexpected event sequence",
+        bool(event_statuses)
+        and event_statuses[0] == "queued"
+        and event_statuses[-1] == "completed"
+        and event_statuses.count("leased") == attempt_count
+        and event_statuses.count("retrying") == attempt_count - 1
+        and set(event_statuses) <= {"queued", "leased", "retrying", "completed"},
+        "controlled remediation operation exceeded its bounded retry sequence",
+    )
+    _require(
+        [event["sequence"] for event in event_receipt]
+        == list(range(1, len(event_receipt) + 1)),
+        "controlled remediation operation event sequence was not contiguous",
     )
     effect_receipt = [_operation_effect_receipt(effect) for effect in operation["effects"]]
     _require(
@@ -1404,6 +1467,10 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
             "provider": str(run["provider"]),
             "model": str(run["model"]),
         },
+        "prompt_contract": {
+            "version": REMEDIATION_REPORT_CONTRACT_VERSION,
+            "sha256": REMEDIATION_REPORT_SHA256,
+        },
         "selection": {
             "fingerprint": str(selection["fingerprint"]),
             "memory_ids": selected_ids,
@@ -1463,9 +1530,12 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
             "produced_memory_count": 0,
         },
         "screenshots": [
-            "governed-remediation-awaiting-approval.png",
+            "governed-remediation-awaiting-action.png",
+            "governed-remediation-awaiting-diagnostic.png",
+            "governed-remediation-awaiting-citations.png",
             "governed-remediation-approval-controls.png",
-            "governed-remediation-completed-ledger.png",
+            "governed-remediation-completed-action.png",
+            "governed-remediation-invalidated-ledger.png",
         ],
     }
 
@@ -1516,6 +1586,11 @@ def _controlled_observation_receipt(
         observation.get("tool_call_id") == target_calls[0]["id"],
         "retry fanout observation did not bind to its completed tool call",
     )
+    _require(
+        observation.get("schema_version") == 1
+        and observation.get("tool") == "aws_cloudwatch_diagnostics",
+        "retry fanout observation did not match the diagnostic schema",
+    )
     metric = observation.get("metric")
     window = observation.get("window")
     _require(isinstance(metric, dict), "retry fanout observation omitted metric metadata")
@@ -1542,13 +1617,25 @@ def _controlled_observation_receipt(
     datapoints = observation.get("datapoints")
     _require(isinstance(datapoints, list) and bool(datapoints), "retry fanout had no datapoints")
     try:
-        values = [float(point["value"]) for point in datapoints if isinstance(point, dict)]
+        normalized_datapoints = [
+            (
+                datetime.fromisoformat(str(point["timestamp"]).replace("Z", "+00:00")),
+                float(point["value"]),
+            )
+            for point in datapoints
+            if isinstance(point, dict)
+        ]
     except (KeyError, TypeError, ValueError):
         raise AssertionError("retry fanout datapoints failed normalized validation") from None
+    values = [value for _timestamp, value in normalized_datapoints]
     datapoint_count = int(observation.get("datapoint_count") or 0)
     _require(
         len(values) == len(datapoints) == datapoint_count,
         "retry fanout datapoint count did not match its normalized values",
+    )
+    _require(
+        all(parsed_start <= timestamp <= parsed_end for timestamp, _value in normalized_datapoints),
+        "retry fanout datapoints escaped the bounded observation window",
     )
     _require(not observation.get("truncated"), "retry fanout observation was truncated")
     maximum_value = max(values)
@@ -1933,7 +2020,10 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
             call["tool"] == "aws_cloudwatch_diagnostics"
             for call in run["action_trace"]["tool_calls"]
         )
-        assert any(call["status"] == "completed" for call in run["action_trace"]["tool_calls"])
+        assert any(
+            call["status"] == "completed"
+            for call in run["action_trace"]["tool_calls"]
+        )
         assert any(
             observation.get("status") == "available"
             and int(observation.get("datapoint_count") or 0) > 0

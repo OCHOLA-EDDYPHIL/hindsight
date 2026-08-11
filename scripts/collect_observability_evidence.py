@@ -80,6 +80,53 @@ EVENT_FIELDS = {
         "span_id",
     },
 }
+BROWSER_EVIDENCE_FIELDS = {
+    "operation_id",
+    "observed",
+    "persisted",
+    "signature",
+    "capture_errors",
+}
+BROWSER_OBSERVED_FIELDS = {"id", "operation_type", "status"}
+BROWSER_PERSISTED_FIELDS = {
+    "id",
+    "operation_type",
+    "status",
+    "invalidated_memory_ids",
+    "restored_memory_ids",
+    "events",
+    "effects",
+}
+BROWSER_EVENT_FIELDS = {"sequence", "status"}
+BROWSER_EFFECT_FIELDS = {
+    "sequence",
+    "effect_type",
+    "source_memory_id",
+    "result_memory_id",
+    "namespace",
+}
+BROWSER_SIGNATURE_FIELDS = {
+    "namespace",
+    "operation_id",
+    "invalidated_memory_ids",
+    "bad",
+    "corrected",
+}
+BROWSER_SIGNATURE_RUN_FIELDS = {
+    "run_id",
+    "decision_id",
+    "status",
+    "reflected_memory_id",
+    "selection_fingerprint",
+    "recommendation_id",
+    "approval_approved",
+    "execution_status",
+    "read_memory_ids",
+    "read_count",
+    "downstream_lineage_edge_count",
+}
+BROWSER_CAPTURE_ERROR_FIELDS = {"stage", "type"}
+BROWSER_CAPTURE_ERROR_STAGES = {"screenshot", "console", "operations", "database"}
 
 
 def _load_object(path: Path, label: str) -> dict[str, Any]:
@@ -94,6 +141,7 @@ def validate_browser_evidence(path: Path) -> tuple[str, str]:
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("browser operation evidence must be a JSON object")
+    _validate_browser_evidence_projection(value)
     signature = value.get("signature")
     corrected = signature.get("corrected") if isinstance(signature, dict) else None
     if not isinstance(corrected, dict):
@@ -104,6 +152,86 @@ def validate_browser_evidence(path: Path) -> tuple[str, str]:
     if corrected.get("status") != "completed":
         raise ValueError("browser operation evidence did not complete the corrected run")
     return run_id, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_browser_evidence_projection(value: dict[str, Any]) -> None:
+    _reject_unknown_browser_fields(value, BROWSER_EVIDENCE_FIELDS, "operation evidence")
+    for item in _browser_object_list(value.get("observed", []), "observed operation"):
+        _reject_unknown_browser_fields(item, BROWSER_OBSERVED_FIELDS, "observed operation")
+
+    persisted = value.get("persisted")
+    if persisted is not None:
+        if not isinstance(persisted, dict):
+            raise ValueError("persisted browser operation must be an object")
+        _reject_unknown_browser_fields(
+            persisted,
+            BROWSER_PERSISTED_FIELDS,
+            "persisted browser operation",
+        )
+        for event in _browser_object_list(
+            persisted.get("events", []), "persisted operation event"
+        ):
+            _reject_unknown_browser_fields(
+                event,
+                BROWSER_EVENT_FIELDS,
+                "persisted operation event",
+            )
+        for effect in _browser_object_list(
+            persisted.get("effects", []), "persisted operation effect"
+        ):
+            _reject_unknown_browser_fields(
+                effect,
+                BROWSER_EFFECT_FIELDS,
+                "persisted operation effect",
+            )
+
+    signature = value.get("signature")
+    if signature is not None:
+        if not isinstance(signature, dict):
+            raise ValueError("browser signature must be an object")
+        _reject_unknown_browser_fields(
+            signature,
+            BROWSER_SIGNATURE_FIELDS,
+            "browser signature",
+        )
+        for label in ("bad", "corrected"):
+            run = signature.get(label)
+            if run is None:
+                continue
+            if not isinstance(run, dict):
+                raise ValueError(f"browser signature {label} run must be an object")
+            _reject_unknown_browser_fields(
+                run,
+                BROWSER_SIGNATURE_RUN_FIELDS,
+                f"browser signature {label} run",
+            )
+
+    for error in _browser_object_list(
+        value.get("capture_errors", []), "browser capture error"
+    ):
+        _reject_unknown_browser_fields(
+            error,
+            BROWSER_CAPTURE_ERROR_FIELDS,
+            "browser capture error",
+        )
+        if (
+            error.get("stage") not in BROWSER_CAPTURE_ERROR_STAGES
+            or error.get("type") != "capture_failed"
+        ):
+            raise ValueError("browser capture error is not a stable code")
+
+
+def _browser_object_list(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"{label} collection must contain only objects")
+    return value
+
+
+def _reject_unknown_browser_fields(
+    value: dict[str, Any], allowed: set[str], label: str
+) -> None:
+    if set(value) - allowed:
+        raise ValueError(f"{label} contains unexpected fields")
 
 
 def validate_provenance(
