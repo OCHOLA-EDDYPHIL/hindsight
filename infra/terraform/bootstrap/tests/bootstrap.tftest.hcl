@@ -21,14 +21,16 @@ mock_provider "aws" {
   }
 
   mock_resource "aws_acm_certificate" {
+    override_during = plan
+
     defaults = {
       arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
       domain_validation_options = [
         {
           domain_name           = "hindsight.example.com"
-          resource_record_name  = "_validation.hindsight.example.com"
+          resource_record_name  = "_validation.hindsight.example.com."
           resource_record_type  = "CNAME"
-          resource_record_value = "_validation.acm-validations.aws"
+          resource_record_value = "_validation.acm-validations.aws."
         }
       ]
     }
@@ -67,6 +69,15 @@ run "isolated_bootstrap" {
   assert {
     condition     = aws_iam_role.github_deploy.name == "hindsight-github-deploy"
     error_message = "The GitHub OIDC deployment role must remain stable."
+  }
+
+  assert {
+    condition = (
+      cloudflare_dns_record.acm_validation["hindsight.example.com"].name == "_validation.hindsight.example.com" &&
+      cloudflare_dns_record.acm_validation["hindsight.example.com"].content == "_validation.acm-validations.aws" &&
+      toset(aws_acm_certificate_validation.demo.validation_record_fqdns) == toset(["_validation.hindsight.example.com."])
+    )
+    error_message = "ACM validation records must use Cloudflare's canonical dotless DNS representation."
   }
 
   assert {
