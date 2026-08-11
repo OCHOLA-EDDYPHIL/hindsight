@@ -12,8 +12,7 @@ concurrency:
 jobs:
   authorize:
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
-    permissions:
-      contents: read
+    permissions: {}
     outputs:
       source_revision: ${{ steps.authorization.outputs.source_revision }}
     steps:
@@ -66,6 +65,7 @@ jobs:
       PLAN_DIR: ${{ runner.temp }}/hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}
       PLAN_ROLE_ARN: ${{ vars.AWS_BOOTSTRAP_PLAN_ROLE_ARN }}
       SOURCE_REVISION: ${{ needs.authorize.outputs.source_revision }}
+      TF_DATA_DIR: ${{ runner.temp }}/hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}/terraform-data
       TF_IN_AUTOMATION: "true"
       TF_PLUGIN_CACHE_DIR: ${{ runner.temp }}/hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}/plugin-cache
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
@@ -107,11 +107,13 @@ jobs:
           test "$RUNNER_TEMP" != "/"
           test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"
           test "$PLAN_DIR" = "$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test "$TF_DATA_DIR" = "$PLAN_DIR/terraform-data"
           test "$TF_PLUGIN_CACHE_DIR" = "$PLAN_DIR/plugin-cache"
           test "$PLAN_DIR" != "$RUNNER_TEMP"
           test ! -e "$PLAN_DIR"
           mkdir -m 0700 -- "$PLAN_DIR"
           mkdir -m 0700 -- "$PLAN_DIR/plugin-cache"
+          mkdir -m 0700 -- "$PLAN_DIR/terraform-data"
       - name: Verify protected planning configuration
         shell: bash
         run: |

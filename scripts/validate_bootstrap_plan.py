@@ -17,6 +17,13 @@ TERRAFORM_VERSION = "1.13.5"
 EXPECTED_REPOSITORY = "OCHOLA-EDDYPHIL/hindsight"
 EXPECTED_WORKFLOW = ".github/workflows/plan-bootstrap.yml"
 EXPECTED_AWS_ACCOUNT_ID = "762397612117"
+REQUIRED_CHECKS = frozenset(
+    {
+        "check.expected_aws_account",
+        "check.state_bucket_scope",
+    }
+)
+VALID_CHECK_KINDS = frozenset({"check", "output_value", "resource", "var"})
 ALLOWED_DATA_REMOVALS = frozenset({"data.aws_s3_bucket.state"})
 ALLOWED_OUTPUT_REMOVALS = frozenset(
     {
@@ -224,11 +231,135 @@ def _action_counts(entries: list[dict[str, Any]]) -> dict[str, int]:
     return {action: counts[action] for action in sorted(counts)}
 
 
+def _check_identity(address: Any, *, subject: str, require_kind: bool) -> dict[str, str]:
+    if not isinstance(address, dict):
+        raise ValueError(f"{subject} is missing its address object")
+    to_display = address.get("to_display")
+    if not isinstance(to_display, str) or not to_display or len(to_display) > 512:
+        raise ValueError(f"{subject} has an invalid display address")
+    identity = {"to_display": to_display}
+    if require_kind:
+        kind = address.get("kind")
+        name = address.get("name")
+        if kind not in VALID_CHECK_KINDS:
+            raise ValueError(f"{subject} has an unsupported check kind")
+        if not isinstance(name, str) or not name or len(name) > 256:
+            raise ValueError(f"{subject} has an invalid check name")
+        identity.update({"kind": kind, "name": name})
+        if kind == "resource":
+            mode = address.get("mode")
+            resource_type = address.get("type")
+            if mode not in {"data", "managed"}:
+                raise ValueError(f"{subject} has an unsupported resource mode")
+            if (
+                not isinstance(resource_type, str)
+                or not resource_type
+                or len(resource_type) > 256
+            ):
+                raise ValueError(f"{subject} has an invalid resource type")
+            expected_suffix = f"{resource_type}.{name}"
+            identity.update({"mode": mode, "type": resource_type})
+        else:
+            prefix = {
+                "check": "check",
+                "output_value": "output",
+                "var": "var",
+            }[kind]
+            expected_suffix = f"{prefix}.{name}"
+        if to_display != expected_suffix and not to_display.endswith(
+            f".{expected_suffix}"
+        ):
+            raise ValueError(f"{subject} address is inconsistent")
+    return identity
+
+
+def _check_summaries(entries: Any) -> list[dict[str, Any]]:
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Terraform plan checks must be a complete non-empty list")
+    summaries: list[dict[str, Any]] = []
+    aggregate_addresses: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Terraform plan check entries must be JSON objects")
+        identity = _check_identity(
+            entry.get("address"), subject="Terraform plan check", require_kind=True
+        )
+        display = identity["to_display"]
+        if display in aggregate_addresses:
+            raise ValueError(f"Terraform plan contains duplicate check identity: {display}")
+        aggregate_addresses.add(display)
+        if entry.get("status") != "pass":
+            raise ValueError(f"Terraform plan check did not pass: {display}")
+        if entry.get("problems") not in (None, []):
+            raise ValueError(f"Terraform plan check contains problems: {display}")
+        instances = entry.get("instances", [])
+        if not isinstance(instances, list) or (
+            not instances and identity["kind"] != "resource"
+        ):
+            raise ValueError(f"Terraform plan check instances are incomplete: {display}")
+        instance_summaries: list[dict[str, str]] = []
+        instance_addresses: set[str] = set()
+        for instance in instances:
+            if not isinstance(instance, dict):
+                raise ValueError(f"Terraform plan check instance is malformed: {display}")
+            instance_identity = _check_identity(
+                instance.get("address"),
+                subject=f"Terraform plan check instance {display}",
+                require_kind=False,
+            )
+            instance_display = instance_identity["to_display"]
+            if instance_display != display and not instance_display.startswith(
+                f"{display}["
+            ):
+                raise ValueError(
+                    f"Terraform plan check instance address is inconsistent: {instance_display}"
+                )
+            if instance_display in instance_addresses:
+                raise ValueError(
+                    f"Terraform plan contains duplicate check instance: {instance_display}"
+                )
+            instance_addresses.add(instance_display)
+            if instance.get("status") != "pass":
+                raise ValueError(
+                    f"Terraform plan check instance did not pass: {instance_display}"
+                )
+            if instance.get("problems") not in (None, []):
+                raise ValueError(
+                    f"Terraform plan check instance contains problems: {instance_display}"
+                )
+            instance_summaries.append(
+                {"status": "pass", "to_display": instance_display}
+            )
+        summaries.append(
+            {
+                **identity,
+                "instances": sorted(
+                    instance_summaries, key=lambda row: row["to_display"]
+                ),
+                "status": "pass",
+            }
+        )
+    observed_required = {
+        summary["to_display"]
+        for summary in summaries
+        if summary["to_display"] in REQUIRED_CHECKS
+        and summary["kind"] == "check"
+        and summary["name"] == summary["to_display"].removeprefix("check.")
+    }
+    missing = sorted(REQUIRED_CHECKS - observed_required)
+    if missing:
+        raise ValueError(
+            "Terraform plan is missing required checks: " + ", ".join(missing)
+        )
+    return sorted(summaries, key=lambda row: row["to_display"])
+
+
 def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """Validate a full Terraform plan JSON document and summarize every action."""
 
     required = {
         "applyable",
+        "checks",
         "complete",
         "configuration",
         "errored",
@@ -257,6 +388,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if _has_sensitive_marker(plan):
         raise ValueError("Terraform plan contains sensitive values and cannot be retained")
 
+    checks = _check_summaries(plan["checks"])
     changes = _resource_actions(plan["resource_changes"], kind="resource_changes")
     drift = _resource_actions(plan.get("resource_drift", []), kind="resource_drift")
     outputs = _output_actions(plan["output_changes"])
@@ -272,6 +404,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return {
         "action_counts": _action_counts(all_entries),
         "applyable": plan["applyable"],
+        "checks": checks,
         "complete": True,
         "observed_allowed_removals": {
             "data_resources": observed_data_removals,
@@ -284,6 +417,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "terraform_version": TERRAFORM_VERSION,
         "totals": {
+            "checks": len(checks),
             "output_changes": len(outputs),
             "resource_changes": len(changes),
             "resource_drift": len(drift),

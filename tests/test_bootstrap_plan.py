@@ -92,6 +92,20 @@ def _plan(validator):
             },
         },
         "configuration": {"root_module": {}},
+        "checks": [
+            {
+                "address": {
+                    "kind": "check",
+                    "name": name.removeprefix("check."),
+                    "to_display": name,
+                },
+                "status": "pass",
+                "instances": [
+                    {"address": {"to_display": name}, "status": "pass"}
+                ],
+            }
+            for name in sorted(validator.REQUIRED_CHECKS)
+        ],
         "applyable": True,
         "complete": True,
         "errored": False,
@@ -124,6 +138,7 @@ def test_validator_records_every_resource_drift_and_output_action():
         "learning_corpus_kms_key_arn",
     ]
     assert summary["totals"] == {
+        "checks": 2,
         "resource_changes": 3,
         "resource_drift": 1,
         "output_changes": 2,
@@ -133,6 +148,179 @@ def test_validator_records_every_resource_drift_and_output_action():
         "data_resources": ["data.aws_s3_bucket.state"],
         "outputs": ["learning_corpus_kms_key_arn"],
     }
+    assert [row["to_display"] for row in summary["checks"]] == sorted(
+        validator.REQUIRED_CHECKS
+    )
+    assert all(row["status"] == "pass" for row in summary["checks"])
+
+
+@pytest.mark.parametrize("status", ["fail", "error", "unknown"])
+def test_validator_rejects_nonpassing_check_statuses(status):
+    validator = _validator()
+    aggregate = _plan(validator)
+    aggregate["checks"][0]["status"] = status
+    with pytest.raises(ValueError, match="check did not pass"):
+        validator.validate_plan(aggregate)
+
+    instance = _plan(validator)
+    instance["checks"][0]["instances"][0]["status"] = status
+    with pytest.raises(ValueError, match="instance did not pass"):
+        validator.validate_plan(instance)
+
+
+@pytest.mark.parametrize("checks", [None, [], {}, ["malformed"]])
+def test_validator_rejects_incomplete_or_malformed_checks(checks):
+    validator = _validator()
+    plan = _plan(validator)
+    plan["checks"] = checks
+    with pytest.raises(ValueError, match="checks|check entries"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_missing_duplicate_and_problematic_checks():
+    validator = _validator()
+    missing = _plan(validator)
+    missing["checks"] = missing["checks"][:1]
+    with pytest.raises(ValueError, match="missing required checks"):
+        validator.validate_plan(missing)
+
+    duplicate = _plan(validator)
+    duplicate["checks"].append(duplicate["checks"][0])
+    with pytest.raises(ValueError, match="duplicate check identity"):
+        validator.validate_plan(duplicate)
+
+    problems = _plan(validator)
+    problems["checks"][0]["instances"][0]["problems"] = [
+        {"message": "must not be persisted"}
+    ]
+    with pytest.raises(ValueError, match="contains problems"):
+        validator.validate_plan(problems)
+
+    wrong_identity = _plan(validator)
+    wrong_identity["checks"][0]["address"].update(
+        {"name": "not_required", "to_display": "check.not_required"}
+    )
+    wrong_identity["checks"][0]["instances"][0]["address"][
+        "to_display"
+    ] = "check.not_required"
+    with pytest.raises(ValueError, match="missing required checks"):
+        validator.validate_plan(wrong_identity)
+
+    aggregate_problems = _plan(validator)
+    aggregate_problems["checks"][0]["problems"] = [
+        {"message": "must not be persisted"}
+    ]
+    with pytest.raises(ValueError, match="check contains problems"):
+        validator.validate_plan(aggregate_problems)
+
+    malformed_resource = _plan(validator)
+    malformed_resource["checks"].append(
+        {
+            "address": {
+                "kind": "resource",
+                "name": "x",
+                "to_display": "garbage",
+            },
+            "status": "pass",
+        }
+    )
+    with pytest.raises(ValueError, match="resource mode"):
+        validator.validate_plan(malformed_resource)
+
+
+def test_validator_records_passing_resource_preconditions():
+    validator = _validator()
+    plan = _plan(validator)
+    plan["checks"].append(
+        {
+            "address": {
+                "kind": "resource",
+                "mode": "managed",
+                "name": "github_deploy",
+                "to_display": "aws_iam_role_policy.github_deploy",
+                "type": "aws_iam_role_policy",
+            },
+            "status": "pass",
+            "instances": [
+                {
+                    "address": {
+                        "to_display": "aws_iam_role_policy.github_deploy"
+                    },
+                    "status": "pass",
+                }
+            ],
+        }
+    )
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["totals"]["checks"] == 3
+    resource_check = next(
+        row
+        for row in summary["checks"]
+        if row["to_display"] == "aws_iam_role_policy.github_deploy"
+    )
+    assert resource_check == {
+        "instances": [
+            {
+                "status": "pass",
+                "to_display": "aws_iam_role_policy.github_deploy",
+            }
+        ],
+        "kind": "resource",
+        "mode": "managed",
+        "name": "github_deploy",
+        "status": "pass",
+        "to_display": "aws_iam_role_policy.github_deploy",
+        "type": "aws_iam_role_policy",
+    }
+
+
+def test_validator_accepts_real_shaped_output_and_zero_count_resource_checks():
+    validator = _validator()
+    plan = _plan(validator)
+    plan["checks"].extend(
+        [
+            {
+                "address": {
+                    "kind": "output_value",
+                    "name": "deployment_ready",
+                    "to_display": "output.deployment_ready",
+                },
+                "status": "pass",
+                "instances": [
+                    {
+                        "address": {"to_display": "output.deployment_ready"},
+                        "status": "pass",
+                    }
+                ],
+            },
+            {
+                "address": {
+                    "kind": "resource",
+                    "mode": "managed",
+                    "name": "zero",
+                    "to_display": "terraform_data.zero",
+                    "type": "terraform_data",
+                },
+                "status": "pass",
+            },
+        ]
+    )
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["totals"]["checks"] == 4
+    zero = next(
+        row for row in summary["checks"] if row["to_display"] == "terraform_data.zero"
+    )
+    assert zero["instances"] == []
+    output = next(
+        row
+        for row in summary["checks"]
+        if row["to_display"] == "output.deployment_ready"
+    )
+    assert output["kind"] == "output_value"
 
 
 def test_validator_rejects_incomplete_error_and_sensitive_plans():
@@ -300,6 +488,7 @@ def test_manifest_binds_exact_files_metadata_actions_and_unchanged_state(tmp_pat
     }
     assert json.loads(paths["manifest"].read_text()) == manifest
     assert json.loads(paths["actions"].read_text())["totals"] == {
+        "checks": 2,
         "resource_changes": 3,
         "resource_drift": 1,
         "output_changes": 2,
@@ -371,7 +560,7 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
         "cancel-in-progress": False,
     }
     assert authorize["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
-    assert authorize["permissions"] == {"contents": "read"}
+    assert authorize["permissions"] == {}
     authorization = authorize["steps"][0]["run"]
     for required in (
         '"$EVENT_NAME" == "workflow_dispatch"',
@@ -440,6 +629,13 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
     assert "-destroy" not in text
     assert "-refresh=false" not in text
     assert text.count("secrets.CLOUDFLARE_API_TOKEN") == 1
+    assert "TF_DATA_DIR" in plan["env"]
+    assert plan["env"]["TF_DATA_DIR"].endswith("/terraform-data")
+    prepare = next(
+        step for step in plan["steps"] if step.get("name") == "Prepare exact temporary workspace"
+    )
+    assert 'test "$TF_DATA_DIR" = "$PLAN_DIR/terraform-data"' in prepare["run"]
+    assert 'mkdir -m 0700 -- "$PLAN_DIR/terraform-data"' in prepare["run"]
 
     before = next(
         step for step in plan["steps"] if step.get("name") == "Record state provenance before planning"
