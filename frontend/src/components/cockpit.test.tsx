@@ -12,7 +12,7 @@ import {
   StoryHeader,
   Timeline,
 } from "@/components/cockpit";
-import type { SignatureScenario, Snapshot } from "@/types";
+import type { Run, SignatureScenario, Snapshot } from "@/types";
 
 const scenario: SignatureScenario = {
   scenario_id: "49109a44-43e7-40de-b547-b4f9d0a387a2",
@@ -211,6 +211,40 @@ const snapshot: Snapshot = {
   ],
 };
 
+const remediationActionTrace: NonNullable<Run["action_trace"]> = {
+  schema_version: 3,
+  mode: "governed_memory_remediation",
+  selection: { fingerprint: "b".repeat(64) },
+  remediation_action: {
+    id: `remediation_action:${"a".repeat(64)}`,
+    name: "retract_recalled_memory",
+    target_memory_id: "memory-unsafe",
+    target_excerpt: "Increase retry fanout during saturation.",
+  },
+  preview: {
+    id: "preview-1",
+    fingerprint: "d".repeat(64),
+    expires_at: "2026-08-10T23:15:00Z",
+    effect_count: 2,
+    effects: {
+      close_memory_ids: ["memory-unsafe"],
+      review_resolutions: [
+        {
+          id: "review-unsafe",
+          semantic_memory_id: "memory-unsafe",
+          status: "superseded",
+        },
+      ],
+    },
+  },
+  execution: {
+    status: "completed",
+    mode: "governed_memory_remediation",
+    operation_id: "operation-1",
+    operation_status: "completed",
+  },
+};
+
 describe("guided replay cockpit", () => {
   it("renders the four recorded causal nodes before any raw identity", () => {
     render(<CausalRail scenario={scenario} snapshot={snapshot} activeRun={null} />);
@@ -298,6 +332,8 @@ describe("guided replay cockpit", () => {
 
     expect(screen.getByText("Historical outcome")).toBeVisible();
     expect(screen.getByText("Current outcome")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Rejected recommendation" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Recovered recommendation" })).toBeVisible();
     expect(screen.getAllByText("Cause")).toHaveLength(2);
     expect(screen.getAllByText("Checks")).toHaveLength(2);
     expect(screen.getAllByText("Action")).toHaveLength(2);
@@ -352,6 +388,62 @@ describe("guided replay cockpit", () => {
     const request = container.querySelector(".action-execution");
     expect(request).toHaveAttribute("data-execution-status", "awaiting_approval");
     expect(request).toHaveTextContent("gemini / gemini-2.5-flash");
+  });
+
+  it("shows the governed retraction target, preview, and completed result", () => {
+    const { container } = render(
+      <OutcomeComparison
+        scenario={null}
+        activeRun={{
+          id: "run-action",
+          status: "completed",
+          action_trace: remediationActionTrace,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Completed governed-memory retraction" }),
+    ).toBeVisible();
+    const result = container.querySelector(".action-execution");
+    expect(result).toHaveTextContent("Increase retry fanout during saturation.");
+    expect(result).toHaveTextContent("2 bounded mutations");
+    expect(result).toHaveTextContent("Close memory memory-unsafe");
+    expect(result).toHaveTextContent(
+      "Resolve review review-unsafe for memory memory-unsafe as superseded",
+    );
+    expect(result).toHaveTextContent("Preview dddddddd");
+    expect(result).toHaveTextContent("Operation operation-1: completed");
+  });
+
+  it("names a rejected governed retraction without relabeling ordinary recommendations", () => {
+    const rejectedRemediation: SignatureScenario = {
+      ...scenario,
+      runs: [
+        {
+          ...scenario.runs[0],
+          action_trace: {
+            ...remediationActionTrace,
+            approval: { approved: false, disposition: "rejected" },
+            execution: {
+              status: "not_executed",
+              mode: "governed_memory_remediation",
+            },
+          },
+        },
+        scenario.runs[1],
+      ],
+    };
+
+    render(<OutcomeComparison scenario={rejectedRemediation} activeRun={null} />);
+
+    expect(
+      screen.getByRole("heading", { name: "Rejected governed-memory retraction" }),
+    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Recovered recommendation" })).toBeVisible();
+    expect(
+      screen.queryByRole("heading", { name: "Rejected recommendation" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders model Markdown without exposing syntax as the primary presentation", () => {

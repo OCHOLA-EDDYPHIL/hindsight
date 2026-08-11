@@ -377,21 +377,24 @@ def test_browser_contract_inventories_have_explicit_local_hosted_parity():
         "tests/test_hosted_acceptance.py::"
         "test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe",
     )
+    expected_hosted_browser = (
+        "tests/test_browser_ui.py::"
+        "test_operator_can_approve_model_selected_governed_memory_retraction",
+        expected_infrastructure[1],
+    )
 
     assert acceptance.SHARED_BROWSER_CONTRACT_SELECTORS == expected_shared
     assert acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS == expected_infrastructure
+    assert acceptance.HOSTED_ONLY_BROWSER_CONTRACT_SELECTORS == expected_hosted_browser
+    assert acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS[0] == expected_hosted_browser[0]
     assert set(expected_shared).issubset(acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS)
     assert set(expected_shared).issubset(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
-    assert set(expected_shared).isdisjoint(expected_infrastructure)
-    assert (
-        set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
-        - set(acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS)
-        == set(acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"])
-    )
-    assert (
-        set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS)
-        - set(acceptance.HOSTED_ONLY_INFRASTRUCTURE_SELECTORS_BY_PHASE["browser"])
-        == set(expected_shared)
+    assert set(expected_shared).isdisjoint(expected_hosted_browser)
+    assert set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS) - set(
+        acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS
+    ) == set(expected_hosted_browser)
+    assert set(acceptance.HOSTED_BROWSER_PRODUCT_SELECTORS) - set(expected_hosted_browser) == set(
+        expected_shared
     )
 
 

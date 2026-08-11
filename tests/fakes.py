@@ -21,12 +21,13 @@ def recommendation_decision(
 ) -> str:
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "diagnosis": diagnosis,
             "recalled_memory_citations": citations or [],
             "next_step_kind": "recommendation",
             "tool_call": None,
             "recommendation": recommendation,
+            "remediation_action": None,
             "rationale": "The recommendation is bounded and follows the available evidence.",
             "rollback": "Restore the previous retry policy if the service degrades.",
             "verification": ["Confirm latency and queue depth return to their expected range."],
@@ -39,7 +40,7 @@ def recommendation_decision(
 def diagnostic_decision(query_key: str) -> str:
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "diagnosis": "Current telemetry is required before recommending a mitigation.",
             "recalled_memory_citations": [],
             "next_step_kind": "diagnostic_tool",
@@ -48,10 +49,39 @@ def diagnostic_decision(query_key: str) -> str:
                 "query_key": query_key,
             },
             "recommendation": None,
+            "remediation_action": None,
             "rationale": "The configured metric can confirm the suspected failure mode.",
             "rollback": "No rollback is required because the diagnostic is read-only.",
             "verification": ["Use the returned datapoints in the next reasoning turn."],
             "safety_constraints": ["Run only the server-configured metric query."],
+        },
+        sort_keys=True,
+    )
+
+
+def retraction_decision(
+    *,
+    memory_id: str,
+    quote: str,
+    reason: str = "Retract recalled guidance that conflicts with the current observation.",
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 2,
+            "diagnosis": "The cited guidance is unsafe for the observed incident state.",
+            "recalled_memory_citations": [{"memory_id": memory_id, "quote": quote}],
+            "next_step_kind": "remediation_action",
+            "tool_call": None,
+            "recommendation": None,
+            "remediation_action": {
+                "name": "retract_recalled_memory",
+                "target_memory_id": memory_id,
+                "reason": reason,
+            },
+            "rationale": "Removing the governed guidance prevents it from directing later runs.",
+            "rollback": "Restore a reviewed replacement through the governed correction workflow.",
+            "verification": ["Confirm the targeted version is no longer current."],
+            "safety_constraints": ["Retract only the cited memory in this namespace."],
         },
         sort_keys=True,
     )

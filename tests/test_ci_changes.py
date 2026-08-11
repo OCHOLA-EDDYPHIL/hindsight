@@ -154,8 +154,21 @@ def test_ci_control_and_unknown_paths_fail_closed(event_name: str, path: str):
             selection("python_static", "database", "main_qualification"),
         ),
         (
+            ".github/workflows/plan-bootstrap.yml",
+            selection("python_static", "terraform"),
+        ),
+        (
             ".github/workflows/recovery-drill.yml",
             selection("python_static", "database", "main_qualification"),
+        ),
+        (
+            ".github/workflows/provision-lifecycle-fixture.yml",
+            selection(
+                "python_static",
+                "database",
+                "main_qualification",
+                "terraform",
+            ),
         ),
         (
             ".github/workflows/tenant-lifecycle.yml",
@@ -176,6 +189,25 @@ def test_manual_workflow_controls_select_only_owned_components(
     path: str, expected: dict[str, bool]
 ):
     assert classify_paths([path], event_name="pull_request") == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/provision_lifecycle_database_credential.py",
+        "scripts/provision_lifecycle_fixture.py",
+    ],
+)
+def test_lifecycle_provisioners_select_database_checks(path: str):
+    assert classify_paths([path], event_name="pull_request") == selection(
+        "python_static", "database"
+    )
+
+
+def test_bootstrap_plan_validator_selects_static_and_terraform_checks():
+    assert classify_paths(
+        ["scripts/validate_bootstrap_plan.py"], event_name="pull_request"
+    ) == selection("python_static", "terraform")
 
 
 @pytest.mark.parametrize("event_name", ["pull_request", "push"])

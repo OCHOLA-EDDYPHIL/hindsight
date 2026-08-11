@@ -132,6 +132,84 @@ def test_diagnostic_action_is_selected_only_by_structured_model_output():
     assert "role" not in provider.requests[0].prompt
 
 
+def test_model_selected_retraction_preview_is_capped_at_ten_causal_effects():
+    from hindsight.agent import AgentDecisionError, _bounded_retraction_effects
+
+    effects = _bounded_retraction_effects(
+        {
+            "effect_payload": {
+                "close_memory_ids": [f"memory-{index}" for index in range(9)],
+                "review_resolutions": [
+                    {
+                        "id": "review-1",
+                        "semantic_memory_id": "memory-0",
+                        "status": "superseded",
+                    }
+                ],
+            }
+        }
+    )
+    assert effects["mutation_count"] == 10
+    assert effects["review_resolutions"][0]["id"] == "review-1"
+    with pytest.raises(AgentDecisionError, match="between one and ten mutations"):
+        _bounded_retraction_effects(
+            {
+                "effect_payload": {
+                    "close_memory_ids": [f"memory-{index}" for index in range(10)],
+                    "review_resolutions": [{"id": "review-1"}],
+                }
+            }
+        )
+
+
+def test_context_invalid_recommendation_repairs_to_required_diagnostic():
+    from hindsight.agent import _generate_agent_decision
+    from tests.fakes import (
+        SequencedReasoningProvider,
+        diagnostic_decision,
+        recommendation_decision,
+    )
+
+    invalid_recommendation = recommendation_decision(
+        "Inspect the worker before collecting current telemetry."
+    )
+    provider = SequencedReasoningProvider(
+        [
+            invalid_recommendation,
+            diagnostic_decision("payments.checkout_latency_ms"),
+        ]
+    )
+    state = {
+        "run_id": "run-repair",
+        "decision_id": "decision-repair",
+        "namespace": "worker-recovery",
+        "incident_id": "worker-recovery",
+        "user_input": "A scheduled command remains pending beyond its dispatch window",
+        "recalled_memories": [],
+        "observations": [],
+        "model_turn_count": 0,
+        "diagnostic_call_count": 0,
+    }
+
+    decision, _, turns = _generate_agent_decision(
+        state,
+        provider=provider,
+        allowed_query_keys={"payments.checkout_latency_ms"},
+    )
+
+    assert decision.next_step_kind == "diagnostic_tool"
+    assert turns == 2
+    assert len(provider.requests) == 2
+    assert (
+        "Stable repair reason: current_diagnostic_observation_required."
+        in provider.requests[1].prompt
+    )
+    assert invalid_recommendation not in provider.requests[1].prompt
+    assert provider.requests[1].response_json_schema["properties"]["next_step_kind"]["enum"] == [
+        "diagnostic_tool"
+    ]
+
+
 def test_review_required_memory_cannot_claim_positive_guidance():
     from hindsight.agent import _governed_guidance_envelope
 
@@ -238,6 +316,143 @@ def test_reflection_marks_only_cited_recalled_memories_as_causal(monkeypatch):
     assert captured["structured_payload"]["cited_memory_ids"] == ["memory-cited"]
 
 
+def test_reused_thread_resets_all_per_run_checkpoint_state(monkeypatch):
+    import hindsight.agent as agent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        SequencedReasoningProvider,
+        recommendation_decision,
+        retraction_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    class FakeMemoryStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            pass
+
+        def remember_agent_reflection(self, **_kwargs):
+            return {"id": "reflection-old", "belief_id": "belief-old"}
+
+    current_memory = {
+        "id": "memory-current",
+        "namespace": "namespace-reused",
+        "belief_id": "belief-current",
+        "version_number": 1,
+        "content": "Increase retry fanout while the processor remains saturated.",
+        "trust_status": "active",
+    }
+
+    def fake_recall(state, **_kwargs):
+        return {
+            "recalled_memories": [current_memory] if state["run_id"] == "run-new" else [],
+            "retrieval_id": f"retrieval:{state['run_id']}",
+            "selection_namespace_revision": 2,
+        }
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(agent, "_recall_for_state", fake_recall)
+    monkeypatch.setattr(agent, "MemoryStore", FakeMemoryStore)
+    monkeypatch.setattr(
+        agent,
+        "preview_retraction",
+        lambda **_kwargs: {
+            "id": "preview-new",
+            "fingerprint": "f" * 64,
+            "expires_at": "2026-08-10T23:15:00Z",
+            "effect_payload": {
+                "close_memory_ids": ["memory-current"],
+                "review_resolutions": [],
+            },
+        },
+    )
+    reasoning = SequencedReasoningProvider(
+        [
+            recommendation_decision("Retain the first run only as an audit record."),
+            retraction_decision(
+                memory_id="memory-current",
+                quote="Increase retry fanout while the processor remains saturated.",
+            ),
+        ]
+    )
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ).compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-reused"}}
+    old = agent._new_incident_state(
+        agent.IncidentInput(
+            user_input="first report",
+            incident_id="incident-old",
+            namespace="namespace-reused",
+        ),
+        thread_id="thread-reused",
+        run_id="run-old",
+        decision_id="decision-old",
+        pause_before_act=False,
+        model_call_count=0,
+        diagnostic_call_count=0,
+    )
+    old.update(
+        {
+            "approval_namespace_revision": 99,
+            "stale_replan_count": 1,
+            "operation_result": {"id": "operation-old"},
+            "action_preview": {"id": "preview-old"},
+            "approval_actor": "actor-old",
+            "tool_calls": [{"id": "tool-old"}],
+            "observations": [{"id": "observation-old"}],
+        }
+    )
+    first = graph.invoke(old, config)
+    assert first["reflected_memory"]["id"] == "reflection-old"
+    assert first["operation_result"]["id"] == "operation-old"
+
+    new = agent._new_incident_state(
+        agent.IncidentInput(
+            user_input="second report",
+            incident_id="incident-new",
+            namespace="namespace-reused",
+        ),
+        thread_id="thread-reused",
+        run_id="run-new",
+        decision_id="decision-new",
+        pause_before_act=False,
+        model_call_count=0,
+        diagnostic_call_count=0,
+    )
+    assert set(new) == set(agent.IncidentAgentState.__annotations__)
+    second = graph.invoke(new, config)
+
+    assert second["run_id"] == "run-new"
+    assert second["recommendation_id"] == ""
+    assert second["reflected_memory"] == {}
+    assert second["operation_result"] == {}
+    assert second["stale_replan_count"] == 0
+    assert second["approval_namespace_revision"] == 0
+    assert second["tool_calls"] == []
+    assert second["observations"] == []
+    assert second["approval_actor"] == "agent:no_operator"
+    assert second["action_preview"]["id"] == "preview-new"
+    assert second["action_trace"]["mode"] == "governed_memory_remediation"
+    assert second["action_approved"] is False
+
+
 def test_graph_records_cloudwatch_result_then_replans_to_recommendation(monkeypatch):
     import hindsight.agent as agent
     from tests.fakes import (
@@ -341,6 +556,299 @@ def test_graph_records_cloudwatch_result_then_replans_to_recommendation(monkeypa
     assert state["guidance_eligible"] is False
     assert state["reflected_memory"]["id"] == "reflection-1"
     assert "842.5" in reasoning.requests[1].prompt
+
+
+def test_approved_model_selected_retraction_executes_governed_operation(monkeypatch):
+    import hindsight.agent as agent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.types import Command
+    from hindsight.tenant import tenant_scope
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        FakeCloudWatchDiagnostics,
+        SequencedReasoningProvider,
+        diagnostic_decision,
+        retraction_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    memory = {
+        "id": "memory-unsafe",
+        "namespace": "namespace-action",
+        "belief_id": "belief-unsafe",
+        "version_number": 1,
+        "content": "Increase retry fanout while the processor is saturated.",
+        "trust_status": "active",
+        "metadata": {"usage_instruction": "positive_guidance"},
+    }
+    operation_calls = []
+    operation_id = uuid4()
+    event_id = uuid4()
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(
+        agent,
+        "_recall_for_state",
+        lambda *_args, **_kwargs: {
+            "recalled_memories": [memory],
+            "retrieval_id": "retrieval-action",
+            "selection_namespace_revision": 7,
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "preview_retraction",
+        lambda **_kwargs: {
+            "id": "preview-action",
+            "fingerprint": "f" * 64,
+            "expires_at": "2026-08-10T23:15:00Z",
+            "effect_payload": {
+                "close_memory_ids": ["memory-unsafe"],
+                "review_resolutions": [
+                    {
+                        "id": "review-unsafe",
+                        "semantic_memory_id": "memory-unsafe",
+                        "status": "superseded",
+                    }
+                ],
+            },
+        },
+    )
+
+    def fake_enqueue(**kwargs):
+        operation_calls.append(("enqueue", kwargs))
+        return {"id": operation_id}, True
+
+    def fake_execute(**kwargs):
+        operation_calls.append(("execute", kwargs))
+        return {
+            "id": operation_id,
+            "status": "completed",
+            "events": [{"id": event_id, "sequence": 1, "status": "completed"}],
+            "effects": [
+                {
+                    "sequence": 1,
+                    "effect_type": "closed",
+                    "source_memory_id": "memory-unsafe",
+                }
+            ],
+            "invalidated_memory_ids": ["memory-unsafe"],
+            "restored_memory_ids": [],
+        }
+
+    monkeypatch.setattr(agent, "enqueue_operation", fake_enqueue)
+    monkeypatch.setattr(agent, "execute_operation", fake_execute)
+    reasoning = SequencedReasoningProvider(
+        [
+            diagnostic_decision("payments.checkout_latency_ms"),
+            retraction_decision(
+                memory_id="memory-unsafe",
+                quote="Increase retry fanout while the processor is saturated.",
+            ),
+        ]
+    )
+    diagnostics = FakeCloudWatchDiagnostics(
+        {
+            "payments.checkout_latency_ms": {
+                "schema_version": 1,
+                "tool": "aws_cloudwatch_diagnostics",
+                "query_key": "payments.checkout_latency_ms",
+                "datapoints": [{"timestamp": "2026-08-10T22:00:00Z", "value": 900.0}],
+                "datapoint_count": 1,
+            }
+        }
+    )
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+        diagnostic_tool=diagnostics,
+    ).compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-action"}}
+    tenant_id = "00000000-0000-0000-0000-000000000091"
+    with tenant_scope(tenant_id):
+        initial = graph.invoke(
+            {
+                "run_id": "run-action",
+                "thread_id": "thread-action",
+                "incident_id": "incident-action",
+                "namespace": "namespace-action",
+                "user_input": "processor saturation contradicts recalled retry guidance",
+                "metadata": {},
+                "pause_before_act": True,
+                "decision_id": "decision-action",
+                "reasoning_steps": [],
+                "model_turn_count": 0,
+                "tool_calls": [],
+                "observations": [],
+                "diagnostic_call_count": 0,
+            },
+            config,
+        )
+        approval = initial["__interrupt__"][0].value
+        completed = graph.invoke(
+            Command(
+                resume={
+                    "approved": True,
+                    "remediation_action_id": approval["remediation_action_id"],
+                    "selection_fingerprint": approval["selection_fingerprint"],
+                    "observation_fingerprint": approval["observation_fingerprint"],
+                    "preview_id": approval["preview_id"],
+                    "preview_fingerprint": approval["preview_fingerprint"],
+                    "actor": "product:operator:test",
+                }
+            ),
+            config,
+        )
+
+    trace = completed["action_trace"]
+    assert trace["schema_version"] == 3
+    assert trace["mode"] == "governed_memory_remediation"
+    assert trace["approval"]["actor"] == "product:operator:test"
+    assert trace["preview"]["effect_count"] == 2
+    assert trace["preview"]["effects"] == {
+        "close_memory_ids": ["memory-unsafe"],
+        "review_resolutions": [
+            {
+                "id": "review-unsafe",
+                "semantic_memory_id": "memory-unsafe",
+                "status": "superseded",
+            }
+        ],
+    }
+    assert trace["execution"]["status"] == "completed"
+    assert trace["execution"]["events"][0]["status"] == "completed"
+    assert trace["execution"]["events"][0]["id"] == str(event_id)
+    assert trace["execution"]["effects"][0]["source_memory_id"] == "memory-unsafe"
+    assert completed.get("reflected_memory") is None
+    assert operation_calls[0][1]["actor"] == "product:operator:test"
+    assert operation_calls[0][1]["idempotency_key"].startswith("agent-remediation:")
+    assert operation_calls[1][1]["operation_id"] == str(operation_id)
+
+
+def test_retraction_allows_one_stale_replan_then_fails_closed(monkeypatch):
+    import hindsight.agent as agent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.types import Command
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        SequencedReasoningProvider,
+        retraction_decision,
+    )
+
+    class FakeHistory:
+        messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            pass
+
+    memories = [
+        {
+            "id": f"memory-v{version}",
+            "namespace": "namespace-stale-action",
+            "belief_id": "belief-action",
+            "version_number": version,
+            "content": f"Unsafe retry guidance version {version}.",
+            "trust_status": "active",
+        }
+        for version in (1, 2, 3)
+    ]
+    recalls = iter(memories)
+
+    def fake_recall(*_args, **_kwargs):
+        memory = next(recalls)
+        return {
+            "recalled_memories": [memory],
+            "retrieval_id": f"retrieval-{memory['version_number']}",
+            "selection_namespace_revision": memory["version_number"],
+        }
+
+    monkeypatch.setattr(agent, "_chat_history", lambda **_kwargs: FakeHistory())
+    monkeypatch.setattr(agent, "_recall_for_state", fake_recall)
+    monkeypatch.setattr(
+        agent,
+        "preview_retraction",
+        lambda root_memory_id, **_kwargs: {
+            "id": f"preview-{root_memory_id}",
+            "fingerprint": ("1" if root_memory_id.endswith("1") else "2") * 64,
+            "expires_at": "2026-08-10T23:15:00Z",
+            "effect_payload": {"close_memory_ids": [root_memory_id]},
+        },
+    )
+    reasoning = SequencedReasoningProvider(
+        [
+            retraction_decision(memory_id="memory-v1", quote="Unsafe retry guidance version 1."),
+            retraction_decision(memory_id="memory-v2", quote="Unsafe retry guidance version 2."),
+        ]
+    )
+    graph = agent.build_incident_graph(
+        db_url="postgresql://unused",
+        reasoning_provider=reasoning,
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ).compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-stale-action"}}
+    initial = graph.invoke(
+        {
+            "run_id": "run-stale-action",
+            "thread_id": "thread-stale-action",
+            "incident_id": "incident-stale-action",
+            "namespace": "namespace-stale-action",
+            "user_input": "recalled retry guidance is unsafe",
+            "metadata": {},
+            "pause_before_act": True,
+            "decision_id": "decision-stale-action",
+            "reasoning_steps": [],
+            "model_turn_count": 0,
+            "tool_calls": [],
+            "observations": [],
+            "diagnostic_call_count": 0,
+        },
+        config,
+    )
+    first = initial["__interrupt__"][0].value
+    replanned = graph.invoke(
+        Command(
+            resume={
+                "approved": True,
+                "remediation_action_id": first["remediation_action_id"],
+                "selection_fingerprint": first["selection_fingerprint"],
+                "observation_fingerprint": first["observation_fingerprint"],
+                "preview_id": first["preview_id"],
+                "preview_fingerprint": first["preview_fingerprint"],
+                "actor": "product:operator:test",
+            }
+        ),
+        config,
+    )
+    second = replanned["__interrupt__"][0].value
+    assert replanned["stale_replan_count"] == 1
+    assert second["remediation_action_id"] != first["remediation_action_id"]
+
+    with pytest.raises(agent.RemediationActionError, match="single replan"):
+        graph.invoke(
+            Command(
+                resume={
+                    "approved": True,
+                    "remediation_action_id": second["remediation_action_id"],
+                    "selection_fingerprint": second["selection_fingerprint"],
+                    "observation_fingerprint": second["observation_fingerprint"],
+                    "preview_id": second["preview_id"],
+                    "preview_fingerprint": second["preview_fingerprint"],
+                    "actor": "product:operator:test",
+                }
+            ),
+            config,
+        )
 
 
 def test_unavailable_cloudwatch_result_cannot_authorize_a_recommendation(monkeypatch):

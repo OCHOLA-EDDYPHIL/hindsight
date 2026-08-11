@@ -425,9 +425,7 @@ def _create_run_once(
                     # Roll the entire transaction back so the candidate decision
                     # disappears without requiring runtime DELETE privileges. A
                     # fresh serializable transaction can then lock the winner.
-                    raise SerializationFailure(
-                        "idempotent run lost a concurrent unique-key race"
-                    )
+                    raise SerializationFailure("idempotent run lost a concurrent unique-key race")
                 run = dict(inserted)
                 cur.execute(
                     "UPDATE memory_decisions SET run_id = %s WHERE id = %s",
@@ -1073,6 +1071,24 @@ def finish_run_attempt(
                     summary=summary,
                     metadata=metadata,
                 )
+                if status in TERMINAL_RUN_STATUSES:
+                    cur.execute(
+                        """
+                            UPDATE memory_decisions
+                            SET status = 'sealed', sealed_at = COALESCE(sealed_at, now())
+                            WHERE id = %s AND status = 'open'
+                        """,
+                        (row["decision_id"],),
+                    )
+                    cur.execute(
+                        "SELECT status FROM memory_decisions WHERE id = %s",
+                        (row["decision_id"],),
+                    )
+                    decision = cur.fetchone()
+                    if decision is None or decision["status"] != "sealed":
+                        raise RunConflictError(
+                            f"terminal run decision was not sealed: {row['decision_id']}"
+                        )
                 return _jsonable(dict(row))
 
 
@@ -1190,11 +1206,16 @@ def prepare_approval(
     *,
     run_id: str | UUID,
     approved: bool,
-    recommendation_id: str,
-    selection_fingerprint: str,
+    recommendation_id: str | None = None,
+    selection_fingerprint: str = "",
+    remediation_action_id: str | None = None,
+    observation_fingerprint: str | None = None,
+    preview_id: str | None = None,
+    preview_fingerprint: str | None = None,
+    approval_actor: str | None = None,
     db_url: str | None = None,
 ) -> dict[str, Any]:
-    """Resume exactly the recommendation and memory selection shown to the operator."""
+    """Resume exactly the terminal decision and evidence shown to the operator."""
 
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.transaction():
@@ -1221,16 +1242,66 @@ def prepare_approval(
                 event = cur.fetchone()
                 metadata = dict(event["metadata"] or {}) if event is not None else {}
                 action_trace = metadata.get("action_trace") or {}
-                expected_recommendation_id = str(
-                    (action_trace.get("recommendation") or {}).get("id") or ""
-                )
                 expected_selection_fingerprint = str(
                     (action_trace.get("selection") or {}).get("fingerprint") or ""
                 )
-                if not expected_recommendation_id or not expected_selection_fingerprint:
-                    raise RunConflictError("run has no approval-bound recommendation")
-                if recommendation_id != expected_recommendation_id:
-                    raise RunConflictError("recommendation changed before approval")
+                mode = str(action_trace.get("mode") or "recommendation_only")
+                if mode == "governed_memory_remediation":
+                    expected_action_id = str(
+                        (action_trace.get("remediation_action") or {}).get("id") or ""
+                    )
+                    expected_observation_fingerprint = str(
+                        action_trace.get("observation_fingerprint") or ""
+                    )
+                    preview = action_trace.get("preview") or {}
+                    expected_preview_id = str(preview.get("id") or "")
+                    expected_preview_fingerprint = str(preview.get("fingerprint") or "")
+                    expected_values = {
+                        "remediation_action_id": expected_action_id,
+                        "observation_fingerprint": expected_observation_fingerprint,
+                        "preview_id": expected_preview_id,
+                        "preview_fingerprint": expected_preview_fingerprint,
+                    }
+                    supplied_values = {
+                        "remediation_action_id": remediation_action_id,
+                        "observation_fingerprint": observation_fingerprint,
+                        "preview_id": preview_id,
+                        "preview_fingerprint": preview_fingerprint,
+                    }
+                    if (
+                        recommendation_id is not None
+                        or not all(expected_values.values())
+                        or not approval_actor
+                        or any(
+                            supplied_values[key] != value for key, value in expected_values.items()
+                        )
+                    ):
+                        raise RunConflictError("remediation action changed before approval")
+                    binding_metadata: dict[str, Any] = {
+                        **expected_values,
+                        "actor": approval_actor,
+                    }
+                else:
+                    expected_recommendation_id = str(
+                        (action_trace.get("recommendation") or {}).get("id") or ""
+                    )
+                    if not expected_recommendation_id:
+                        raise RunConflictError("run has no approval-bound recommendation")
+                    if recommendation_id != expected_recommendation_id:
+                        raise RunConflictError("recommendation changed before approval")
+                    if any(
+                        value is not None
+                        for value in (
+                            remediation_action_id,
+                            observation_fingerprint,
+                            preview_id,
+                            preview_fingerprint,
+                        )
+                    ):
+                        raise RunConflictError("recommendation approval has action bindings")
+                    binding_metadata = {"recommendation_id": expected_recommendation_id}
+                if not expected_selection_fingerprint:
+                    raise RunConflictError("run has no approval-bound memory selection")
                 if selection_fingerprint != expected_selection_fingerprint:
                     raise RunConflictError("memory selection changed before approval")
                 cur.execute(
@@ -1255,7 +1326,7 @@ def prepare_approval(
                     else "Operator rejected the proposed action",
                     metadata={
                         "approved": approved,
-                        "recommendation_id": recommendation_id,
+                        **binding_metadata,
                         "selection_fingerprint": selection_fingerprint,
                     },
                 )
@@ -1269,7 +1340,7 @@ def prepare_approval(
                         "run_id": str(run_id),
                         "command_generation": int(row["command_generation"]),
                         "approved": approved,
-                        "recommendation_id": recommendation_id,
+                        **binding_metadata,
                         "selection_fingerprint": selection_fingerprint,
                     },
                 )

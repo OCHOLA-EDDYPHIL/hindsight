@@ -6,6 +6,11 @@ variable "aws_region" {
 variable "state_bucket_name" {
   description = "Existing versioned S3 bucket shared for Terraform state."
   type        = string
+
+  validation {
+    condition     = can(regex("^home-in-cloud-terraform-state-[0-9]{12}-us-east-1$", var.state_bucket_name))
+    error_message = "state_bucket_name must identify the fixed us-east-1 account state bucket."
+  }
 }
 
 variable "expected_aws_account_id" {
@@ -43,17 +48,6 @@ variable "stage" {
   default = "demo"
 }
 
-variable "lifecycle_database_url_parameter_name" {
-  description = "Dedicated SecureString parameter for the non-bypass-RLS lifecycle database login."
-  type        = string
-  default     = "/hindsight/demo/lifecycle-database-url"
-
-  validation {
-    condition     = can(regex("^/hindsight/[a-z][a-z0-9-]{1,15}/lifecycle-database-url$", var.lifecycle_database_url_parameter_name))
-    error_message = "lifecycle_database_url_parameter_name must be a stage-scoped Hindsight lifecycle parameter path."
-  }
-}
-
 variable "domain_name" {
   description = "Stable CloudFront hostname prepared for the demo."
   type        = string
@@ -81,23 +75,6 @@ variable "enable_learning_infrastructure" {
   description = "Retain the source account's immutable learning archive and evidence role. Disable only for a fresh product-only account."
   type        = bool
   default     = true
-}
-
-variable "enable_cold_region_recovery_profile" {
-  description = "Provision the opt-in locked cross-region lifecycle export replica and replication path."
-  type        = bool
-  default     = false
-}
-
-variable "cold_region_recovery_region" {
-  description = "AWS region operators target when the cold-region recovery drill profile is enabled."
-  type        = string
-  default     = "us-west-2"
-
-  validation {
-    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]+$", var.cold_region_recovery_region))
-    error_message = "cold_region_recovery_region must be an AWS region identifier."
-  }
 }
 
 variable "create_github_oidc_provider" {

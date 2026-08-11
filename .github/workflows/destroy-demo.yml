@@ -42,7 +42,7 @@ env:
 jobs:
   destroy:
     if: github.ref == 'refs/heads/main'
-    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ inputs.deployment_environment }}
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}

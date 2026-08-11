@@ -1085,8 +1085,22 @@ export function useCockpit(options: UseCockpitOptions = {}) {
       const current = runRef.current;
       if (!current) return;
       const recommendationId = current.action_trace?.recommendation?.id?.trim();
+      const remediationActionId = current.action_trace?.remediation_action?.id?.trim();
       const selectionFingerprint = current.action_trace?.selection?.fingerprint?.trim();
-      if (!recommendationId || !selectionFingerprint) {
+      const observationFingerprint = current.action_trace?.observation_fingerprint?.trim();
+      const previewId = current.action_trace?.preview?.id?.trim();
+      const previewFingerprint = current.action_trace?.preview?.fingerprint?.trim();
+      const isRemediation = current.action_trace?.mode === "governed_memory_remediation";
+      const identityReady = isRemediation
+        ? Boolean(
+            remediationActionId &&
+              selectionFingerprint &&
+              observationFingerprint &&
+              previewId &&
+              previewFingerprint,
+          )
+        : Boolean(recommendationId && selectionFingerprint);
+      if (!identityReady || !selectionFingerprint) {
         announce(
           "Approval identity is unavailable. Refresh or rerun the analysis before deciding.",
           "error",
@@ -1099,14 +1113,25 @@ export function useCockpit(options: UseCockpitOptions = {}) {
           method: "POST",
           body: JSON.stringify({
             approved,
-            recommendation_id: recommendationId,
             selection_fingerprint: selectionFingerprint,
+            ...(isRemediation
+              ? {
+                  remediation_action_id: remediationActionId,
+                  observation_fingerprint: observationFingerprint,
+                  preview_id: previewId,
+                  preview_fingerprint: previewFingerprint,
+                }
+              : { recommendation_id: recommendationId }),
           }),
         });
         announce(
-          approved
-            ? "Recommendation approved and retained in the audit trail."
-            : "Recommendation rejected and retained in the audit trail.",
+          isRemediation
+            ? approved
+              ? "Governed-memory retraction approved and queued for immediate execution."
+              : "Governed-memory retraction rejected."
+            : approved
+              ? "Recommendation approved and retained in the audit trail."
+              : "Recommendation rejected and retained in the audit trail.",
         );
         await loadRun(current.id, true);
       } catch (error) {

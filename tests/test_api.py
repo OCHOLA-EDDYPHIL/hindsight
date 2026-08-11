@@ -170,13 +170,19 @@ def test_tenant_selectors_and_tenant_body_fields_fail_closed(monkeypatch):
     monkeypatch.setattr(api, "create_incident", lambda **_values: pytest.fail("write reached"))
     client = TestClient(api.app)
 
-    assert client.get(
-        "/v1/incidents",
-        headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
-    ).status_code == 400
-    assert client.get(
-        f"/v2/incidents?tenant_id={ACCEPTANCE_TENANT_ID}",
-    ).status_code == 400
+    assert (
+        client.get(
+            "/v1/incidents",
+            headers={"X-Tenant-Id": ACCEPTANCE_TENANT_ID},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            f"/v2/incidents?tenant_id={ACCEPTANCE_TENANT_ID}",
+        ).status_code
+        == 400
+    )
     body_selector = client.post(
         "/v2/incidents",
         json={
@@ -519,6 +525,78 @@ def test_approval_remains_accepted_when_immediate_dispatch_fails(monkeypatch):
             "db_url": "postgresql://resolved/database",
         }
     ]
+
+
+def test_remediation_approval_injects_authenticated_actor_and_all_bindings(monkeypatch):
+    import hindsight.api as api
+
+    transitions = []
+    identity = _product_identity()
+    monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: identity)
+    monkeypatch.setattr(
+        api,
+        "prepare_approval",
+        lambda **kwargs: transitions.append(kwargs) or {"id": kwargs["run_id"]},
+    )
+    monkeypatch.setattr(
+        api,
+        "dispatch_run_commands",
+        lambda **_kwargs: {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0},
+    )
+    client = TestClient(api.app)
+    payload = {
+        "approved": True,
+        "selection_fingerprint": "a" * 64,
+        "remediation_action_id": f"remediation_action:{'b' * 64}",
+        "observation_fingerprint": "c" * 64,
+        "preview_id": "preview-1",
+        "preview_fingerprint": "d" * 64,
+    }
+
+    response = client.post("/v2/runs/run-action/approval", json=payload)
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "run_id": "run-action",
+        "status": "resuming",
+        **payload,
+    }
+    assert transitions == [
+        {
+            "run_id": "run-action",
+            "approved": True,
+            "recommendation_id": None,
+            "selection_fingerprint": "a" * 64,
+            "remediation_action_id": f"remediation_action:{'b' * 64}",
+            "observation_fingerprint": "c" * 64,
+            "preview_id": "preview-1",
+            "preview_fingerprint": "d" * 64,
+            "approval_actor": identity.actor,
+            "db_url": "postgresql://resolved/database",
+        }
+    ]
+
+
+def test_approval_contract_rejects_mixed_recommendation_and_remediation_identity(monkeypatch):
+    import hindsight.api as api
+
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: _product_identity())
+    client = TestClient(api.app)
+    response = client.post(
+        "/v2/runs/run-action/approval",
+        json={
+            "approved": True,
+            "recommendation_id": f"recommendation:{'a' * 64}",
+            "selection_fingerprint": "b" * 64,
+            "remediation_action_id": f"remediation_action:{'c' * 64}",
+            "observation_fingerprint": "d" * 64,
+            "preview_id": "preview-1",
+            "preview_fingerprint": "e" * 64,
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_rewind_execute_rejects_stale_preview(monkeypatch):

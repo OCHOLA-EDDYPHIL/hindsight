@@ -1014,8 +1014,9 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     }
     authorize = workflow["jobs"]["authorize"]
     qualification = workflow["jobs"]["qualify"]
-    assert authorize["runs-on"] == "ubuntu-latest"
-    assert qualification["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL || 'ubuntu-latest' }}"
+    runner = "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
+    assert authorize["runs-on"] == runner
+    assert qualification["runs-on"] == runner
     assert "$ACTOR" in authorize["steps"][0]["run"]
     assert "$TRIGGERING_ACTOR" in authorize["steps"][0]["run"]
     assert "refs/heads/main" in authorize["steps"][0]["run"]
