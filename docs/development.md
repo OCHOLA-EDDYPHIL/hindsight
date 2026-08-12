@@ -6,8 +6,10 @@
 - Node.js 22 and npm
 - Docker with Compose
 - Git
+- a Gemini API key for product execution
+- AWS credentials only when exercising the optional CloudWatch-backed local acceptance path
 
-Start from a clean checkout:
+Install from a clean checkout:
 
 ```bash
 cp .env.example .env
@@ -15,51 +17,71 @@ uv sync --frozen
 npm ci
 make dev-up
 make migrate-local
-DATABASE_URL="postgresql://root@localhost:26257/hindsight?sslmode=disable" \
-  EMBEDDING_PROVIDER=deterministic LLM_PROVIDER=deterministic \
-  uv run python scripts/initialize_agent_storage.py
 ```
 
-`make dev-up` starts CockroachDB 25.2 on ports 26257 and 8080 and enables rangefeeds and vector indexes. The Compose server is insecure and suitable only for local development.
+`make dev-up` starts CockroachDB 25.4.5 on ports 26257 and 8080 and enables rangefeeds and vector indexes. The server is insecure and suitable only for loopback development.
 
-## Deterministic product loop
+## Production-aligned local loop
 
-Keep local debugging independent from cloud credentials:
+Gemini is the reasoning and embedding provider for product entrypoints. Tests inject fakes directly; there is no fake provider mode in the product runtime.
+
+Set the local database and the fixed public-demo tenant, clear deployed SSM parameter locators, and load the Gemini key through your preferred local secret mechanism:
 
 ```bash
 export DATABASE_URL="postgresql://root@localhost:26257/hindsight?sslmode=disable"
-export EMBEDDING_PROVIDER=deterministic
-export LLM_PROVIDER=deterministic
+export PGOPTIONS="-c hindsight.tenant_id=00000000-0000-0000-0000-000000000002"
+export LLM_PROVIDER=gemini
+export EMBEDDING_PROVIDER=gemini
 export HINDSIGHT_DATABASE_URL_PARAM=""
 export HINDSIGHT_GEMINI_API_KEY_PARAM=""
 export HINDSIGHT_GEMINI_API_KEYS_PARAM=""
-export HINDSIGHT_FUNCTION_AUTH_TOKEN_PARAM=""
-export HINDSIGHT_FUNCTION_AUTH_TOKEN=local-operator-token
-export HINDSIGHT_INLINE_WORKER=1
-export HINDSIGHT_SECURE_COOKIES=0
+# Export GEMINI_API_KEY from your local secret manager here.
+
+uv run python scripts/initialize_agent_storage.py
+uv run python scripts/reembed_memories.py --max-distance 0.35
 npm run build:web
-uv run uvicorn hindsight.api:app --reload --host 127.0.0.1 --port 8766
+make product-api-local
 ```
 
-The built UI is served at <http://127.0.0.1:8766>. Re-run `npm run build:web` after frontend changes, or use Vite’s development server separately:
+The FastAPI-served build is available at <http://127.0.0.1:8766>. It exercises the public read-only tenant boundary. Protected `/v2` routes intentionally reject requests that do not carry API Gateway-verified Cognito claims.
+
+For component work, run Vite separately:
 
 ```bash
 npm exec vite -- --config frontend/vite.config.ts
 ```
 
-The standalone Vite server is useful for component work, but full product behavior should be checked against the FastAPI-served build.
+Rebuild the FastAPI-served assets after frontend changes with `npm run build:web`.
 
-Run the complete deterministic correction scenario:
+## Full local product acceptance
+
+`scripts/run_live_acceptance.py local-product-full` creates separate fresh databases for provider/semantic, resilience, and browser stages. The runner binds semantic and resilience work to the fixed acceptance tenant and browser work to the fixed public-demo tenant, overriding inherited `PGOPTIONS`.
+
+The shared browser contract requires the same controlled CloudWatch observations used by the deployed flow. With an authenticated AWS profile that may write and read the controlled metric namespace:
 
 ```bash
-make poison-rewind-demo-local
+export AWS_PROFILE=your-profile
+export AWS_REGION=us-east-1
+export HINDSIGHT_AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export HINDSIGHT_STAGE=local
+
+uv run python scripts/publish_controlled_incident_telemetry.py \
+  --stage "$HINDSIGHT_STAGE" \
+  --region "$AWS_REGION" \
+  --checkout-latency-ms 842.5 \
+  --retry-fanout 8 \
+  --processor-queue-depth 217 \
+  --confirm-controlled-fixture
+
+uv run python scripts/run_live_acceptance.py local-product-full \
+  --database-url "postgresql://root@localhost:26257/hindsight?sslmode=disable"
 ```
 
-It creates a clean session, records a good belief, injects a poisoned belief, demonstrates its influence, previews and applies a rewind, and verifies the corrected result.
+The telemetry publisher writes only the explicitly labeled `Hindsight/ControlledIncidentTelemetry` fixture. The agent's diagnostic tool remains read-only, limited to configured queries, at most three calls, and a 15-minute window.
 
 ## Verification before pushing
 
-Use hosted Actions to validate cloud-only behavior, not as the primary debugging loop. Before a behavioral change is pushed, run the applicable local checks:
+GitHub Actions is a verifier, not the debugging environment. Reproduce and correct behavioral failures locally, then run the applicable checks before pushing:
 
 ```bash
 uv lock --check
@@ -72,22 +94,22 @@ npm run build:web
 git diff --exit-code -- src/hindsight/web
 ```
 
-Database changes also require a fresh CockroachDB, migrations, agent storage initialization, affected product tests, populated-upgrade verification, and fresh/populated schema comparison. `scripts/run_affected_ci.py` and `.github/workflows/ci.yml` are the executable references for the affected test selection and exact commands.
+Database changes also require a fresh CockroachDB, forward migrations, agent storage initialization, affected product tests, populated-upgrade verification, and fresh/populated schema comparison. `scripts/run_affected_ci.py` and `.github/workflows/ci.yml` are the executable references for affected selection and exact commands.
 
-Validate workflow and CLI contracts locally when changing automation:
+Validate workflow and acceptance CLI contracts locally when changing automation:
 
 ```bash
 uv run pytest -q tests/test_ci_contracts.py tests/test_live_acceptance_cli.py
 ```
 
-After local success, push one coherent revision and allow normal PR CI to run once. A targeted hosted browser run is appropriate only for AWS permissions, SSM, Lambda, WebSocket, Gemini, changefeed, revision-identity, or deployed-origin behavior that local execution cannot prove. Run the complete exact-main hosted acceptance once after merge when the change affects product behavior.
+After local success, push one coherent revision and let normal PR CI confirm it. Use hosted acceptance only for the integrated deployed boundary—AWS permissions, SSM resolution, Lambda, Cognito/API Gateway, SQS, CloudWatch, changefeeds, WebSockets, exact revision identity, and the deployed origin.
 
-## Live providers
+## Provider configuration
 
-Local development defaults should remain deterministic. To opt into Gemini, set `LLM_PROVIDER=gemini`, `EMBEDDING_PROVIDER=gemini`, the model names shown in `.env.example`, and a local `GEMINI_API_KEY` (or versioned key-pool material). Never commit `.env` or credentials.
+The supported product values are `LLM_PROVIDER=gemini` and `EMBEDDING_PROVIDER=gemini`. Model names and the raw-control embedding representation are documented in `.env.example`. A local process may receive `GEMINI_API_KEY` or versioned key-pool material directly; deployed functions receive only SSM parameter names and resolve key material at runtime.
 
-The code also contains Bedrock reasoning and embedding providers for explicitly configured local/runtime use. The current hosted application Terraform intentionally accepts Gemini as its embedding provider; do not infer hosted Bedrock deployment support from the provider classes alone.
+Never commit `.env`, API keys, database URLs, access tokens, or generated provider payloads.
 
 ## Fresh data and shutdown
 
-`make dev-down` preserves the named `crdb-data` volume. For migration or isolation testing, use a unique Compose project/database as CI does, and delete only that exact project’s volumes after inspecting the target. Avoid broad Docker cleanup commands.
+`make dev-down` preserves the named `crdb-data` volume. For migration or isolation testing, use a unique Compose project or fresh derived database as CI and the local acceptance runner do. Inspect the exact target before deleting a database, container, or volume; avoid broad Docker cleanup commands.
