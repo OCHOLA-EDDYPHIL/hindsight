@@ -667,8 +667,10 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
         _wait_for_run_status(driver, expected_status="awaiting approval", timeout=150)
         wait.until(
             lambda browser: (
-                "Governed-memory retraction"
-                in browser.find_element(By.CSS_SELECTOR, ".action-execution").text
+                "governed-memory retraction"
+                in browser.find_element(
+                    By.CSS_SELECTOR, ".outcome-current .action-execution"
+                ).text.casefold()
             )
         )
 
@@ -698,7 +700,7 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
             "browser did not render the awaiting remediation execution state",
         )
         _require(
-            "Governed-memory retraction" in current_execution.text,
+            "governed-memory retraction" in current_execution.text.casefold(),
             "browser did not render governed remediation controls",
         )
         assert [
