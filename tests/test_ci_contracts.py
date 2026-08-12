@@ -285,9 +285,12 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
         "provision-lifecycle-fixture.yml",
         "recovery-drill.yml",
         "tenant-lifecycle.yml",
-        "verify-deployed.yml",
     ):
         assert set(workflows[name]) == {"workflow_dispatch"}
+    assert set(workflows["verify-deployed.yml"]) == {"schedule", "workflow_dispatch"}
+    assert workflows["verify-deployed.yml"]["schedule"] == [
+        {"cron": "17 */6 * * *"}
+    ]
 
 
 def test_every_uv_workflow_setup_uses_the_dependency_cache():
