@@ -650,6 +650,71 @@ def test_acknowledged_dispatch_is_never_resent(monkeypatch):
 
 
 @requires_db
+def test_pending_dispatch_recovers_expired_attempt_but_not_live_lease(monkeypatch):
+    from hindsight.run_dispatch import dispatch_run_commands
+    from hindsight.runs import claim_run_attempt, create_run, get_run
+
+    monkeypatch.setenv("HINDSIGHT_RUN_QUEUE_URL", "https://sqs.example/run-queue")
+    run, _ = create_run(
+        incident_slug=f"dispatch-expired-attempt-{uuid4().hex}",
+        namespace="dispatch-expired-attempt",
+        user_input="checkout latency",
+    )
+    first = claim_run_attempt(
+        run_id=run["id"],
+        command="start",
+        command_generation=0,
+        lease_ttl=timedelta(minutes=5),
+        max_attempts=3,
+    )
+    client = RecordingSqs()
+
+    live = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        conn.execute(
+            """
+                UPDATE agent_runs
+                SET worker_attempt_lease_expires_at = now() - INTERVAL '1 second'
+                WHERE id = %s
+            """,
+            (run["id"],),
+        )
+        conn.commit()
+
+    expired = dispatch_run_commands(
+        run_id=run["id"],
+        command="start",
+        limit=1,
+        client=client,
+    )
+    body = _assert_delivery_envelope(client.messages[0]["body"], run=run, sequence=1)
+    recovered = claim_run_attempt(
+        run_id=run["id"],
+        command="start",
+        command_generation=0,
+        lease_ttl=timedelta(minutes=5),
+        max_attempts=3,
+        dispatch_id=str(body["dispatch_id"]),
+        dispatch_attempt_id=str(body["dispatch_attempt_id"]),
+        dispatch_sequence=1,
+        worker_message_id="worker-message-1",
+    )
+    persisted = get_run(run_id=run["id"])
+
+    assert first.outcome == "claimed"
+    assert live == {"leased": 0, "dispatched": 0, "failed": 0, "lease_lost": 0}
+    assert expired == {"leased": 1, "dispatched": 1, "failed": 0, "lease_lost": 0}
+    assert recovered.outcome == "claimed"
+    assert persisted["worker_attempt_count"] == 2
+    assert any(event["phase"] == "recovery" for event in persisted["events"])
+
+
+@requires_db
 def test_queue_failure_leaves_unsent_attempt_and_retry_advances_sequence(monkeypatch):
     from hindsight.run_dispatch import dispatch_run_commands
     from hindsight.runs import create_run
