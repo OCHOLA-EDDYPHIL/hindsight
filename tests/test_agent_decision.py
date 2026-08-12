@@ -12,6 +12,7 @@ from hindsight.agent_decision import (
     agent_decision_from_payload,
     agent_decision_provider_schema,
     memory_selection_fingerprint,
+    normalize_agent_decision_provider_text,
     parse_agent_decision,
     recommendation_id,
 )
@@ -72,7 +73,15 @@ def test_unobserved_provider_schema_requires_exact_diagnostic_and_empty_citation
 
     assert schema["properties"]["next_step_kind"]["enum"] == ["diagnostic_tool"]
     assert schema["properties"]["tool_call"] == {"$ref": "#/$defs/DiagnosticToolCall"}
-    assert schema["properties"]["recommendation"] == {"type": "null"}
+    assert "recommendation" not in schema["properties"]
+    assert "remediation_action" not in schema["properties"]
+    assert "tool_call" in schema["required"]
+    assert "anyOf" not in schema
+    assert '"const"' not in json.dumps(schema)
+    assert schema["properties"]["schema_version"]["enum"] == [2]
+    assert schema["$defs"]["DiagnosticToolCall"]["properties"]["name"]["enum"] == [
+        "aws_cloudwatch_diagnostics"
+    ]
     assert schema["properties"]["recalled_memory_citations"]["maxItems"] == 0
     assert schema["$defs"]["DiagnosticToolCall"]["properties"]["query_key"]["enum"] == [
         "payments.checkout_latency_ms",
@@ -99,36 +108,12 @@ def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
         "recommendation",
         "remediation_action",
     ]
-    assert schema["anyOf"] == [
-        {
-            "properties": {
-                "next_step_kind": {"const": "diagnostic_tool"},
-                "tool_call": {"$ref": "#/$defs/DiagnosticToolCall"},
-                "recommendation": {"type": "null"},
-                "remediation_action": {"type": "null"},
-            }
-        },
-        {
-            "properties": {
-                "next_step_kind": {"const": "recommendation"},
-                "tool_call": {"type": "null"},
-                "recommendation": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4_000,
-                },
-                "remediation_action": {"type": "null"},
-            }
-        },
-        {
-            "properties": {
-                "next_step_kind": {"const": "remediation_action"},
-                "tool_call": {"type": "null"},
-                "recommendation": {"type": "null"},
-                "remediation_action": {"$ref": "#/$defs/RetractRecalledMemoryAction"},
-            }
-        },
-    ]
+    assert "anyOf" not in schema
+    assert {
+        "tool_call",
+        "recommendation",
+        "remediation_action",
+    }.isdisjoint(schema["required"])
     assert schema["properties"]["recalled_memory_citations"]["maxItems"] == 2
     assert schema["$defs"]["MemoryCitation"]["properties"]["memory_id"]["enum"] == [
         "memory-1",
@@ -137,6 +122,71 @@ def test_observed_provider_schema_exposes_both_coherent_bounded_branches():
     assert schema["$defs"]["RetractRecalledMemoryAction"]["properties"]["target_memory_id"][
         "enum"
     ] == ["memory-1", "memory-2"]
+
+
+def test_provider_adapter_restores_omitted_nullable_branch_siblings_before_strict_parse():
+    payload = _payload(
+        recalled_memory_citations=[],
+        next_step_kind="diagnostic_tool",
+        tool_call={
+            "name": "aws_cloudwatch_diagnostics",
+            "query_key": "payments.checkout_latency",
+        },
+        recommendation=None,
+        remediation_action=None,
+    )
+    payload.pop("recommendation")
+    payload.pop("remediation_action")
+    raw = json.dumps(payload)
+
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            raw,
+            recalled_memory_ids=set(),
+            allowed_query_keys={"payments.checkout_latency"},
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
+    decision = parse_agent_decision(
+        normalize_agent_decision_provider_text(raw),
+        recalled_memory_ids=set(),
+        allowed_query_keys={"payments.checkout_latency"},
+        diagnostic_calls_used=0,
+        diagnostic_observation_available=False,
+        model_turn=1,
+    )
+    assert decision.next_step_kind == "diagnostic_tool"
+    assert decision.recommendation is None
+    assert decision.remediation_action is None
+
+    branchless = dict(payload)
+    branchless.pop("tool_call")
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            normalize_agent_decision_provider_text(json.dumps(branchless)),
+            recalled_memory_ids=set(),
+            allowed_query_keys={"payments.checkout_latency"},
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
+    unexpected = dict(payload)
+    unexpected["unexpected"] = True
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV2"):
+        parse_agent_decision(
+            normalize_agent_decision_provider_text(json.dumps(unexpected)),
+            recalled_memory_ids=set(),
+            allowed_query_keys={"payments.checkout_latency"},
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+        )
+
+    assert normalize_agent_decision_provider_text("not-json") == "not-json"
+    assert normalize_agent_decision_provider_text("[]") == "[]"
 
 
 def test_remediation_action_requires_a_verbatim_citation_and_current_observation():
@@ -216,8 +266,10 @@ def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
     )
 
     assert schema["properties"]["next_step_kind"]["enum"] == ["recommendation"]
-    assert schema["properties"]["tool_call"] == {"type": "null"}
+    assert "tool_call" not in schema["properties"]
     assert schema["properties"]["recommendation"]["type"] == "string"
+    assert "recommendation" in schema["required"]
+    assert "remediation_action" not in schema["properties"]
 
     with pytest.raises(AgentDecisionError, match="current diagnostic observation"):
         parse_agent_decision(
@@ -238,10 +290,8 @@ def test_final_unobserved_turn_exposes_no_diagnostic_and_still_fails_closed():
     )
     assert constrained["properties"]["next_step_kind"]["enum"] == ["recommendation"]
     assert "RetractRecalledMemoryAction" in constrained["$defs"]
-    assert all(
-        branch["properties"]["next_step_kind"].get("const") != "remediation_action"
-        for branch in constrained["anyOf"]
-    )
+    assert "remediation_action" not in constrained["properties"]
+    assert "anyOf" not in constrained
 
 
 @pytest.mark.parametrize(

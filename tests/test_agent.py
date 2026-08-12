@@ -132,6 +132,46 @@ def test_diagnostic_action_is_selected_only_by_structured_model_output():
     assert "role" not in provider.requests[0].prompt
 
 
+def test_provider_may_omit_forbidden_branch_siblings_without_changing_raw_response_hash():
+    import hashlib
+    import json
+
+    from hindsight.agent import _generate_agent_decision
+    from tests.fakes import DeterministicReasoningProvider, diagnostic_decision
+
+    payload = json.loads(diagnostic_decision("payments.checkout_latency_ms"))
+    payload.pop("recommendation")
+    payload.pop("remediation_action")
+    raw_response = json.dumps(payload, sort_keys=True)
+    provider = DeterministicReasoningProvider(response_text=raw_response)
+
+    decision, response, turns = _generate_agent_decision(
+        {
+            "run_id": "run-provider-shape",
+            "decision_id": "decision-provider-shape",
+            "namespace": "provider-shape",
+            "incident_id": "provider-shape",
+            "user_input": "Collect current checkout telemetry",
+            "recalled_memories": [],
+            "observations": [],
+            "model_turn_count": 0,
+            "diagnostic_call_count": 0,
+        },
+        provider=provider,
+        allowed_query_keys={"payments.checkout_latency_ms"},
+    )
+
+    assert decision.next_step_kind == "diagnostic_tool"
+    assert turns == 1
+    assert response.usage["response_sha256"] == hashlib.sha256(
+        raw_response.encode("utf-8")
+    ).hexdigest()
+    schema = provider.requests[0].response_json_schema
+    assert schema is not None
+    assert "recommendation" not in schema["properties"]
+    assert "remediation_action" not in schema["properties"]
+
+
 def test_model_selected_retraction_preview_is_capped_at_ten_causal_effects():
     from hindsight.agent import AgentDecisionError, _bounded_retraction_effects
 
