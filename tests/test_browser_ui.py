@@ -48,6 +48,27 @@ REMEDIATION_REPORT_CONTRACT_VERSION = 1
 REMEDIATION_REPORT_SHA256 = hashlib.sha256(REMEDIATION_REPORT.encode("utf-8")).hexdigest()
 
 
+def test_signature_trace_selected_action_id_follows_valid_modes():
+    assert (
+        _signature_trace_selected_action_id(
+            {
+                "mode": "recommendation_only",
+                "recommendation": {"id": "recommendation:one"},
+            }
+        )
+        == "recommendation:one"
+    )
+    assert (
+        _signature_trace_selected_action_id(
+            {
+                "mode": "governed_memory_remediation",
+                "remediation_action": {"id": "remediation_action:two"},
+            }
+        )
+        == "remediation_action:two"
+    )
+
+
 def test_reset_installs_exact_replay_identity_before_loading_fresh_state():
     source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     reset = source.split("const resetDemo = useCallback", 1)[1].split(
@@ -1934,6 +1955,14 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
     }
 
 
+def _signature_trace_selected_action_id(action_trace: dict[str, Any]) -> str:
+    key = {
+        "recommendation_only": "recommendation",
+        "governed_memory_remediation": "remediation_action",
+    }[action_trace["mode"]]
+    return str(action_trace[key]["id"])
+
+
 def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     from hindsight.db import connect, database_url
     from hindsight.memory import MemoryStore
@@ -2020,13 +2049,14 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert bad["model"]
     bad_trace = bad["action_trace"]
     assert bad_trace["mode"] in {"recommendation_only", "governed_memory_remediation"}
+    bad_action_id = _signature_trace_selected_action_id(bad_trace)
     assert bad["action_trace"]["approval"]["approved"] is False
     assert bad["action_trace"]["execution"]["status"] == "not_executed"
     if bad_trace["mode"] == "recommendation_only":
-        assert bad_trace["recommendation"]["id"].startswith("recommendation:")
+        assert bad_action_id.startswith("recommendation:")
         assert bad["reflected_memory_id"]
     else:
-        assert bad_trace["remediation_action"]["id"].startswith("remediation_action:")
+        assert bad_action_id.startswith("remediation_action:")
         assert bad_trace["remediation_action"]["name"] == "retract_recalled_memory"
         assert bad["reflected_memory_id"] is None
     assert bad["action_trace"]["selection"]["fingerprint"]
@@ -2046,10 +2076,7 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert corrected["action_trace"]["approval"]["approved"] is True
     assert corrected["action_trace"]["execution"]["status"] == "recommendation_approved"
     assert corrected["action_trace"]["recommendation"]["id"].startswith("recommendation:")
-    assert (
-        corrected["action_trace"]["recommendation"]["id"]
-        != bad["action_trace"]["recommendation"]["id"]
-    )
+    assert corrected["action_trace"]["recommendation"]["id"] != bad_action_id
     assert (
         corrected["action_trace"]["selection"]["fingerprint"]
         != bad["action_trace"]["selection"]["fingerprint"]
