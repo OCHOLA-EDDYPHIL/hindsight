@@ -30,6 +30,9 @@ EXPECTED_INDEXES = sorted((LEGACY_INDEX, EXPECTED_INDEX))
 BASE_SCHEMA_THROUGH = "0029e_product_credential_locators.sql"
 LEGACY_VECTOR_MIGRATION = "0009_embedding_profiles_and_retrieval.sql"
 TENANT_VECTOR_MIGRATION = "0030_tenant_vector_cosine_index.sql"
+VECTOR_BACKFILL_MERGE_BATCH_SETTING = "bulkio.index_backfill.vector_merge_batch_size"
+VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE = 3
+VECTOR_BACKFILL_MERGE_BATCH_SIZE = 64
 EXPECTED_VECTOR_INSERT_WORKERS = 1
 EXPECTED_VECTOR_METHOD = "deterministic_tenant_anchored_13bit_1024d"
 EXPECTED_SEEDING_METHOD = (
@@ -40,13 +43,18 @@ EXPECTED_FIXTURE_VECTOR_INDEXES = (
     "legacy_only_before_seed_then_none_during_copy_then_legacy_restored_"
     "before_populated_tenant_index_migration"
 )
+EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD = (
+    f"{VECTOR_BACKFILL_MERGE_BATCH_SETTING}={VECTOR_BACKFILL_MERGE_BATCH_SIZE}_run_scoped"
+)
 EXPECTED_DATABASE_METHOD = (
     "disposable_local_single_node_cockroachdb_in_memory_2_gib_explicit_memory_budgets"
 )
-SCHEMA_VERSION = "hindsight.capacity_qualification.v5"
-DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v2"
-RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v2"
-INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION = "hindsight.capacity_infrastructure_cleanup.v2"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v6"
+DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v3"
+RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v3"
+INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION = "hindsight.capacity_infrastructure_cleanup.v3"
+UPTIME_QUANTUM_NS = 10_000_000
+MAX_RECORDED_SAMPLE_GAP_NS = 990_000_000
 EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
     "image": (
         "cockroachdb/cockroach@sha256:"
@@ -57,12 +65,13 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
     ),
     "image_platform": "linux/amd64",
     "execution_topology": "owner_runner_sibling_dind_capacity_cgroup_v2",
+    "go_max_procs": 2,
     "start_args": [
         "--store=type=mem,size=2GiB",
         "--cache=128MiB",
         "--max-sql-memory=128MiB",
         "--max-tsdb-memory=64MiB",
-        "--max-go-memory=3GiB",
+        "--max-go-memory=2304MiB",
     ],
     "capacity_boundary": {
         "cgroup_version": 2,
@@ -91,7 +100,7 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
         "workspace_mounts": 0,
         "pids_limit": 16,
         "memory_bytes": 32 * 1024**2,
-        "nano_cpus": 100_000_000,
+        "nano_cpus": 500_000_000,
         "nominal_sample_sleep_seconds": 0.25,
         "maximum_sample_gap_seconds": 1.0,
     },
@@ -100,7 +109,7 @@ EXPECTED_RUNTIME_MEMORY_ENVELOPE = {
         "cache": 128 * 1024**2,
         "sql": 128 * 1024**2,
         "tsdb": 64 * 1024**2,
-        "go": 3 * 1024**3,
+        "go": 2304 * 1024**2,
     },
 }
 EXPECTED_PROCESS_ARGS = [
@@ -124,8 +133,6 @@ EXPECTED_BOUNDARY_EVENT_KEYS = frozenset(
 )
 COMPOSE_PROJECT_PATTERN = re.compile(r"hindsight_capacity_[0-9]+_[0-9]+_(diagnostic|qualification)")
 EXECUTION_ID_PATTERN = re.compile(r"capacity_[0-9]+_1_(diagnostic|qualification)")
-MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES = int(3.25 * 1024**3)
-MAX_PROJECTED_DURATION_SECONDS = 960
 DATABASE_PATTERN = re.compile(r"hindsight_capacity_[a-z0-9]{8,20}")
 
 
@@ -171,6 +178,7 @@ def _validate_measurements(
 ) -> dict[str, dict[str, Any]]:
     expected_names = [
         "base_migrations",
+        "vector_backfill_merge_batch",
         "legacy_index_suspension",
         "vector_seed",
         "legacy_index_restore",
@@ -189,6 +197,7 @@ def _validate_measurements(
     if set(values) != set(expected_names):
         raise ValueError("capacity evidence does not contain the complete measurement set")
     base_migrations = values["base_migrations"]
+    vector_backfill_merge_batch = values["vector_backfill_merge_batch"]
     legacy_index_suspension = values["legacy_index_suspension"]
     legacy_index_restore = values["legacy_index_restore"]
     post_seed_migrations = values["post_seed_migrations"]
@@ -196,6 +205,7 @@ def _validate_measurements(
     vector_indexes = values["vector_indexes"]
     timed_rows = (
         base_migrations,
+        vector_backfill_merge_batch,
         legacy_index_suspension,
         values["vector_seed"],
         legacy_index_restore,
@@ -211,6 +221,18 @@ def _validate_measurements(
     if (
         base_migrations.get("through") != BASE_SCHEMA_THROUGH
         or post_seed_migrations.get("through") != "latest"
+        or vector_backfill_merge_batch.get("setting")
+        != VECTOR_BACKFILL_MERGE_BATCH_SETTING
+        or type(vector_backfill_merge_batch.get("previous_value")) is not int
+        or vector_backfill_merge_batch["previous_value"]
+        != VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE
+        or type(vector_backfill_merge_batch.get("configured_value")) is not int
+        or vector_backfill_merge_batch["configured_value"]
+        != VECTOR_BACKFILL_MERGE_BATCH_SIZE
+        or vector_backfill_merge_batch.get("scope")
+        != "run_scoped_disposable_cockroachdb_node"
+        or vector_backfill_merge_batch.get("next_populated_index_phase")
+        != "legacy_index_restore"
         or legacy_index_suspension.get("removed_index") != LEGACY_INDEX
         or legacy_index_suspension.get("before_indexes") != [LEGACY_INDEX]
         or legacy_index_suspension.get("after_indexes") != []
@@ -221,7 +243,9 @@ def _validate_measurements(
         or type(legacy_index_restore.get("vectors")) is not int
         or legacy_index_restore["vectors"] != targets["vectors"]
         or type(legacy_index_restore.get("storage_bytes")) is not int
-        or not 0 < legacy_index_restore["storage_bytes"] <= EXPECTED_CEILINGS["storage_bytes"]
+        or not 0
+        < legacy_index_restore["storage_bytes"]
+        <= EXPECTED_CEILINGS["storage_bytes"]
         or type(index_build_input.get("vectors")) is not int
         or index_build_input["vectors"] != targets["vectors"]
         or index_build_input.get("present_indexes") != [LEGACY_INDEX]
@@ -232,7 +256,8 @@ def _validate_measurements(
         or not 0 < vector_indexes["storage_bytes"] <= EXPECTED_CEILINGS["storage_bytes"]
     ):
         raise ValueError(
-            "capacity evidence does not prove a populated tenant-index build with both indexes live"
+            "capacity evidence does not prove the exact run-scoped backfill setting, "
+            "index-free seed lifecycle, or populated tenant-index build with both indexes live"
         )
     seed = values["vector_seed"]
     storage_checks = seed.get("storage_checks")
@@ -398,7 +423,9 @@ def _validate_runtime(
             "compose_project",
             "compose_service",
             "running",
+            "configured_go_max_procs",
             "live_argv",
+            "live_go_max_procs",
             "effective_memory",
         }
         or process.get("path") != "/cockroach/cockroach.sh"
@@ -409,7 +436,13 @@ def _validate_runtime(
         or process.get("compose_project") != project
         or process.get("compose_service") != "crdb"
         or process.get("running") is not True
+        or type(process.get("configured_go_max_procs")) is not int
+        or process.get("configured_go_max_procs")
+        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
         or process.get("live_argv") != EXPECTED_LIVE_PROCESS_ARGS
+        or type(process.get("live_go_max_procs")) is not int
+        or process.get("live_go_max_procs")
+        != EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
         or process.get("effective_memory")
         != {
             "go_limit_bytes": EXPECTED_RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"],
@@ -504,6 +537,15 @@ def _validate_runtime(
         "post_teardown_sample_monotonic_ns",
         "final_snapshot_monotonic_ns",
     )
+    uptime_fields = (
+        "baseline_monotonic_ns",
+        "workload_stop_observed_monotonic_ns",
+        "workload_last_monotonic_ns",
+        "post_teardown_observed_monotonic_ns",
+        "post_teardown_sample_monotonic_ns",
+        "final_snapshot_monotonic_ns",
+    )
+    gap_fields = ("observed_max_sample_gap_ns", "sampling_elapsed_ns")
     if (
         set(cgroup) != expected_cgroup_keys
         or cgroup.get("version") != 2
@@ -516,6 +558,14 @@ def _validate_runtime(
         or cgroup.get("nominal_sample_sleep_seconds") != 0.25
         or cgroup.get("maximum_sample_gap_seconds") != 1.0
         or any(type(cgroup.get(key)) is not int or cgroup[key] < 0 for key in integer_fields)
+        or any(
+            cgroup[key] <= 0 or cgroup[key] % UPTIME_QUANTUM_NS != 0
+            for key in uptime_fields
+        )
+        or any(
+            cgroup[key] <= 0 or cgroup[key] % UPTIME_QUANTUM_NS != 0
+            for key in gap_fields
+        )
         or cgroup["memory_swap_current_before_bytes"] != 0
         or cgroup["memory_swap_current_after_bytes"] != 0
         or cgroup["swap_devices_before"] != boundary["swap_devices"]
@@ -524,7 +574,7 @@ def _validate_runtime(
         or cgroup["memory_current_after_bytes"] > boundary["memory_max_bytes"]
         or not 3 <= cgroup["sample_count"] <= 7_201
         or cgroup["baseline_sequence"] != 0
-        or not 0 < cgroup["observed_max_sample_gap_ns"] <= 1_000_000_000
+        or not 0 < cgroup["observed_max_sample_gap_ns"] <= MAX_RECORDED_SAMPLE_GAP_NS
         or cgroup["observed_max_sample_gap_ns"] > cgroup["sampling_elapsed_ns"]
         or cgroup["sampling_elapsed_ns"]
         > cgroup["observed_max_sample_gap_ns"] * (cgroup["sample_count"] - 1)
@@ -538,10 +588,10 @@ def _validate_runtime(
         < cgroup["final_snapshot_monotonic_ns"]
         or cgroup["workload_last_monotonic_ns"]
         - cgroup["workload_stop_observed_monotonic_ns"]
-        > 1_000_000_000
+        > MAX_RECORDED_SAMPLE_GAP_NS
         or cgroup["post_teardown_sample_monotonic_ns"]
         - cgroup["post_teardown_observed_monotonic_ns"]
-        > 1_000_000_000
+        > MAX_RECORDED_SAMPLE_GAP_NS
         or not 0 <= cgroup["workload_last_sequence"] < cgroup["sample_count"] - 2
         or not 0 < cgroup["sampled_peak_bytes"] < cgroup["memory_max_bytes"]
         or cgroup["sampled_peak_bytes"] < cgroup["memory_current_before_bytes"]
@@ -595,6 +645,7 @@ def _validate_infrastructure_cleanup(
             "execution_id",
             "compose_project",
             "down_status",
+            "runtime_evidence_capture_status",
             "runtime_finalize_status",
             "probe_cleanup_status",
             "container_query_status",
@@ -614,6 +665,8 @@ def _validate_infrastructure_cleanup(
         or cleanup.get("compose_project") != project
         or type(cleanup.get("down_status")) is not int
         or cleanup["down_status"] != 0
+        or type(cleanup.get("runtime_evidence_capture_status")) is not int
+        or cleanup["runtime_evidence_capture_status"] != 0
         or type(cleanup.get("runtime_finalize_status")) is not int
         or cleanup["runtime_finalize_status"] != 0
         or type(cleanup.get("probe_cleanup_status")) is not int
@@ -709,6 +762,11 @@ def validate(
         raise ValueError("capacity evidence does not identify the bounded vector seeding method")
     if method.get("fixture_vector_indexes") != EXPECTED_FIXTURE_VECTOR_INDEXES:
         raise ValueError("capacity evidence does not identify the bounded index lifecycle")
+    if (
+        method.get("vector_backfill_merge_batch")
+        != EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+    ):
+        raise ValueError("capacity evidence does not identify the bounded vector backfill method")
     if method.get("clients") != "20_bounded_parallel_index_queries":
         raise ValueError("capacity evidence does not identify twenty bounded clients")
     environment = document["environment"]

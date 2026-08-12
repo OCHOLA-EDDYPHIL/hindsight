@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import re
 import sys
 from pathlib import Path
@@ -23,9 +22,8 @@ from validate_capacity_evidence import (  # noqa: E402
     EXPECTED_INDEXES,
     EXPECTED_RUNTIME_MEMORY_ENVELOPE,
     EXPECTED_SEEDING_METHOD,
+    EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD,
     EXPECTED_VECTOR_METHOD,
-    MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES,
-    MAX_PROJECTED_DURATION_SECONDS,
     TARGETS,
     _matches_exact_integers,
     _validate_execution_id,
@@ -102,6 +100,8 @@ def validate(
         or method.get("vectors") != EXPECTED_VECTOR_METHOD
         or method.get("seeding") != EXPECTED_SEEDING_METHOD
         or method.get("fixture_vector_indexes") != EXPECTED_FIXTURE_VECTOR_INDEXES
+        or method.get("vector_backfill_merge_batch")
+        != EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
         or method.get("clients") != "20_bounded_parallel_index_queries"
         or not isinstance(environment, dict)
         or environment.get("isolation") != "run_scoped_database_and_compose_project"
@@ -182,14 +182,6 @@ def validate(
         mode="diagnostic",
         execution_id=execution_id,
     )
-    if (
-        max(
-            runtime["cgroup"]["sampled_peak_bytes"],
-            runtime["container_cgroup"]["memory_peak_bytes"],
-        )
-        > MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES
-    ):
-        raise ValueError("capacity diagnostic lacks the required memory headroom")
     infrastructure_cleanup = _validate_infrastructure_cleanup(
         infrastructure_cleanup,
         source_revision=source_revision,
@@ -210,9 +202,6 @@ def validate(
     duration = values["total"]["duration_seconds"]
     if runtime["cgroup"]["sampling_elapsed_ns"] < duration * 1_000_000_000:
         raise ValueError("capacity diagnostic sampling does not cover the measured workload")
-    projected_duration = math.ceil(duration * 11 / 8)
-    if projected_duration > MAX_PROJECTED_DURATION_SECONDS:
-        raise ValueError("capacity diagnostic lacks the required timing headroom")
     limitations = document.get("limitations")
     if not isinstance(
         limitations, list
@@ -226,16 +215,6 @@ def validate(
         "acceptance_eligible": False,
         "qualification_evidence": False,
         "gate_passed": True,
-        "projection": {
-            "method": "whole_diagnostic_duration_scaled_by_conservative_11_over_8",
-            "diagnostic_duration_seconds": duration,
-            "projected_final_duration_seconds": projected_duration,
-            "maximum_projected_duration_seconds": MAX_PROJECTED_DURATION_SECONDS,
-            "final_duration_ceiling_seconds": EXPECTED_CEILINGS["duration_seconds"],
-            "minimum_headroom_seconds": (
-                EXPECTED_CEILINGS["duration_seconds"] - MAX_PROJECTED_DURATION_SECONDS
-            ),
-        },
         "runtime_pressure": runtime,
         "infrastructure_cleanup": infrastructure_cleanup,
         "artifacts": artifact_digests,

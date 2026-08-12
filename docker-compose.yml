@@ -2,6 +2,8 @@ services:
   crdb:
     image: ${COCKROACH_IMAGE:-cockroachdb/cockroach:v25.4.5}
     command: start-single-node --insecure ${COCKROACH_START_ARGS:-}
+    environment:
+      GOMAXPROCS: ${COCKROACH_GOMAXPROCS:-}
     ports:
       - "26257:26257"
       - "8080:8080"

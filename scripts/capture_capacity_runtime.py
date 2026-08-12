@@ -16,10 +16,10 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_SCHEMA_VERSION = "hindsight.capacity_runtime_baseline.v2"
-SAMPLES_SCHEMA_VERSION = "hindsight.capacity_runtime_samples.v2"
-RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v2"
-CAPACITY_SCHEMA_VERSION = "hindsight.capacity_qualification.v5"
+BASELINE_SCHEMA_VERSION = "hindsight.capacity_runtime_baseline.v3"
+SAMPLES_SCHEMA_VERSION = "hindsight.capacity_runtime_samples.v3"
+RUNTIME_SCHEMA_VERSION = "hindsight.capacity_runtime.v3"
+CAPACITY_SCHEMA_VERSION = "hindsight.capacity_qualification.v6"
 MODES = frozenset({"diagnostic", "qualification"})
 EXPECTED_IMAGE_DIGEST = "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
 EXPECTED_IMAGE = f"cockroachdb/cockroach@{EXPECTED_IMAGE_DIGEST}"
@@ -31,7 +31,7 @@ EXPECTED_START_ARGS = (
     "--cache=128MiB",
     "--max-sql-memory=128MiB",
     "--max-tsdb-memory=64MiB",
-    "--max-go-memory=3GiB",
+    "--max-go-memory=2304MiB",
 )
 EXPECTED_START_ARGS_TEXT = " ".join(EXPECTED_START_ARGS)
 EXPECTED_PROCESS_ARGS = ("start-single-node", "--insecure", *EXPECTED_START_ARGS)
@@ -49,12 +49,14 @@ EXPECTED_BOUNDARY_MEMORY_BYTES = 4 * 1024**3
 EXPECTED_BOUNDARY_SWAP_MAX = "max"
 EXPECTED_CPU_QUOTA_US = 150_000
 EXPECTED_CPU_PERIOD_US = 100_000
+EXPECTED_GO_MAX_PROCS = 2
+EXPECTED_GOMAXPROCS_ENV = f"GOMAXPROCS={EXPECTED_GO_MAX_PROCS}"
 EXPECTED_MEMORY_BYTES = {
     "store": 2 * 1024**3,
     "cache": 128 * 1024**2,
     "sql": 128 * 1024**2,
     "tsdb": 64 * 1024**2,
-    "go": 3 * 1024**3,
+    "go": 2304 * 1024**2,
 }
 REQUIRED_EVENT_KEYS = frozenset({"low", "high", "max", "oom", "oom_kill"})
 PROBE_EVENT_KEYS = ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
@@ -63,14 +65,16 @@ EXECUTION_ID_PATTERN = re.compile(r"capacity_[0-9]+_1_(diagnostic|qualification)
 COMPOSE_PROJECT_PATTERN = re.compile(r"hindsight_capacity_[0-9]+_[0-9]+_(diagnostic|qualification)")
 CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 NOMINAL_SAMPLE_SLEEP_SECONDS = 0.25
-MAX_SAMPLE_GAP_NS = 1_000_000_000
+UPTIME_QUANTUM_NS = 10_000_000
+MAX_REAL_SAMPLE_GAP_SECONDS = 1.0
+MAX_RECORDED_SAMPLE_GAP_NS = 990_000_000
 MAX_MONITOR_SECONDS = 1_600
 DOCKER_COMMAND_TIMEOUT_SECONDS = 15
 PROBE_RECORD_PREFIX = "hindsight.capacity_cgroup_sample.v2"
 PROBE_MAX_SAMPLES = 7_200
 PROBE_MAX_LOG_BYTES = 2 * 1024**2
 PROBE_MEMORY_BYTES = 32 * 1024**2
-PROBE_NANO_CPUS = 100_000_000
+PROBE_NANO_CPUS = 500_000_000
 PROBE_PIDS_LIMIT = 16
 PROBE_LABEL_ROLE = "runtime-pressure-probe"
 PROBE_LOG_CONFIG = {
@@ -81,18 +85,22 @@ PROBE_EMIT_FUNCTION = r"""
 emit_sample() {
   sequence="$1"
   IFS=' ' read -r monotonic_seconds _ < /proc/uptime
-  device="$(stat -c %d /sys/fs/cgroup)"
-  inode="$(stat -c %i /sys/fs/cgroup)"
-  memory_max="$(cat /sys/fs/cgroup/memory.max)"
-  memory_swap_max="$(cat /sys/fs/cgroup/memory.swap.max)"
-  memory_current="$(cat /sys/fs/cgroup/memory.current)"
-  memory_peak="$(cat /sys/fs/cgroup/memory.peak)"
-  memory_swap_current="$(cat /sys/fs/cgroup/memory.swap.current)"
-  set -- $(cat /sys/fs/cgroup/cpu.max)
+  set -- $(stat -c '%d %i' /sys/fs/cgroup)
   test "$#" -eq 2
-  cpu_quota="$1"
-  cpu_period="$2"
-  swaps_active="$(awk 'NR > 1 { count++ } END { print count + 0 }' /proc/swaps)"
+  device="$1"
+  inode="$2"
+  IFS= read -r memory_max < /sys/fs/cgroup/memory.max
+  IFS= read -r memory_swap_max < /sys/fs/cgroup/memory.swap.max
+  IFS= read -r memory_current < /sys/fs/cgroup/memory.current
+  IFS= read -r memory_peak < /sys/fs/cgroup/memory.peak
+  IFS= read -r memory_swap_current < /sys/fs/cgroup/memory.swap.current
+  IFS=' ' read -r cpu_quota cpu_period cpu_extra < /sys/fs/cgroup/cpu.max
+  test -n "$cpu_quota" && test -n "$cpu_period" && test -z "$cpu_extra"
+  swaps_active=-1
+  while IFS= read -r _; do
+    swaps_active=$((swaps_active + 1))
+  done < /proc/swaps
+  test "$swaps_active" -ge 0
   low=""
   high=""
   max=""
@@ -164,7 +172,19 @@ def _parse_monotonic_seconds(raw: str, *, name: str) -> int:
     matched = re.fullmatch(r"(0|[1-9][0-9]*)\.([0-9]{2})", raw)
     if matched is None:
         raise ValueError(f"{name} is not canonical kernel uptime")
-    return int(matched.group(1)) * 1_000_000_000 + int(matched.group(2)) * 10_000_000
+    return (
+        int(matched.group(1)) * 1_000_000_000
+        + int(matched.group(2)) * UPTIME_QUANTUM_NS
+    )
+
+
+def _validate_uptime_ns(value: object, *, name: str) -> int:
+    if type(value) is not int or value <= 0 or value % UPTIME_QUANTUM_NS != 0:
+        raise RuntimeError(
+            f"{name} must be a positive {UPTIME_QUANTUM_NS}-nanosecond-quantized "
+            f"uptime: value_ns={value!r}"
+        )
+    return value
 
 
 def _read_monotonic_uptime_ns() -> int:
@@ -180,6 +200,7 @@ def _configured_envelope() -> dict[str, Any]:
         "image_id": EXPECTED_IMAGE_ID,
         "image_platform": EXPECTED_IMAGE_PLATFORM,
         "execution_topology": EXPECTED_EXECUTION_TOPOLOGY,
+        "go_max_procs": EXPECTED_GO_MAX_PROCS,
         "start_args": list(EXPECTED_START_ARGS),
         "capacity_boundary": {
             "cgroup_version": 2,
@@ -205,7 +226,7 @@ def _configured_envelope() -> dict[str, Any]:
             "memory_bytes": PROBE_MEMORY_BYTES,
             "nano_cpus": PROBE_NANO_CPUS,
             "nominal_sample_sleep_seconds": NOMINAL_SAMPLE_SLEEP_SECONDS,
-            "maximum_sample_gap_seconds": MAX_SAMPLE_GAP_NS / 1_000_000_000,
+            "maximum_sample_gap_seconds": MAX_REAL_SAMPLE_GAP_SECONDS,
         },
         "memory_bytes": dict(EXPECTED_MEMORY_BYTES),
     }
@@ -253,6 +274,8 @@ def _validate_invocation(source_revision: str, mode: str, execution_id: str, pro
         raise ValueError("capacity runtime CockroachDB image ID differs from the reviewed image")
     if os.environ.get("COCKROACH_START_ARGS") != EXPECTED_START_ARGS_TEXT:
         raise ValueError("capacity runtime memory arguments differ from the reviewed envelope")
+    if os.environ.get("COCKROACH_GOMAXPROCS") != str(EXPECTED_GO_MAX_PROCS):
+        raise ValueError("capacity runtime Go processor budget differs from the reviewed envelope")
 
 
 def _probe_name(project: str) -> str:
@@ -337,6 +360,7 @@ def _validate_probe_snapshot(snapshot: dict[str, Any]) -> None:
     if (
         type(snapshot.get("monotonic_ns")) is not int
         or snapshot["monotonic_ns"] <= 0
+        or snapshot["monotonic_ns"] % UPTIME_QUANTUM_NS != 0
         or snapshot.get("memory_max_bytes") != EXPECTED_BOUNDARY_MEMORY_BYTES
         or snapshot.get("memory_swap_max") != EXPECTED_BOUNDARY_SWAP_MAX
         or snapshot.get("memory_swap_current_bytes") != 0
@@ -371,25 +395,65 @@ def _validate_probe_series(
 ) -> tuple[int, int]:
     if not records:
         raise RuntimeError("capacity cgroup probe emitted no samples")
-    snapshots = [snapshot for _sequence, snapshot in records]
+    samples: list[tuple[int | str, dict[str, Any]]] = list(records)
     if final_snapshot is not None:
-        snapshots.append(final_snapshot)
+        samples.append(("final_snapshot", final_snapshot))
+    for sequence, snapshot in samples:
+        _validate_uptime_ns(
+            snapshot.get("monotonic_ns"), name=f"probe sequence {sequence} monotonic uptime"
+        )
     gaps: list[int] = []
-    for previous, current in zip(snapshots, snapshots[1:], strict=False):
+    for (previous_sequence, previous), (current_sequence, current) in zip(
+        samples, samples[1:], strict=False
+    ):
         gap = current["monotonic_ns"] - previous["monotonic_ns"]
-        if gap <= 0 or gap > MAX_SAMPLE_GAP_NS:
-            raise RuntimeError("capacity cgroup probe sampling cadence is invalid")
+        if gap <= 0 or gap > MAX_RECORDED_SAMPLE_GAP_NS:
+            raise RuntimeError(
+                "capacity cgroup probe sampling cadence is invalid between "
+                f"sequences {previous_sequence} and {current_sequence}: gap_ns={gap}"
+            )
         gaps.append(gap)
         if current["identity"] != previous["identity"]:
-            raise RuntimeError("capacity DinD cgroup identity changed during sampling")
+            raise RuntimeError(
+                "capacity DinD cgroup identity changed during sampling between "
+                f"sequences {previous_sequence} and {current_sequence}"
+            )
         if current["kernel_memory_peak_bytes"] < previous["kernel_memory_peak_bytes"]:
-            raise RuntimeError("capacity cgroup memory peak is not monotonic")
+            raise RuntimeError(
+                "capacity cgroup memory peak is not monotonic between "
+                f"sequences {previous_sequence} and {current_sequence}"
+            )
         if any(
             current["events"][key] < previous["events"][key]
             for key in PROBE_EVENT_KEYS
         ):
-            raise RuntimeError("capacity cgroup pressure counters are not monotonic")
-    return max(gaps, default=0), snapshots[-1]["monotonic_ns"] - snapshots[0]["monotonic_ns"]
+            raise RuntimeError(
+                "capacity cgroup pressure counters are not monotonic between "
+                f"sequences {previous_sequence} and {current_sequence}"
+            )
+    return (
+        max(gaps, default=0),
+        samples[-1][1]["monotonic_ns"] - samples[0][1]["monotonic_ns"],
+    )
+
+
+def _validate_boundary_bridge(
+    *, name: str, observed_monotonic_ns: object, sample_sequence: int, sample_monotonic_ns: object
+) -> int:
+    observed = _validate_uptime_ns(
+        observed_monotonic_ns, name=f"{name} observed monotonic uptime"
+    )
+    sampled = _validate_uptime_ns(
+        sample_monotonic_ns,
+        name=f"{name} sample sequence {sample_sequence} monotonic uptime",
+    )
+    gap = sampled - observed
+    if gap < 0 or gap > MAX_RECORDED_SAMPLE_GAP_NS:
+        raise RuntimeError(
+            f"capacity probe {name} bridge is invalid at sequence "
+            f"{sample_sequence}: gap_ns={gap}"
+        )
+    return gap
 
 
 def _probe_run_command(execution_id: str, project: str) -> list[str]:
@@ -415,7 +479,7 @@ def _probe_run_command(execution_id: str, project: str) -> list[str]:
         "--memory-swap",
         str(PROBE_MEMORY_BYTES),
         "--cpus",
-        "0.10",
+        "0.50",
         "--cap-drop",
         "ALL",
         "--security-opt",
@@ -661,6 +725,9 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
     ):
         raise RuntimeError("capacity runtime Docker inspection is incomplete")
     labels = config.get("Labels")
+    configured_go_max_procs = _go_max_procs_from_environment(
+        config.get("Env"), source="Docker configuration"
+    )
     process = {
         "path": row.get("Path"),
         "args": row.get("Args"),
@@ -674,6 +741,7 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
         if isinstance(labels, dict)
         else None,
         "running": state.get("Running"),
+        "configured_go_max_procs": configured_go_max_procs,
     }
     if (
         process["path"] != "/cockroach/cockroach.sh"
@@ -687,20 +755,55 @@ def _inspect_container(project: str) -> dict[str, Any] | None:
         or process["running"] is not True
     ):
         raise RuntimeError("capacity CockroachDB process differs from the reviewed envelope")
+    health = state.get("Health")
+    health_status = health.get("Status") if isinstance(health, dict) else None
+    if (
+        not isinstance(health, dict)
+        or not isinstance(health_status, str)
+        or health_status not in {"starting", "healthy"}
+    ):
+        raise RuntimeError("capacity CockroachDB Docker health is invalid")
     pid_raw = _try_read_container_file("/cockroach/server_pid")
     if pid_raw is None:
-        return None
+        if health_status == "starting":
+            return None
+        raise RuntimeError("healthy capacity CockroachDB server PID is missing")
     pid = _parse_nonnegative_integer(pid_raw, name="CockroachDB server PID")
     if pid == 0:
         raise RuntimeError("capacity CockroachDB server PID is invalid")
     live_raw = _try_read_container_file(f"/proc/{pid}/cmdline")
     if not live_raw:
-        return None
+        if health_status == "starting":
+            return None
+        raise RuntimeError("healthy capacity CockroachDB live argv is missing")
     live_argv = [part for part in live_raw.split("\0") if part]
+    if health_status == "starting":
+        return None
     if live_argv != list(EXPECTED_LIVE_PROCESS_ARGS):
         raise RuntimeError("capacity CockroachDB live argv differs from the reviewed envelope")
+    live_environment_raw = _try_read_container_file(f"/proc/{pid}/environ")
+    if not live_environment_raw:
+        raise RuntimeError("healthy capacity CockroachDB live environment is missing")
+    live_go_max_procs = _go_max_procs_from_environment(
+        [part for part in live_environment_raw.split("\0") if part],
+        source="live CockroachDB process",
+    )
     process["live_argv"] = live_argv
+    process["live_go_max_procs"] = live_go_max_procs
     return process
+
+
+def _go_max_procs_from_environment(entries: object, *, source: str) -> int:
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, str) for entry in entries
+    ):
+        raise RuntimeError(f"capacity {source} environment is malformed")
+    matches = [entry for entry in entries if entry.partition("=")[0] == "GOMAXPROCS"]
+    if len(matches) != 1 or matches[0] != EXPECTED_GOMAXPROCS_ENV:
+        raise RuntimeError(
+            f"capacity {source} must contain exactly {EXPECTED_GOMAXPROCS_ENV}"
+        )
+    return EXPECTED_GO_MAX_PROCS
 
 
 def _query_single_integer(statement: str) -> int | None:
@@ -881,18 +984,26 @@ def _monitor(args: argparse.Namespace) -> int:
             ):
                 break
             if time.monotonic() >= record_deadline:
+                if workload_records:
+                    _validate_boundary_bridge(
+                        name="workload boundary",
+                        observed_monotonic_ns=workload_stop_observed_monotonic_ns,
+                        sample_sequence=workload_records[-1][0],
+                        sample_monotonic_ns=workload_records[-1][1]["monotonic_ns"],
+                    )
                 raise RuntimeError("capacity probe did not sample the workload stop boundary")
             time.sleep(0.05)
         workload_observed_max_sample_gap_ns, workload_sampling_elapsed_ns = (
             _validate_probe_series(workload_records)
         )
-        if (
-            workload_records[0] != (0, baseline_snapshot)
-            or workload_records[-1][1]["monotonic_ns"]
-            - workload_stop_observed_monotonic_ns
-            > MAX_SAMPLE_GAP_NS
-        ):
+        if workload_records[0] != (0, baseline_snapshot):
             raise RuntimeError("capacity probe workload boundary is invalid")
+        _validate_boundary_bridge(
+            name="workload boundary",
+            observed_monotonic_ns=workload_stop_observed_monotonic_ns,
+            sample_sequence=workload_records[-1][0],
+            sample_monotonic_ns=workload_records[-1][1]["monotonic_ns"],
+        )
         if process is None:
             process = _inspect_container(args.compose_project)
         if process is None:
@@ -984,6 +1095,13 @@ def _finalize(args: argparse.Namespace) -> int:
             ):
                 break
             if time.monotonic() >= record_deadline:
+                if records:
+                    _validate_boundary_bridge(
+                        name="post-teardown boundary",
+                        observed_monotonic_ns=post_teardown_observed_monotonic_ns,
+                        sample_sequence=records[-1][0],
+                        sample_monotonic_ns=records[-1][1]["monotonic_ns"],
+                    )
                 raise RuntimeError("capacity probe did not sample the post-teardown boundary")
             time.sleep(0.05)
         final_snapshot = _final_probe_snapshot(
@@ -1009,6 +1127,24 @@ def _finalize(args: argparse.Namespace) -> int:
             records, final_snapshot=final_snapshot
         )
         if (
+            type(workload_last) is int
+            and type(workload_last_monotonic_ns) is int
+            and type(workload_stop_monotonic_ns) is int
+        ):
+            _validate_boundary_bridge(
+                name="workload boundary",
+                observed_monotonic_ns=workload_stop_monotonic_ns,
+                sample_sequence=workload_last,
+                sample_monotonic_ns=workload_last_monotonic_ns,
+            )
+        if records:
+            _validate_boundary_bridge(
+                name="post-teardown boundary",
+                observed_monotonic_ns=post_teardown_observed_monotonic_ns,
+                sample_sequence=records[-1][0],
+                sample_monotonic_ns=records[-1][1]["monotonic_ns"],
+            )
+        if (
             not records
             or baseline_sequence != 0
             or baseline.get("baseline_sequence") != samples.get("baseline_sequence")
@@ -1030,8 +1166,6 @@ def _finalize(args: argparse.Namespace) -> int:
             or not baseline_cgroup["monotonic_ns"]
             <= workload_stop_monotonic_ns
             <= workload_last_monotonic_ns
-            or workload_last_monotonic_ns - workload_stop_monotonic_ns
-            > MAX_SAMPLE_GAP_NS
             or measured_workload_max_gap_ns != workload_max_gap_ns
             or measured_workload_elapsed_ns != workload_elapsed_ns
             or max(
@@ -1044,9 +1178,6 @@ def _finalize(args: argparse.Namespace) -> int:
             < post_teardown_observed_monotonic_ns
             <= records[-1][1]["monotonic_ns"]
             < final_snapshot["monotonic_ns"]
-            or records[-1][1]["monotonic_ns"]
-            - post_teardown_observed_monotonic_ns
-            > MAX_SAMPLE_GAP_NS
             or baseline_cgroup.get("identity") != final_snapshot["identity"]
             or samples.get("cgroup_identity") != final_snapshot["identity"]
             or any(
@@ -1111,7 +1242,7 @@ def _finalize(args: argparse.Namespace) -> int:
                     "kernel_memory_peak_bytes"
                 ],
                 "nominal_sample_sleep_seconds": NOMINAL_SAMPLE_SLEEP_SECONDS,
-                "maximum_sample_gap_seconds": MAX_SAMPLE_GAP_NS / 1_000_000_000,
+                "maximum_sample_gap_seconds": MAX_REAL_SAMPLE_GAP_SECONDS,
                 "observed_max_sample_gap_ns": observed_max_gap_ns,
                 "sampling_elapsed_ns": sampling_elapsed_ns,
                 "baseline_sequence": baseline_sequence,

@@ -52,7 +52,8 @@ jobs:
       EXECUTION_ID: capacity_${{ github.run_id }}_${{ github.run_attempt }}_diagnostic
       COCKROACH_IMAGE: cockroachdb/cockroach@sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
       COCKROACH_IMAGE_ID: sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
-      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=3GiB
+      COCKROACH_GOMAXPROCS: "2"
+      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=2304MiB
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EVIDENCE_DIR: build/capacity-diagnostic
       SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
@@ -158,6 +159,14 @@ jobs:
           timeout 120 docker compose down --volumes --remove-orphans
           down_status=$?
           runtime_prefix="$RUNNER_TEMP/hindsight-capacity-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CAPACITY_MODE}"
+          runtime_evidence_capture_status=0
+          cp "${runtime_prefix}.baseline.json" "$EVIDENCE_DIR/runtime-pressure-baseline.json" \
+            || runtime_evidence_capture_status=1
+          cp "${runtime_prefix}.samples.json" "$EVIDENCE_DIR/runtime-pressure-samples.json" \
+            || runtime_evidence_capture_status=1
+          timeout 30 docker logs --tail 7200 "${COMPOSE_PROJECT_NAME}_runtime_probe" \
+            > "$EVIDENCE_DIR/runtime-pressure-probe.tsv" \
+            || runtime_evidence_capture_status=1
           uv run python scripts/capture_capacity_runtime.py finalize \
             --source-revision "$SOURCE_SHA" \
             --mode "$CAPACITY_MODE" \
@@ -188,12 +197,13 @@ jobs:
           networks="$(awk 'NF { count++ } END { print count + 0 }' <<< "$network_ids")"
           probes="$(awk 'NF { count++ } END { print count + 0 }' <<< "$probe_ids")"
           jq -n \
-            --arg schema_version "hindsight.capacity_infrastructure_cleanup.v2" \
+            --arg schema_version "hindsight.capacity_infrastructure_cleanup.v3" \
             --arg source_revision "$SOURCE_SHA" \
             --arg mode "$CAPACITY_MODE" \
             --arg execution_id "$EXECUTION_ID" \
             --arg compose_project "$COMPOSE_PROJECT_NAME" \
             --argjson down_status "$down_status" \
+            --argjson runtime_evidence_capture_status "$runtime_evidence_capture_status" \
             --argjson runtime_finalize_status "$runtime_finalize_status" \
             --argjson probe_cleanup_status "$probe_cleanup_status" \
             --argjson container_query_status "$container_query_status" \
@@ -207,6 +217,7 @@ jobs:
             '{schema_version: $schema_version, source_revision: $source_revision,
               mode: $mode, execution_id: $execution_id,
               compose_project: $compose_project, down_status: $down_status,
+              runtime_evidence_capture_status: $runtime_evidence_capture_status,
               runtime_finalize_status: $runtime_finalize_status,
               probe_cleanup_status: $probe_cleanup_status,
               container_query_status: $container_query_status,
@@ -217,7 +228,7 @@ jobs:
               remaining_volumes: $remaining_volumes,
               remaining_networks: $remaining_networks,
               remaining_probes: $remaining_probes,
-              compose_state_removed: ($down_status == 0 and $runtime_finalize_status == 0
+              compose_state_removed: ($down_status == 0
                 and $probe_cleanup_status == 0 and $container_query_status == 0
                 and $volume_query_status == 0 and $network_query_status == 0
                 and $probe_query_status == 0
@@ -227,6 +238,7 @@ jobs:
             > "$EVIDENCE_DIR/infrastructure-cleanup.json"
           set -e
           test "$down_status" -eq 0
+          test "$runtime_evidence_capture_status" -eq 0
           test "$runtime_finalize_status" -eq 0
           test "$probe_cleanup_status" -eq 0
           test "$container_query_status" -eq 0
@@ -268,7 +280,8 @@ jobs:
       EXECUTION_ID: capacity_${{ github.run_id }}_${{ github.run_attempt }}_qualification
       COCKROACH_IMAGE: cockroachdb/cockroach@sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
       COCKROACH_IMAGE_ID: sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7
-      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=3GiB
+      COCKROACH_GOMAXPROCS: "2"
+      COCKROACH_START_ARGS: --store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB --max-tsdb-memory=64MiB --max-go-memory=2304MiB
       DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
       EVIDENCE_DIR: build/capacity-qualification
       SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
@@ -374,6 +387,14 @@ jobs:
           timeout 120 docker compose down --volumes --remove-orphans
           down_status=$?
           runtime_prefix="$RUNNER_TEMP/hindsight-capacity-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CAPACITY_MODE}"
+          runtime_evidence_capture_status=0
+          cp "${runtime_prefix}.baseline.json" "$EVIDENCE_DIR/runtime-pressure-baseline.json" \
+            || runtime_evidence_capture_status=1
+          cp "${runtime_prefix}.samples.json" "$EVIDENCE_DIR/runtime-pressure-samples.json" \
+            || runtime_evidence_capture_status=1
+          timeout 30 docker logs --tail 7200 "${COMPOSE_PROJECT_NAME}_runtime_probe" \
+            > "$EVIDENCE_DIR/runtime-pressure-probe.tsv" \
+            || runtime_evidence_capture_status=1
           uv run python scripts/capture_capacity_runtime.py finalize \
             --source-revision "$SOURCE_SHA" \
             --mode "$CAPACITY_MODE" \
@@ -404,12 +425,13 @@ jobs:
           networks="$(awk 'NF { count++ } END { print count + 0 }' <<< "$network_ids")"
           probes="$(awk 'NF { count++ } END { print count + 0 }' <<< "$probe_ids")"
           jq -n \
-            --arg schema_version "hindsight.capacity_infrastructure_cleanup.v2" \
+            --arg schema_version "hindsight.capacity_infrastructure_cleanup.v3" \
             --arg source_revision "$SOURCE_SHA" \
             --arg mode "$CAPACITY_MODE" \
             --arg execution_id "$EXECUTION_ID" \
             --arg compose_project "$COMPOSE_PROJECT_NAME" \
             --argjson down_status "$down_status" \
+            --argjson runtime_evidence_capture_status "$runtime_evidence_capture_status" \
             --argjson runtime_finalize_status "$runtime_finalize_status" \
             --argjson probe_cleanup_status "$probe_cleanup_status" \
             --argjson container_query_status "$container_query_status" \
@@ -423,6 +445,7 @@ jobs:
             '{schema_version: $schema_version, source_revision: $source_revision,
               mode: $mode, execution_id: $execution_id,
               compose_project: $compose_project, down_status: $down_status,
+              runtime_evidence_capture_status: $runtime_evidence_capture_status,
               runtime_finalize_status: $runtime_finalize_status,
               probe_cleanup_status: $probe_cleanup_status,
               container_query_status: $container_query_status,
@@ -433,7 +456,7 @@ jobs:
               remaining_volumes: $remaining_volumes,
               remaining_networks: $remaining_networks,
               remaining_probes: $remaining_probes,
-              compose_state_removed: ($down_status == 0 and $runtime_finalize_status == 0
+              compose_state_removed: ($down_status == 0
                 and $probe_cleanup_status == 0 and $container_query_status == 0
                 and $volume_query_status == 0 and $network_query_status == 0
                 and $probe_query_status == 0
@@ -443,6 +466,7 @@ jobs:
             > "$EVIDENCE_DIR/infrastructure-cleanup.json"
           set -e
           test "$down_status" -eq 0
+          test "$runtime_evidence_capture_status" -eq 0
           test "$runtime_finalize_status" -eq 0
           test "$probe_cleanup_status" -eq 0
           test "$container_query_status" -eq 0

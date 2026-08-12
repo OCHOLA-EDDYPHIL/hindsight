@@ -37,9 +37,9 @@ from hindsight.vector_index_qualification import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "hindsight.capacity_qualification.v5"
-DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v2"
-ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v2"
+SCHEMA_VERSION = "hindsight.capacity_qualification.v6"
+DIAGNOSTIC_SCHEMA_VERSION = "hindsight.capacity_resource_diagnostic.v3"
+ATTEMPT_PROGRESS_SCHEMA_VERSION = "hindsight.capacity_attempt_progress.v3"
 ATTEMPT_PROGRESS_FILENAME = "capacity-attempt-progress.json"
 MODES = frozenset({"diagnostic", "qualification"})
 QUALIFICATION_TARGETS = {
@@ -85,13 +85,14 @@ RUNTIME_MEMORY_ENVELOPE = {
         "sha256:53f2dea6f5a666551f404bf6c341bde6595964cf786f24ade7d85249ccedecc7"
     ),
     "image_platform": "linux/amd64",
+    "go_max_procs": 2,
     "execution_topology": "owner_runner_sibling_dind_capacity_cgroup_v2",
     "start_args": [
         "--store=type=mem,size=2GiB",
         "--cache=128MiB",
         "--max-sql-memory=128MiB",
         "--max-tsdb-memory=64MiB",
-        "--max-go-memory=3GiB",
+        "--max-go-memory=2304MiB",
     ],
     "capacity_boundary": {
         "cgroup_version": 2,
@@ -120,7 +121,7 @@ RUNTIME_MEMORY_ENVELOPE = {
         "workspace_mounts": 0,
         "pids_limit": 16,
         "memory_bytes": 32 * 1024**2,
-        "nano_cpus": 100_000_000,
+        "nano_cpus": 500_000_000,
         "nominal_sample_sleep_seconds": 0.25,
         "maximum_sample_gap_seconds": 1.0,
     },
@@ -129,12 +130,11 @@ RUNTIME_MEMORY_ENVELOPE = {
         "cache": 128 * 1024**2,
         "sql": 128 * 1024**2,
         "tsdb": 64 * 1024**2,
-        "go": 3 * 1024**3,
+        "go": 2304 * 1024**2,
     },
 }
 MAX_CLEANUP_SECONDS = 120
 CLEANUP_JOB_SECONDS = 90
-CLEANUP_DROP_SECONDS = 25
 CLEANUP_VERIFY_SECONDS = 5
 CLEANUP_POLL_SECONDS = 0.5
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]{8,20}")
@@ -151,6 +151,9 @@ LEGACY_VECTOR_INDEX_CREATE_SQL = (
     "ON semantic_memory_vectors (embedding)"
 )
 TENANT_VECTOR_MIGRATION = "0030_tenant_vector_cosine_index.sql"
+VECTOR_BACKFILL_MERGE_BATCH_SETTING = "bulkio.index_backfill.vector_merge_batch_size"
+VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE = 3
+VECTOR_BACKFILL_MERGE_BATCH_SIZE = 64
 QUALIFIED_VECTOR_INDEXES = frozenset({LEGACY_VECTOR_INDEX, TENANT_VECTOR_INDEX})
 CLEANUP_VECTOR_INDEX_JOB_TYPES = frozenset({"SCHEMA CHANGE", "NEW SCHEMA CHANGE"})
 CLEANUP_VECTOR_INDEX_CANCELLABLE_STATUSES = frozenset(
@@ -170,9 +173,13 @@ LIMITATIONS = [
     "The deterministic synthetic vectors and in-process backlog do not model live traffic.",
     "Fixture loading temporarily removes and exactly recreates the legacy vector index; "
     "seed timing is not indexed-ingestion throughput.",
+    "Populated vector-index construction uses an explicit run-scoped merge batch; its timing "
+    "is not a default-production migration timing claim.",
     "Synthetic fixture loading restores write triggers before qualification; it does not "
     "measure application ingestion throughput or realtime outbox load.",
     "The measurements are benchmark evidence and are not production SLO claims.",
+    "The capacity container fixes GOMAXPROCS at 2 to align database concurrency with the "
+    "1.5-CPU DinD quota; timings are not unbounded-production concurrency claims.",
     "The 2 GiB in-memory store size is configured capacity, not a kernel allocation cap; "
     "the Go limit is soft, database budgets overlap, cache is outside the Go limit, and "
     "the 4 GiB DinD cgroup remains the hard database execution boundary.",
@@ -476,18 +483,23 @@ def _drop_database(admin_url: str, database: str, deadline: Deadline) -> None:
     ) as conn:
         cancel_deadline = Deadline(
             min(
-                deadline.expires_at - CLEANUP_DROP_SECONDS - CLEANUP_VERIFY_SECONDS,
+                deadline.expires_at - CLEANUP_VERIFY_SECONDS,
                 time.monotonic() + CLEANUP_JOB_SECONDS,
             )
         )
         _cancel_disposable_vector_index_jobs(conn, database, cancel_deadline)
-        if deadline.remaining(MAX_CLEANUP_SECONDS) < (
-            CLEANUP_DROP_SECONDS + CLEANUP_VERIFY_SECONDS
-        ):
+        drop_seconds = deadline.expires_at - time.monotonic() - CLEANUP_VERIFY_SECONDS
+        if drop_seconds <= 0:
             raise TimeoutError("capacity cleanup did not preserve database-drop headroom")
-        _set_cleanup_timeouts(conn, CLEANUP_DROP_SECONDS)
+        _set_cleanup_timeouts(conn, drop_seconds)
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} CASCADE").format(sql.Identifier(database)))
-        _set_cleanup_timeouts(conn, CLEANUP_VERIFY_SECONDS)
+        verify_seconds = min(
+            CLEANUP_VERIFY_SECONDS,
+            deadline.expires_at - time.monotonic(),
+        )
+        if verify_seconds <= 0:
+            raise TimeoutError("capacity cleanup exhausted database-verification headroom")
+        _set_cleanup_timeouts(conn, verify_seconds)
         remaining = {str(row[0]) for row in conn.execute("SHOW DATABASES").fetchall()}
     if database in remaining:
         raise RuntimeError("disposable capacity database still exists after cleanup")
@@ -497,8 +509,11 @@ def _refresh_cleanup_timeouts(conn: psycopg.Connection[Any], deadline: Deadline)
     _set_cleanup_timeouts(conn, deadline.remaining(MAX_CLEANUP_SECONDS))
 
 
-def _set_cleanup_timeouts(conn: psycopg.Connection[Any], seconds: int) -> None:
-    timeout = f"{seconds * 1000}ms"
+def _set_cleanup_timeouts(conn: psycopg.Connection[Any], seconds: float) -> None:
+    milliseconds = math.floor(seconds * 1000)
+    if milliseconds <= 0:
+        raise TimeoutError("capacity cleanup timeout is exhausted")
+    timeout = f"{milliseconds}ms"
     conn.execute("SELECT set_config('statement_timeout', %s, false)", (timeout,))
     conn.execute("SELECT set_config('lock_timeout', %s, false)", (timeout,))
 
@@ -1154,6 +1169,45 @@ def _vector_index_names(conn: psycopg.Connection[Any], deadline: Deadline) -> fr
     return frozenset(str(row[0]) for row in rows)
 
 
+def _configure_vector_backfill_merge_batch(
+    database_url: str, deadline: Deadline
+) -> dict[str, Any]:
+    started = time.monotonic()
+    with _connection(database_url, deadline) as conn:
+        _refresh_qualification_timeout(conn, deadline)
+        before_row = conn.execute(
+            f"SHOW CLUSTER SETTING {VECTOR_BACKFILL_MERGE_BATCH_SETTING}"
+        ).fetchone()
+        if before_row is None:
+            raise RuntimeError("vector backfill merge batch setting was not readable")
+        before = int(before_row[0])
+        if before != VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE:
+            raise RuntimeError("vector backfill merge batch did not start at its reviewed default")
+        _refresh_qualification_timeout(conn, deadline)
+        conn.execute(
+            f"SET CLUSTER SETTING {VECTOR_BACKFILL_MERGE_BATCH_SETTING} = "
+            f"{VECTOR_BACKFILL_MERGE_BATCH_SIZE}"
+        )
+        _refresh_qualification_timeout(conn, deadline)
+        after_row = conn.execute(
+            f"SHOW CLUSTER SETTING {VECTOR_BACKFILL_MERGE_BATCH_SETTING}"
+        ).fetchone()
+        if after_row is None:
+            raise RuntimeError("configured vector backfill merge batch was not readable")
+        after = int(after_row[0])
+    if after != VECTOR_BACKFILL_MERGE_BATCH_SIZE:
+        raise RuntimeError("vector backfill merge batch configuration was not exact")
+    return {
+        "name": "vector_backfill_merge_batch",
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "setting": VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+        "previous_value": before,
+        "configured_value": after,
+        "scope": "run_scoped_disposable_cockroachdb_node",
+        "next_populated_index_phase": "legacy_index_restore",
+    }
+
+
 def _suspend_legacy_vector_index(database_url: str, deadline: Deadline) -> dict[str, Any]:
     started = time.monotonic()
     with _connection(database_url, deadline) as conn:
@@ -1428,6 +1482,10 @@ def _run(
             name="base_migrations",
             through=BASE_SCHEMA_THROUGH,
         )
+    with progress.phase("vector_backfill_merge_batch"):
+        vector_backfill_merge_batch = _configure_vector_backfill_merge_batch(
+            database_url, deadline
+        )
     with progress.phase("legacy_index_suspension"):
         legacy_index_suspension = _suspend_legacy_vector_index(database_url, deadline)
     with progress.phase("vector_seed"):
@@ -1491,6 +1549,10 @@ def _run(
             "vectors": VECTOR_METHOD,
             "seeding": SEEDING_METHOD,
             "fixture_vector_indexes": FIXTURE_VECTOR_INDEX_METHOD,
+            "vector_backfill_merge_batch": (
+                f"{VECTOR_BACKFILL_MERGE_BATCH_SETTING}="
+                f"{VECTOR_BACKFILL_MERGE_BATCH_SIZE}_run_scoped"
+            ),
             "fixture_write_triggers": "restored_and_catalog_verified_before_completion_checks",
             "clients": f"{TARGETS['clients']}_bounded_parallel_index_queries",
             "backlog": "in_process_synthetic_accounting_without_live_worker",
@@ -1509,6 +1571,7 @@ def _run(
         },
         "raw_measurements": [
             base_migration,
+            vector_backfill_merge_batch,
             legacy_index_suspension,
             seed,
             legacy_index_restore,

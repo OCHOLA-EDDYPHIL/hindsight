@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -32,6 +33,22 @@ def _script(name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _crdb_container_config(capture, project: str) -> dict:
+    return {
+        "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+        "Image": capture.EXPECTED_IMAGE,
+        "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+        "Labels": {
+            "com.docker.compose.project": project,
+            "com.docker.compose.service": "crdb",
+        },
+    }
+
+
+def _live_crdb_environment(capture) -> str:
+    return f"PATH=/usr/bin\0{capture.EXPECTED_GOMAXPROCS_ENV}"
 
 
 def _qualification(validator):
@@ -91,19 +108,33 @@ def _report(validator):
             "vectors": validator.EXPECTED_VECTOR_METHOD,
             "seeding": validator.EXPECTED_SEEDING_METHOD,
             "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+            "vector_backfill_merge_batch": (
+                validator.EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+            ),
             "clients": "20_bounded_parallel_index_queries",
         },
         "environment": {
             "isolation": "run_scoped_database_and_compose_project",
             "paid_model_calls": 0,
             "live_worker_invocations": 0,
-            "runtime_memory_envelope": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
+            "runtime_memory_envelope": deepcopy(
+                validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE
+            ),
         },
         "raw_measurements": [
             {
                 "name": "base_migrations",
                 "duration_seconds": 1,
                 "through": validator.BASE_SCHEMA_THROUGH,
+            },
+            {
+                "name": "vector_backfill_merge_batch",
+                "duration_seconds": 1,
+                "setting": validator.VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+                "previous_value": validator.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE,
+                "configured_value": validator.VECTOR_BACKFILL_MERGE_BATCH_SIZE,
+                "scope": "run_scoped_disposable_cockroachdb_node",
+                "next_populated_index_phase": "legacy_index_restore",
             },
             {
                 "name": "legacy_index_suspension",
@@ -207,7 +238,7 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
         "mode": mode,
         "execution_id": _execution_id(mode),
         "compose_project": project,
-        "configured": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE,
+        "configured": deepcopy(validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE),
         "effective_process": {
             "path": "/cockroach/cockroach.sh",
             "args": validator.EXPECTED_PROCESS_ARGS,
@@ -217,9 +248,15 @@ def _runtime(validator, *, mode="qualification", peak_bytes=3 * 1024**3, deltas=
             "compose_project": project,
             "compose_service": "crdb",
             "running": True,
+            "configured_go_max_procs": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE[
+                "go_max_procs"
+            ],
             "live_argv": validator.EXPECTED_LIVE_PROCESS_ARGS,
+            "live_go_max_procs": validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE[
+                "go_max_procs"
+            ],
             "effective_memory": {
-                "go_limit_bytes": 3 * 1024**3,
+                "go_limit_bytes": 2_415_919_104,
                 "store_capacity_bytes": 2 * 1024**3,
                 "store_count": 1,
             },
@@ -277,6 +314,7 @@ def _infrastructure_cleanup(validator, *, mode="qualification"):
         "execution_id": _execution_id(mode),
         "compose_project": f"hindsight_capacity_123_1_{mode}",
         "down_status": 0,
+        "runtime_evidence_capture_status": 0,
         "runtime_finalize_status": 0,
         "probe_cleanup_status": 0,
         "container_query_status": 0,
@@ -329,6 +367,15 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
             "name": "base_migrations",
             "duration_seconds": 1,
             "through": protocol.BASE_SCHEMA_THROUGH,
+        },
+        {
+            "name": "vector_backfill_merge_batch",
+            "duration_seconds": 1,
+            "setting": protocol.VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+            "previous_value": protocol.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE,
+            "configured_value": protocol.VECTOR_BACKFILL_MERGE_BATCH_SIZE,
+            "scope": "run_scoped_disposable_cockroachdb_node",
+            "next_populated_index_phase": "legacy_index_restore",
         },
         {
             "name": "legacy_index_suspension",
@@ -414,6 +461,9 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
             "vectors": validator.EXPECTED_VECTOR_METHOD,
             "seeding": validator.EXPECTED_SEEDING_METHOD,
             "fixture_vector_indexes": validator.EXPECTED_FIXTURE_VECTOR_INDEXES,
+            "vector_backfill_merge_batch": (
+                validator.EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+            ),
             "clients": "20_bounded_parallel_index_queries",
         },
         "environment": {
@@ -465,8 +515,10 @@ def _diagnostic_bundle(validator, *, duration=10, peak_bytes=3 * 1024**3):
         "infrastructure-cleanup.json": "f" * 64,
     }
     runtime = _runtime(protocol, mode="diagnostic", peak_bytes=peak_bytes)
+    required_elapsed_ns = int(duration * 1_000_000_000) + 500_000_000
     sampling_elapsed_ns = max(
-        10_500_000_000, int(duration * 1_000_000_000) + 500_000_000
+        10_500_000_000,
+        ((required_elapsed_ns + 9_999_999) // 10_000_000) * 10_000_000,
     )
     sample_count = (sampling_elapsed_ns + 249_999_999) // 250_000_000 + 1
     final_monotonic_ns = 1_000_000_000 + sampling_elapsed_ns
@@ -566,6 +618,16 @@ def test_producer_is_exact_bounded_and_deterministic():
         "single_bounded_writer_one_atomic_copy_transaction_per_tenant_"
         "between_exact_legacy_index_drop_and_restore"
     )
+    assert producer.FIXTURE_VECTOR_INDEX_METHOD == (
+        "legacy_only_before_seed_then_none_during_copy_then_legacy_restored_"
+        "before_populated_tenant_index_migration"
+    )
+    assert producer.VECTOR_BACKFILL_MERGE_BATCH_SETTING == (
+        "bulkio.index_backfill.vector_merge_batch_size"
+    )
+    assert producer.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE == 3
+    assert producer.VECTOR_BACKFILL_MERGE_BATCH_SIZE == 64
+    assert "SET CLUSTER SETTING" in source
     assert "COPY semantic_memory_vectors" in source
     assert "copy.write_row" in source
     assert "executemany" not in source
@@ -676,6 +738,78 @@ def test_tenant_index_build_requires_exact_populated_legacy_index(monkeypatch):
         producer._tenant_index_build_input("postgresql://db", producer.Deadline.after(10))
 
 
+def test_vector_backfill_merge_batch_requires_default_and_exact_readback(monkeypatch):
+    producer = _script("run_capacity_qualification")
+    calls = []
+    show_values = iter((3, 64))
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params=None):
+            calls.append((str(statement), params))
+            if str(statement).startswith("SHOW CLUSTER SETTING"):
+                value = next(show_values)
+                return SimpleNamespace(fetchone=lambda: (value,))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    measurement = producer._configure_vector_backfill_merge_batch(
+        "postgresql://db", producer.Deadline.after(10)
+    )
+    assert measurement | {"duration_seconds": 1} == {
+        "name": "vector_backfill_merge_batch",
+        "duration_seconds": 1,
+        "setting": producer.VECTOR_BACKFILL_MERGE_BATCH_SETTING,
+        "previous_value": 3,
+        "configured_value": 64,
+        "scope": "run_scoped_disposable_cockroachdb_node",
+        "next_populated_index_phase": "legacy_index_restore",
+    }
+    assert any(
+        statement
+        == "SET CLUSTER SETTING bulkio.index_backfill.vector_merge_batch_size = 64"
+        for statement, _params in calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("show_values", "message"),
+    [
+        ((4,), "reviewed default"),
+        ((3, 63), "configuration was not exact"),
+    ],
+)
+def test_vector_backfill_merge_batch_fails_closed_on_wrong_values(
+    monkeypatch, show_values, message
+):
+    producer = _script("run_capacity_qualification")
+    values = iter(show_values)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            if str(statement).startswith("SHOW CLUSTER SETTING"):
+                value = next(values)
+                return SimpleNamespace(fetchone=lambda: (value,))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(producer, "_connection", lambda *_args: Connection())
+    with pytest.raises(RuntimeError, match=message):
+        producer._configure_vector_backfill_merge_batch(
+            "postgresql://db", producer.Deadline.after(10)
+        )
+
+
 def test_legacy_vector_index_is_suspended_and_restored_exactly(monkeypatch):
     producer = _script("run_capacity_qualification")
     executed = []
@@ -711,7 +845,9 @@ def test_legacy_vector_index_is_suspended_and_restored_exactly(monkeypatch):
 
     states = iter((frozenset(), frozenset({producer.LEGACY_VECTOR_INDEX})))
     monkeypatch.setattr(producer, "_vector_index_names", lambda *_args: next(states))
-    restored = producer._restore_legacy_vector_index("postgresql://db", producer.Deadline.after(10))
+    restored = producer._restore_legacy_vector_index(
+        "postgresql://db", producer.Deadline.after(10)
+    )
     assert restored["vectors"] == producer.TARGETS["vectors"]
     assert restored["before_indexes"] == []
     assert restored["after_indexes"] == [producer.LEGACY_VECTOR_INDEX]
@@ -952,12 +1088,38 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     validator = _script("validate_capacity_evidence")
     capture = _script("capture_capacity_runtime")
 
+    assert producer.SCHEMA_VERSION == "hindsight.capacity_qualification.v6"
+    assert producer.DIAGNOSTIC_SCHEMA_VERSION == "hindsight.capacity_resource_diagnostic.v3"
+    assert producer.ATTEMPT_PROGRESS_SCHEMA_VERSION == "hindsight.capacity_attempt_progress.v3"
+    assert capture.RUNTIME_SCHEMA_VERSION == "hindsight.capacity_runtime.v3"
+    assert (
+        validator.INFRASTRUCTURE_CLEANUP_SCHEMA_VERSION
+        == "hindsight.capacity_infrastructure_cleanup.v3"
+    )
     assert producer.SCHEMA_VERSION == validator.SCHEMA_VERSION
     assert producer.DIAGNOSTIC_SCHEMA_VERSION == validator.DIAGNOSTIC_SCHEMA_VERSION
     assert capture.CAPACITY_SCHEMA_VERSION == validator.SCHEMA_VERSION
     assert capture.RUNTIME_SCHEMA_VERSION == validator.RUNTIME_SCHEMA_VERSION
     assert capture._configured_envelope() == producer.RUNTIME_MEMORY_ENVELOPE
     assert capture._configured_envelope() == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE
+    assert (
+        capture.EXPECTED_GO_MAX_PROCS
+        == producer.RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
+        == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["go_max_procs"]
+        == 2
+    )
+    assert (
+        capture.EXPECTED_START_ARGS[-1]
+        == producer.RUNTIME_MEMORY_ENVELOPE["start_args"][-1]
+        == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["start_args"][-1]
+        == "--max-go-memory=2304MiB"
+    )
+    assert (
+        capture.EXPECTED_MEMORY_BYTES["go"]
+        == producer.RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"]
+        == validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["memory_bytes"]["go"]
+        == 2_415_919_104
+    )
     assert producer.TARGETS == validator.TARGETS
     assert producer.MAX_DURATION_SECONDS == validator.EXPECTED_CEILINGS["duration_seconds"]
     assert producer.MAX_STORAGE_BYTES == validator.EXPECTED_CEILINGS["storage_bytes"]
@@ -967,6 +1129,21 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     assert producer.VECTOR_METHOD == validator.EXPECTED_VECTOR_METHOD
     assert producer.SEEDING_METHOD == validator.EXPECTED_SEEDING_METHOD
     assert producer.FIXTURE_VECTOR_INDEX_METHOD == validator.EXPECTED_FIXTURE_VECTOR_INDEXES
+    assert (
+        f"{producer.VECTOR_BACKFILL_MERGE_BATCH_SETTING}="
+        f"{producer.VECTOR_BACKFILL_MERGE_BATCH_SIZE}_run_scoped"
+        == validator.EXPECTED_VECTOR_BACKFILL_MERGE_BATCH_METHOD
+    )
+    assert (
+        producer.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE
+        == validator.VECTOR_BACKFILL_DEFAULT_MERGE_BATCH_SIZE
+        == 3
+    )
+    assert (
+        producer.VECTOR_BACKFILL_MERGE_BATCH_SIZE
+        == validator.VECTOR_BACKFILL_MERGE_BATCH_SIZE
+        == 64
+    )
     assert producer.DATABASE_METHOD == validator.EXPECTED_DATABASE_METHOD
     assert producer.BASE_SCHEMA_THROUGH == validator.BASE_SCHEMA_THROUGH
     assert producer.LEGACY_VECTOR_INDEX == validator.LEGACY_INDEX
@@ -974,6 +1151,34 @@ def test_capacity_schema_contract_is_shared_by_producer_and_validator():
     assert sorted(producer.QUALIFIED_VECTOR_INDEXES) == validator.EXPECTED_INDEXES
     assert producer.LEGACY_VECTOR_MIGRATION == validator.LEGACY_VECTOR_MIGRATION
     assert producer.TENANT_VECTOR_MIGRATION == validator.TENANT_VECTOR_MIGRATION
+
+
+@pytest.mark.parametrize("processor_budget", [None, "", "1", "02"])
+def test_runtime_invocation_requires_exact_go_processor_budget(
+    monkeypatch, processor_budget
+):
+    capture = _script("capture_capacity_runtime")
+    mode = "diagnostic"
+    execution_id = _execution_id(mode)
+    project = f"hindsight_{execution_id}"
+    environment = {
+        "EXECUTION_ID": execution_id,
+        "COMPOSE_PROJECT_NAME": project,
+        "COCKROACH_IMAGE": capture.EXPECTED_IMAGE,
+        "COCKROACH_IMAGE_ID": capture.EXPECTED_IMAGE_ID,
+        "COCKROACH_START_ARGS": capture.EXPECTED_START_ARGS_TEXT,
+        "COCKROACH_GOMAXPROCS": str(capture.EXPECTED_GO_MAX_PROCS),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    capture._validate_invocation(SOURCE_SHA, mode, execution_id, project)
+    if processor_budget is None:
+        monkeypatch.delenv("COCKROACH_GOMAXPROCS")
+    else:
+        monkeypatch.setenv("COCKROACH_GOMAXPROCS", processor_budget)
+    with pytest.raises(ValueError, match="processor budget"):
+        capture._validate_invocation(SOURCE_SHA, mode, execution_id, project)
 
 
 def test_validator_requires_populated_index_build_and_both_live_indexes():
@@ -1020,6 +1225,75 @@ def test_validator_requires_populated_index_build_and_both_live_indexes():
             artifact_digests=digests,
         )
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("previous_value", 4),
+        ("configured_value", 63),
+        ("scope", "database_scoped"),
+        ("next_populated_index_phase", "tenant_index_build_input"),
+    ],
+)
+def test_validator_requires_exact_vector_backfill_merge_batch_measurement(field, value):
+    validator = _script("validate_capacity_evidence")
+    report = _report(validator)
+    measurement = next(
+        row
+        for row in report["raw_measurements"]
+        if row["name"] == "vector_backfill_merge_batch"
+    )
+    measurement[field] = value
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "error": None,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    with pytest.raises(ValueError, match="run-scoped backfill setting"):
+        _validate(
+            validator,
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=_qualification(validator),
+            cleanup=cleanup,
+            artifact_digests={
+                "index-qualification.json": "b" * 64,
+                "capacity-report.json": "c" * 64,
+                "cleanup.json": "d" * 64,
+            },
+        )
+
+
+def test_validator_requires_exact_vector_backfill_merge_batch_method():
+    validator = _script("validate_capacity_evidence")
+    report = _report(validator)
+    report["method"]["vector_backfill_merge_batch"] = (
+        "bulkio.index_backfill.vector_merge_batch_size=63_run_scoped"
+    )
+    cleanup = {
+        "schema_version": validator.SCHEMA_VERSION,
+        "database": "hindsight_capacity_abcdefgh",
+        "database_removed": True,
+        "error": None,
+        "source_revision": SOURCE_SHA,
+        "timeout_seconds": 120,
+    }
+    with pytest.raises(ValueError, match="vector backfill method"):
+        _validate(
+            validator,
+            report,
+            source_revision=SOURCE_SHA,
+            qualification=_qualification(validator),
+            cleanup=cleanup,
+            artifact_digests={
+                "index-qualification.json": "b" * 64,
+                "capacity-report.json": "c" * 64,
+                "cleanup.json": "d" * 64,
+            },
+        )
 
 def test_validator_rejects_booleans_in_exact_numeric_evidence():
     validator = _script("validate_capacity_evidence")
@@ -1612,7 +1886,7 @@ def test_seed_shard_orchestrator_rejects_inexact_vector_count_and_reaps(monkeypa
     assert result_queue.closed is result_queue.joined is True
 
 
-def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
+def test_drop_database_uses_dynamic_remaining_statement_and_lock_timeouts(monkeypatch):
     producer = _script("run_capacity_qualification")
     calls = []
 
@@ -1646,8 +1920,11 @@ def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
         return Connection()
 
     monkeypatch.setattr(producer.psycopg, "connect", connect)
+    monkeypatch.setattr(producer, "_cancel_disposable_vector_index_jobs", lambda *_args: None)
+    monotonic_values = iter((100.0, 101.25, 218.75))
+    monkeypatch.setattr(producer.time, "monotonic", lambda: next(monotonic_values))
     deadline = SimpleNamespace(
-        expires_at=producer.time.monotonic() + producer.MAX_CLEANUP_SECONDS,
+        expires_at=220.0,
         remaining=lambda maximum: min(maximum, producer.MAX_CLEANUP_SECONDS),
     )
     producer._drop_database(
@@ -1656,14 +1933,13 @@ def test_drop_database_applies_bounded_statement_and_lock_timeouts(monkeypatch):
         deadline,
     )
 
-    for seconds in (
-        producer.CLEANUP_JOB_SECONDS,
-        producer.CLEANUP_DROP_SECONDS,
-        producer.CLEANUP_VERIFY_SECONDS,
-    ):
-        timeout = (f"{seconds * 1000}ms",)
+    for timeout in (("113750ms",), ("1250ms",)):
         assert ("SELECT set_config('statement_timeout', %s, false)", timeout) in calls
         assert ("SELECT set_config('lock_timeout', %s, false)", timeout) in calls
+    assert not hasattr(producer, "CLEANUP_DROP_SECONDS")
+
+    with pytest.raises(TimeoutError, match="timeout is exhausted"):
+        producer._set_cleanup_timeouts(Connection(), 0.0001)
 
 
 def test_cleanup_vector_job_prefixes_are_exact_and_disposable():
@@ -1863,6 +2139,11 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
     monkeypatch.setattr(producer, "_migrate", migrate)
     monkeypatch.setattr(
         producer,
+        "_configure_vector_backfill_merge_batch",
+        lambda *_args: {"name": "vector_backfill_merge_batch", "duration_seconds": 1},
+    )
+    monkeypatch.setattr(
+        producer,
         "_suspend_legacy_vector_index",
         lambda *_args: {"name": "legacy_index_suspension", "duration_seconds": 1},
     )
@@ -1914,6 +2195,7 @@ def test_attempt_progress_preserves_completed_phase_timings_on_failure(tmp_path,
     assert [row["name"] for row in progress["completed_phases"]] == [
         "database_create",
         "base_migrations",
+        "vector_backfill_merge_batch",
         "legacy_index_suspension",
         "vector_seed",
         "legacy_index_restore",
@@ -2139,10 +2421,15 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
     )
     expected_args = (
         "--store=type=mem,size=2GiB --cache=128MiB --max-sql-memory=128MiB "
-        "--max-tsdb-memory=64MiB --max-go-memory=3GiB"
+        "--max-tsdb-memory=64MiB --max-go-memory=2304MiB"
     )
     assert diagnostic["env"]["COCKROACH_START_ARGS"] == expected_args
     assert qualification["env"]["COCKROACH_START_ARGS"] == expected_args
+    assert "--max-go-memory=1920MiB" not in source
+    assert "--max-go-memory=2176MiB" not in source
+    assert "--max-go-memory=3GiB" not in source
+    assert diagnostic["env"]["COCKROACH_GOMAXPROCS"] == "2"
+    assert qualification["env"]["COCKROACH_GOMAXPROCS"] == "2"
     assert diagnostic["env"]["CAPACITY_MODE"] == "diagnostic"
     assert qualification["env"]["CAPACITY_MODE"] == "qualification"
     expected_image_digest = (
@@ -2155,6 +2442,7 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
         assert job["env"]["COCKROACH_IMAGE_ID"] == expected_image_digest
     compose = (ROOT / "docker-compose.yml").read_text()
     assert "start-single-node --insecure ${COCKROACH_START_ARGS:-}" in compose
+    assert "GOMAXPROCS: ${COCKROACH_GOMAXPROCS:-}" in compose
     assert "--timeout-seconds 1200" in source
     assert "scripts/run_capacity_qualification.py" in source
     assert "scripts/capture_capacity_runtime.py" in source
@@ -2177,28 +2465,48 @@ def test_workflow_is_owner_only_exact_main_bounded_and_always_cleans_up():
         assert workload.index("capture_capacity_runtime.py monitor") < workload.index(
             "docker compose up -d crdb"
         )
-    cleanup = next(
-        step
-        for step in qualification["steps"]
-        if step.get("name")
-        == "Remove isolated CockroachDB, finalize pressure, and verify storage cleanup"
-    )
-    assert cleanup["if"] == "always()"
-    assert "docker compose down --volumes --remove-orphans" in cleanup["run"]
-    assert cleanup["run"].index("docker compose down") < cleanup["run"].index(
-        "capture_capacity_runtime.py finalize"
-    )
-    assert cleanup["run"].index("capture_capacity_runtime.py finalize") < cleanup[
-        "run"
-    ].index("capture_capacity_runtime.py cleanup-probe")
-    assert "remaining_containers" in cleanup["run"]
-    assert "remaining_volumes" in cleanup["run"]
-    assert "remaining_networks" in cleanup["run"]
-    assert "remaining_probes" in cleanup["run"]
-    assert "container_query_status" in cleanup["run"]
-    assert "volume_query_status" in cleanup["run"]
-    assert "network_query_status" in cleanup["run"]
-    assert "probe_query_status" in cleanup["run"]
+    for job in (diagnostic, qualification):
+        cleanup = next(
+            step
+            for step in job["steps"]
+            if step.get("name")
+            == "Remove isolated CockroachDB, finalize pressure, and verify storage cleanup"
+        )
+        cleanup_run = cleanup["run"]
+        assert cleanup["if"] == "always()"
+        assert "docker compose down --volumes --remove-orphans" in cleanup_run
+        assert cleanup_run.index("docker compose down") < cleanup_run.index(
+            "capture_capacity_runtime.py finalize"
+        )
+        for evidence_name in (
+            "runtime-pressure-baseline.json",
+            "runtime-pressure-samples.json",
+            "runtime-pressure-probe.tsv",
+        ):
+            assert evidence_name in cleanup_run
+            assert cleanup_run.index(evidence_name) < cleanup_run.index(
+                "capture_capacity_runtime.py finalize"
+            )
+        assert 'cp "${runtime_prefix}.baseline.json"' in cleanup_run
+        assert 'cp "${runtime_prefix}.samples.json"' in cleanup_run
+        assert "docker logs --tail 7200" in cleanup_run
+        assert "runtime_evidence_capture_status" in cleanup_run
+        assert cleanup_run.index("capture_capacity_runtime.py finalize") < cleanup_run.index(
+            "capture_capacity_runtime.py cleanup-probe"
+        )
+        compose_truth = cleanup_run.split("compose_state_removed:", 1)[1].split(
+            "> \"$EVIDENCE_DIR/infrastructure-cleanup.json\"", 1
+        )[0]
+        assert "runtime_finalize_status" not in compose_truth
+        assert "runtime_evidence_capture_status" not in compose_truth
+        assert "remaining_containers" in cleanup_run
+        assert "remaining_volumes" in cleanup_run
+        assert "remaining_networks" in cleanup_run
+        assert "remaining_probes" in cleanup_run
+        assert "container_query_status" in cleanup_run
+        assert "volume_query_status" in cleanup_run
+        assert "network_query_status" in cleanup_run
+        assert "probe_query_status" in cleanup_run
     upload = qualification["steps"][-1]
     assert upload["if"] == "always()"
     assert upload["with"]["if-no-files-found"] == "error"
@@ -2365,11 +2673,37 @@ def test_runtime_rejects_every_memory_argument_mutation():
         [*expected[:2], expected[3], expected[2], *expected[4:]],
         [*expected[:2], "--store=type=mem,size=2048MiB", *expected[3:]],
         [*expected[:2], "--store=type=mem,size=50%", *expected[3:]],
+        [*expected[:-1], "--max-go-memory=1920MiB"],
+        [*expected[:-1], "--max-go-memory=2176MiB"],
+        [*expected[:-1], "--max-go-memory=3GiB"],
     ]
     for mutation in mutations:
         runtime = _runtime(validator)
         runtime["effective_process"]["args"] = mutation
         with pytest.raises(ValueError, match="reviewed memory arguments"):
+            validator._validate_runtime(
+                runtime,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+            )
+
+
+def test_runtime_validator_rejects_every_altered_go_processor_budget():
+    validator = _script("validate_capacity_evidence")
+    mutations = (
+        lambda runtime: runtime["configured"].update({"go_max_procs": 1}),
+        lambda runtime: runtime["effective_process"].update(
+            {"configured_go_max_procs": 1}
+        ),
+        lambda runtime: runtime["effective_process"].update(
+            {"live_go_max_procs": 1}
+        ),
+    )
+    for mutate in mutations:
+        runtime = _runtime(validator)
+        mutate(runtime)
+        with pytest.raises(ValueError, match="runtime envelope|runtime process"):
             validator._validate_runtime(
                 runtime,
                 source_revision=SOURCE_SHA,
@@ -2492,6 +2826,29 @@ def test_runtime_rejects_impossible_peak_and_cadence_summaries():
             )
 
 
+def test_runtime_accepts_990ms_recorded_gap_and_rejects_claimed_or_unquantized_gap():
+    validator = _script("validate_capacity_evidence")
+    runtime = _runtime(validator)
+    runtime["cgroup"]["observed_max_sample_gap_ns"] = 990_000_000
+    validator._validate_runtime(
+        runtime,
+        source_revision=SOURCE_SHA,
+        mode="qualification",
+        execution_id=_execution_id("qualification"),
+    )
+
+    for gap_ns in (1_000_000_000, 995_000_000):
+        forged = _runtime(validator)
+        forged["cgroup"]["observed_max_sample_gap_ns"] = gap_ns
+        with pytest.raises(ValueError, match="cgroup telemetry"):
+            validator._validate_runtime(
+                forged,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+            )
+
+
 def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
     validator = _script("validate_capacity_evidence")
     for field in (
@@ -2512,7 +2869,7 @@ def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
                 project="hindsight_capacity_123_1_qualification",
             )
     for field in (
-        "runtime_finalize_status",
+        "down_status",
         "probe_cleanup_status",
         "container_query_status",
         "volume_query_status",
@@ -2531,10 +2888,23 @@ def test_infrastructure_cleanup_rejects_any_remaining_compose_state():
                 project="hindsight_capacity_123_1_qualification",
             )
 
+    for field in ("runtime_evidence_capture_status", "runtime_finalize_status"):
+        cleanup = _infrastructure_cleanup(validator)
+        cleanup[field] = 1
+        assert cleanup["compose_state_removed"] is True
+        with pytest.raises(ValueError, match="Compose cleanup"):
+            validator._validate_infrastructure_cleanup(
+                cleanup,
+                source_revision=SOURCE_SHA,
+                mode="qualification",
+                execution_id=_execution_id("qualification"),
+                project="hindsight_capacity_123_1_qualification",
+            )
 
-def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
+
+def test_diagnostic_uses_the_direct_duration_ceiling():
     validator = _script("validate_capacity_diagnostic")
-    bundle = _diagnostic_bundle(validator, duration=7680 / 11)
+    bundle = _diagnostic_bundle(validator, duration=1_200)
     report = validator.validate(
         bundle[0],
         source_revision=SOURCE_SHA,
@@ -2544,10 +2914,9 @@ def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
         infrastructure_cleanup=bundle[3],
         artifact_digests=bundle[4],
     )
-    assert report["projection"]["projected_final_duration_seconds"] == 960
-    assert report["projection"]["minimum_headroom_seconds"] == 240
-    bundle = _diagnostic_bundle(validator, duration=699)
-    with pytest.raises(ValueError, match="timing headroom"):
+    assert "projection" not in report
+    bundle = _diagnostic_bundle(validator, duration=1_200.001)
+    with pytest.raises(ValueError, match="duration ceiling"):
         validator.validate(
             bundle[0],
             source_revision=SOURCE_SHA,
@@ -2559,12 +2928,23 @@ def test_diagnostic_timing_gate_uses_conservative_projection_and_headroom():
         )
 
 
-def test_diagnostic_rejects_memory_peak_above_its_headroom_gate():
+def test_diagnostic_uses_the_configured_capacity_boundary():
     validator = _script("validate_capacity_diagnostic")
-    bundle = _diagnostic_bundle(
-        validator, peak_bytes=validator.MAX_DIAGNOSTIC_SAMPLED_PEAK_BYTES + 1
+    boundary = validator.EXPECTED_RUNTIME_MEMORY_ENVELOPE["capacity_boundary"][
+        "memory_max_bytes"
+    ]
+    bundle = _diagnostic_bundle(validator, peak_bytes=boundary - 1)
+    validator.validate(
+        bundle[0],
+        source_revision=SOURCE_SHA,
+        execution_id=_execution_id("diagnostic"),
+        cleanup=bundle[1],
+        runtime=bundle[2],
+        infrastructure_cleanup=bundle[3],
+        artifact_digests=bundle[4],
     )
-    with pytest.raises(ValueError, match="memory headroom"):
+    bundle = _diagnostic_bundle(validator, peak_bytes=boundary)
+    with pytest.raises(ValueError, match="container cgroup recorded memory pressure"):
         validator.validate(
             bundle[0],
             source_revision=SOURCE_SHA,
@@ -2587,12 +2967,13 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
             "Config": {
                 "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
                 "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
                 "Labels": {
                     "com.docker.compose.project": ("hindsight_capacity_123_1_diagnostic"),
                     "com.docker.compose.service": "crdb",
                 },
             },
-            "State": {"Running": True},
+            "State": {"Running": True, "Health": {"Status": "starting"}},
             "HostConfig": {"CgroupnsMode": "private"},
         }
     ]
@@ -2607,9 +2988,13 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
                 if not pid_ready:
                     return SimpleNamespace(returncode=1, stdout="")
                 return SimpleNamespace(returncode=0, stdout="42\n")
-            assert command[-1] == "/proc/42/cmdline"
+            if command[-1] == "/proc/42/cmdline":
+                return SimpleNamespace(
+                    returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+                )
+            assert command[-1] == "/proc/42/environ"
             return SimpleNamespace(
-                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+                returncode=0, stdout=_live_crdb_environment(capture)
             )
         assert command == ["docker", "inspect", container_id]
         return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
@@ -2617,18 +3002,328 @@ def test_runtime_collector_inspects_the_entrypoint_and_exact_command(monkeypatch
     monkeypatch.setattr(capture.subprocess, "run", run)
     assert capture._inspect_container("hindsight_capacity_123_1_diagnostic") is None
     pid_ready = True
+    assert capture._inspect_container("hindsight_capacity_123_1_diagnostic") is None
+    inspection[0]["State"]["Health"]["Status"] = "healthy"
     process = capture._inspect_container("hindsight_capacity_123_1_diagnostic")
     assert process["path"] == "/cockroach/cockroach.sh"
     assert process["cgroup_namespace"] == "private"
     assert process["args"] == list(capture.EXPECTED_PROCESS_ARGS)
+    assert process["configured_go_max_procs"] == 2
     assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
-    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2GiB"
+    assert process["live_go_max_procs"] == 2
+    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2176MiB"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
-    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=3GiB"
+    inspection[0]["Config"]["Cmd"][-1] = "--max-go-memory=2304MiB"
     inspection[0]["HostConfig"]["CgroupnsMode"] = "host"
     with pytest.raises(RuntimeError, match="reviewed envelope"):
         capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+    inspection[0]["HostConfig"]["CgroupnsMode"] = "private"
+    valid_environment = list(inspection[0]["Config"]["Env"])
+    invalid_environments = (
+        [entry for entry in valid_environment if not entry.startswith("GOMAXPROCS=")],
+        [*valid_environment[:-1], "GOMAXPROCS=1"],
+        [*valid_environment, capture.EXPECTED_GOMAXPROCS_ENV],
+    )
+    for invalid_environment in invalid_environments:
+        inspection[0]["Config"]["Env"] = invalid_environment
+        with pytest.raises(RuntimeError, match="Docker configuration"):
+            capture._inspect_container("hindsight_capacity_123_1_diagnostic")
+    inspection[0]["Config"]["Env"] = valid_environment
+
+
+@pytest.mark.parametrize("live_environment_case", ["missing", "wrong", "duplicate"])
+def test_runtime_collector_rejects_invalid_live_go_processor_budget(
+    monkeypatch, live_environment_case
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            if command[-1] == "/proc/42/cmdline":
+                return SimpleNamespace(
+                    returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+                )
+            assert command[-1] == "/proc/42/environ"
+            if live_environment_case == "missing":
+                return SimpleNamespace(returncode=1, stdout="")
+            if live_environment_case == "wrong":
+                return SimpleNamespace(returncode=0, stdout="GOMAXPROCS=1")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"{capture.EXPECTED_GOMAXPROCS_ENV}\0"
+                    f"{capture.EXPECTED_GOMAXPROCS_ENV}"
+                ),
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(
+        RuntimeError, match="live environment|live CockroachDB process"
+    ):
+        capture._inspect_container(project)
+
+
+def test_runtime_collector_retries_transient_live_argv_only_while_health_is_starting(
+    monkeypatch,
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "starting"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+    live_argv = ["/cockroach/cockroach", "mt", "start-sql", "--insecure"]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            if command[-1] == "/proc/42/cmdline":
+                return SimpleNamespace(returncode=0, stdout="\0".join(live_argv))
+            assert command[-1] == "/proc/42/environ"
+            return SimpleNamespace(
+                returncode=0, stdout=_live_crdb_environment(capture)
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    assert capture._inspect_container(project) is None
+
+    live_argv[:] = capture.EXPECTED_LIVE_PROCESS_ARGS
+    inspection[0]["State"]["Health"]["Status"] = "healthy"
+    process = capture._inspect_container(project)
+    assert process["live_argv"] == list(capture.EXPECTED_LIVE_PROCESS_ARGS)
+
+    live_argv[-1] = "--max-go-memory=3GiB"
+    with pytest.raises(RuntimeError, match="live argv"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize(
+    "health",
+    [None, {}, {"Status": ""}, {"Status": "unhealthy"}, {"Status": "unknown"}],
+)
+def test_runtime_collector_rejects_missing_malformed_or_nonready_health(
+    monkeypatch, health
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    state = {"Running": True}
+    if health is not None:
+        state["Health"] = health
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": state,
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            return SimpleNamespace(
+                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="health"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize("missing", ["pid", "cmdline"])
+def test_runtime_collector_rejects_missing_process_evidence_once_healthy(
+    monkeypatch, missing
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(
+                    returncode=1 if missing == "pid" else 0,
+                    stdout="" if missing == "pid" else "42\n",
+                )
+            assert command[-1] == "/proc/42/cmdline"
+            return SimpleNamespace(
+                returncode=1 if missing == "cmdline" else 0,
+                stdout="",
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="healthy|PID|argv"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize("pid", ["0\n", "not-a-pid\n"])
+def test_runtime_collector_rejects_invalid_pid_even_while_health_is_starting(
+    monkeypatch, pid
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": {
+                "Cmd": list(capture.EXPECTED_PROCESS_ARGS),
+                "Image": capture.EXPECTED_IMAGE,
+                "Env": ["PATH=/usr/bin", capture.EXPECTED_GOMAXPROCS_ENV],
+                "Labels": {
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "crdb",
+                },
+            },
+            "State": {"Running": True, "Health": {"Status": "starting"}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            assert command[-1] == "/cockroach/server_pid"
+            return SimpleNamespace(returncode=0, stdout=pid)
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises((RuntimeError, ValueError), match="PID|integer"):
+        capture._inspect_container(project)
+
+
+@pytest.mark.parametrize(
+    ("health_status", "static_field", "value"),
+    [
+        ("starting", "configured_command", "--max-go-memory=3GiB"),
+        ("starting", "cgroup_namespace", "host"),
+    ],
+)
+def test_runtime_collector_never_retries_static_envelope_mismatch(
+    monkeypatch, health_status, static_field, value
+):
+    capture = _script("capture_capacity_runtime")
+    project = "hindsight_capacity_123_1_diagnostic"
+    container_id = "a" * 64
+    inspection = [
+        {
+            "Image": capture.EXPECTED_IMAGE_ID,
+            "Path": "/cockroach/cockroach.sh",
+            "Args": list(capture.EXPECTED_PROCESS_ARGS),
+            "Config": _crdb_container_config(capture, project),
+            "State": {"Running": True, "Health": {"Status": health_status}},
+            "HostConfig": {"CgroupnsMode": "private"},
+        }
+    ]
+    if static_field == "configured_command":
+        inspection[0]["Config"]["Cmd"][-1] = value
+    elif static_field == "cgroup_namespace":
+        inspection[0]["HostConfig"]["CgroupnsMode"] = value
+
+    def run(command, **_kwargs):
+        if command[:4] == ["docker", "compose", "ps", "-q"]:
+            return SimpleNamespace(returncode=0, stdout=f"{container_id}\n")
+        if command[:4] == ["docker", "compose", "exec", "-T"]:
+            if command[-1] == "/cockroach/server_pid":
+                return SimpleNamespace(returncode=0, stdout="42\n")
+            return SimpleNamespace(
+                returncode=0, stdout="\0".join(capture.EXPECTED_LIVE_PROCESS_ARGS)
+            )
+        assert command == ["docker", "inspect", container_id]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspection))
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="reviewed envelope|health"):
+        capture._inspect_container(project)
 
 
 def test_runtime_collector_retries_zero_effective_metric_and_requires_exact_values(
@@ -2640,19 +3335,19 @@ def test_runtime_collector_retries_zero_effective_metric_and_requires_exact_valu
 
     def exact(statement):
         if "node_metrics" in statement:
-            return 3 * 1024**3
+            return 2_415_919_104
         return 2 * 1024**3
 
     monkeypatch.setattr(capture, "_query_single_integer", exact)
     assert capture._inspect_effective_memory() == {
-        "go_limit_bytes": 3 * 1024**3,
+        "go_limit_bytes": 2_415_919_104,
         "store_capacity_bytes": 2 * 1024**3,
         "store_count": 1,
     }
     monkeypatch.setattr(
         capture,
         "_query_single_integer",
-        lambda statement: 2 * 1024**3 if "node_metrics" in statement else 2 * 1024**3,
+        lambda statement: 3 * 1024**3 if "node_metrics" in statement else 2 * 1024**3,
     )
     with pytest.raises(RuntimeError, match="effective database memory"):
         capture._inspect_effective_memory()
@@ -2669,6 +3364,7 @@ def test_runtime_probe_command_is_sandboxed_and_has_no_mount_or_secret_channel()
     assert command[command.index("--user") + 1] == "65534:65534"
     assert command[command.index("--memory") + 1] == str(32 * 1024**2)
     assert command[command.index("--memory-swap") + 1] == str(32 * 1024**2)
+    assert command[command.index("--cpus") + 1] == "0.50"
     assert command[command.index("--pids-limit") + 1] == "16"
     assert "--read-only" in command
     assert command[command.index("--cap-drop") + 1] == "ALL"
@@ -2681,6 +3377,16 @@ def test_runtime_probe_command_is_sandboxed_and_has_no_mount_or_secret_channel()
     assert "--mount" not in command
     assert "-v" not in command
     assert "--env" not in command
+    assert "cat " not in capture.PROBE_LOOP_SCRIPT
+    assert "awk " not in capture.PROBE_LOOP_SCRIPT
+    assert capture.PROBE_NANO_CPUS == 500_000_000
+    assert capture.UPTIME_QUANTUM_NS == 10_000_000
+    assert capture.MAX_REAL_SAMPLE_GAP_SECONDS == 1.0
+    assert capture.MAX_RECORDED_SAMPLE_GAP_NS == 990_000_000
+    assert (
+        capture._configured_envelope()["telemetry_probe"]["maximum_sample_gap_seconds"]
+        == 1.0
+    )
     assert command[-3:] == [capture.EXPECTED_IMAGE, "-ec", capture.PROBE_LOOP_SCRIPT]
 
 
@@ -2773,9 +3479,16 @@ def test_runtime_probe_rejects_timestamp_gaps_and_counter_regressions():
     assert capture._validate_probe_series(
         [(0, snapshot(1_000_000_000)), (1, snapshot(1_250_000_000))]
     ) == (250_000_000, 250_000_000)
+    assert capture._validate_probe_series(
+        [(0, snapshot(1_000_000_000)), (1, snapshot(1_990_000_000))]
+    ) == (990_000_000, 990_000_000)
     with pytest.raises(RuntimeError, match="sampling cadence"):
         capture._validate_probe_series(
-            [(0, snapshot(1_000_000_000)), (1, snapshot(2_010_000_000))]
+            [(0, snapshot(1_000_000_000)), (1, snapshot(2_000_000_000))]
+        )
+    with pytest.raises(RuntimeError, match="quantized uptime"):
+        capture._validate_probe_series(
+            [(0, snapshot(1_000_000_000)), (1, snapshot(1_995_000_000))]
         )
     with pytest.raises(RuntimeError, match="memory peak"):
         capture._validate_probe_series(
@@ -2790,6 +3503,30 @@ def test_runtime_probe_rejects_timestamp_gaps_and_counter_regressions():
                 (0, snapshot(1_000_000_000, event_max=1)),
                 (1, snapshot(1_250_000_000, event_max=0)),
             ]
+        )
+
+
+def test_runtime_probe_boundary_bridge_uses_conservative_quantized_limit():
+    capture = _script("capture_capacity_runtime")
+    assert capture._validate_boundary_bridge(
+        name="workload boundary",
+        observed_monotonic_ns=1_000_000_000,
+        sample_sequence=4,
+        sample_monotonic_ns=1_990_000_000,
+    ) == 990_000_000
+    with pytest.raises(RuntimeError, match="gap_ns=1000000000"):
+        capture._validate_boundary_bridge(
+            name="workload boundary",
+            observed_monotonic_ns=1_000_000_000,
+            sample_sequence=4,
+            sample_monotonic_ns=2_000_000_000,
+        )
+    with pytest.raises(RuntimeError, match="quantized uptime"):
+        capture._validate_boundary_bridge(
+            name="workload boundary",
+            observed_monotonic_ns=1_000_000_000,
+            sample_sequence=4,
+            sample_monotonic_ns=1_995_000_000,
         )
 
 
@@ -2820,7 +3557,7 @@ def test_runtime_probe_inspection_rejects_private_namespace(monkeypatch):
                 "PidsLimit": 16,
                 "Memory": 32 * 1024**2,
                 "MemorySwap": 32 * 1024**2,
-                "NanoCpus": 100_000_000,
+                "NanoCpus": 500_000_000,
                 "AutoRemove": True,
                 "LogConfig": capture.PROBE_LOG_CONFIG,
             },
