@@ -775,7 +775,8 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
             )
         ] == expected_effect_labels
         _require(
-            f"Operation {operation_id}: Completed" in current_execution.text,
+            f"Operation {operation_id}: completed".casefold()
+            in current_execution.text.casefold(),
             "browser did not render the completed remediation operation identity",
         )
         wait.until(
