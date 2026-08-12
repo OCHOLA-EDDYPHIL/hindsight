@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import pathlib
 from types import SimpleNamespace
@@ -73,6 +74,7 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
     database_url = "postgresql://root@localhost:26257/db?sslmode=disable"
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
+    monkeypatch.setenv("PGOPTIONS", "-c hindsight.tenant_id=untrusted")
     calls = []
     monkeypatch.setattr(
         acceptance,
@@ -96,6 +98,7 @@ def test_semantic_verification_uses_shared_live_selectors_and_explicit_scope(mon
 
     assert calls[0][0] == acceptance.LOCAL_SEMANTIC_SELECTORS
     assert calls[0][1]["RUN_LIVE_GEMINI_ACCEPTANCE"] == "1"
+    assert calls[0][1]["PGOPTIONS"] == (f"-c hindsight.tenant_id={acceptance.ACCEPTANCE_TENANT_ID}")
     with pytest.raises(ValueError, match="refuses loopback"):
         acceptance._verify_semantic(
             SimpleNamespace(
@@ -442,6 +445,7 @@ def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, t
     monkeypatch.setenv("RUN_HOSTED_ACCEPTANCE", "1")
     monkeypatch.setenv("HOSTED_API_URL", "https://hosted.invalid")
     monkeypatch.setenv("GEMINI_API_KEYS", "opaque-material")
+    monkeypatch.setenv("PGOPTIONS", "-c hindsight.tenant_id=untrusted")
     calls = []
 
     class Server:
@@ -488,10 +492,50 @@ def test_local_browser_product_uses_live_handler_and_runs_history(monkeypatch, t
     assert env["HINDSIGHT_ALLOWED_ORIGINS"] == "http://127.0.0.1:8766"
     assert env["HINDSIGHT_COGNITO_CLIENT_ID"] == "local-browser-client"
     assert env["HINDSIGHT_LOCAL_AUTH_AUTO"] == "1"
+    assert env["PGOPTIONS"] == (f"-c hindsight.tenant_id={acceptance.PUBLIC_DEMO_TENANT_ID}")
     assert selectors == acceptance.LOCAL_BROWSER_PRODUCT_SELECTORS
     assert set(acceptance.SHARED_BROWSER_CONTRACT_SELECTORS).issubset(selectors)
     assert phase == "local-browser"
     assert artifact_dir == tmp_path
+
+
+def test_local_product_identity_uses_bound_managed_operator_slot(monkeypatch):
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, params):
+            calls.append((query, params))
+            if query.startswith("SELECT status FROM tenants"):
+                return SimpleNamespace(fetchone=lambda: ("active",))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(
+        acceptance.psycopg,
+        "connect",
+        lambda *_args, **_kwargs: Connection(),
+    )
+    issuer = "http://127.0.0.1:8766/local-user-pool"
+
+    acceptance._configure_local_product_identity(
+        database_url="postgresql://root@localhost:26257/product?sslmode=disable",
+        issuer=issuer,
+    )
+
+    assert calls[0][1] == (acceptance.PUBLIC_DEMO_TENANT_ID,)
+    assert calls[1][1] == (acceptance.PUBLIC_DEMO_TENANT_ID,)
+    insert, params = calls[2]
+    assert "ON CONFLICT (provisioning_key)" in insert
+    assert params == (
+        hashlib.sha256(f"{issuer}\0local-browser-acceptance-operator".encode()).hexdigest(),
+        hashlib.sha256(f"{issuer}\0managed-role\0operator".encode()).hexdigest(),
+        acceptance.PUBLIC_DEMO_TENANT_ID,
+    )
 
 
 def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypatch):
@@ -508,7 +552,7 @@ def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypa
         acceptance,
         "_initialize_product_database",
         lambda env, *, configure_embeddings: initialized.append(
-            (env["DATABASE_URL"], configure_embeddings)
+            (env["DATABASE_URL"], env["PGOPTIONS"], configure_embeddings)
         ),
     )
     monkeypatch.setattr(acceptance, "_verify_semantic", lambda _args: calls.append("semantic"))
@@ -540,7 +584,12 @@ def test_local_product_full_uses_fresh_stage_databases_without_sha_gate(monkeypa
         "/product_1234567890ab_resilience",
         "/product_1234567890ab_browser",
     ]
-    assert [configured for _url, configured in initialized] == [True, False, True]
+    assert [configured for _url, _options, configured in initialized] == [True, False, True]
+    assert [options for _url, options, _configured in initialized] == [
+        f"-c hindsight.tenant_id={acceptance.ACCEPTANCE_TENANT_ID}",
+        f"-c hindsight.tenant_id={acceptance.ACCEPTANCE_TENANT_ID}",
+        f"-c hindsight.tenant_id={acceptance.PUBLIC_DEMO_TENANT_ID}",
+    ]
     assert calls == ["providers", "semantic", "resilience", "browser"]
 
 
