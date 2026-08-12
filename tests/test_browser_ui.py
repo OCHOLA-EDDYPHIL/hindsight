@@ -528,6 +528,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         selected_action = driver.find_element(
             By.CSS_SELECTOR, ".outcome-current .action-execution"
         ).text.casefold()
+        rejected_remediation = "governed-memory retraction" in selected_action
         assert any(
             action_kind in selected_action
             for action_kind in ("recommendation", "governed-memory retraction")
@@ -536,9 +537,15 @@ def test_operator_can_run_and_explain_signature_workflow():
         driver.find_element(By.ID, "rejectRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
+        rejected_reflection_count = 0 if rejected_remediation else 1
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text == "3 live · 0 invalid"
+            lambda browser: (
+                browser.find_element(By.ID, "memoryCount").text
+                == f"{2 + rejected_reflection_count} live · 0 invalid"
+            )
         )
+        if rejected_remediation:
+            assert not driver.find_elements(By.CSS_SELECTOR, "#operations [data-operation-id]")
 
         driver.find_element(By.ID, "previewRewind").click()
         wait.until(
@@ -558,8 +565,12 @@ def test_operator_can_run_and_explain_signature_workflow():
             "return Number(window.HINDSIGHT_CONFIG.operationPollSeconds || 600);"
         )
         _wait_for_completed_operation(driver, timeout=float(operation_poll_seconds) + 30)
+        invalidated_count = 1 + rejected_reflection_count
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text == "1 live · 2 invalid"
+            lambda browser: (
+                browser.find_element(By.ID, "memoryCount").text
+                == f"1 live · {invalidated_count} invalid"
+            )
         )
         wait.until(
             lambda browser: browser.find_element(By.ID, "executeRewind").text == "Execute rewind"
@@ -582,7 +593,10 @@ def test_operator_can_run_and_explain_signature_workflow():
             lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Current Beliefs"
         )
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text == "1 live · 2 invalid"
+            lambda browser: (
+                browser.find_element(By.ID, "memoryCount").text
+                == f"1 live · {invalidated_count} invalid"
+            )
         )
 
         driver.find_element(By.ID, "startRun").click()
@@ -594,12 +608,21 @@ def test_operator_can_run_and_explain_signature_workflow():
         corrected_action = driver.find_element(By.ID, "proposedAction").text.strip()
         assert corrected_action
         assert corrected_action != bad_action
+        assert (
+            "recommendation"
+            in driver.find_element(
+                By.CSS_SELECTOR, ".outcome-current .action-execution"
+            ).text.casefold()
+        )
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         driver.find_element(By.ID, "approveRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "completed")
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text == "2 live · 2 invalid"
+            lambda browser: (
+                browser.find_element(By.ID, "memoryCount").text
+                == f"2 live · {invalidated_count} invalid"
+            )
         )
         _assert_typed_reflection(namespace)
         signature = _assert_signature_trace(namespace=namespace, operation_id=operation_id)
@@ -1890,7 +1913,9 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
             "status": str(run["status"]),
             "reflected_memory_id": run.get("reflected_memory_id"),
             "selection_fingerprint": str(trace["selection"]["fingerprint"]),
-            "recommendation_id": str(trace["recommendation"]["id"]),
+            "recommendation_id": (
+                str(trace["recommendation"]["id"]) if trace.get("recommendation") else None
+            ),
             "approval_approved": bool(trace["approval"]["approved"]),
             "execution_status": str(trace["execution"]["status"]),
             "read_memory_ids": [str(read["memory_id"]) for read in reads],
@@ -1993,16 +2018,24 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert bad["status"] == "rejected"
     assert bad["provider"] == "gemini"
     assert bad["model"]
-    assert bad["action_trace"]["mode"] == "recommendation_only"
+    bad_trace = bad["action_trace"]
+    assert bad_trace["mode"] in {"recommendation_only", "governed_memory_remediation"}
     assert bad["action_trace"]["approval"]["approved"] is False
     assert bad["action_trace"]["execution"]["status"] == "not_executed"
-    assert bad["action_trace"]["recommendation"]["id"].startswith("recommendation:")
+    if bad_trace["mode"] == "recommendation_only":
+        assert bad_trace["recommendation"]["id"].startswith("recommendation:")
+        assert bad["reflected_memory_id"]
+    else:
+        assert bad_trace["remediation_action"]["id"].startswith("remediation_action:")
+        assert bad_trace["remediation_action"]["name"] == "retract_recalled_memory"
+        assert bad["reflected_memory_id"] is None
     assert bad["action_trace"]["selection"]["fingerprint"]
     assert "score" not in bad["action_trace"]
     poison_read = next(read for read in bad["reads"] if read["writer"] == "demo.fixture-import")
     assert poison_read["source_ref"] == "demo:stale-runbook-import"
     assert poison_read["justification"]
-    assert poison_read["downstream_lineage_edges"] >= 1
+    if bad["reflected_memory_id"]:
+        assert poison_read["downstream_lineage_edges"] >= 1
     assert corrected["status"] == "completed"
     assert corrected["provider"] == "gemini"
     assert corrected["model"]
@@ -2054,7 +2087,10 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert poison is not None and poison["t_invalid"] is not None
     invalidated = {str(value) for value in operation[0]}
     assert poison_id in invalidated
-    assert bad["reflected_memory_id"] in invalidated
+    if bad["reflected_memory_id"]:
+        assert bad["reflected_memory_id"] in invalidated
+    else:
+        assert invalidated == {poison_id}
     assert all(read["memory_id"] not in invalidated for read in corrected["reads"])
     return {
         "namespace": namespace,
