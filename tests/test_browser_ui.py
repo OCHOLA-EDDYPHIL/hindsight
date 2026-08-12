@@ -525,7 +525,13 @@ def test_operator_can_run_and_explain_signature_workflow():
         )
         bad_action = driver.find_element(By.ID, "proposedAction").text.strip()
         assert bad_action
-        assert "Recommendation" in driver.find_element(By.CSS_SELECTOR, ".action-execution").text
+        selected_action = driver.find_element(
+            By.CSS_SELECTOR, ".outcome-current .action-execution"
+        ).text.casefold()
+        assert any(
+            action_kind in selected_action
+            for action_kind in ("recommendation", "governed-memory retraction")
+        )
         assert not driver.find_elements(By.CSS_SELECTOR, ".action-score")
         driver.find_element(By.ID, "rejectRun").click()
         wait.until(lambda browser: browser.find_element(By.ID, "runStatus").text == "rejected")
