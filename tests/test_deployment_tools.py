@@ -404,7 +404,6 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
     authorize = workflow.split("  authorize:\n", 1)[1].split("  exact_main_ci:\n", 1)[0]
 
     assert "  workflow_dispatch:\n" in workflow
-    assert "  schedule:\n" in workflow
     assert "pull_request:" not in workflow
     assert '"$REF_NAME" == "refs/heads/main"' in authorize
     assert '"$WORKFLOW_REF" == ' in authorize
@@ -513,6 +512,7 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
     verify = workflow.split("  verify:\n", 1)[1]
 
     assert "  workflow_dispatch:\n" in workflow
+    assert "  schedule:\n" in workflow
     assert "pull_request:" not in workflow
     assert set(parsed["jobs"]) == {"authorize", "verify"}
     assert parsed["jobs"]["verify"]["needs"] == "authorize"
