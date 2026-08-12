@@ -180,15 +180,8 @@ def _verify_semantic(args: argparse.Namespace) -> None:
         _require_hosted_database(database_url)
         selectors = SEMANTIC_RETRIEVAL_SELECTORS
     _require_gemini_credentials()
-    env = dict(os.environ)
-    env.update(
-        {
-            "DATABASE_URL": database_url,
-            "EMBEDDING_PROVIDER": "gemini",
-            "LLM_PROVIDER": "gemini",
-            "RUN_LIVE_GEMINI_ACCEPTANCE": "1",
-        }
-    )
+    env = _product_environment(database_url, tenant_id=ACCEPTANCE_TENANT_ID)
+    env["RUN_LIVE_GEMINI_ACCEPTANCE"] = "1"
     phase = f"semantic-{args.database_scope}"
     artifact_dir = _acceptance_artifact_dir(phase)
     _run_strict_pytest(
@@ -202,14 +195,7 @@ def _verify_semantic(args: argparse.Namespace) -> None:
 def _verify_resilience(args: argparse.Namespace) -> None:
     database_url = _required_database_url(args.database_url)
     _validate_local_url(database_url)
-    env = dict(os.environ)
-    env.update(
-        {
-            "DATABASE_URL": database_url,
-            "EMBEDDING_PROVIDER": "gemini",
-            "LLM_PROVIDER": "gemini",
-        }
-    )
+    env = _product_environment(database_url, tenant_id=ACCEPTANCE_TENANT_ID)
     artifact_dir = _acceptance_artifact_dir("resilience")
     _run_strict_pytest(
         RESILIENCE_SELECTORS,
@@ -230,15 +216,24 @@ def _run_local_product_full(args: argparse.Namespace) -> None:
         _create_local_database(url)
 
     _verify_product_providers()
-    semantic_env = _product_environment(semantic_url)
+    semantic_env = _product_environment(
+        semantic_url,
+        tenant_id=ACCEPTANCE_TENANT_ID,
+    )
     _initialize_product_database(semantic_env, configure_embeddings=True)
     _verify_semantic(argparse.Namespace(database_url=semantic_url, database_scope="local"))
 
-    resilience_env = _product_environment(resilience_url)
+    resilience_env = _product_environment(
+        resilience_url,
+        tenant_id=ACCEPTANCE_TENANT_ID,
+    )
     _initialize_product_database(resilience_env, configure_embeddings=False)
     _verify_resilience(argparse.Namespace(database_url=resilience_url))
 
-    browser_env = _product_environment(browser_url)
+    browser_env = _product_environment(
+        browser_url,
+        tenant_id=PUBLIC_DEMO_TENANT_ID,
+    )
     _initialize_product_database(browser_env, configure_embeddings=True)
     _run_local_browser_product(
         database_url=browser_url,
@@ -270,7 +265,10 @@ def _run_local_browser_product(*, database_url: str, base_url: str) -> None:
     issuer = f"{base_url}/local-user-pool"
     client_id = "local-browser-client"
     _configure_local_product_identity(database_url=database_url, issuer=issuer)
-    env = _product_environment(database_url)
+    env = _product_environment(
+        database_url,
+        tenant_id=PUBLIC_DEMO_TENANT_ID,
+    )
     for name in (
         "RUN_HOSTED_ACCEPTANCE",
         "HOSTED_API_URL",
@@ -333,26 +331,39 @@ def _configure_local_product_identity(*, database_url: str, issuer: str) -> None
     from tests.local_product_app import LOCAL_SUBJECT
 
     principal_hash = hashlib.sha256(f"{issuer}\0{LOCAL_SUBJECT}".encode()).hexdigest()
+    provisioning_key = hashlib.sha256(f"{issuer}\0managed-role\0operator".encode()).hexdigest()
     with psycopg.connect(
         database_url,
         application_name="hindsight-local-product-identity",
     ) as connection:
         connection.execute(
+            "SELECT set_config('hindsight.tenant_id', %s, true)",
+            (PUBLIC_DEMO_TENANT_ID,),
+        )
+        tenant = connection.execute(
+            "SELECT status FROM tenants WHERE id = %s FOR UPDATE",
+            (PUBLIC_DEMO_TENANT_ID,),
+        ).fetchone()
+        if tenant != ("active",):
+            raise RuntimeError("local product identity tenant is not active")
+        connection.execute(
             """
                 INSERT INTO product_principal_roles (
                     principal_hash,
+                    provisioning_key,
                     tenant_id,
                     role,
                     status
                 )
-                VALUES (%s, %s, 'operator', 'active')
-                ON CONFLICT (principal_hash) DO UPDATE
-                SET tenant_id = excluded.tenant_id,
+                VALUES (%s, %s, %s, 'operator', 'active')
+                ON CONFLICT (provisioning_key) DO UPDATE
+                SET principal_hash = excluded.principal_hash,
+                    tenant_id = excluded.tenant_id,
                     role = 'operator',
                     status = 'active',
                     updated_at = now()
             """,
-            (principal_hash, PUBLIC_DEMO_TENANT_ID),
+            (principal_hash, provisioning_key, PUBLIC_DEMO_TENANT_ID),
         )
 
 
@@ -701,13 +712,14 @@ def _required_positive_int_env(name: str) -> int:
     return parsed
 
 
-def _product_environment(database_url: str) -> dict[str, str]:
+def _product_environment(database_url: str, *, tenant_id: str) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
         {
             "DATABASE_URL": database_url,
             "EMBEDDING_PROVIDER": "gemini",
             "LLM_PROVIDER": "gemini",
+            "PGOPTIONS": f"-c hindsight.tenant_id={tenant_id}",
             "HINDSIGHT_DATABASE_URL_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEY_PARAM": "",
             "HINDSIGHT_GEMINI_API_KEYS_PARAM": "",
