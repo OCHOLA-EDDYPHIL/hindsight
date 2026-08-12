@@ -46,6 +46,24 @@ On a DLQ alarm:
 
 Error persistence redacts common URL passwords, tokens, secrets, and API keys, but operators must still avoid placing credentials in user-controlled text.
 
+### Local SQS contract
+
+The opt-in `aws` Compose profile provides a loopback-only SQS endpoint for
+checking the production enqueue contract without accessing an AWS account. It
+uses synthetic local credentials, creates a uniquely named temporary queue,
+verifies one tenant-scoped command, and removes the queue even when validation
+fails.
+
+```bash
+make aws-up
+make aws-queue-smoke
+make aws-down
+```
+
+The default Compose stack does not start this service. Its container image can
+be a substantial download, so pull it intentionally. The smoke command refuses
+non-loopback endpoints and is not a substitute for hosted acceptance.
+
 ## Changefeed and realtime lifecycle
 
 The CockroachDB changefeed projects committed outbox rows to an authenticated webhook. The relay deduplicates deliveries, resolves tenant subscriptions, and posts WebSocket notifications. Before destroying or replacing the application endpoint, pause the exact changefeed. After deployment, apply or resume it with `scripts/configure_changefeed.py`, confirm the referenced database and webhook, and exercise reconnect/state-reload behavior.

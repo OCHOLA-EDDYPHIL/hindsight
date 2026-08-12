@@ -1,5 +1,6 @@
 LOCAL_DATABASE_URL ?= postgresql://root@localhost:26257/hindsight?sslmode=disable
-.PHONY: dev-up dev-down otel-up otel-down migrate migrate-local test lint lambda-artifacts product-api-local changefeed-apply changefeed-pause changefeed-status
+LOCAL_AWS_ENDPOINT ?= http://127.0.0.1:4566
+.PHONY: dev-up dev-down otel-up otel-down aws-up aws-down aws-queue-smoke migrate migrate-local test lint lambda-artifacts product-api-local changefeed-apply changefeed-pause changefeed-status
 
 dev-up:
 	docker compose up -d --wait
@@ -16,6 +17,15 @@ otel-up:
 
 otel-down:
 	docker compose --profile otel stop jaeger
+
+aws-up:
+	docker compose --profile aws up -d --wait localstack
+
+aws-down:
+	docker compose --profile aws stop localstack
+
+aws-queue-smoke:
+	HINDSIGHT_AWS_ENDPOINT_URL="$(LOCAL_AWS_ENDPOINT)" uv run python scripts/run_local_sqs_smoke.py
 
 migrate:
 	uv run python scripts/migrate.py

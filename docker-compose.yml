@@ -23,5 +23,20 @@ services:
       - "4317:4317"
       - "4318:4318"
 
+  localstack:
+    image: localstack/localstack:2026.07.3
+    profiles: ["aws"]
+    environment:
+      SERVICES: sqs
+      PERSISTENCE: "0"
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - "127.0.0.1:4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
 volumes:
   crdb-data:
