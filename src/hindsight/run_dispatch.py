@@ -137,6 +137,15 @@ def _lease_run_dispatches(
                                         dispatch.command = 'resume'
                                         AND run.status = 'resuming'
                                     )
+                                    OR (
+                                        run.status IN (
+                                            'triaging', 'recalling', 'planning', 'reflecting'
+                                        )
+                                        AND run.worker_attempt_command = dispatch.command
+                                        AND run.worker_attempt_generation =
+                                            dispatch.command_generation
+                                        AND run.worker_attempt_lease_expires_at <= now()
+                                    )
                                 )
                         )
                         {filter_sql}
