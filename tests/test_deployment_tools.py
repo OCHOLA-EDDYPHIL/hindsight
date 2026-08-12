@@ -404,6 +404,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
     authorize = workflow.split("  authorize:\n", 1)[1].split("  exact_main_ci:\n", 1)[0]
 
     assert "  workflow_dispatch:\n" in workflow
+    assert "  schedule:\n" in workflow
     assert "pull_request:" not in workflow
     assert '"$REF_NAME" == "refs/heads/main"' in authorize
     assert '"$WORKFLOW_REF" == ' in authorize
@@ -524,6 +525,7 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
     assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorize
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorize
     assert "=~ ^[0-9a-f]{40}$" in authorize
+    assert "vars.HINDSIGHT_MONITORED_SHA" in workflow
 
     output = tmp_path / "authorized-output"
     result = _run_authorization_script(
@@ -558,6 +560,27 @@ def test_verify_deployed_is_owner_authorized_exact_revision_and_read_only(tmp_pa
         output_path=tmp_path / "rejected-output",
     )
     assert rejected.returncode != 0
+    scheduled_output = tmp_path / "scheduled-output"
+    scheduled = _run_authorization_script(
+        workflow_path,
+        values={
+            "EVENT_NAME": "schedule",
+            "REF_NAME": "refs/heads/main",
+            "WORKFLOW_REF": (
+                "owner/project/.github/workflows/verify-deployed.yml@refs/heads/main"
+            ),
+            "REPOSITORY": "owner/project",
+            "ACTOR": "schedule-owner",
+            "TRIGGERING_ACTOR": "schedule-owner",
+            "REPOSITORY_OWNER": "owner",
+            "REQUESTED_SHA": "b" * 40,
+            "REQUESTED_ENVIRONMENT": "demo",
+        },
+        output_path=scheduled_output,
+    )
+    assert scheduled.returncode == 0
+    assert f"expected_sha={'b' * 40}" in scheduled_output.read_text()
+    assert "deployment_environment=demo" in scheduled_output.read_text()
 
     assert "ref: ${{ needs.authorize.outputs.expected_sha }}" in verify
     assert "Verify exact source revision" in verify

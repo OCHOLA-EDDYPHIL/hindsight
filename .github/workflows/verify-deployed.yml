@@ -1,6 +1,8 @@
 name: verify deployed demo
 
 on:
+  schedule:
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -39,7 +41,7 @@ jobs:
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
-          REQUESTED_SHA: ${{ inputs.expected_sha }}
+          REQUESTED_SHA: ${{ inputs.expected_sha || vars.HINDSIGHT_MONITORED_SHA }}
           REQUESTED_ENVIRONMENT: ${{ inputs.deployment_environment || 'demo' }}
         shell: bash
         run: |
@@ -48,12 +50,21 @@ jobs:
             echo "Unsupported deployment environment." >&2
             exit 1
           }
-          [[ "$EVENT_NAME" == "workflow_dispatch" \
+          authorized=false
+          if [[ "$EVENT_NAME" == "workflow_dispatch" \
             && "$REF_NAME" == "refs/heads/main" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/verify-deployed.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
-            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
-            echo "Deployed verification requires the repository owner on main." >&2
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]]; then
+            authorized=true
+          elif [[ "$EVENT_NAME" == "schedule" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/verify-deployed.yml@$REF_NAME" \
+            && "$REQUESTED_ENVIRONMENT" == "demo" ]]; then
+            authorized=true
+          fi
+          [[ "$authorized" == "true" ]] || {
+            echo "Deployed verification requires scheduled main or the repository owner on main." >&2
             exit 1
           }
           [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
