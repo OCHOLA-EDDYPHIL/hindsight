@@ -32,6 +32,7 @@ from hindsight.agent_decision import (
     agent_decision_provider_schema,
     diagnostic_observation_fingerprint,
     memory_selection_fingerprint,
+    normalize_agent_decision_provider_text,
     parse_agent_decision,
     recommendation_id,
     remediation_action_id,
@@ -1561,7 +1562,7 @@ def _generate_agent_decision(
         )
         try:
             decision = parse_agent_decision(
-                response.text,
+                normalize_agent_decision_provider_text(response.text),
                 recalled_memory_ids=recalled_memory_ids,
                 recalled_memory_text=recalled_memory_text,
                 allowed_query_keys=allowed_query_keys,

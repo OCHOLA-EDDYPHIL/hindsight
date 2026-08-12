@@ -148,6 +148,7 @@ class AgentDecisionV2(BaseModel):
 
 
 AGENT_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV2.model_json_schema()
+_PROVIDER_BRANCH_FIELDS = ("tool_call", "recommendation", "remediation_action")
 
 
 def agent_decision_provider_schema(
@@ -169,8 +170,25 @@ def agent_decision_provider_schema(
         raise ValueError(f"diagnostic_calls_used must be between zero and {MAX_DIAGNOSTIC_CALLS}")
 
     schema = deepcopy(AGENT_DECISION_JSON_SCHEMA)
+    schema.pop("anyOf", None)
     properties = schema["properties"]
     definitions = schema["$defs"]
+    required = schema["required"]
+
+    def omit_field(name: str) -> None:
+        properties.pop(name, None)
+        if name in required:
+            required.remove(name)
+
+    def require_field(name: str, field_schema: dict[str, Any]) -> None:
+        properties[name] = field_schema
+        if name not in required:
+            required.append(name)
+
+    def allow_optional_field(name: str, field_schema: dict[str, Any]) -> None:
+        properties[name] = field_schema
+        if name in required:
+            required.remove(name)
 
     recalled_ids = sorted(recalled_memory_ids)
     citations = properties["recalled_memory_citations"]
@@ -189,72 +207,89 @@ def agent_decision_provider_schema(
         and model_turn < MAX_MODEL_TURNS
     )
     action_available = bool(recalled_ids) and (not query_keys or diagnostic_observation_available)
-    terminal_branches = [
-        {
-            "properties": {
-                "next_step_kind": {"const": "recommendation"},
-                "tool_call": {"type": "null"},
-                "recommendation": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4_000,
-                },
-                "remediation_action": {"type": "null"},
-            }
-        }
-    ]
     if action_available:
         definitions["RetractRecalledMemoryAction"]["properties"]["target_memory_id"]["enum"] = (
             recalled_ids
         )
-        terminal_branches.append(
-            {
-                "properties": {
-                    "next_step_kind": {"const": "remediation_action"},
-                    "tool_call": {"type": "null"},
-                    "recommendation": {"type": "null"},
-                    "remediation_action": {"$ref": "#/$defs/RetractRecalledMemoryAction"},
-                }
-            }
-        )
 
     if diagnostic_available and not diagnostic_observation_available:
         properties["next_step_kind"]["enum"] = ["diagnostic_tool"]
-        properties["tool_call"] = {"$ref": "#/$defs/DiagnosticToolCall"}
-        properties["recommendation"] = {"type": "null"}
-        properties["remediation_action"] = {"type": "null"}
+        require_field("tool_call", {"$ref": "#/$defs/DiagnosticToolCall"})
+        omit_field("recommendation")
+        omit_field("remediation_action")
     elif diagnostic_available and diagnostic_observation_available:
         properties["next_step_kind"]["enum"] = [
             "diagnostic_tool",
             "recommendation",
             *(["remediation_action"] if action_available else []),
         ]
-        schema["anyOf"] = [
-            {
-                "properties": {
-                    "next_step_kind": {"const": "diagnostic_tool"},
-                    "tool_call": {"$ref": "#/$defs/DiagnosticToolCall"},
-                    "recommendation": {"type": "null"},
-                    "remediation_action": {"type": "null"},
-                }
-            },
-            *terminal_branches,
-        ]
+        allow_optional_field("tool_call", {"$ref": "#/$defs/DiagnosticToolCall"})
+        allow_optional_field(
+            "recommendation",
+            {"type": "string", "minLength": 1, "maxLength": 4_000},
+        )
+        if action_available:
+            allow_optional_field(
+                "remediation_action",
+                {"$ref": "#/$defs/RetractRecalledMemoryAction"},
+            )
+        else:
+            omit_field("remediation_action")
     else:
         properties["next_step_kind"]["enum"] = [
             "recommendation",
             *(["remediation_action"] if action_available else []),
         ]
-        if not action_available:
-            properties["tool_call"] = {"type": "null"}
-            properties["recommendation"] = {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 4_000,
-            }
-            properties["remediation_action"] = {"type": "null"}
-        schema["anyOf"] = terminal_branches
+        omit_field("tool_call")
+        if action_available:
+            allow_optional_field(
+                "recommendation",
+                {"type": "string", "minLength": 1, "maxLength": 4_000},
+            )
+            allow_optional_field(
+                "remediation_action",
+                {"$ref": "#/$defs/RetractRecalledMemoryAction"},
+            )
+        else:
+            require_field(
+                "recommendation",
+                {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4_000,
+                },
+            )
+            omit_field("remediation_action")
+    _replace_provider_consts(schema)
     return schema
+
+
+def _replace_provider_consts(value: Any) -> None:
+    """Use the literal form supported by Gemini structured outputs."""
+
+    if isinstance(value, dict):
+        if "const" in value:
+            value["enum"] = [value.pop("const")]
+        for nested in value.values():
+            _replace_provider_consts(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _replace_provider_consts(nested)
+
+
+def normalize_agent_decision_provider_text(text: str) -> str:
+    """Restore omitted branch siblings before the strict decision parser runs."""
+
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+    if not isinstance(payload, dict):
+        return text
+    normalized = dict(payload)
+    for field in _PROVIDER_BRANCH_FIELDS:
+        normalized.setdefault(field, None)
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
 
 def parse_agent_decision(
