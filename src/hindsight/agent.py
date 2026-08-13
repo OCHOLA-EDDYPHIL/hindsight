@@ -67,6 +67,7 @@ from hindsight.tracing import memory_ids, set_span_attributes, start_span
 from hindsight.tenant import current_tenant_id
 
 AGENT_CHAT_TABLE = "agent_chat_messages"
+PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY = "payments.retry_fanout"
 _AGENT_STORAGE_PROBES = (
     (
         "checkpoint_migrations",
@@ -1525,6 +1526,11 @@ def _generate_agent_decision(
     if starting_turn >= MAX_MODEL_TURNS:
         raise AgentDecisionError("model turn budget is exhausted")
     operational_action_contract = _operational_action_contract(state)
+    if (
+        operational_action_contract == PAYMENTS_OPERATIONAL_ACTION_CONTRACT
+        and PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY in allowed_query_keys
+    ):
+        allowed_query_keys = {PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY}
     decision_contract_name = (
         "AgentDecisionV3" if operational_action_contract is not None else "AgentDecisionV2"
     )
