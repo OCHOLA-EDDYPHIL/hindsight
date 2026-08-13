@@ -1,9 +1,9 @@
 locals {
   name = "${var.project_name}-${var.stage}"
 
-  worker_timeout_seconds        = var.validation_mode ? 30 : 180
+  worker_timeout_seconds        = var.validation_mode ? 45 : 180
   run_attempt_lease_seconds     = var.validation_mode ? 60 : 300
-  run_queue_visibility_seconds  = var.validation_mode ? 180 : 1080
+  run_queue_visibility_seconds  = var.validation_mode ? 270 : 1080
   run_max_attempts              = 3
   run_dispatch_schedule         = "rate(1 minute)"
   run_dispatch_schedule_seconds = 60
