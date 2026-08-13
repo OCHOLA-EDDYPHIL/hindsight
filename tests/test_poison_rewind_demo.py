@@ -1,11 +1,84 @@
 """Tests for the memory poisoning and rewind demo."""
 
 import os
+from contextlib import nullcontext
+from pathlib import Path
 from uuid import uuid4
 
+import psycopg
 import pytest
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_demo_supersession_boundary_is_tenant_scoped_and_does_not_grant_table_update():
+    sql = (ROOT / "migrations/0032_demo_supersession_boundary.sql").read_text()
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+    agent_update_grant = roles.split("GRANT UPDATE ON TABLE", 1)[1].split(
+        "TO hindsight_agent_writer;", 1
+    )[0]
+
+    assert "SECURITY DEFINER" in sql
+    assert "public.current_hindsight_tenant_id()" in sql
+    assert "session.demo_kind = 'compromised_guidance_rewind'" in sql
+    assert "session.status = 'active'" in sql
+    assert "writer = 'demo.seed'" in sql
+    assert "metadata->>'role' = 'known-good'" in sql
+    assert "REVOKE ALL ON FUNCTION" in sql
+    assert "GRANT EXECUTE ON FUNCTION" in sql
+    assert "semantic_memories" not in agent_update_grant
+
+
+@requires_db
+def test_restricted_api_role_can_only_use_the_demo_supersession_boundary(monkeypatch):
+    from hindsight import demo_state
+    from hindsight.db import connect, database_url
+    from tests.fakes import DeterministicEmbeddingProvider
+
+    provider = DeterministicEmbeddingProvider()
+    namespace = demo_state.reset_poison_rewind_state(
+        namespace=f"restricted-demo:{uuid4()}",
+        db_url=database_url(),
+    )
+    seed = demo_state.seed_good_demo_memory(
+        namespace=namespace,
+        db_url=database_url(),
+        embedding_provider=provider,
+    )
+
+    with connect(database_url()) as conn:
+        conn.execute((ROOT / "infra/db/roles.sql").read_text())
+        conn.commit()
+        conn.execute("SET ROLE hindsight_agent_writer")
+        conn.commit()
+        monkeypatch.setattr(
+            demo_state,
+            "connect",
+            lambda *_args, **_kwargs: nullcontext(conn),
+        )
+
+        poisoned = demo_state.poison_demo_memory(
+            namespace=namespace,
+            db_url=database_url(),
+            embedding_provider=provider,
+        )
+        conn.commit()
+
+        assert poisoned["belief_id"] == seed["belief_id"]
+        assert poisoned["previous_version_id"] == seed["id"]
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute(
+                "SELECT close_active_demo_seed_for_supersession(%s, %s)",
+                (poisoned["id"], namespace),
+            )
+        conn.rollback()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(
+                "UPDATE semantic_memories SET trust_status = trust_status WHERE id = %s",
+                (poisoned["id"],),
+            )
+        conn.rollback()
 
 
 @requires_db
@@ -184,9 +257,7 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
     assert reasserted["version_number"] == poison["version_number"] + 1
     assert reasserted["previous_version_id"] == poison["id"]
     assert reasserted["transition_kind"] == "rewind_reassertion"
-    assert str(reasserted["id"]) in {
-        str(value) for value in completed["restored_memory_ids"]
-    }
+    assert str(reasserted["id"]) in {str(value) for value in completed["restored_memory_ids"]}
     assert seed_audit is not None and seed_audit["t_invalid"] is not None
     assert poison_audit is not None and poison_audit["t_invalid"] is not None
     assert reflection_audit is not None and reflection_audit["t_invalid"] is not None
