@@ -69,6 +69,52 @@ def test_signature_trace_selected_action_id_follows_valid_modes():
     )
 
 
+def test_controlled_supersession_predecessor_requires_exact_history_binding():
+    superseded_at = datetime.fromisoformat("2026-08-13T12:00:00+00:00")
+    target = {
+        "id": "compromised-memory",
+        "tenant_id": "public-demo-tenant",
+        "namespace": "demo:test-session",
+        "belief_id": "payment-guidance",
+        "version_number": 2,
+        "previous_version_id": "known-good-memory",
+        "transition_kind": "supersession",
+        "t_valid": superseded_at,
+    }
+    predecessor = {
+        "id": "known-good-memory",
+        "tenant_id": "public-demo-tenant",
+        "namespace": "demo:test-session",
+        "belief_id": "payment-guidance",
+        "version_number": 1,
+        "writer": "demo.seed",
+        "source_ref": "demo:known-good-payment-incident",
+        "metadata": {
+            "demo": "compromised-guidance-rewind",
+            "role": "known-good",
+        },
+        "invalidated_by": "demo.fixture-import",
+        "invalidation_reason": (
+            "Supersede the accepted belief with the imported runbook version"
+        ),
+        "t_invalid": superseded_at,
+        "invalidated_at": superseded_at,
+    }
+
+    _assert_controlled_supersession_predecessor(
+        target=target,
+        predecessor=predecessor,
+        namespace="demo:test-session",
+    )
+
+    with pytest.raises(AssertionError, match="invalidation actor or reason changed"):
+        _assert_controlled_supersession_predecessor(
+            target=target,
+            predecessor={**predecessor, "invalidated_by": "unexpected.actor"},
+            namespace="demo:test-session",
+        )
+
+
 def test_reset_installs_exact_replay_identity_before_loading_fresh_state():
     source = (Path(__file__).parents[1] / "frontend/src/hooks/use-cockpit.ts").read_text()
     reset = source.split("const resetDemo = useCallback", 1)[1].split(
@@ -1184,6 +1230,23 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
                 (selected_ids,),
             )
             memories = {str(row["id"]): dict(row) for row in cur.fetchall()}
+            target_row = memories.get(target_id)
+            _require(target_row is not None, "remediation target was not recalled")
+            predecessor_id = target_row.get("previous_version_id")
+            _require(
+                predecessor_id is not None,
+                "remediation target omitted its superseded predecessor",
+            )
+            cur.execute(
+                "SELECT * FROM semantic_memories WHERE id = %s",
+                (predecessor_id,),
+            )
+            predecessor_row = cur.fetchone()
+            _require(
+                predecessor_row is not None,
+                "remediation target predecessor was not persisted",
+            )
+            predecessor = dict(predecessor_row)
             cur.execute(
                 "SELECT id, tenant_id, retrieval_id, memory_id, rank "
                 "FROM memory_reads WHERE retrieval_id = ("
@@ -1254,6 +1317,11 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
         target["writer"] == "demo.fixture-import"
         and target["source_ref"] == "demo:stale-runbook-import",
         "remediation target provenance did not match the controlled fixture",
+    )
+    _assert_controlled_supersession_predecessor(
+        target=target,
+        predecessor=predecessor,
+        namespace=namespace,
     )
     _require(
         " ".join(quote.split()) in " ".join(target["content"].split()),
@@ -1479,9 +1547,14 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
         target["invalidation_reason"] == operation["reason"],
         "target invalidation reason did not match the operation",
     )
+    expected_namespace_invalidated = [str(predecessor["id"]), *close_ids]
     _require(
-        sorted(namespace_invalidated) == sorted(close_ids),
-        "fresh namespace contained unexpected invalidated memories",
+        len(set(expected_namespace_invalidated)) == len(expected_namespace_invalidated),
+        "controlled supersession and retraction invalidated the same memory",
+    )
+    _require(
+        sorted(namespace_invalidated) == sorted(expected_namespace_invalidated),
+        "fresh namespace invalidation history did not match the controlled transitions",
     )
 
     tenant_values = {
@@ -1496,6 +1569,7 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
         *[str(item["tenant_id"]) for item in retrievals],
         *[str(read["tenant_id"]) for read in reads],
         *[str(memory["tenant_id"]) for memory in memories.values()],
+        str(predecessor["tenant_id"]),
         *[str(event["tenant_id"]) for event in operation["events"]],
         *[str(effect["tenant_id"]) for effect in operation["effects"]],
     }
@@ -1565,6 +1639,17 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
             "restored_memory_ids": [],
         },
         "ledger": {
+            "superseded_predecessor": {
+                "memory_id": str(predecessor["id"]),
+                "belief_id": str(predecessor["belief_id"]),
+                "source_ref": str(predecessor["source_ref"]),
+                "writer": str(predecessor["writer"]),
+                "invalidated": True,
+                "invalidated_by": str(predecessor["invalidated_by"]),
+                "invalidation_reason": str(predecessor["invalidation_reason"]),
+                "t_invalid": predecessor["t_invalid"].isoformat(),
+                "invalidated_at": predecessor["invalidated_at"].isoformat(),
+            },
             "target": {
                 "memory_id": target_id,
                 "content": COMPROMISED_GUIDANCE_CONTENT,
@@ -1720,6 +1805,56 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _assert_controlled_supersession_predecessor(
+    *,
+    target: dict[str, Any],
+    predecessor: dict[str, Any],
+    namespace: str,
+) -> None:
+    _require(
+        target.get("transition_kind") == "supersession"
+        and str(target.get("previous_version_id") or "") == str(predecessor.get("id") or ""),
+        "remediation target was not linked to the persisted superseded predecessor",
+    )
+    _require(
+        str(predecessor.get("tenant_id")) == str(target.get("tenant_id"))
+        and predecessor.get("namespace") == target.get("namespace") == namespace
+        and str(predecessor.get("belief_id")) == str(target.get("belief_id")),
+        "superseded predecessor crossed its tenant, namespace, or belief boundary",
+    )
+    _require(
+        int(target.get("version_number") or 0)
+        == int(predecessor.get("version_number") or 0) + 1,
+        "superseded predecessor was not the immediately prior belief version",
+    )
+    metadata = predecessor.get("metadata")
+    _require(
+        predecessor.get("writer") == "demo.seed"
+        and predecessor.get("source_ref") == "demo:known-good-payment-incident"
+        and isinstance(metadata, dict)
+        and metadata.get("demo") == "compromised-guidance-rewind"
+        and metadata.get("role") == "known-good",
+        "superseded predecessor provenance did not match the controlled seed",
+    )
+    _require(
+        predecessor.get("invalidated_by") == "demo.fixture-import"
+        and predecessor.get("invalidation_reason")
+        == "Supersede the accepted belief with the imported runbook version",
+        "superseded predecessor invalidation actor or reason changed",
+    )
+    t_invalid = predecessor.get("t_invalid")
+    invalidated_at = predecessor.get("invalidated_at")
+    target_t_valid = target.get("t_valid")
+    _require(
+        isinstance(t_invalid, datetime)
+        and isinstance(invalidated_at, datetime)
+        and isinstance(target_t_valid, datetime)
+        and t_invalid == invalidated_at
+        and t_invalid <= target_t_valid,
+        "superseded predecessor invalidation timestamps were inconsistent",
+    )
 
 
 def _require(condition: Any, message: str) -> None:
