@@ -68,17 +68,17 @@ jobs:
       HINDSIGHT_COGNITO_ISSUER: ${{ vars.HINDSIGHT_COGNITO_ISSUER }}
       HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT: ${{ vars.HINDSIGHT_WEBSOCKET_MANAGEMENT_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Verify exact source revision
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_LIFECYCLE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -159,7 +159,7 @@ jobs:
               > build/tenant-lifecycle-result.json
             exit "$exit_code"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: tenant-lifecycle-${{ inputs.operation }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

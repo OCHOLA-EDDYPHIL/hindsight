@@ -102,7 +102,7 @@ jobs:
       ci_run_url: ${{ steps.provenance.outputs.ci_run_url }}
       ci_workflow_path: ${{ steps.provenance.outputs.ci_workflow_path }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
@@ -142,7 +142,7 @@ jobs:
       candidate_websocket_url: ${{ steps.plan.outputs.candidate_websocket_url }}
       observed_revision: ${{ steps.plan.outputs.observed_revision }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
@@ -150,7 +150,7 @@ jobs:
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -188,7 +188,7 @@ jobs:
       COMPOSE_PROJECT_NAME: hindsight_product_preflight_${{ github.run_id }}_${{ github.run_attempt }}
       DATABASE_URL: postgresql://root@localhost:26257/hindsight_product_${{ github.run_id }}?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
@@ -196,7 +196,7 @@ jobs:
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -216,7 +216,7 @@ jobs:
             -e 'SET CLUSTER SETTING feature.vector_index.enabled = true'
           uv run python scripts/migrate.py
           uv run python scripts/initialize_agent_storage.py
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -294,16 +294,16 @@ jobs:
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -352,16 +352,16 @@ jobs:
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -411,16 +411,16 @@ jobs:
       HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS: ${{ needs.deploy.outputs.run_max_attempts }}
       HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS: ${{ needs.deploy.outputs.run_dispatch_schedule_seconds }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -467,16 +467,16 @@ jobs:
       EMBEDDING_PROVIDER: gemini
       LLM_PROVIDER: gemini
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -549,7 +549,7 @@ jobs:
           docker logs "$container_name" > "$HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR/selenium-service.log" 2>&1
           docker rm -f "$container_name"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hindsight-browser-evidence
@@ -571,16 +571,16 @@ jobs:
       HINDSIGHT_API_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       HINDSIGHT_WORKER_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_WORKER_DATABASE_URL_PARAM || '/hindsight/demo/worker-database-url' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -672,7 +672,7 @@ jobs:
               "websocket_url": os.environ["WEBSOCKET_URL"],
           }, sort_keys=True))
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: product-provenance-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
           path: product-provenance.json

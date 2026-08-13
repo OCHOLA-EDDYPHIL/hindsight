@@ -88,7 +88,7 @@ jobs:
       HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
       UI_DOMAIN: ${{ vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.expected_sha }}
           fetch-depth: 1
@@ -97,11 +97,11 @@ jobs:
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.expected_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}

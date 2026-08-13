@@ -268,7 +268,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.plan_name.outputs.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
@@ -276,17 +276,17 @@ jobs:
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - uses: hashicorp/setup-terraform@v3
-      - uses: actions/cache@v4
+      - uses: hashicorp/setup-terraform@v4
+      - uses: actions/cache@v6
         with:
           path: .terraform.d/plugin-cache
           key: terraform-${{ runner.os }}-${{ hashFiles('infra/terraform/**/.terraform.lock.hcl') }}
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -344,7 +344,7 @@ jobs:
           DEPLOYMENT_ENVIRONMENT: ${{ needs.authorize.outputs.deployment_environment }}
           SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
         run: echo "name=${DEPLOYMENT_ENVIRONMENT}-plan-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.plan_name.outputs.name }}
           path: |
@@ -397,7 +397,7 @@ jobs:
       run_max_attempts: ${{ steps.stack_outputs.outputs.run_max_attempts }}
       run_dispatch_schedule_seconds: ${{ steps.stack_outputs.outputs.run_dispatch_schedule_seconds }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
@@ -405,17 +405,17 @@ jobs:
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - uses: hashicorp/setup-terraform@v3
-      - uses: actions/cache@v4
+      - uses: hashicorp/setup-terraform@v4
+      - uses: actions/cache@v6
         with:
           path: .terraform.d/plugin-cache
           key: terraform-${{ runner.os }}-${{ hashFiles('infra/terraform/**/.terraform.lock.hcl') }}
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -454,7 +454,7 @@ jobs:
           --domain-name "$TF_VAR_domain_name"
           --source-state-key "$SOURCE_STATE_KEY"
           --source-domain-name "$SOURCE_DOMAIN_NAME"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.plan.outputs.artifact_name }}
           path: build
