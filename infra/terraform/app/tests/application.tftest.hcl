@@ -523,10 +523,10 @@ run "validation_timing_profile" {
 
   assert {
     condition = (
-      aws_lambda_function.worker.timeout == 30 &&
+      aws_lambda_function.worker.timeout == 45 &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS) == 60 &&
-      aws_sqs_queue.runs.visibility_timeout_seconds == 180 &&
-      aws_sqs_queue.run_dlq.visibility_timeout_seconds == 180 &&
+      aws_sqs_queue.runs.visibility_timeout_seconds == 270 &&
+      aws_sqs_queue.run_dlq.visibility_timeout_seconds == 270 &&
       tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == 3
     )
     error_message = "Validation mode must shorten timing without weakening the attempt budget."
@@ -544,7 +544,7 @@ run "validation_timing_profile" {
   }
 
   assert {
-    condition     = local.operation_poll_seconds == 450
+    condition     = local.operation_poll_seconds == 645
     error_message = "The deployed UI must wait through the complete validation retry budget."
   }
 }

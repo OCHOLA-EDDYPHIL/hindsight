@@ -118,9 +118,9 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert "HINDSIGHT_RUN_DLQ_ARN" in worker_lambda
     assert "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS" in worker_lambda
     assert "HINDSIGHT_RUN_MAX_ATTEMPTS" in worker_lambda
-    assert "var.validation_mode ? 30 : 180" in stack
+    assert "var.validation_mode ? 45 : 180" in stack
     assert "var.validation_mode ? 60 : 300" in stack
-    assert "var.validation_mode ? 180 : 1080" in stack
+    assert "var.validation_mode ? 270 : 1080" in stack
     assert re.search(r"run_max_attempts\s*= 3", stack)
     assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' in stack
     assert stack.count("message_retention_seconds  = 1209600") == 2
