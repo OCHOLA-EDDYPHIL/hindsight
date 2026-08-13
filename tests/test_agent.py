@@ -197,6 +197,58 @@ def test_payments_replay_records_strict_operational_action_without_changing_gene
     )
 
 
+def test_payments_replay_pins_the_causal_pair_to_one_diagnostic():
+    import json
+
+    from hindsight.agent import (
+        PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY,
+        _generate_agent_decision,
+    )
+    from tests.fakes import DeterministicReasoningProvider, diagnostic_decision
+
+    state = {
+        "run_id": "run-controlled-diagnostic",
+        "decision_id": "decision-controlled-diagnostic",
+        "namespace": "demo:payments-poison-rewind:session:abc123",
+        "service_slug": "payments-api",
+        "incident_id": "demo-payments-checkout-latency",
+        "user_input": (
+            "Checkout p99 is above 2s and the queue is growing. Inspect current telemetry "
+            "and recommend one reversible next action."
+        ),
+        "recalled_memories": [],
+        "observations": [],
+        "reasoning_steps": [],
+        "tool_calls": [],
+        "model_turn_count": 0,
+        "diagnostic_call_count": 0,
+    }
+    payload = json.loads(diagnostic_decision(PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY))
+    payload.update({"schema_version": 3, "operational_action": None})
+    provider = DeterministicReasoningProvider(response_text=json.dumps(payload))
+
+    decision, _, turns = _generate_agent_decision(
+        state,
+        provider=provider,
+        allowed_query_keys={
+            "payments.checkout_latency_ms",
+            "payments.processor_queue_depth",
+            "payments.retry_fanout",
+        },
+    )
+
+    query_schema = provider.requests[0].response_json_schema["$defs"]["DiagnosticToolCall"][
+        "properties"
+    ]["query_key"]
+    assert turns == 1
+    assert decision.tool_call is not None
+    assert decision.tool_call.query_key == PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY
+    assert query_schema["enum"] == [PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY]
+    assert (
+        'Configured CloudWatch query keys: ["payments.retry_fanout"]' in provider.requests[0].prompt
+    )
+
+
 def test_provider_may_omit_forbidden_branch_siblings_without_changing_raw_response_hash():
     import hashlib
     import json
