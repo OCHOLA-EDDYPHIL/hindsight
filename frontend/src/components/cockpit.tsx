@@ -115,7 +115,7 @@ function rejectedRun(scenario: SignatureScenario | null, activeRun?: Run | null)
   );
 }
 
-function recoveredRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
+function postCorrectionRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
   const stageId = scenario?.stages.corrected_decision_id;
   return (
     scenario?.runs.find((item) => stageId && item.decision_id === stageId) ||
@@ -142,8 +142,8 @@ function runApproval(run?: Run | null): boolean | null {
 
 function decisionDisposition(
   run: Run | null | undefined,
-  mode: "rejected" | "recovered",
-  recoveryConfirmed = false,
+  mode: "rejected" | "post",
+  correctionProven = false,
 ) {
   if (!run) return "Unavailable";
   const approved = runApproval(run);
@@ -154,12 +154,23 @@ function decisionDisposition(
       ? "Run rejected; approval unavailable"
       : humanStatus(run.status);
   }
-  if (approved === true && recoveryConfirmed) return "Approved and recovered";
+  if (approved === true && correctionProven) return "Approved after correction";
   if (approved === true) return "Approved by operator";
   if (approved === false) return "Rejected by operator";
   return run.status === "completed"
     ? "Run completed; approval unavailable"
     : humanStatus(run.status);
+}
+
+function causalClaim(scenario: SignatureScenario | null) {
+  const comparison = scenario?.action_comparison;
+  if (comparison?.controlled_pair) {
+    return "Recorded action changed after correction.";
+  }
+  if (comparison?.status === "unchanged" && comparison.memory_correction_proven) {
+    return "Active memory changed; primary action did not.";
+  }
+  return "History preserved; active memory changed.";
 }
 
 function findCitedRead(run: Run | null | undefined, memoryId?: string | null) {
@@ -245,7 +256,7 @@ export function CausalRail({
   activeRun: Run | null;
 }) {
   const rejected = rejectedRun(scenario, activeRun);
-  const latestRun = recoveredRun(scenario, activeRun);
+  const latestRun = postCorrectionRun(scenario, activeRun);
   const compromisedId =
     scenario?.stages.compromised_memory_id || scenario?.stages.poison_memory_id;
   const compromised = findMemory(compromisedId, scenario, snapshot);
@@ -255,7 +266,7 @@ export function CausalRail({
     snapshot?.operations.find((item) => item.id === scenario?.stages.rewind_operation_id) ||
     null;
   const correctedStageId = scenario?.stages.corrected_decision_id;
-  const recovered = correctedStageId
+  const postCorrection = correctedStageId
     ? latestRun
     : operation?.status === "completed" &&
         latestRun?.decision_id &&
@@ -277,9 +288,7 @@ export function CausalRail({
       <div className="rail-heading">
         <div>
           <p className="section-kicker">Before → correction → after</p>
-          <h2 id="causalHeading">
-            The memory read changed the decision. The rewind changed the next run.
-          </h2>
+          <h2 id="causalHeading">{causalClaim(scenario)}</h2>
         </div>
         <IdentifierValue value={scenario?.scenario_id} label="scenario identity" quiet />
       </div>
@@ -300,7 +309,7 @@ export function CausalRail({
           }
           content={compromised?.content || citedRead?.justification}
           identity={compromisedId}
-          identityLabel="cited belief identity"
+          identityLabel="cited belief"
           details={[
             { label: "Writer", value: citedRead?.writer || compromised?.writer },
             { label: "Source", value: citedRead?.source_ref || compromised?.source_ref },
@@ -310,17 +319,21 @@ export function CausalRail({
           step="02"
           kind="decision"
           dataStage="influenced_decision_id"
-          title="Rejected recommendation"
+          title="Pre-correction recommendation"
           status={decisionDisposition(rejected, "rejected")}
           content={recommendationText(rejected)}
           identity={scenario?.stages.influenced_decision_id || rejected?.decision_id}
-          identityLabel="rejected decision identity"
+          identityLabel="pre-correction decision"
           details={[
             {
               label: "Provider",
               value: rejected?.provider || rejected?.action_trace?.selection?.provider,
             },
             { label: "Model", value: rejected?.model || rejected?.action_trace?.selection?.model },
+            {
+              label: "Primary action",
+              value: scenario?.action_comparison?.before?.primary_action,
+            },
           ]}
         />
         <CausalCard
@@ -331,7 +344,7 @@ export function CausalRail({
           status={operation ? humanStatus(operation.status) : "Unavailable"}
           content={operation?.reason}
           identity={scenario?.stages.rewind_operation_id || operation?.id}
-          identityLabel="rewind operation identity"
+          identityLabel="rewind operation"
           details={[
             { label: "Effect", value: correctionCounts },
             { label: "Completed", value: operation?.completed_at ? formatTime(operation.completed_at) : null },
@@ -343,19 +356,31 @@ export function CausalRail({
           dataStage="corrected_decision_id"
           title={
             scenario?.status === "completed"
-              ? "Recovered recommendation"
+              ? "Post-correction recommendation"
               : "Rerun recommendation"
           }
-          status={decisionDisposition(recovered, "recovered", scenario?.status === "completed")}
-          content={recommendationText(recovered)}
-          identity={scenario?.stages.corrected_decision_id || recovered?.decision_id}
-          identityLabel="recovered decision identity"
+          status={decisionDisposition(
+            postCorrection,
+            "post",
+            Boolean(scenario?.action_comparison?.memory_correction_proven),
+          )}
+          content={recommendationText(postCorrection)}
+          identity={scenario?.stages.corrected_decision_id || postCorrection?.decision_id}
+          identityLabel="post-correction decision"
           details={[
             {
               label: "Provider",
-              value: recovered?.provider || recovered?.action_trace?.selection?.provider,
+              value:
+                postCorrection?.provider || postCorrection?.action_trace?.selection?.provider,
             },
-            { label: "Model", value: recovered?.model || recovered?.action_trace?.selection?.model },
+            {
+              label: "Model",
+              value: postCorrection?.model || postCorrection?.action_trace?.selection?.model,
+            },
+            {
+              label: "Primary action",
+              value: scenario?.action_comparison?.after?.primary_action,
+            },
           ]}
           last
         />
@@ -367,7 +392,7 @@ export function CausalRail({
 function PlanSections({ run, primary = false }: { run?: Run | null; primary?: boolean }) {
   const plan = structurePlan(run);
   const approval = run
-    ? decisionDisposition(run, run.status === "rejected" ? "rejected" : "recovered")
+    ? decisionDisposition(run, run.status === "rejected" ? "rejected" : "post")
     : "Unavailable";
   const fields = [
     { label: "Recorded plan", value: plan.recordedPlan },
@@ -407,7 +432,7 @@ function outcomeHeading(run: Run | null | undefined, historical: boolean) {
   if (run.status === "rejected") return `Rejected ${decisionKind}`;
   if (run.status === "completed") {
     if (remediation) return "Completed governed-memory retraction";
-    return historical ? "Completed recommendation" : "Recovered recommendation";
+    return historical ? "Completed recommendation" : "Post-correction recommendation";
   }
   return `${historical ? "Historical" : "Current"} ${decisionKind}`;
 }
@@ -447,6 +472,11 @@ function Outcome({ run, mode }: { run?: Run | null; mode: "historical" | "curren
             {selection?.provider || run?.provider || "Unavailable"} /{" "}
             {selection?.model || run?.model || "Unavailable"}
           </span>
+          {recommendation.operational_action ? (
+            <span>
+              Primary action: {humanStatus(recommendation.operational_action.primary_action)}
+            </span>
+          ) : null}
         </div>
       ) : null}
       {remediationAction ? (
@@ -541,13 +571,13 @@ export function OutcomeComparison({
   activeRun: Run | null;
 }) {
   const rejected = rejectedRun(scenario, activeRun);
-  const corrected = recoveredRun(scenario, activeRun);
+  const corrected = postCorrectionRun(scenario, activeRun);
   return (
     <section className="comparison" aria-labelledby="comparisonHeading">
       <div className="comparison-heading">
         <div>
           <p className="section-kicker">Recorded decision delta</p>
-          <h2 id="comparisonHeading">Compare the rejected run with the recovered run.</h2>
+          <h2 id="comparisonHeading">Before vs after.</h2>
         </div>
         <div className="delta-key" aria-label="Outcome chronology">
           <ClockCounterClockwise aria-hidden="true" size={16} />
@@ -883,9 +913,10 @@ export function StoryHeader({
   const runs = [...(scenario?.runs || []), ...(run ? [run] : [])].filter(
     (item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index,
   );
-  const recovered = recoveredRun(scenario, run);
+  const postCorrection = postCorrectionRun(scenario, run);
   const recordedIncident = scenario?.incident || incident;
-  const service = run?.service_slug || recovered?.service_slug || recordedIncident?.service_slug;
+  const service =
+    run?.service_slug || postCorrection?.service_slug || recordedIncident?.service_slug;
   const models = reasoningModels(runs);
   const profiles = embeddingProfiles(runs);
   return (

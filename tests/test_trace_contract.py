@@ -8,6 +8,21 @@ import pytest
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 
+def test_public_redaction_removes_nested_aws_account_identifiers():
+    from hindsight.redaction import redact_account_identifiers
+
+    secret = "123456789012"
+    redacted = redact_account_identifiers(
+        {
+            "account_id": secret,
+            "nested": [{"aws_account_id": secret, "region": "us-east-1"}],
+        }
+    )
+
+    assert redacted == {"nested": [{"region": "us-east-1"}]}
+    assert secret not in str(redacted)
+
+
 def test_signature_trace_pairs_latest_pre_rewind_rejection_with_correction():
     from datetime import UTC, datetime, timedelta
 
@@ -36,6 +51,155 @@ def test_signature_trace_pairs_latest_pre_rewind_rejection_with_correction():
     )
 
     assert selected == corrected_rejection
+
+
+def test_action_comparison_requires_structured_actions_equivalent_context_and_lineage():
+    from copy import deepcopy
+
+    from hindsight.agent_decision import operational_action_fingerprint
+    from hindsight.trace_contract import _action_comparison
+
+    prompt = (
+        "Checkout p99 is above 2s and the queue is growing. Inspect current telemetry "
+        "and recommend one reversible next action."
+    )
+
+    def observation(timestamp: str, *, account_id: str) -> dict:
+        return {
+            "status": "available",
+            "tool": "aws_cloudwatch_diagnostics",
+            "query_key": "payments.checkout_latency_ms",
+            "account_id": account_id,
+            "region": "us-east-1",
+            "metric": {
+                "namespace": "Hindsight/Demo",
+                "name": "CheckoutLatency",
+                "dimensions": [
+                    {"name": "Service", "value": "payments-api"},
+                    {"name": "Stage", "value": "demo"},
+                ],
+                "statistic": "Maximum",
+                "period_seconds": 60,
+            },
+            "window": {"start": timestamp, "end": timestamp, "seconds": 900},
+            "datapoints": [{"timestamp": timestamp, "value": 2400.0}],
+            "datapoint_count": 1,
+        }
+
+    def run(decision_id: str, memory_id: str, action: str, timestamp: str) -> dict:
+        payload = {
+            "contract": "payments_retry_amplification.v1",
+            "primary_action": action,
+        }
+        return {
+            "decision_id": decision_id,
+            "user_input": prompt,
+            "trace": {"reads": [{"memory_id": memory_id}]},
+            "action_trace": {
+                "observations": [observation(timestamp, account_id=f"secret-{decision_id}")],
+                "recommendation": {
+                    "operational_action": {
+                        **payload,
+                        "fingerprint": operational_action_fingerprint(payload),
+                    }
+                },
+            },
+        }
+
+    seed = {
+        "id": "memory-v1",
+        "belief_id": "belief-1",
+        "version_number": 1,
+        "transition_kind": "assertion",
+        "t_invalid": "2026-08-13T10:01:00Z",
+    }
+    stale = {
+        "id": "memory-v2",
+        "belief_id": "belief-1",
+        "version_number": 2,
+        "previous_version_id": "memory-v1",
+        "transition_kind": "supersession",
+        "t_invalid": "2026-08-13T10:04:00Z",
+    }
+    restored = {
+        "id": "memory-v3",
+        "belief_id": "belief-1",
+        "version_number": 3,
+        "previous_version_id": "memory-v2",
+        "transition_kind": "rewind_reassertion",
+        "created_by_operation_id": "operation-1",
+        "t_invalid": None,
+    }
+    rejected = run("decision-before", "memory-v2", "scale_workers", "2026-08-13T10:02:00Z")
+    corrected = run(
+        "decision-after",
+        "memory-v3",
+        "throttle_retries",
+        "2026-08-13T10:05:00Z",
+    )
+    operation = {
+        "id": "operation-1",
+        "status": "completed",
+        "invalidated_memory_ids": ["memory-v2"],
+    }
+    effects = [
+        {
+            "effect_type": "reasserted",
+            "source_memory_id": "memory-v1",
+            "result_memory_id": "memory-v3",
+            "belief_id": "belief-1",
+        }
+    ]
+
+    comparison = _action_comparison(
+        rejected=rejected,
+        corrected=corrected,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+
+    assert comparison["status"] == "changed"
+    assert comparison["before"]["primary_action"] == "scale_workers"
+    assert comparison["after"]["primary_action"] == "throttle_retries"
+    assert comparison["context"] == {
+        "prompt_equal": True,
+        "normalized_telemetry_equal": True,
+    }
+    assert comparison["memory_correction_proven"] is True
+    assert comparison["controlled_pair"] is True
+
+    different_prompt = deepcopy(corrected)
+    different_prompt["user_input"] = "A changed report"
+    not_controlled = _action_comparison(
+        rejected=rejected,
+        corrected=different_prompt,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert not_controlled["status"] == "changed"
+    assert not_controlled["controlled_pair"] is False
+
+    tampered = deepcopy(corrected)
+    tampered["action_trace"]["recommendation"]["operational_action"]["fingerprint"] = (
+        "operational_action:tampered"
+    )
+    unavailable = _action_comparison(
+        rejected=rejected,
+        corrected=tampered,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["controlled_pair"] is False
 
 
 @requires_db
@@ -219,6 +383,7 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
     )
     from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
+    from hindsight.operations import enqueue_operation, execute_operation, preview_rewind
     from hindsight.runs import create_run
     from hindsight.trace_contract import signature_scenario_trace
     from psycopg.types.json import Jsonb
@@ -299,50 +464,26 @@ def test_signature_scenario_resolves_by_scenario_and_decision_identity():
                     bad["id"],
                 ),
             )
-    with MemoryStore(url=database_url()) as store:
-        store.invalidate(
-            memory_id=str(poison["id"]),
-            actor="pytest.trace",
-            reason="Remove poison",
-        )
-    with connect(database_url()) as conn:
-        with conn.transaction():
-            operation = conn.execute(
-                """
-                    INSERT INTO memory_operations (
-                        operation_type, actor, reason, namespace,
-                        invalidated_memory_ids, restored_memory_ids,
-                        idempotency_key, status, request_payload,
-                        expected_revisions, applied_revisions, attempt_count,
-                        completed_at
-                    )
-                    VALUES (
-                        'rewind', 'pytest.trace', 'Remove poison', %s,
-                        jsonb_build_array(%s::STRING), '[]'::JSONB, %s,
-                        'completed', '{}'::JSONB,
-                        '{}'::JSONB, '{}'::JSONB, 1, now()
-                    )
-                    RETURNING id
-                """,
-                (namespace, str(poison["id"]), f"trace:{uuid4()}"),
-            ).fetchone()[0]
-            conn.execute(
-                """
-                    INSERT INTO memory_operation_events (
-                        operation_id, sequence, status, summary
-                    ) VALUES (%s, 1, 'completed', 'Memory operation completed')
-                """,
-                (operation,),
-            )
-            conn.execute(
-                """
-                    INSERT INTO memory_operation_effects (
-                        operation_id, sequence, effect_type,
-                        source_memory_id, belief_id, namespace
-                    ) VALUES (%s, 1, 'closed', %s, %s, %s)
-                """,
-                (operation, poison["id"], poison["belief_id"], namespace),
-            )
+    preview = preview_rewind(
+        namespace=namespace,
+        target_timestamp=rewind_anchor,
+        actor="pytest.trace",
+        reason="Restore the accepted belief version",
+        db_url=database_url(),
+    )
+    queued, _ = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=str(preview["fingerprint"]),
+        idempotency_key=f"trace:{uuid4()}",
+        db_url=database_url(),
+    )
+    completed_operation = execute_operation(
+        operation_id=str(queued["id"]),
+        embedding_provider=provider,
+        worker_id="pytest.trace",
+        db_url=database_url(),
+    )
+    operation = completed_operation["id"]
     corrected, _ = create_run(
         incident_slug=incident["slug"],
         namespace=namespace,

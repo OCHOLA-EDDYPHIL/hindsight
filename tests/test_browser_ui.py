@@ -231,6 +231,7 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
         "reflected_memory_id",
         "selection_fingerprint",
         "recommendation_id",
+        "operational_action",
         "approval_approved",
         "execution_status",
         "read_memory_ids",
@@ -532,7 +533,7 @@ def test_operator_can_run_and_explain_signature_workflow():
 
         driver.find_element(By.ID, "poisonDemo").click()
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text == "2 live · 0 invalid"
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "1 live · 1 invalid"
         )
 
         driver.find_element(By.ID, "startRun").click()
@@ -562,7 +563,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(
             lambda browser: (
                 browser.find_element(By.ID, "memoryCount").text
-                == f"{2 + rejected_reflection_count} live · 0 invalid"
+                == f"{1 + rejected_reflection_count} live · 1 invalid"
             )
         )
         if rejected_remediation:
@@ -586,11 +587,11 @@ def test_operator_can_run_and_explain_signature_workflow():
             "return Number(window.HINDSIGHT_CONFIG.operationPollSeconds || 600);"
         )
         _wait_for_completed_operation(driver, timeout=float(operation_poll_seconds) + 30)
-        invalidated_count = 1 + rejected_reflection_count
+        ledger_invalidated_count = 2 + rejected_reflection_count
         wait.until(
             lambda browser: (
                 browser.find_element(By.ID, "memoryCount").text
-                == f"1 live · {invalidated_count} invalid"
+                == f"1 live · {ledger_invalidated_count} invalid"
             )
         )
         wait.until(
@@ -616,7 +617,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(
             lambda browser: (
                 browser.find_element(By.ID, "memoryCount").text
-                == f"1 live · {invalidated_count} invalid"
+                == f"1 live · {ledger_invalidated_count} invalid"
             )
         )
 
@@ -642,7 +643,7 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(
             lambda browser: (
                 browser.find_element(By.ID, "memoryCount").text
-                == f"2 live · {invalidated_count} invalid"
+                == f"2 live · {ledger_invalidated_count} invalid"
             )
         )
         _assert_typed_reflection(namespace)
@@ -673,7 +674,8 @@ def test_operator_can_run_and_explain_signature_workflow():
         assert "demo.fixture-import" in historical_evidence
         assert "demo:stale-runbook-import" in historical_evidence
         assert "previously approved payment runbook" in historical_evidence
-        assert "demo.seed" in current_evidence
+        assert "demo.fixture-import" not in current_evidence
+        assert "memory:" in current_evidence
         assert not driver.find_elements(By.CSS_SELECTOR, ".operator-console")
         _assert_no_browser_errors(driver)
     finally:
@@ -707,7 +709,7 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
         namespace = wait.until(lambda browser: _ready_reset_namespace(browser, previous_namespace))
         driver.find_element(By.ID, "poisonDemo").click()
         wait.until(
-            lambda browser: browser.find_element(By.ID, "memoryCount").text == "2 live · 0 invalid"
+            lambda browser: browser.find_element(By.ID, "memoryCount").text == "1 live · 1 invalid"
         )
 
         report = driver.find_element(By.ID, "incidentInput")
@@ -1928,6 +1930,9 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
     def run_receipt(run: dict[str, Any]) -> dict[str, Any]:
         trace = run["action_trace"]
         reads = run.get("reads") or []
+        operational_action = (trace.get("recommendation") or {}).get(
+            "operational_action"
+        )
         return {
             "run_id": str(run["run_id"]),
             "decision_id": str(run["decision_id"]),
@@ -1936,6 +1941,15 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
             "selection_fingerprint": str(trace["selection"]["fingerprint"]),
             "recommendation_id": (
                 str(trace["recommendation"]["id"]) if trace.get("recommendation") else None
+            ),
+            "operational_action": (
+                {
+                    "contract": str(operational_action["contract"]),
+                    "primary_action": str(operational_action["primary_action"]),
+                    "fingerprint": str(operational_action["fingerprint"]),
+                }
+                if operational_action
+                else None
             ),
             "approval_approved": bool(trace["approval"]["approved"]),
             "execution_status": str(trace["execution"]["status"]),
@@ -1952,6 +1966,7 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
         "invalidated_memory_ids": [str(value) for value in signature["invalidated_memory_ids"]],
         "bad": run_receipt(signature["bad"]),
         "corrected": run_receipt(signature["corrected"]),
+        "action_comparison": signature.get("action_comparison"),
     }
 
 
@@ -1966,6 +1981,7 @@ def _signature_trace_selected_action_id(action_trace: dict[str, Any]) -> str:
 def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     from hindsight.db import connect, database_url
     from hindsight.memory import MemoryStore
+    from hindsight.trace_contract import signature_scenario_trace
 
     with connect(database_url(), application_name="hindsight-browser-signature") as conn:
         run_rows = conn.execute(
@@ -2048,17 +2064,15 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert bad["provider"] == "gemini"
     assert bad["model"]
     bad_trace = bad["action_trace"]
-    assert bad_trace["mode"] in {"recommendation_only", "governed_memory_remediation"}
+    assert bad_trace["mode"] == "recommendation_only"
     bad_action_id = _signature_trace_selected_action_id(bad_trace)
     assert bad["action_trace"]["approval"]["approved"] is False
     assert bad["action_trace"]["execution"]["status"] == "not_executed"
-    if bad_trace["mode"] == "recommendation_only":
-        assert bad_action_id.startswith("recommendation:")
-        assert bad["reflected_memory_id"]
-    else:
-        assert bad_action_id.startswith("remediation_action:")
-        assert bad_trace["remediation_action"]["name"] == "retract_recalled_memory"
-        assert bad["reflected_memory_id"] is None
+    assert bad_action_id.startswith("recommendation:")
+    assert bad["reflected_memory_id"]
+    assert bad_trace["recommendation"]["operational_action"]["primary_action"] == (
+        "scale_workers"
+    )
     assert bad["action_trace"]["selection"]["fingerprint"]
     assert "score" not in bad["action_trace"]
     poison_read = next(read for read in bad["reads"] if read["writer"] == "demo.fixture-import")
@@ -2076,6 +2090,9 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert corrected["action_trace"]["approval"]["approved"] is True
     assert corrected["action_trace"]["execution"]["status"] == "recommendation_approved"
     assert corrected["action_trace"]["recommendation"]["id"].startswith("recommendation:")
+    assert corrected["action_trace"]["recommendation"]["operational_action"][
+        "primary_action"
+    ] == "throttle_retries"
     assert corrected["action_trace"]["recommendation"]["id"] != bad_action_id
     assert (
         corrected["action_trace"]["selection"]["fingerprint"]
@@ -2098,19 +2115,21 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
             and int(observation.get("datapoint_count") or 0) > 0
             for observation in run["action_trace"]["observations"]
         )
-    assert any(read["writer"] == "demo.seed" for read in corrected["reads"])
     assert all(read["writer"] != "demo.fixture-import" for read in corrected["reads"])
     assert operation is not None and operation[2] == "completed"
 
     with MemoryStore(url=database_url()) as store:
         memories = store.list_current_semantic(namespace=namespace, limit=100)
-        current_writers = {memory["writer"] for memory in memories}
         poison_id = next(
             read["memory_id"] for read in bad["reads"] if read["writer"] == "demo.fixture-import"
         )
         poison = store.audit_memory(memory_kind="semantic", memory_id=poison_id)
 
-    assert "demo.seed" in current_writers
+    reasserted = next(
+        memory for memory in memories if memory["transition_kind"] == "rewind_reassertion"
+    )
+    assert str(reasserted["previous_version_id"]) == poison_id
+    assert any(read["memory_id"] == str(reasserted["id"]) for read in corrected["reads"])
     assert poison is not None and poison["t_invalid"] is not None
     invalidated = {str(value) for value in operation[0]}
     assert poison_id in invalidated
@@ -2119,12 +2138,23 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     else:
         assert invalidated == {poison_id}
     assert all(read["memory_id"] not in invalidated for read in corrected["reads"])
+    public_trace = signature_scenario_trace(namespace=namespace, db_url=database_url())
+    assert public_trace is not None
+    comparison = public_trace["action_comparison"]
+    assert comparison["status"] == "changed"
+    assert comparison["context"] == {
+        "prompt_equal": True,
+        "normalized_telemetry_equal": True,
+    }
+    assert comparison["memory_correction_proven"] is True
+    assert comparison["controlled_pair"] is True
     return {
         "namespace": namespace,
         "operation_id": operation_id,
         "invalidated_memory_ids": sorted(invalidated),
         "bad": bad,
         "corrected": corrected,
+        "action_comparison": comparison,
     }
 
 

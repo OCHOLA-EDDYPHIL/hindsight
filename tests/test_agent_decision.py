@@ -7,15 +7,19 @@ import pytest
 from hindsight.agent_decision import (
     AGENT_DECISION_JSON_SCHEMA,
     MAX_MODEL_TURNS,
+    PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
     AgentDecisionError,
     AgentDecisionV2,
+    AgentDecisionV3,
     agent_decision_from_payload,
     agent_decision_provider_schema,
     memory_selection_fingerprint,
     normalize_agent_decision_provider_text,
+    operational_action_fingerprint,
     parse_agent_decision,
     recommendation_id,
 )
+from tests.fakes import controlled_recommendation_decision
 
 
 def _payload(**overrides):
@@ -60,6 +64,88 @@ def test_recommendation_contract_is_strict_and_content_addressed():
         selection_fingerprint="selection-1",
     )
     assert first.startswith("recommendation:")
+
+
+def test_controlled_replay_requires_model_produced_operational_action():
+    raw = controlled_recommendation_decision(
+        "scale_workers",
+        "Scale payment workers, then inspect queue depth.",
+        citations=[
+            {
+                "memory_id": "memory-1",
+                "quote": "Inspect the downstream processor first.",
+            }
+        ],
+    )
+    decision = parse_agent_decision(
+        raw,
+        recalled_memory_ids={"memory-1"},
+        recalled_memory_text={"memory-1": "Inspect the downstream processor first."},
+        allowed_query_keys=set(),
+        diagnostic_calls_used=0,
+        diagnostic_observation_available=False,
+        model_turn=1,
+        operational_action_contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+    )
+
+    assert isinstance(decision, AgentDecisionV3)
+    assert decision.operational_action is not None
+    assert decision.operational_action.primary_action == "scale_workers"
+    assert operational_action_fingerprint(decision.operational_action).startswith(
+        "operational_action:"
+    )
+    assert agent_decision_from_payload(decision.model_dump(mode="json")) == decision
+
+    missing = json.loads(raw)
+    missing.pop("operational_action")
+    with pytest.raises(AgentDecisionError, match="AgentDecisionV3"):
+        parse_agent_decision(
+            normalize_agent_decision_provider_text(json.dumps(missing)),
+            recalled_memory_ids={"memory-1"},
+            allowed_query_keys=set(),
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+            operational_action_contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+        )
+
+
+def test_controlled_provider_schema_forbids_remediation_and_narrows_action_contract():
+    observed = agent_decision_provider_schema(
+        recalled_memory_ids={"memory-1"},
+        allowed_query_keys={"payments.checkout_latency_ms"},
+        diagnostic_calls_used=1,
+        diagnostic_observation_available=True,
+        model_turn=2,
+        operational_action_contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+    )
+
+    assert observed["properties"]["schema_version"]["enum"] == [3]
+    assert observed["properties"]["next_step_kind"]["enum"] == [
+        "diagnostic_tool",
+        "recommendation",
+    ]
+    assert "remediation_action" not in observed["properties"]
+    assert "operational_action" in observed["properties"]
+    assert "operational_action" not in observed["required"]
+    action = observed["$defs"]["OperationalAction"]["properties"]
+    assert action["contract"]["enum"] == [PAYMENTS_OPERATIONAL_ACTION_CONTRACT]
+    assert action["primary_action"]["enum"] == [
+        "scale_workers",
+        "throttle_retries",
+        "inspect_only",
+    ]
+
+    terminal = agent_decision_provider_schema(
+        recalled_memory_ids={"memory-1"},
+        allowed_query_keys=set(),
+        diagnostic_calls_used=0,
+        diagnostic_observation_available=False,
+        model_turn=1,
+        operational_action_contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+    )
+    assert terminal["properties"]["next_step_kind"]["enum"] == ["recommendation"]
+    assert "operational_action" in terminal["required"]
 
 
 def test_unobserved_provider_schema_requires_exact_diagnostic_and_empty_citations():

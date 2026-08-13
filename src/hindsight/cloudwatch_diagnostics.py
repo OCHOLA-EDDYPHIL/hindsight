@@ -419,7 +419,6 @@ def _normalize_observation(
         "tool": TOOL_NAME,
         "query_key": query_key,
         "status": "available",
-        "account_id": config.account_id,
         "region": config.region,
         "metric": {
             "namespace": query.namespace,
