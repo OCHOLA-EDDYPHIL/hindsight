@@ -46,6 +46,26 @@ REMEDIATION_REPORT = (
 )
 REMEDIATION_REPORT_CONTRACT_VERSION = 1
 REMEDIATION_REPORT_SHA256 = hashlib.sha256(REMEDIATION_REPORT.encode("utf-8")).hexdigest()
+CONTROLLED_DIAGNOSTIC_CONTRACTS = {
+    "payments.checkout_latency_ms": {
+        "metric_name": "CheckoutLatencyMs",
+        "statistic": "Average",
+        "unit": "Milliseconds",
+        "elevated_floor": 842.5,
+    },
+    "payments.processor_queue_depth": {
+        "metric_name": "ProcessorQueueDepth",
+        "statistic": "Maximum",
+        "unit": "Count",
+        "elevated_floor": 217.0,
+    },
+    "payments.retry_fanout": {
+        "metric_name": "RetryFanout",
+        "statistic": "Maximum",
+        "unit": "Count",
+        "elevated_floor": 8.0,
+    },
+}
 
 
 def test_signature_trace_selected_action_id_follows_valid_modes():
@@ -288,14 +308,36 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
     assert secret not in json.dumps(receipt, sort_keys=True)
 
 
-def test_controlled_observation_receipt_excludes_raw_cloudwatch_payloads():
+@pytest.mark.parametrize(
+    ("query_key", "metric_name", "statistic", "unit", "elevated_value"),
+    [
+        (
+            "payments.checkout_latency_ms",
+            "CheckoutLatencyMs",
+            "Average",
+            "Milliseconds",
+            842.5,
+        ),
+        (
+            "payments.processor_queue_depth",
+            "ProcessorQueueDepth",
+            "Maximum",
+            "Count",
+            217.0,
+        ),
+        ("payments.retry_fanout", "RetryFanout", "Maximum", "Count", 8.0),
+    ],
+)
+def test_controlled_observation_receipt_excludes_raw_cloudwatch_payloads(
+    query_key, metric_name, statistic, unit, elevated_value
+):
     secret = "unrestricted-cloudwatch-material"
     receipt = _controlled_observation_receipt(
         [
             {
                 "id": "diagnostic:run-1:1",
                 "tool": "aws_cloudwatch_diagnostics",
-                "query_key": "payments.retry_fanout",
+                "query_key": query_key,
                 "status": "completed",
                 "request": secret,
             }
@@ -305,15 +347,15 @@ def test_controlled_observation_receipt_excludes_raw_cloudwatch_payloads():
                 "schema_version": 1,
                 "tool_call_id": "diagnostic:run-1:1",
                 "tool": "aws_cloudwatch_diagnostics",
-                "query_key": "payments.retry_fanout",
+                "query_key": query_key,
                 "status": "available",
                 "account_id": secret,
                 "region": secret,
                 "metric": {
                     "namespace": "Hindsight/ControlledIncidentTelemetry",
-                    "name": "RetryFanout",
+                    "name": metric_name,
                     "dimensions": [{"name": secret, "value": secret}],
-                    "statistic": "Maximum",
+                    "statistic": statistic,
                     "period_seconds": 60,
                 },
                 "window": {
@@ -324,7 +366,7 @@ def test_controlled_observation_receipt_excludes_raw_cloudwatch_payloads():
                 "datapoints": [
                     {
                         "timestamp": "2026-08-11T12:14:00Z",
-                        "value": 8.0,
+                        "value": elevated_value,
                         "raw": secret,
                     }
                 ],
@@ -339,23 +381,23 @@ def test_controlled_observation_receipt_excludes_raw_cloudwatch_payloads():
         "completed_tool_calls": [
             {
                 "id": "diagnostic:run-1:1",
-                "query_key": "payments.retry_fanout",
+                "query_key": query_key,
                 "status": "completed",
             }
         ],
         "elevated_observations": [
             {
-                "query_key": "payments.retry_fanout",
+                "query_key": query_key,
                 "metric_namespace": "Hindsight/ControlledIncidentTelemetry",
-                "metric_name": "RetryFanout",
-                "statistic": "Maximum",
+                "metric_name": metric_name,
+                "statistic": statistic,
                 "window_start": "2026-08-11T12:00:00Z",
                 "window_end": "2026-08-11T12:15:00Z",
                 "window_seconds": 900,
                 "period_seconds": 60,
-                "unit": "Count",
+                "unit": unit,
                 "datapoint_count": 1,
-                "maximum_value": 8.0,
+                "maximum_value": elevated_value,
             }
         ],
     }
@@ -790,8 +832,10 @@ def test_operator_can_approve_model_selected_governed_memory_retraction():
         current_diagnostic = driver.find_element(
             By.CSS_SELECTOR, ".outcome-current .action-observation"
         )
-        current_citations = driver.find_element(
-            By.CSS_SELECTOR, ".outcome-current .decision-citations"
+        current_citations = wait.until(
+            expected.presence_of_element_located(
+                (By.CSS_SELECTOR, ".outcome-current .decision-citations")
+            )
         )
         _require(
             current_execution.get_attribute("data-execution-status") == "awaiting_approval",
@@ -1684,78 +1728,77 @@ def _controlled_observation_receipt(
     tool_calls: list[dict[str, Any]],
     observations: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    allowed_query_keys = {
-        "payments.checkout_latency_ms",
-        "payments.processor_queue_depth",
-        "payments.retry_fanout",
-    }
     completed_calls = [
         call
         for call in tool_calls
         if call.get("tool") == "aws_cloudwatch_diagnostics" and call.get("status") == "completed"
     ]
-    _require(bool(completed_calls), "remediation run did not complete CloudWatch diagnostics")
     _require(
-        all(call.get("query_key") in allowed_query_keys for call in completed_calls),
+        len(completed_calls) == 1,
+        "remediation run did not complete exactly one CloudWatch diagnostic",
+    )
+    completed_call = completed_calls[0]
+    query_key = str(completed_call.get("query_key") or "")
+    contract = CONTROLLED_DIAGNOSTIC_CONTRACTS.get(query_key)
+    _require(
+        contract is not None,
         "remediation run used an unconfigured diagnostic query",
     )
     completed = [
         {
-            "id": str(call["id"]),
-            "query_key": str(call["query_key"]),
+            "id": str(completed_call["id"]),
+            "query_key": query_key,
             "status": "completed",
         }
-        for call in completed_calls
     ]
-    target_calls = [
-        call for call in completed_calls if call.get("query_key") == "payments.retry_fanout"
-    ]
-    _require(len(target_calls) == 1, "retry fanout diagnostics did not complete exactly once")
     target_observations = [
         observation
         for observation in observations
-        if observation.get("query_key") == "payments.retry_fanout"
+        if observation.get("query_key") == query_key
         and observation.get("status") == "available"
     ]
     _require(
         len(target_observations) == 1,
-        "retry fanout diagnostics did not return one available observation",
+        "controlled diagnostics did not return one matching available observation",
     )
     observation = target_observations[0]
     _require(
-        observation.get("tool_call_id") == target_calls[0]["id"],
-        "retry fanout observation did not bind to its completed tool call",
+        observation.get("tool_call_id") == completed_call["id"],
+        "controlled observation did not bind to its completed tool call",
     )
     _require(
         observation.get("schema_version") == 1
         and observation.get("tool") == "aws_cloudwatch_diagnostics",
-        "retry fanout observation did not match the diagnostic schema",
+        "controlled observation did not match the diagnostic schema",
     )
     metric = observation.get("metric")
     window = observation.get("window")
-    _require(isinstance(metric, dict), "retry fanout observation omitted metric metadata")
-    _require(isinstance(window, dict), "retry fanout observation omitted its bounded window")
+    _require(isinstance(metric, dict), "controlled observation omitted metric metadata")
+    _require(isinstance(window, dict), "controlled observation omitted its bounded window")
     _require(
         metric.get("namespace") == "Hindsight/ControlledIncidentTelemetry"
-        and metric.get("name") == "RetryFanout"
-        and metric.get("statistic") == "Maximum"
+        and metric.get("name") == contract["metric_name"]
+        and metric.get("statistic") == contract["statistic"]
         and metric.get("period_seconds") == 60,
-        "retry fanout observation did not match the controlled metric contract",
+        "controlled observation did not match its metric contract",
     )
-    _require(window.get("seconds") == 900, "retry fanout observation window was not bounded")
+    _require(window.get("seconds") == 900, "controlled observation window was not bounded")
     window_start = str(window.get("start") or "")
     window_end = str(window.get("end") or "")
     try:
         parsed_start = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
         parsed_end = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
     except ValueError:
-        raise AssertionError("retry fanout observation window timestamps were invalid") from None
+        raise AssertionError("controlled observation window timestamps were invalid") from None
     _require(
         (parsed_end - parsed_start).total_seconds() == 900,
-        "retry fanout observation timestamps did not match its bounded window",
+        "controlled observation timestamps did not match its bounded window",
     )
     datapoints = observation.get("datapoints")
-    _require(isinstance(datapoints, list) and bool(datapoints), "retry fanout had no datapoints")
+    _require(
+        isinstance(datapoints, list) and bool(datapoints),
+        "controlled observation had no datapoints",
+    )
     try:
         normalized_datapoints = [
             (
@@ -1766,31 +1809,34 @@ def _controlled_observation_receipt(
             if isinstance(point, dict)
         ]
     except (KeyError, TypeError, ValueError):
-        raise AssertionError("retry fanout datapoints failed normalized validation") from None
+        raise AssertionError("controlled datapoints failed normalized validation") from None
     values = [value for _timestamp, value in normalized_datapoints]
     datapoint_count = int(observation.get("datapoint_count") or 0)
     _require(
         len(values) == len(datapoints) == datapoint_count,
-        "retry fanout datapoint count did not match its normalized values",
+        "controlled datapoint count did not match its normalized values",
     )
     _require(
         all(parsed_start <= timestamp <= parsed_end for timestamp, _value in normalized_datapoints),
-        "retry fanout datapoints escaped the bounded observation window",
+        "controlled datapoints escaped the bounded observation window",
     )
-    _require(not observation.get("truncated"), "retry fanout observation was truncated")
+    _require(not observation.get("truncated"), "controlled observation was truncated")
     maximum_value = max(values)
-    _require(maximum_value >= 8.0, "retry fanout did not meet the controlled elevated floor")
+    _require(
+        maximum_value >= contract["elevated_floor"],
+        "controlled observation did not meet its elevated floor",
+    )
     elevated = [
         {
-            "query_key": "payments.retry_fanout",
+            "query_key": query_key,
             "metric_namespace": "Hindsight/ControlledIncidentTelemetry",
-            "metric_name": "RetryFanout",
-            "statistic": "Maximum",
+            "metric_name": contract["metric_name"],
+            "statistic": contract["statistic"],
             "window_start": window_start,
             "window_end": window_end,
             "window_seconds": 900,
             "period_seconds": 60,
-            "unit": "Count",
+            "unit": contract["unit"],
             "datapoint_count": datapoint_count,
             "maximum_value": maximum_value,
         }

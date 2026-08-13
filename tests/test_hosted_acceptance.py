@@ -237,15 +237,15 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
     reclaimed_slug = f"hosted-reclaim:{token}"
     create_incident(
         slug=reclaimed_slug,
-        title="Expired attempt reclaim validation",
+        title="Scheduled queue and approval validation",
         severity="sev3",
-        summary="Verify a naturally expired attempt is reclaimed.",
+        summary="Verify the hosted dispatcher and approval resume path.",
         db_url=database_url,
     )
     reclaimed, _ = create_run(
         incident_slug=reclaimed_slug,
         namespace=f"hosted-reclaim:{token}",
-        user_input="Verify recovery after an expired worker attempt",
+        user_input="Verify scheduled recovery of a deliberately pending command",
         dispatch_available_at=datetime.now(UTC) + timedelta(seconds=5),
         db_url=database_url,
     )
