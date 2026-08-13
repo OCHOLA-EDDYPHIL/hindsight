@@ -150,6 +150,7 @@ def poison_demo_memory(
     db_url: str | None = None,
 ) -> dict[str, Any]:
     resolved_db_url = db_url or database_url()
+    prepared_embedding = embedding_provider.embed_document(COMPROMISED_GUIDANCE_CONTENT)
     with connect(resolved_db_url, application_name="hindsight-demo-supersession") as conn:
         with conn.transaction():
             store = MemoryStore(conn=conn, embedding_provider=embedding_provider)
@@ -211,6 +212,7 @@ def poison_demo_memory(
                 belief_id=str(seed["belief_id"]),
                 previous_version_id=str(seed["id"]),
                 transition_kind="supersession",
+                precomputed_embedding=prepared_embedding,
             )
 
 

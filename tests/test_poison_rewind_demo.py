@@ -3,6 +3,7 @@
 import os
 from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import psycopg
@@ -10,6 +11,85 @@ import pytest
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_demo_poison_precomputes_embedding_before_atomic_supersession(monkeypatch):
+    from hindsight import demo_state
+
+    events = []
+    prepared_embedding = [0.0] * 1024
+    seed_id = uuid4()
+    belief_id = uuid4()
+    seed = {
+        "id": seed_id,
+        "belief_id": belief_id,
+        "writer": "demo.seed",
+        "metadata": {
+            "demo": "compromised-guidance-rewind",
+            "role": "known-good",
+        },
+    }
+    poisoned = {"id": uuid4(), "belief_id": belief_id, "previous_version_id": seed_id}
+
+    provider = MagicMock()
+
+    def embed_document(content):
+        assert content == demo_state.COMPROMISED_GUIDANCE_CONTENT
+        events.append("embed")
+        return prepared_embedding
+
+    provider.embed_document.side_effect = embed_document
+    transaction = MagicMock()
+    transaction.__enter__.side_effect = lambda: events.append("transaction.begin")
+    transaction.__exit__.side_effect = lambda exc_type, *_args: events.append(
+        "transaction.rollback" if exc_type else "transaction.commit"
+    )
+    connection = MagicMock()
+    connection.transaction.return_value = transaction
+
+    def execute(query, params):
+        assert "close_active_demo_seed_for_supersession" in query
+        assert params == (seed_id, "test:demo")
+        events.append("close")
+        result = MagicMock()
+        result.fetchone.return_value = (seed_id,)
+        return result
+
+    connection.execute.side_effect = execute
+    store = MagicMock()
+    store.list_current_semantic.return_value = [seed]
+
+    def write_semantic(**kwargs):
+        assert kwargs["precomputed_embedding"] is prepared_embedding
+        assert kwargs["belief_id"] == str(belief_id)
+        assert kwargs["previous_version_id"] == str(seed_id)
+        events.append("write")
+        return poisoned
+
+    store.write_semantic.side_effect = write_semantic
+
+    def fake_connect(*_args, **_kwargs):
+        events.append("connect")
+        return nullcontext(connection)
+
+    monkeypatch.setattr(demo_state, "connect", fake_connect)
+    monkeypatch.setattr(demo_state, "MemoryStore", MagicMock(return_value=store))
+
+    result = demo_state.poison_demo_memory(
+        namespace="test:demo",
+        db_url="postgresql://test",
+        embedding_provider=provider,
+    )
+
+    assert result is poisoned
+    assert events == [
+        "embed",
+        "connect",
+        "transaction.begin",
+        "close",
+        "write",
+        "transaction.commit",
+    ]
 
 
 def test_demo_supersession_boundary_is_tenant_scoped_and_does_not_grant_table_update():
