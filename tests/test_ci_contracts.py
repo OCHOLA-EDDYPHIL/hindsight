@@ -18,6 +18,26 @@ WORKFLOW_PATHS = tuple(
         )
     )
 )
+RELEASE_WORKFLOW_NAMES = (
+    "ci.yml",
+    "deploy-demo.yml",
+    "destroy-demo.yml",
+    "live-acceptance.yml",
+    "tenant-lifecycle.yml",
+    "verify-deployed.yml",
+)
+EXPECTED_ACTION_GENERATIONS = {
+    "actions/cache": "actions/cache@v6",
+    "actions/checkout": "actions/checkout@v7",
+    "actions/download-artifact": "actions/download-artifact@v8",
+    "actions/setup-node": "actions/setup-node@v7",
+    "actions/upload-artifact": "actions/upload-artifact@v7",
+    "astral-sh/setup-uv": "astral-sh/setup-uv@v10.0.0",
+    "aws-actions/configure-aws-credentials": (
+        "aws-actions/configure-aws-credentials@v6"
+    ),
+    "hashicorp/setup-terraform": "hashicorp/setup-terraform@v4",
+}
 
 
 def _load_script(name: str):
@@ -71,6 +91,25 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
         "qualification_authority",
         "tenant_vector_index",
     }
+
+
+def test_release_workflows_pin_current_action_runtime_generations():
+    observed = set()
+    for workflow_name in RELEASE_WORKFLOW_NAMES:
+        workflow = yaml.safe_load((WORKFLOW_DIRECTORY / workflow_name).read_text())
+        for job in workflow["jobs"].values():
+            for step in job.get("steps", []):
+                action = step.get("uses")
+                if not action:
+                    continue
+                action_name = action.partition("@")[0]
+                expected = EXPECTED_ACTION_GENERATIONS.get(action_name)
+                if expected is None:
+                    continue
+                assert action == expected
+                observed.add(action_name)
+
+    assert observed == set(EXPECTED_ACTION_GENERATIONS)
 
 
 @pytest.mark.parametrize("workflow_path", WORKFLOW_PATHS, ids=lambda path: path.name)
