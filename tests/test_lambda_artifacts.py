@@ -42,6 +42,7 @@ def test_realtime_artifact_bundles_only_required_tracing_dependencies():
     assert builder.ARTIFACTS["realtime"]["dependencies"] == [
         "opentelemetry-api>=1.43.0",
         "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+        "opentelemetry-propagator-aws-xray>=1.0.2",
         "opentelemetry-sdk>=1.43.0",
     ]
     assert builder.ARTIFACTS["realtime"]["modules"] == [
@@ -109,6 +110,13 @@ def test_worker_uses_managed_runtime_aws_sdk_instead_of_bundling_a_second_copy()
         dependency.startswith(("boto3", "botocore"))
         for dependency in builder.ARTIFACTS["worker"]["dependencies"]
     )
+
+
+def test_every_lambda_artifact_bundles_terraform_configured_xray_propagator():
+    builder = _builder()
+
+    for artifact in builder.ARTIFACTS.values():
+        assert "opentelemetry-propagator-aws-xray>=1.0.2" in artifact["dependencies"]
 
 
 def test_lambda_size_budget_includes_confirmed_adot_layer():

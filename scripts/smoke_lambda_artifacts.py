@@ -50,6 +50,7 @@ artifact_root = pathlib.Path(sys.argv[1]).resolve()
 handler = sys.argv[2]
 artifact = sys.argv[3]
 sys.path.insert(0, str(artifact_root))
+os.environ["OTEL_PROPAGATORS"] = "xray,tracecontext"
 
 if not (artifact_root / "boto3").exists():
     def unavailable(*args, **kwargs):

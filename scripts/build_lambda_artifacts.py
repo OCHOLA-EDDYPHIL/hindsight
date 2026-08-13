@@ -27,6 +27,7 @@ ARTIFACTS = {
             "mangum>=0.19.0",
             "opentelemetry-api>=1.43.0",
             "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+            "opentelemetry-propagator-aws-xray>=1.0.2",
             "opentelemetry-sdk>=1.43.0",
             "psycopg[binary]>=3.2",
             "python-dotenv>=1.0",
@@ -73,6 +74,7 @@ ARTIFACTS = {
             "langgraph>=1.2.9",
             "opentelemetry-api>=1.43.0",
             "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+            "opentelemetry-propagator-aws-xray>=1.0.2",
             "opentelemetry-sdk>=1.43.0",
             "psycopg[binary]>=3.2",
             "python-dotenv>=1.0",
@@ -110,6 +112,7 @@ ARTIFACTS = {
         "dependencies": [
             "opentelemetry-api>=1.43.0",
             "opentelemetry-exporter-otlp-proto-grpc>=1.43.0",
+            "opentelemetry-propagator-aws-xray>=1.0.2",
             "opentelemetry-sdk>=1.43.0",
         ],
         "modules": [
