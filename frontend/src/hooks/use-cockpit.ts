@@ -29,7 +29,7 @@ import type {
 
 const DEFAULT_NAMESPACE = "demo:payments-poison-rewind";
 const DEFAULT_REPORT =
-  "payments-api checkout p99 latency breached the 2s SLO while processor timeouts and retry fanout rose together.";
+  "Checkout p99 is above 2s and the queue is growing. Inspect current telemetry and recommend one reversible next action.";
 const TERMINAL_RUN_STATES = new Set(["completed", "rejected", "failed"]);
 
 type LoadState = "loading" | "ready" | "empty" | "error";
@@ -180,7 +180,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   const [rewindAnchor, setRewindAnchor] = useState<string | null>(null);
   const [rewindTimestamp, setRewindTimestamp] = useState("");
   const [rewindReason, setRewindReason] = useState(
-    "Stale guidance led to an unsafe recommendation",
+    "Replace stale operational guidance with the previously accepted belief version",
   );
   const [rewindPreview, setRewindPreview] = useState<RewindPreview | null>(null);
   const [busy, setBusy] = useState<string | null>(null);

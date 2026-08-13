@@ -119,6 +119,10 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
     assert poison["metadata"]["scenario_role"] == "compromised_guidance"
     assert poison["metadata"]["risk_class"] == "stale_operational_guidance"
     assert "role" not in poison["metadata"]
+    assert poison["belief_id"] == seed["belief_id"]
+    assert poison["previous_version_id"] == seed["id"]
+    assert poison["version_number"] == seed["version_number"] + 1
+    assert poison["transition_kind"] == "supersession"
     with MemoryStore(
         url=database_url(),
         embedding_provider=provider,
@@ -165,11 +169,24 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
             memory_kind="semantic",
             memory_id=str(poison["id"]),
         )
+        seed_audit = store.audit_memory(
+            memory_kind="semantic",
+            memory_id=str(seed["id"]),
+        )
         reflection_audit = store.audit_memory(
             memory_kind="semantic",
             memory_id=str(rejected_reflection["id"]),
         )
 
-    assert {str(memory["id"]) for memory in current} == {str(seed["id"])}
+    assert len(current) == 1
+    reasserted = current[0]
+    assert reasserted["belief_id"] == seed["belief_id"]
+    assert reasserted["version_number"] == poison["version_number"] + 1
+    assert reasserted["previous_version_id"] == poison["id"]
+    assert reasserted["transition_kind"] == "rewind_reassertion"
+    assert str(reasserted["id"]) in {
+        str(value) for value in completed["restored_memory_ids"]
+    }
+    assert seed_audit is not None and seed_audit["t_invalid"] is not None
     assert poison_audit is not None and poison_audit["t_invalid"] is not None
     assert reflection_audit is not None and reflection_audit["t_invalid"] is not None

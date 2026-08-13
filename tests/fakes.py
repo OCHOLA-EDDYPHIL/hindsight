@@ -37,6 +37,37 @@ def recommendation_decision(
     )
 
 
+def controlled_recommendation_decision(
+    primary_action: str,
+    recommendation: str,
+    *,
+    diagnosis: str = "Retry amplification is saturating the downstream processor.",
+    citations: list[dict[str, str]] | None = None,
+) -> str:
+    """Return a strict controlled-replay recommendation."""
+
+    return json.dumps(
+        {
+            "schema_version": 3,
+            "diagnosis": diagnosis,
+            "recalled_memory_citations": citations or [],
+            "next_step_kind": "recommendation",
+            "tool_call": None,
+            "recommendation": recommendation,
+            "remediation_action": None,
+            "operational_action": {
+                "contract": "payments_retry_amplification.v1",
+                "primary_action": primary_action,
+            },
+            "rationale": "The recommendation is bounded and follows the available evidence.",
+            "rollback": "Restore the previous retry policy if the service degrades.",
+            "verification": ["Confirm latency and queue depth return to their expected range."],
+            "safety_constraints": ["Do not mutate infrastructure from this workflow."],
+        },
+        sort_keys=True,
+    )
+
+
 def diagnostic_decision(query_key: str) -> str:
     return json.dumps(
         {

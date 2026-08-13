@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from hindsight.db import connect
+from hindsight.redaction import redact_account_identifiers
 
 TERMINAL_RUN_STATUSES = frozenset({"completed", "rejected", "failed"})
 RUN_STATUSES = frozenset(
@@ -573,7 +574,7 @@ def _read_run(*, run_id: str | UUID, db_url: str | None) -> dict[str, Any] | Non
                 ),
                 None,
             )
-            return _jsonable(run)
+            return _jsonable(redact_account_identifiers(run))
 
 
 def claim_run_attempt(

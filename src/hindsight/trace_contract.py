@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from typing import Any
 from uuid import UUID
 
@@ -9,7 +12,12 @@ from psycopg.rows import dict_row
 
 from hindsight.db import connect
 from hindsight.demo_state import DEMO_NAMESPACE
+from hindsight.agent_decision import (
+    PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+    operational_action_fingerprint,
+)
 from hindsight.memory import MemoryStore
+from hindsight.redaction import redact_account_identifiers
 
 
 def decision_influence(*, decision_id: str, db_url: str | None = None) -> dict[str, Any]:
@@ -37,14 +45,14 @@ def decision_influence(*, decision_id: str, db_url: str | None = None) -> dict[s
                 }
             )
         trace = _governed_decision_trace(conn, decision_id=decision_id)
-    return {
+    return redact_account_identifiers({
         "decision_id": decision_id,
         "count": len(memories),
         "memories": memories,
         "decision": trace["decision"] if trace else None,
         "retrievals": trace["retrievals"] if trace else [],
         "trace": trace,
-    }
+    })
 
 
 def governed_decision_trace(
@@ -53,7 +61,9 @@ def governed_decision_trace(
     """Return the durable identities connecting one decision to governed memory."""
 
     with connect(db_url, application_name="hindsight-trace-api") as conn:
-        return _governed_decision_trace(conn, decision_id=decision_id)
+        return redact_account_identifiers(
+            _governed_decision_trace(conn, decision_id=decision_id)
+        )
 
 
 def signature_scenario_trace(
@@ -101,7 +111,7 @@ def signature_scenario_trace(
             cur.execute(
                 """
                     SELECT id, thread_id, incident_id, incident_slug, namespace,
-                           service_slug, status, decision_id, plan, proposed_action,
+                           service_slug, user_input, status, decision_id, plan, proposed_action,
                            action_approved, provider, model, reflected_memory_id,
                            failure_code, created_at, started_at, updated_at, completed_at
                     FROM agent_runs
@@ -228,6 +238,15 @@ def signature_scenario_trace(
         )
         for memory in memories:
             memory.pop("metadata", None)
+        action_comparison = _action_comparison(
+            rejected=rejected,
+            corrected=corrected,
+            operation=operation,
+            operation_effects=effects,
+            memories=memories,
+            seed=seed,
+            compromised=compromised,
+        )
         stages = {
             "baseline_memory_id": seed["id"] if seed else None,
             "compromised_memory_id": compromised["id"] if compromised else None,
@@ -237,7 +256,7 @@ def signature_scenario_trace(
             "rewind_operation_id": operation["id"] if operation else None,
             "corrected_decision_id": corrected["decision_id"] if corrected else None,
         }
-        return {
+        return redact_account_identifiers({
             "scenario_id": session["id"],
             "namespace": session["namespace"],
             "status": (
@@ -258,7 +277,297 @@ def signature_scenario_trace(
             "operation_effects": effects,
             "memories": memories,
             "stages": stages,
-        }
+            "action_comparison": action_comparison,
+        })
+
+
+def _action_comparison(
+    *,
+    rejected: dict[str, Any] | None,
+    corrected: dict[str, Any] | None,
+    operation: Any | None,
+    operation_effects: list[dict[str, Any]],
+    memories: list[dict[str, Any]],
+    seed: dict[str, Any] | None,
+    compromised: dict[str, Any] | None,
+) -> dict[str, Any]:
+    before = _operational_action(rejected)
+    after = _operational_action(corrected)
+    same_contract = bool(
+        before
+        and after
+        and before["contract"] == after["contract"]
+        and before["contract"] == PAYMENTS_OPERATIONAL_ACTION_CONTRACT
+    )
+    if same_contract:
+        status = (
+            "changed"
+            if before["primary_action"] != after["primary_action"]
+            else "unchanged"
+        )
+        contract: str | None = PAYMENTS_OPERATIONAL_ACTION_CONTRACT
+    else:
+        status = "unavailable"
+        contract = None
+
+    prompt_equal = bool(
+        rejected
+        and corrected
+        and isinstance(rejected.get("user_input"), str)
+        and rejected["user_input"]
+        and rejected["user_input"] == corrected.get("user_input")
+    )
+    before_telemetry = _normalized_telemetry_fingerprint(rejected)
+    after_telemetry = _normalized_telemetry_fingerprint(corrected)
+    telemetry_equal = bool(
+        before_telemetry
+        and after_telemetry
+        and before_telemetry == after_telemetry
+    )
+    memory_correction_proven = _memory_correction_proven(
+        rejected=rejected,
+        corrected=corrected,
+        operation=operation,
+        operation_effects=operation_effects,
+        memories=memories,
+        seed=seed,
+        compromised=compromised,
+    )
+    controlled_pair = bool(
+        status == "changed"
+        and prompt_equal
+        and telemetry_equal
+        and memory_correction_proven
+    )
+    return {
+        "status": status,
+        "contract": contract,
+        "before": before,
+        "after": after,
+        "context": {
+            "prompt_equal": prompt_equal,
+            "normalized_telemetry_equal": telemetry_equal,
+        },
+        "memory_correction_proven": memory_correction_proven,
+        "controlled_pair": controlled_pair,
+    }
+
+
+def _operational_action(run: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(run, dict):
+        return None
+    trace = run.get("action_trace")
+    recommendation = trace.get("recommendation") if isinstance(trace, dict) else None
+    action = (
+        recommendation.get("operational_action")
+        if isinstance(recommendation, dict)
+        else None
+    )
+    if not isinstance(action, dict) or set(action) != {
+        "contract",
+        "primary_action",
+        "fingerprint",
+    }:
+        return None
+    payload = {
+        "contract": action.get("contract"),
+        "primary_action": action.get("primary_action"),
+    }
+    try:
+        expected = operational_action_fingerprint(payload)
+    except (TypeError, ValueError):
+        return None
+    if action.get("fingerprint") != expected:
+        return None
+    decision_id = run.get("decision_id")
+    if not decision_id:
+        return None
+    return {
+        "decision_id": decision_id,
+        **payload,
+        "fingerprint": expected,
+    }
+
+
+def _normalized_telemetry_fingerprint(run: dict[str, Any] | None) -> str | None:
+    if not isinstance(run, dict):
+        return None
+    trace = run.get("action_trace")
+    observations = trace.get("observations") if isinstance(trace, dict) else None
+    if not isinstance(observations, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for observation in observations:
+        if not isinstance(observation, dict) or observation.get("status") != "available":
+            continue
+        tool = observation.get("tool")
+        query_key = observation.get("query_key")
+        metric = observation.get("metric")
+        datapoints = observation.get("datapoints")
+        if (
+            tool != "aws_cloudwatch_diagnostics"
+            or not isinstance(query_key, str)
+            or not query_key
+            or not isinstance(metric, dict)
+            or not isinstance(datapoints, list)
+            or not datapoints
+        ):
+            return None
+        namespace = metric.get("namespace")
+        name = metric.get("name")
+        statistic = metric.get("statistic")
+        period_seconds = metric.get("period_seconds")
+        dimensions = metric.get("dimensions")
+        if (
+            not isinstance(namespace, str)
+            or not namespace
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(statistic, str)
+            or not statistic
+            or isinstance(period_seconds, bool)
+            or not isinstance(period_seconds, int)
+            or period_seconds < 1
+            or not isinstance(dimensions, list)
+        ):
+            return None
+        normalized_dimensions: list[dict[str, str]] = []
+        for dimension in dimensions:
+            if (
+                not isinstance(dimension, dict)
+                or not isinstance(dimension.get("name"), str)
+                or not dimension["name"]
+                or not isinstance(dimension.get("value"), str)
+                or not dimension["value"]
+            ):
+                return None
+            normalized_dimensions.append(
+                {"name": dimension["name"], "value": dimension["value"]}
+            )
+        finite_points: list[tuple[str, float]] = []
+        for datapoint in datapoints:
+            if not isinstance(datapoint, dict) or not isinstance(
+                datapoint.get("timestamp"), str
+            ):
+                return None
+            value = datapoint.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            resolved_value = float(value)
+            if not math.isfinite(resolved_value):
+                return None
+            finite_points.append(
+                (datapoint["timestamp"], 0.0 if resolved_value == 0.0 else resolved_value)
+            )
+        latest = max(finite_points, key=lambda item: item[0])
+        normalized.append(
+            {
+                "tool": tool,
+                "query_key": query_key,
+                "metric": {
+                    "namespace": namespace,
+                    "name": name,
+                    "dimensions": sorted(
+                        normalized_dimensions,
+                        key=lambda item: (item["name"], item["value"]),
+                    ),
+                    "statistic": statistic,
+                    "period_seconds": period_seconds,
+                },
+                "latest_value": latest[1],
+            }
+        )
+    if not normalized:
+        return None
+    normalized.sort(
+        key=lambda item: (
+            item["query_key"],
+            item["metric"]["namespace"],
+            item["metric"]["name"],
+        )
+    )
+    digest = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"telemetry:{digest}"
+
+
+def _memory_correction_proven(
+    *,
+    rejected: dict[str, Any] | None,
+    corrected: dict[str, Any] | None,
+    operation: Any | None,
+    operation_effects: list[dict[str, Any]],
+    memories: list[dict[str, Any]],
+    seed: dict[str, Any] | None,
+    compromised: dict[str, Any] | None,
+) -> bool:
+    if (
+        not isinstance(rejected, dict)
+        or not isinstance(corrected, dict)
+        or not isinstance(operation, dict)
+        or operation.get("status") != "completed"
+        or not isinstance(seed, dict)
+        or not isinstance(compromised, dict)
+    ):
+        return False
+    operation_id = str(operation.get("id") or "")
+    seed_id = str(seed.get("id") or "")
+    compromised_id = str(compromised.get("id") or "")
+    belief_id = str(seed.get("belief_id") or "")
+    invalidated = {str(value) for value in operation.get("invalidated_memory_ids") or []}
+    if not all((operation_id, seed_id, compromised_id, belief_id)):
+        return False
+    if not (
+        str(compromised.get("belief_id") or "") == belief_id
+        and str(compromised.get("previous_version_id") or "") == seed_id
+        and compromised.get("transition_kind") == "supersession"
+        and compromised.get("t_invalid") is not None
+        and compromised_id in invalidated
+    ):
+        return False
+    reasserted = next(
+        (
+            memory
+            for memory in memories
+            if memory.get("transition_kind") == "rewind_reassertion"
+            and str(memory.get("belief_id") or "") == belief_id
+            and str(memory.get("previous_version_id") or "") == compromised_id
+            and str(memory.get("created_by_operation_id") or "") == operation_id
+            and memory.get("t_invalid") is None
+        ),
+        None,
+    )
+    if reasserted is None:
+        return False
+    reasserted_id = str(reasserted.get("id") or "")
+    effect_proven = any(
+        effect.get("effect_type") == "reasserted"
+        and str(effect.get("source_memory_id") or "") == seed_id
+        and str(effect.get("result_memory_id") or "") == reasserted_id
+        and str(effect.get("belief_id") or "") == belief_id
+        for effect in operation_effects
+    )
+    rejected_reads = _read_memory_ids(rejected)
+    corrected_reads = _read_memory_ids(corrected)
+    return bool(
+        effect_proven
+        and compromised_id in rejected_reads
+        and reasserted_id in corrected_reads
+        and compromised_id not in corrected_reads
+    )
+
+
+def _read_memory_ids(run: dict[str, Any]) -> set[str]:
+    trace = run.get("trace")
+    reads = trace.get("reads") if isinstance(trace, dict) else None
+    if not isinstance(reads, list):
+        return set()
+    return {
+        str(read.get("memory_id"))
+        for read in reads
+        if isinstance(read, dict) and read.get("memory_id")
+    }
 
 
 def _run_precedes_operation(run: dict[str, Any], operation: Any | None) -> bool:

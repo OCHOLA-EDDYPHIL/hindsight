@@ -122,7 +122,6 @@ export interface DiagnosticObservation {
   schema_version: number;
   tool: "aws_cloudwatch_diagnostics";
   query_key: string;
-  account_id?: string;
   region?: string;
   metric?: {
     namespace?: string;
@@ -167,6 +166,7 @@ export interface RecommendationActionTrace {
     verification?: string[];
     safety_constraints?: string[];
     status?: string;
+    operational_action?: OperationalAction;
   };
   observation_fingerprint?: string;
   remediation_action?: {
@@ -221,6 +221,25 @@ export interface RecommendationActionTrace {
     events?: Array<Record<string, unknown>>;
     effects?: Array<Record<string, unknown>>;
   };
+}
+
+export interface OperationalAction {
+  contract: "payments_retry_amplification.v1";
+  primary_action: "scale_workers" | "throttle_retries" | "inspect_only";
+  fingerprint: string;
+}
+
+export interface ActionComparison {
+  status: "changed" | "unchanged" | "unavailable";
+  contract: "payments_retry_amplification.v1" | null;
+  before: (OperationalAction & { decision_id: Identifier }) | null;
+  after: (OperationalAction & { decision_id: Identifier }) | null;
+  context: {
+    prompt_equal: boolean;
+    normalized_telemetry_equal: boolean;
+  };
+  memory_correction_proven: boolean;
+  controlled_pair: boolean;
 }
 
 export interface Run {
@@ -322,6 +341,7 @@ export interface SignatureScenario {
   }>;
   operation_effects?: OperationEffect[];
   memories: MemoryRecord[];
+  action_comparison?: ActionComparison;
   stages: {
     baseline_memory_id?: Identifier | null;
     compromised_memory_id?: Identifier | null;

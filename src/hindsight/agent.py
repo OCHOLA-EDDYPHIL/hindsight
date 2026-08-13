@@ -26,17 +26,21 @@ from hindsight.db import TenantConnection, connect, database_url, database_url_w
 from hindsight.agent_decision import (
     MAX_DIAGNOSTIC_CALLS,
     MAX_MODEL_TURNS,
+    PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
     AgentDecisionError,
     AgentDecisionV2,
+    AgentDecisionV3,
     agent_decision_from_payload,
     agent_decision_provider_schema,
     diagnostic_observation_fingerprint,
     memory_selection_fingerprint,
     normalize_agent_decision_provider_text,
+    operational_action_fingerprint,
     parse_agent_decision,
     recommendation_id,
     remediation_action_id,
 )
+from hindsight.demo_state import DEMO_INPUT, DEMO_NAMESPACE, DEMO_SERVICE_SLUG
 from hindsight.embeddings import (
     EmbeddingProvider,
     embedding_profile,
@@ -1424,6 +1428,9 @@ def _plan_prompt(state: IncidentAgentState) -> str:
         memory_lines.append("No prior memories were recalled.")
 
     triage = state.get("triage", {})
+    decision_contract = (
+        "AgentDecisionV3" if _operational_action_contract(state) is not None else "AgentDecisionV2"
+    )
     return "\n".join(
         [
             f"Incident: {triage.get('title') or state.get('title') or state['incident_id']}",
@@ -1434,9 +1441,27 @@ def _plan_prompt(state: IncidentAgentState) -> str:
             "Recalled memories:",
             *memory_lines,
             "",
-            "Use this evidence to produce the next AgentDecisionV2 step.",
+            f"Use this evidence to produce the next {decision_contract} step.",
         ]
     )
+
+
+def _operational_action_contract(state: IncidentAgentState) -> str | None:
+    """Select the narrow comparison contract only for the protected replay."""
+
+    namespace = str(state.get("namespace") or "")
+    triage = state.get("triage") or {}
+    service_slug = str(triage.get("service_slug") or state.get("service_slug") or "")
+    replay_namespace = namespace == DEMO_NAMESPACE or namespace.startswith(
+        f"{DEMO_NAMESPACE}:session:"
+    )
+    if (
+        replay_namespace
+        and service_slug == DEMO_SERVICE_SLUG
+        and state.get("user_input") == DEMO_INPUT
+    ):
+        return PAYMENTS_OPERATIONAL_ACTION_CONTRACT
+    return None
 
 
 def _governed_guidance_envelope(memory: dict[str, Any]) -> dict[str, Any]:
@@ -1491,7 +1516,7 @@ def _generate_agent_decision(
     provider: ReasoningProvider,
     allowed_query_keys: set[str],
     call_reservation: BudgetReservation | None = None,
-) -> tuple[AgentDecisionV2, Any, int]:
+) -> tuple[AgentDecisionV2 | AgentDecisionV3, Any, int]:
     """Generate one valid decision with at most one schema-repair turn."""
 
     starting_turn = int(state.get("model_turn_count") or 0)
@@ -1499,7 +1524,15 @@ def _generate_agent_decision(
         raise AgentDecisionError("model turn count is invalid")
     if starting_turn >= MAX_MODEL_TURNS:
         raise AgentDecisionError("model turn budget is exhausted")
-    prompt = _decision_prompt(state, allowed_query_keys=allowed_query_keys)
+    operational_action_contract = _operational_action_contract(state)
+    decision_contract_name = (
+        "AgentDecisionV3" if operational_action_contract is not None else "AgentDecisionV2"
+    )
+    prompt = _decision_prompt(
+        state,
+        allowed_query_keys=allowed_query_keys,
+        operational_action_contract=operational_action_contract,
+    )
     recalled_memory_ids = {
         str(memory.get("memory_id") or memory.get("id"))
         for memory in state.get("recalled_memories", [])
@@ -1529,13 +1562,14 @@ def _generate_agent_decision(
             diagnostic_calls_used=diagnostic_calls_used,
             diagnostic_observation_available=diagnostic_observation_available,
             model_turn=logical_turn,
+            operational_action_contract=operational_action_contract,
         )
         request_prompt = prompt
         if attempts == 2:
             assert last_error is not None
             request_prompt = (
                 f"{prompt}\n\n"
-                "The prior response failed a server-enforced AgentDecisionV2 constraint. "
+                f"The prior response failed a server-enforced {decision_contract_name} constraint. "
                 f"Stable repair reason: {_decision_repair_reason(last_error)}. "
                 "Return only one JSON object matching the supplied schema for this turn. "
                 "Do not add markdown or commentary."
@@ -1551,7 +1585,18 @@ def _generate_agent_decision(
                     "you cite verbatim. Never propose another executable action. "
                     "Every recalled-memory citation quote must be a verbatim excerpt. "
                     "Every recommendation must be reversible, verifiable, and suitable for "
-                    "operator review. Return only AgentDecisionV2 JSON."
+                    "operator review. "
+                    + (
+                        "This controlled replay requires AgentDecisionV3. For a recommendation, "
+                        "operational_action must classify the first affirmative operator action "
+                        "as scale_workers, throttle_retries, or inspect_only under the supplied "
+                        "contract. Do not classify a negation, rollback, safety constraint, or "
+                        "verification step. The classification records evidence and executes "
+                        "nothing; governed-memory remediation is unavailable in this replay. "
+                        if operational_action_contract is not None
+                        else ""
+                    )
+                    + f"Return only {decision_contract_name} JSON."
                 ),
                 prompt=request_prompt,
                 temperature=0,
@@ -1569,6 +1614,7 @@ def _generate_agent_decision(
                 diagnostic_calls_used=diagnostic_calls_used,
                 diagnostic_observation_available=diagnostic_observation_available,
                 model_turn=logical_turn,
+                operational_action_contract=operational_action_contract,
             )
         except AgentDecisionError as exc:
             last_error = exc
@@ -1587,6 +1633,7 @@ def _generate_agent_decision(
 
 _DECISION_REPAIR_REASONS = {
     "model response did not satisfy AgentDecisionV2": "agent_decision_schema_mismatch",
+    "model response did not satisfy AgentDecisionV3": "controlled_action_schema_mismatch",
     "a recalled memory may be cited only once per decision": "duplicate_memory_citation",
     "model cited memory that was not recalled": "unrecalled_memory_citation",
     "model citation is not a quote from recalled memory": "non_verbatim_memory_citation",
@@ -1625,6 +1672,7 @@ def _decision_prompt(
     state: IncidentAgentState,
     *,
     allowed_query_keys: set[str],
+    operational_action_contract: str | None = None,
 ) -> str:
     observations = state.get("observations", [])
     remaining_turns = MAX_MODEL_TURNS - int(state.get("model_turn_count") or 0)
@@ -1639,16 +1687,26 @@ def _decision_prompt(
             f"Configured CloudWatch query keys: {json.dumps(query_keys)}",
             f"Remaining logical model turns including this turn: {remaining_turns}",
             (
+                f"Operational action contract: {operational_action_contract}"
+                if operational_action_contract is not None
+                else "Operational action contract: none"
+            ),
+            (
                 "When configured query keys are available and there is no current observation, "
                 "choose the most relevant diagnostic_tool before a terminal decision. Otherwise choose "
                 "diagnostic_tool only when another configured observation is necessary. The final "
-                "available turn must return a recommendation or the allowed remediation action."
+                "available turn must return a recommendation"
+                + (
+                    "."
+                    if operational_action_contract is not None
+                    else " or the allowed remediation action."
+                )
             ),
         ]
     )
 
 
-def _decision_plan_text(decision: AgentDecisionV2) -> str:
+def _decision_plan_text(decision: AgentDecisionV2 | AgentDecisionV3) -> str:
     verification = "; ".join(decision.verification)
     safety = "; ".join(decision.safety_constraints)
     action = (
@@ -1678,11 +1736,14 @@ def _decision_plan_text(decision: AgentDecisionV2) -> str:
 def _recommendation_trace(
     *,
     state: IncidentAgentState,
-    decision: AgentDecisionV2,
+    decision: AgentDecisionV2 | AgentDecisionV3,
     recommendation_identity: str,
 ) -> dict[str, Any]:
+    operational_action = (
+        decision.operational_action if isinstance(decision, AgentDecisionV3) else None
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3 if operational_action is not None else 2,
         "mode": "recommendation_only",
         "selection": {
             "fingerprint": state["selection_fingerprint"],
@@ -1706,6 +1767,16 @@ def _recommendation_trace(
             "verification": decision.verification,
             "safety_constraints": decision.safety_constraints,
             "status": "awaiting_approval",
+            **(
+                {
+                    "operational_action": {
+                        **operational_action.model_dump(mode="json"),
+                        "fingerprint": operational_action_fingerprint(operational_action),
+                    }
+                }
+                if operational_action is not None
+                else {}
+            ),
         },
         "execution": {
             "status": "awaiting_approval",

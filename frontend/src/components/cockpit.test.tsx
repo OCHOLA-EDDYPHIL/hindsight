@@ -60,7 +60,7 @@ const scenario: SignatureScenario = {
         ],
       },
       action_trace: {
-        schema_version: 2,
+        schema_version: 3,
         mode: "recommendation_only",
         selection: {
           fingerprint: "b".repeat(64),
@@ -71,6 +71,11 @@ const scenario: SignatureScenario = {
           id: `recommendation:${"a".repeat(64)}`,
           summary: "Scale payment workers while retry fanout remains elevated.",
           status: "awaiting_approval",
+          operational_action: {
+            contract: "payments_retry_amplification.v1",
+            primary_action: "scale_workers",
+            fingerprint: "operational_action:before",
+          },
         },
         execution: { status: "not_executed", mode: "recommendation_only" },
         tool_calls: [
@@ -125,7 +130,7 @@ const scenario: SignatureScenario = {
         ],
       },
       action_trace: {
-        schema_version: 2,
+        schema_version: 3,
         mode: "recommendation_only",
         selection: {
           fingerprint: "d".repeat(64),
@@ -136,6 +141,11 @@ const scenario: SignatureScenario = {
           id: `recommendation:${"c".repeat(64)}`,
           summary: "Throttle retry fanout while processor health recovers.",
           status: "awaiting_approval",
+          operational_action: {
+            contract: "payments_retry_amplification.v1",
+            primary_action: "throttle_retries",
+            fingerprint: "operational_action:after",
+          },
         },
         execution: { status: "recommendation_approved", mode: "recommendation_only" },
         tool_calls: [
@@ -169,6 +179,25 @@ const scenario: SignatureScenario = {
     status: "completed",
   },
   memories: [],
+  action_comparison: {
+    status: "changed",
+    contract: "payments_retry_amplification.v1",
+    before: {
+      decision_id: "decision-rejected",
+      contract: "payments_retry_amplification.v1",
+      primary_action: "scale_workers",
+      fingerprint: "operational_action:before",
+    },
+    after: {
+      decision_id: "decision-corrected",
+      contract: "payments_retry_amplification.v1",
+      primary_action: "throttle_retries",
+      fingerprint: "operational_action:after",
+    },
+    context: { prompt_equal: true, normalized_telemetry_equal: true },
+    memory_correction_proven: true,
+    controlled_pair: true,
+  },
   stages: {
     baseline_memory_id: "memory-baseline",
     compromised_memory_id: "memory-compromised",
@@ -252,11 +281,18 @@ describe("guided replay cockpit", () => {
     const rail = screen.getByRole("list", { name: "Signature replay chronology" });
     expect(within(rail).getAllByRole("listitem")).toHaveLength(4);
     expect(within(rail).getByText("Cited belief")).toBeVisible();
-    expect(within(rail).getByText("Rejected recommendation")).toBeVisible();
+    expect(within(rail).getByText("Pre-correction recommendation")).toBeVisible();
     expect(within(rail).getByText("Audited rewind")).toBeVisible();
-    expect(within(rail).getByText("Recovered recommendation")).toBeVisible();
+    expect(within(rail).getByText("Post-correction recommendation")).toBeVisible();
+    expect(
+      screen.getByRole("heading", {
+        name: "Recorded action changed after correction.",
+      }),
+    ).toBeVisible();
+    expect(within(rail).getByText("scale_workers")).toBeVisible();
+    expect(within(rail).getByText("throttle_retries")).toBeVisible();
     expect(within(rail).getByText(/Stale guidance recommends scaling workers/)).toBeVisible();
-    expect(screen.getByLabelText(/Copy rejected decision identity/)).toHaveAttribute(
+    expect(screen.getByLabelText(/Copy pre-correction decision/)).toHaveAttribute(
       "title",
       "decision-rejected",
     );
@@ -284,6 +320,33 @@ describe("guided replay cockpit", () => {
 
     expect(screen.getByText("Rerun recommendation")).toBeVisible();
     expect(screen.getByText(/Inspect the latest processor state/)).toBeVisible();
+  });
+
+  it("does not claim an action delta when the strict comparison is unavailable", () => {
+    render(
+      <CausalRail
+        scenario={{
+          ...scenario,
+          action_comparison: {
+            ...scenario.action_comparison!,
+            status: "unavailable",
+            contract: null,
+            controlled_pair: false,
+          },
+        }}
+        snapshot={snapshot}
+        activeRun={null}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", {
+        name: "History preserved; active memory changed.",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("Recorded action changed after correction."),
+    ).not.toBeInTheDocument();
   });
 
   it("does not present a pre-rewind active run as the rerun", () => {
@@ -333,7 +396,9 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText("Historical outcome")).toBeVisible();
     expect(screen.getByText("Current outcome")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Rejected recommendation" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Recovered recommendation" })).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: "Post-correction recommendation" }),
+    ).toBeVisible();
     expect(screen.getAllByText("Cause")).toHaveLength(2);
     expect(screen.getAllByText("Checks")).toHaveLength(2);
     expect(screen.getAllByText("Action")).toHaveLength(2);
@@ -440,7 +505,9 @@ describe("guided replay cockpit", () => {
     expect(
       screen.getByRole("heading", { name: "Rejected governed-memory retraction" }),
     ).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Recovered recommendation" })).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: "Post-correction recommendation" }),
+    ).toBeVisible();
     expect(
       screen.queryByRole("heading", { name: "Rejected recommendation" }),
     ).not.toBeInTheDocument();

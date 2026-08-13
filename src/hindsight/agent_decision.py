@@ -12,10 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 
 AGENT_DECISION_SCHEMA_VERSION = 2
+CONTROLLED_ACTION_DECISION_SCHEMA_VERSION = 3
 MAX_MODEL_TURNS = 4
 MAX_DIAGNOSTIC_CALLS = 3
 CLOUDWATCH_DIAGNOSTIC_TOOL = "aws_cloudwatch_diagnostics"
 MIN_CITATION_QUOTE_LENGTH = 12
+PAYMENTS_OPERATIONAL_ACTION_CONTRACT = "payments_retry_amplification.v1"
+PrimaryOperationalAction = Literal["scale_workers", "throttle_retries", "inspect_only"]
 
 
 class AgentDecisionError(RuntimeError):
@@ -65,6 +68,15 @@ class RetractRecalledMemoryAction(BaseModel):
     name: Literal["retract_recalled_memory"]
     target_memory_id: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=500)
+
+
+class OperationalAction(BaseModel):
+    """One model-produced, comparison-safe operator action classification."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    contract: Literal["payments_retry_amplification.v1"]
+    primary_action: PrimaryOperationalAction
 
 
 class AgentDecisionV1(BaseModel):
@@ -147,7 +159,24 @@ class AgentDecisionV2(BaseModel):
         return self
 
 
+class AgentDecisionV3(AgentDecisionV2):
+    """A controlled recommendation with an explicit operational action."""
+
+    schema_version: Literal[3]
+    operational_action: OperationalAction | None
+
+    @model_validator(mode="after")
+    def validate_operational_action(self) -> AgentDecisionV3:
+        if self.next_step_kind == "recommendation":
+            if self.operational_action is None:
+                raise ValueError("recommendation requires one operational action")
+        elif self.operational_action is not None:
+            raise ValueError("non-recommendation branches forbid operational action")
+        return self
+
+
 AGENT_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV2.model_json_schema()
+CONTROLLED_ACTION_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV3.model_json_schema()
 _PROVIDER_BRANCH_FIELDS = ("tool_call", "recommendation", "remediation_action")
 
 
@@ -158,6 +187,7 @@ def agent_decision_provider_schema(
     diagnostic_calls_used: int,
     diagnostic_observation_available: bool,
     model_turn: int,
+    operational_action_contract: str | None = None,
 ) -> dict[str, Any]:
     """Narrow the provider schema to the decision branch allowed for this turn."""
 
@@ -169,7 +199,14 @@ def agent_decision_provider_schema(
     ):
         raise ValueError(f"diagnostic_calls_used must be between zero and {MAX_DIAGNOSTIC_CALLS}")
 
-    schema = deepcopy(AGENT_DECISION_JSON_SCHEMA)
+    if operational_action_contract not in {None, PAYMENTS_OPERATIONAL_ACTION_CONTRACT}:
+        raise ValueError("unsupported operational action contract")
+    controlled_action = operational_action_contract is not None
+    schema = deepcopy(
+        CONTROLLED_ACTION_DECISION_JSON_SCHEMA
+        if controlled_action
+        else AGENT_DECISION_JSON_SCHEMA
+    )
     schema.pop("anyOf", None)
     properties = schema["properties"]
     definitions = schema["$defs"]
@@ -206,7 +243,11 @@ def agent_decision_provider_schema(
         and diagnostic_calls_used < MAX_DIAGNOSTIC_CALLS
         and model_turn < MAX_MODEL_TURNS
     )
-    action_available = bool(recalled_ids) and (not query_keys or diagnostic_observation_available)
+    action_available = (
+        not controlled_action
+        and bool(recalled_ids)
+        and (not query_keys or diagnostic_observation_available)
+    )
     if action_available:
         definitions["RetractRecalledMemoryAction"]["properties"]["target_memory_id"]["enum"] = (
             recalled_ids
@@ -217,6 +258,8 @@ def agent_decision_provider_schema(
         require_field("tool_call", {"$ref": "#/$defs/DiagnosticToolCall"})
         omit_field("recommendation")
         omit_field("remediation_action")
+        if controlled_action:
+            omit_field("operational_action")
     elif diagnostic_available and diagnostic_observation_available:
         properties["next_step_kind"]["enum"] = [
             "diagnostic_tool",
@@ -235,6 +278,11 @@ def agent_decision_provider_schema(
             )
         else:
             omit_field("remediation_action")
+        if controlled_action:
+            allow_optional_field(
+                "operational_action",
+                {"$ref": "#/$defs/OperationalAction"},
+            )
     else:
         properties["next_step_kind"]["enum"] = [
             "recommendation",
@@ -260,6 +308,11 @@ def agent_decision_provider_schema(
                 },
             )
             omit_field("remediation_action")
+        if controlled_action:
+            require_field(
+                "operational_action",
+                {"$ref": "#/$defs/OperationalAction"},
+            )
     _replace_provider_consts(schema)
     return schema
 
@@ -289,6 +342,8 @@ def normalize_agent_decision_provider_text(text: str) -> str:
     normalized = dict(payload)
     for field in _PROVIDER_BRANCH_FIELDS:
         normalized.setdefault(field, None)
+    if normalized.get("schema_version") == CONTROLLED_ACTION_DECISION_SCHEMA_VERSION:
+        normalized.setdefault("operational_action", None)
     return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
 
@@ -301,14 +356,25 @@ def parse_agent_decision(
     diagnostic_calls_used: int,
     diagnostic_observation_available: bool,
     model_turn: int,
-) -> AgentDecisionV2:
+    operational_action_contract: str | None = None,
+) -> AgentDecisionV2 | AgentDecisionV3:
     """Parse and enforce constraints that cannot be represented in JSON Schema."""
 
     try:
         payload = json.loads(text)
-        decision = AgentDecisionV2.model_validate(payload)
+        if operational_action_contract is None:
+            decision: AgentDecisionV2 | AgentDecisionV3 = AgentDecisionV2.model_validate(payload)
+            schema_name = "AgentDecisionV2"
+        elif operational_action_contract == PAYMENTS_OPERATIONAL_ACTION_CONTRACT:
+            decision = AgentDecisionV3.model_validate(payload)
+            schema_name = "AgentDecisionV3"
+        else:
+            raise ValueError("unsupported operational action contract")
     except (json.JSONDecodeError, ValidationError, TypeError) as exc:
-        raise AgentDecisionError("model response did not satisfy AgentDecisionV2") from exc
+        schema_name = (
+            "AgentDecisionV3" if operational_action_contract is not None else "AgentDecisionV2"
+        )
+        raise AgentDecisionError(f"model response did not satisfy {schema_name}") from exc
 
     cited_ids = [citation.memory_id for citation in decision.recalled_memory_citations]
     if len(cited_ids) != len(set(cited_ids)):
@@ -343,9 +409,11 @@ def parse_agent_decision(
     return decision
 
 
-def agent_decision_from_payload(payload: Mapping[str, Any]) -> AgentDecisionV2:
+def agent_decision_from_payload(payload: Mapping[str, Any]) -> AgentDecisionV2 | AgentDecisionV3:
     """Load current decisions while preserving resumability of V1 checkpoints."""
 
+    if payload.get("schema_version") == 3:
+        return AgentDecisionV3.model_validate(payload)
     if payload.get("schema_version") == 2:
         return AgentDecisionV2.model_validate(payload)
     legacy = AgentDecisionV1.model_validate(payload)
@@ -399,7 +467,7 @@ def memory_selection_fingerprint(memories: list[dict[str, Any]]) -> str:
 def recommendation_id(
     *,
     run_id: str,
-    decision: AgentDecisionV1 | AgentDecisionV2,
+    decision: AgentDecisionV1 | AgentDecisionV2 | AgentDecisionV3,
     selection_fingerprint: str,
 ) -> str:
     """Return a stable content identity for an approval-bound recommendation."""
@@ -412,6 +480,15 @@ def recommendation_id(
         }
     )
     return f"recommendation:{digest}"
+
+
+def operational_action_fingerprint(
+    action: OperationalAction | Mapping[str, Any],
+) -> str:
+    """Return a stable identity for a validated operational action."""
+
+    validated = action if isinstance(action, OperationalAction) else OperationalAction.model_validate(action)
+    return f"operational_action:{_digest(validated.model_dump(mode='json'))}"
 
 
 def remediation_action_id(

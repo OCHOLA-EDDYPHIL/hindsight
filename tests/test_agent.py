@@ -132,6 +132,71 @@ def test_diagnostic_action_is_selected_only_by_structured_model_output():
     assert "role" not in provider.requests[0].prompt
 
 
+def test_payments_replay_records_strict_operational_action_without_changing_generic_agent():
+    from hindsight.agent import _generate_agent_decision, _recommendation_trace
+    from hindsight.agent_decision import recommendation_id
+    from tests.fakes import (
+        DeterministicReasoningProvider,
+        controlled_recommendation_decision,
+    )
+
+    state = {
+        "run_id": "run-controlled",
+        "decision_id": "decision-controlled",
+        "namespace": "demo:payments-poison-rewind:session:abc123",
+        "service_slug": "payments-api",
+        "incident_id": "demo-payments-checkout-latency",
+        "user_input": (
+            "Checkout p99 is above 2s and the queue is growing. Inspect current telemetry "
+            "and recommend one reversible next action."
+        ),
+        "recalled_memories": [],
+        "observations": [],
+        "reasoning_steps": [],
+        "tool_calls": [],
+        "model_turn_count": 0,
+        "diagnostic_call_count": 0,
+        "selection_fingerprint": "selection-controlled",
+        "reasoning": {"provider": "test", "model": "controlled"},
+    }
+    provider = DeterministicReasoningProvider(
+        response_text=controlled_recommendation_decision(
+            "scale_workers",
+            "Scale payment workers, then inspect queue depth.",
+        )
+    )
+
+    decision, _, turns = _generate_agent_decision(
+        state,
+        provider=provider,
+        allowed_query_keys=set(),
+    )
+    identity = recommendation_id(
+        run_id=state["run_id"],
+        decision=decision,
+        selection_fingerprint=state["selection_fingerprint"],
+    )
+    trace = _recommendation_trace(
+        state=state,
+        decision=decision,
+        recommendation_identity=identity,
+    )
+
+    assert turns == 1
+    assert decision.schema_version == 3
+    assert provider.requests[0].response_json_schema["properties"]["schema_version"][
+        "enum"
+    ] == [3]
+    assert "governed-memory remediation is unavailable" in provider.requests[0].system
+    assert trace["schema_version"] == 3
+    assert trace["recommendation"]["operational_action"]["primary_action"] == (
+        "scale_workers"
+    )
+    assert trace["recommendation"]["operational_action"]["fingerprint"].startswith(
+        "operational_action:"
+    )
+
+
 def test_provider_may_omit_forbidden_branch_siblings_without_changing_raw_response_hash():
     import hashlib
     import json

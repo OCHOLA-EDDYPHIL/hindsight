@@ -113,7 +113,6 @@ def test_exact_allowlisted_query_returns_deterministic_bounded_observation():
         "tool": "aws_cloudwatch_diagnostics",
         "query_key": "worker.duration",
         "status": "available",
-        "account_id": "123456789012",
         "region": "us-east-1",
         "metric": {
             "namespace": "AWS/Lambda",
