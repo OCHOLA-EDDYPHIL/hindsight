@@ -181,12 +181,11 @@ def poison_demo_memory(
                 reader="demo.fixture-import",
                 purpose="Supersede the exact accepted belief version",
             )
-            invalidated = store.invalidate(
-                memory_id=str(seed["id"]),
-                actor="demo.fixture-import",
-                reason="Supersede the accepted belief with the imported runbook version",
-            )
-            if invalidated is None:
+            closed = conn.execute(
+                "SELECT close_active_demo_seed_for_supersession(%s, %s)",
+                (seed["id"], namespace),
+            ).fetchone()
+            if closed is None or str(closed[0]) != str(seed["id"]):
                 raise RuntimeError("known-good demo belief changed before supersession")
             return store.write_semantic(
                 namespace=namespace,
