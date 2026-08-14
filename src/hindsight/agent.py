@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import partial
 from collections.abc import Callable, Collection
 import json
@@ -23,7 +26,14 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from hindsight.db import TenantConnection, connect, database_url, database_url_with_tls_roots
+from hindsight.causal_evidence import (
+    GOVERNED_MEMORY_PROMPT_MARKER,
+    build_causal_envelope,
+    canonical_sha256,
+    text_sha256,
+)
 from hindsight.agent_decision import (
+    CONTROLLED_ACTION_SELECTION_RATIONALES,
     MAX_DIAGNOSTIC_CALLS,
     MAX_MODEL_TURNS,
     PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
@@ -32,15 +42,26 @@ from hindsight.agent_decision import (
     AgentDecisionV3,
     agent_decision_from_payload,
     agent_decision_provider_schema,
+    controlled_action_selection_from_decision,
+    controlled_action_selection_provider_schema,
+    controlled_decision_from_selection,
     diagnostic_observation_fingerprint,
     memory_selection_fingerprint,
     normalize_agent_decision_provider_text,
     operational_action_fingerprint,
+    operational_action_catalog,
+    operational_action_directive,
     parse_agent_decision,
+    parse_controlled_action_selection,
     recommendation_id,
     remediation_action_id,
 )
-from hindsight.demo_state import DEMO_INPUT, DEMO_NAMESPACE, DEMO_SERVICE_SLUG
+from hindsight.demo_state import (
+    DEMO_INPUT,
+    DEMO_NAMESPACE,
+    DEMO_SERVICE_SLUG,
+    signature_replay_context,
+)
 from hindsight.embeddings import (
     EmbeddingProvider,
     embedding_profile,
@@ -68,6 +89,16 @@ from hindsight.tenant import current_tenant_id
 
 AGENT_CHAT_TABLE = "agent_chat_messages"
 PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY = "payments.retry_fanout"
+TRIAGE_PROMPT_TEMPLATE_ID = "hindsight.incident-triage.v1"
+DECISION_PROMPT_TEMPLATE_ID = "hindsight.incident-decision.v3"
+TRIAGE_PROMPT_TEMPLATE = (
+    "incident_id|namespace|service_slug|severity|title|normalized_user_incident|"
+    "prior_chat_message_count"
+)
+DECISION_PROMPT_TEMPLATE = (
+    "incident|severity|service|current_report|ordered_governed_memories|"
+    "ordered_diagnostic_observations|allowed_query_keys|remaining_turns|action_contract"
+)
 _AGENT_STORAGE_PROBES = (
     (
         "checkpoint_migrations",
@@ -595,10 +626,21 @@ def build_incident_graph(
                     ),
                 },
             )
+        response_usage = dict(response.usage)
+        request_contract = response_usage.pop("request_contract", None)
+        request_contracts = response_usage.pop("request_contracts", None)
         step = {
             "turn": model_turn_count,
             "provider": response.provider,
             "model": response.model,
+            "request": request_contract,
+            "requests": (
+                request_contracts
+                if isinstance(request_contracts, list)
+                else [request_contract]
+                if isinstance(request_contract, dict)
+                else []
+            ),
             "decision": decision.model_dump(mode="json"),
         }
         reasoning_steps = [*state.get("reasoning_steps", []), step]
@@ -610,7 +652,7 @@ def build_incident_graph(
                 "provider": response.provider,
                 "model": response.model,
                 "usage": {
-                    **dict(response.usage),
+                    **response_usage,
                     "logical_model_turns": model_turn_count,
                 },
             },
@@ -629,7 +671,7 @@ def build_incident_graph(
             update.update(
                 {
                     "recommendation_id": resolved_recommendation_id,
-                    "proposed_action": decision.recommendation or "",
+                    "proposed_action": _recommendation_action_text(decision),
                     "action_trace": _recommendation_trace(
                         state={**state, **update},
                         decision=decision,
@@ -724,8 +766,17 @@ def build_incident_graph(
             call_number = diagnostic_call_reservation()
             if not calls_used < call_number <= MAX_DIAGNOSTIC_CALLS:
                 raise RuntimeError("diagnostic call reservation returned an invalid count")
+        replay_context = _controlled_replay_context(state)
+        controlled_contract = _operational_action_contract(state)
+        if controlled_contract is not None and replay_context is None:
+            raise AgentDecisionError("controlled replay requires a persisted replay anchor")
+        diagnostic_identity = (
+            replay_context["scenario_routing_key"]
+            if replay_context is not None
+            else state["run_id"]
+        )
         call = {
-            "id": f"diagnostic:{state['run_id']}:{call_number}",
+            "id": f"diagnostic:{diagnostic_identity}:{call_number}",
             "tool": diagnostic_tool.name,
             "query_key": decision.tool_call.query_key,
             "status": "executing",
@@ -739,10 +790,29 @@ def build_incident_graph(
         )
         budget = CloudWatchCallBudget(initial_used_calls=call_number - 1)
         try:
-            tool_observation = diagnostic_tool.observe(
-                decision.tool_call.query_key,
-                budget=budget,
-            )
+            if replay_context is not None:
+                anchored_observer = getattr(
+                    diagnostic_tool,
+                    "observe_at_replay_anchor",
+                    None,
+                )
+                if not callable(anchored_observer):
+                    raise AgentDecisionError(
+                        "controlled replay diagnostic does not support anchored reads"
+                    )
+                replay_anchor = datetime.fromisoformat(
+                    replay_context["replay_anchor"].replace("Z", "+00:00")
+                )
+                tool_observation = anchored_observer(
+                    decision.tool_call.query_key,
+                    budget=budget,
+                    replay_anchor=replay_anchor,
+                )
+            else:
+                tool_observation = diagnostic_tool.observe(
+                    decision.tool_call.query_key,
+                    budget=budget,
+                )
             observation = {**tool_observation, "status": "available"}
         except CloudWatchDiagnosticsError as exc:
             observation = {
@@ -760,7 +830,7 @@ def build_incident_graph(
             raise RuntimeError("diagnostic tool did not consume exactly one call budget unit")
         completed_call = {**call, "status": call_status}
         recorded_observation = {
-            "id": f"observation:{state['run_id']}:{call_number}",
+            "id": f"observation:{diagnostic_identity}:{call_number}",
             "tool_call_id": call["id"],
             **observation,
         }
@@ -801,7 +871,7 @@ def build_incident_graph(
                 "recommendation_id": expected_recommendation_id,
                 "selection_fingerprint": expected_selection_fingerprint,
             }
-            proposed_action = decision.recommendation or ""
+            proposed_action = _recommendation_action_text(decision)
         if state.get("pause_before_act"):
             approval_identity = (
                 {
@@ -1281,6 +1351,17 @@ def _recall_for_state(
         "retrieval_id": retrieval_id,
         "selection_namespace_revision": selection_namespace_revision,
     }
+    if _operational_action_contract(state) is not None:
+        replay = signature_replay_context(namespace=state["namespace"], db_url=db_url)
+        if replay is not None:
+            replay["scenario_routing_key"] = _scenario_routing_key(
+                state,
+                replay_context=replay,
+            )
+            update["metadata"] = {
+                **dict(state.get("metadata") or {}),
+                "causal_replay": replay,
+            }
     return update
 
 
@@ -1419,17 +1500,25 @@ def _agent_result(thread_id: str, state: dict[str, Any]) -> IncidentAgentResult:
     )
 
 
-def _plan_prompt(state: IncidentAgentState) -> str:
-    recalled = state.get("recalled_memories", [])
-    memory_lines = []
-    for idx, memory in enumerate(recalled, start=1):
-        envelope = _governed_guidance_envelope(memory)
-        memory_lines.append(f"{idx}. {json.dumps(envelope, sort_keys=True)}")
-    if not memory_lines:
-        memory_lines.append("No prior memories were recalled.")
+def _plan_prompt(
+    state: IncidentAgentState,
+    *,
+    governed_memory_lines: list[str] | None = None,
+    decision_contract_name: str | None = None,
+) -> str:
+    if governed_memory_lines is None:
+        recalled = state.get("recalled_memories", [])
+        memory_lines = []
+        for idx, memory in enumerate(recalled, start=1):
+            envelope = _governed_guidance_envelope(memory)
+            memory_lines.append(f"{idx}. {json.dumps(envelope, sort_keys=True)}")
+        if not memory_lines:
+            memory_lines.append("No prior memories were recalled.")
+    else:
+        memory_lines = list(governed_memory_lines)
 
     triage = state.get("triage", {})
-    decision_contract = (
+    decision_contract = decision_contract_name or (
         "AgentDecisionV3" if _operational_action_contract(state) is not None else "AgentDecisionV2"
     )
     return "\n".join(
@@ -1463,6 +1552,99 @@ def _operational_action_contract(state: IncidentAgentState) -> str | None:
     ):
         return PAYMENTS_OPERATIONAL_ACTION_CONTRACT
     return None
+
+
+def _controlled_replay_context(state: IncidentAgentState) -> dict[str, Any] | None:
+    metadata = state.get("metadata")
+    replay = metadata.get("causal_replay") if isinstance(metadata, dict) else None
+    if not isinstance(replay, dict):
+        return None
+    required = ("scenario_id", "namespace", "replay_anchor", "scenario_routing_key")
+    if any(not isinstance(replay.get(key), str) or not replay[key] for key in required):
+        return None
+    if replay["namespace"] != state.get("namespace"):
+        return None
+    expected = _scenario_routing_key(state, replay_context=replay)
+    if replay["scenario_routing_key"] != expected:
+        return None
+    try:
+        anchor = datetime.fromisoformat(replay["replay_anchor"].replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if anchor.tzinfo is None or anchor.utcoffset() is None:
+        return None
+    result: dict[str, Any] = {key: replay[key] for key in required}
+    correction = replay.get("correction_operation")
+    if correction is not None:
+        if (
+            not isinstance(correction, dict)
+            or set(correction)
+            != {
+                "id",
+                "target_timestamp",
+                "invalidated_memory_ids",
+                "restored_memory_ids",
+                "effects",
+            }
+            or not isinstance(correction.get("id"), str)
+            or not correction["id"]
+            or not isinstance(correction.get("target_timestamp"), str)
+            or any(
+                not isinstance(correction.get(key), list)
+                for key in ("invalidated_memory_ids", "restored_memory_ids", "effects")
+            )
+            or any(
+                not isinstance(value, str) or not value
+                for key in ("invalidated_memory_ids", "restored_memory_ids")
+                for value in correction[key]
+            )
+            or any(
+                not isinstance(effect, dict)
+                or set(effect)
+                != {
+                    "sequence",
+                    "effect_type",
+                    "source_memory_id",
+                    "result_memory_id",
+                    "belief_id",
+                    "namespace",
+                }
+                for effect in correction["effects"]
+            )
+        ):
+            return None
+        try:
+            target_timestamp = datetime.fromisoformat(
+                correction["target_timestamp"].replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+        if target_timestamp.tzinfo is None or target_timestamp.utcoffset() is None:
+            return None
+        result["correction_operation"] = correction
+    return result
+
+
+def _scenario_routing_key(
+    state: IncidentAgentState,
+    *,
+    replay_context: dict[str, Any] | None = None,
+) -> str:
+    """Return one stable provider route for both sides of a signature scenario."""
+
+    if replay_context is None:
+        metadata = state.get("metadata")
+        candidate = metadata.get("causal_replay") if isinstance(metadata, dict) else None
+        replay = candidate if isinstance(candidate, dict) else {}
+    else:
+        replay = replay_context
+    identity = {
+        "contract": _operational_action_contract(state),
+        "namespace": str(replay.get("namespace") or state.get("namespace") or ""),
+        "replay_anchor": str(replay.get("replay_anchor") or "unavailable"),
+        "scenario_id": str(replay.get("scenario_id") or "unavailable"),
+    }
+    return f"signature:{canonical_sha256(identity).removeprefix('sha256:')}"
 
 
 def _governed_guidance_envelope(memory: dict[str, Any]) -> dict[str, Any]:
@@ -1526,18 +1708,71 @@ def _generate_agent_decision(
     if starting_turn >= MAX_MODEL_TURNS:
         raise AgentDecisionError("model turn budget is exhausted")
     operational_action_contract = _operational_action_contract(state)
-    if (
-        operational_action_contract == PAYMENTS_OPERATIONAL_ACTION_CONTRACT
-        and PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY in allowed_query_keys
-    ):
+    if operational_action_contract == PAYMENTS_OPERATIONAL_ACTION_CONTRACT:
+        if PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY not in allowed_query_keys:
+            raise AgentDecisionError(
+                "controlled replay requires the pinned diagnostic query"
+            )
         allowed_query_keys = {PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY}
+    diagnostic_calls_used = int(state.get("diagnostic_call_count") or 0)
+    diagnostic_observation_available = _has_current_diagnostic_observation(
+        state,
+        allowed_query_keys=allowed_query_keys,
+    )
+    controlled_terminal_selection = bool(
+        operational_action_contract is not None
+        and diagnostic_observation_available
+    )
     decision_contract_name = (
-        "AgentDecisionV3" if operational_action_contract is not None else "AgentDecisionV2"
+        "ControlledActionSelectionV1"
+        if controlled_terminal_selection
+        else "AgentDecisionV3"
+        if operational_action_contract is not None
+        else "AgentDecisionV2"
+    )
+    system_prompt = (
+        "You are Hindsight, an incident-response copilot. Use only memories "
+        "whose usage_instruction is positive_guidance as recommendations. "
+        "Audit-only memories may support diagnosis but must never direct a next "
+        "step. Diagnostic tools are read-only. The only executable action is "
+        "retract_recalled_memory, and it may target only a recalled memory that "
+        "you cite verbatim. Never propose another executable action. "
+        "Every recalled-memory citation quote must be a verbatim excerpt. "
+        "Every recommendation must be reversible, verifiable, and suitable for "
+        "operator review. "
+        + (
+            (
+                "This controlled terminal call returns only action_id, disposition, "
+                "parameters, and rationale. Select exactly one action ID and one neutral "
+                "explanatory rationale from the server-supplied schema. Do not "
+                "return catalog metadata, directive text, diagnosis, or other prose. "
+                "The server renders the operator directive and this workflow executes "
+                "nothing. "
+            )
+            if controlled_terminal_selection
+            else (
+                "This controlled replay requires AgentDecisionV3 until the configured "
+                "diagnostic observation exists. Select only a server-configured "
+                "diagnostic tool and copy the controlled explanation fields from the "
+                "response schema. Governed-memory remediation is unavailable. "
+            )
+            if operational_action_contract is not None
+            else ""
+        )
+        + f"Return only {decision_contract_name} JSON."
     )
     prompt = _decision_prompt(
         state,
         allowed_query_keys=allowed_query_keys,
         operational_action_contract=operational_action_contract,
+        decision_contract_name=decision_contract_name,
+    )
+    invariant_prompt = _decision_prompt(
+        state,
+        allowed_query_keys=allowed_query_keys,
+        operational_action_contract=operational_action_contract,
+        governed_memory_lines=[GOVERNED_MEMORY_PROMPT_MARKER],
+        decision_contract_name=decision_contract_name,
     )
     recalled_memory_ids = {
         str(memory.get("memory_id") or memory.get("id"))
@@ -1551,10 +1786,9 @@ def _generate_agent_decision(
         for memory in state.get("recalled_memories", [])
         if memory.get("memory_id") or memory.get("id")
     }
-    diagnostic_calls_used = int(state.get("diagnostic_call_count") or 0)
-    diagnostic_observation_available = _has_current_diagnostic_observation(state)
     attempts = 0
     last_error: AgentDecisionError | None = None
+    request_contracts: list[dict[str, Any]] = []
     while attempts < 2 and starting_turn + attempts < MAX_MODEL_TURNS:
         attempts += 1
         logical_turn = (
@@ -1562,71 +1796,113 @@ def _generate_agent_decision(
         )
         if not starting_turn < logical_turn <= MAX_MODEL_TURNS:
             raise RuntimeError("model call reservation returned an invalid count")
-        response_schema = agent_decision_provider_schema(
-            recalled_memory_ids=recalled_memory_ids,
-            allowed_query_keys=allowed_query_keys,
-            diagnostic_calls_used=diagnostic_calls_used,
-            diagnostic_observation_available=diagnostic_observation_available,
-            model_turn=logical_turn,
-            operational_action_contract=operational_action_contract,
-        )
-        request_prompt = prompt
-        if attempts == 2:
-            assert last_error is not None
-            request_prompt = (
-                f"{prompt}\n\n"
-                f"The prior response failed a server-enforced {decision_contract_name} constraint. "
-                f"Stable repair reason: {_decision_repair_reason(last_error)}. "
-                "Return only one JSON object matching the supplied schema for this turn. "
-                "Do not add markdown or commentary."
+        response_schema = (
+            controlled_action_selection_provider_schema(
+                contract=str(operational_action_contract)
             )
-        response = provider.generate(
-            ReasoningRequest(
-                system=(
-                    "You are Hindsight, an incident-response copilot. Use only memories "
-                    "whose usage_instruction is positive_guidance as recommendations. "
-                    "Audit-only memories may support diagnosis but must never direct a next "
-                    "step. Diagnostic tools are read-only. The only executable action is "
-                    "retract_recalled_memory, and it may target only a recalled memory that "
-                    "you cite verbatim. Never propose another executable action. "
-                    "Every recalled-memory citation quote must be a verbatim excerpt. "
-                    "Every recommendation must be reversible, verifiable, and suitable for "
-                    "operator review. "
-                    + (
-                        "This controlled replay requires AgentDecisionV3. For a recommendation, "
-                        "operational_action must classify the first affirmative operator action "
-                        "as scale_workers, throttle_retries, or inspect_only under the supplied "
-                        "contract. Do not classify a negation, rollback, safety constraint, or "
-                        "verification step. The classification records evidence and executes "
-                        "nothing; governed-memory remediation is unavailable in this replay. "
-                        if operational_action_contract is not None
-                        else ""
-                    )
-                    + f"Return only {decision_contract_name} JSON."
-                ),
-                prompt=request_prompt,
-                temperature=0,
-                max_output_tokens=1_024,
-                routing_key=f"{state['decision_id']}:turn:{logical_turn}",
-                response_json_schema=response_schema,
-            )
-        )
-        try:
-            decision = parse_agent_decision(
-                normalize_agent_decision_provider_text(response.text),
+            if controlled_terminal_selection
+            else agent_decision_provider_schema(
                 recalled_memory_ids=recalled_memory_ids,
-                recalled_memory_text=recalled_memory_text,
                 allowed_query_keys=allowed_query_keys,
                 diagnostic_calls_used=diagnostic_calls_used,
                 diagnostic_observation_available=diagnostic_observation_available,
                 model_turn=logical_turn,
                 operational_action_contract=operational_action_contract,
             )
+        )
+        request_prompt = prompt
+        request_invariant_prompt = invariant_prompt
+        repair_reason = None
+        if attempts == 2:
+            assert last_error is not None
+            repair_reason = _decision_repair_reason(last_error)
+            request_prompt = (
+                f"{prompt}\n\n"
+                f"The prior response failed a server-enforced {decision_contract_name} constraint. "
+                f"Stable repair reason: {repair_reason}. "
+                "Return only one JSON object matching the supplied schema for this turn. "
+                "Do not add markdown or commentary."
+            )
+            request_invariant_prompt = (
+                f"{invariant_prompt}\n\n"
+                f"The prior response failed a server-enforced {decision_contract_name} constraint. "
+                f"Stable repair reason: {repair_reason}. "
+                "Return only one JSON object matching the supplied schema for this turn. "
+                "Do not add markdown or commentary."
+            )
+        response = provider.generate(
+            ReasoningRequest(
+                system=system_prompt,
+                prompt=request_prompt,
+                temperature=0,
+                max_output_tokens=1_024,
+                routing_key=(
+                    f"{_scenario_routing_key(state)}:turn:{logical_turn}"
+                    if operational_action_contract is not None
+                    else f"{state['decision_id']}:turn:{logical_turn}"
+                ),
+                response_json_schema=response_schema,
+            )
+        )
+        request_routing_key = (
+            f"{_scenario_routing_key(state)}:turn:{logical_turn}"
+            if operational_action_contract is not None
+            else f"{state['decision_id']}:turn:{logical_turn}"
+        )
+        request_contract = {
+            "schema_version": 1,
+            "attempt": attempts,
+            "repair_reason": repair_reason,
+            "logical_turn": logical_turn,
+            "provider": response.provider,
+            "model": response.model,
+            "system": system_prompt,
+            "prompt": request_prompt,
+            "prompt_invariant": request_invariant_prompt,
+            "prompt_invariant_sha256": text_sha256(request_invariant_prompt),
+            "temperature": 0,
+            "max_output_tokens": 1_024,
+            "routing_key": request_routing_key,
+            "decision_contract": decision_contract_name,
+            "response_schema_version": (
+                1
+                if controlled_terminal_selection
+                else 3
+                if operational_action_contract is not None
+                else 2
+            ),
+            "response_json_schema": response_schema,
+        }
+        try:
+            if controlled_terminal_selection:
+                selection = parse_controlled_action_selection(
+                    response.text,
+                    contract=str(operational_action_contract),
+                )
+                decision = controlled_decision_from_selection(
+                    selection,
+                    contract=str(operational_action_contract),
+                )
+            else:
+                decision = parse_agent_decision(
+                    normalize_agent_decision_provider_text(response.text),
+                    recalled_memory_ids=recalled_memory_ids,
+                    recalled_memory_text=recalled_memory_text,
+                    allowed_query_keys=allowed_query_keys,
+                    diagnostic_calls_used=diagnostic_calls_used,
+                    diagnostic_observation_available=diagnostic_observation_available,
+                    model_turn=logical_turn,
+                    operational_action_contract=operational_action_contract,
+                )
         except AgentDecisionError as exc:
+            request_contracts.append(request_contract)
             last_error = exc
             continue
+        request_contracts.append(request_contract)
         usage = dict(response.usage)
         usage["response_sha256"] = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
+        usage["request_contract"] = request_contract
+        usage["request_contracts"] = request_contracts
         normalized_response = type(response)(
             text=response.text,
             provider=response.provider,
@@ -1640,6 +1916,12 @@ def _generate_agent_decision(
 _DECISION_REPAIR_REASONS = {
     "model response did not satisfy AgentDecisionV2": "agent_decision_schema_mismatch",
     "model response did not satisfy AgentDecisionV3": "controlled_action_schema_mismatch",
+    "model response did not satisfy ControlledActionSelectionV1": (
+        "controlled_action_selection_schema_mismatch"
+    ),
+    "controlled action rationale is outside server-approved explanatory prose": (
+        "controlled_action_rationale_not_approved"
+    ),
     "a recalled memory may be cited only once per decision": "duplicate_memory_citation",
     "model cited memory that was not recalled": "unrecalled_memory_citation",
     "model citation is not a quote from recalled memory": "non_verbatim_memory_citation",
@@ -1650,6 +1932,9 @@ _DECISION_REPAIR_REASONS = {
         "current_diagnostic_observation_required"
     ),
     "remediation target must be cited verbatim": "uncited_remediation_target",
+    "recommendation prose contradicts server-owned operational action": (
+        "operational_action_prose_contradiction"
+    ),
 }
 
 
@@ -1662,11 +1947,30 @@ def _validate_initial_call_count(value: int, *, limit: int, name: str) -> None:
         raise ValueError(f"{name} must be between zero and {limit}")
 
 
-def _has_current_diagnostic_observation(state: IncidentAgentState) -> bool:
+def _has_current_diagnostic_observation(
+    state: IncidentAgentState,
+    *,
+    allowed_query_keys: set[str],
+) -> bool:
+    completed_calls = {
+        (call.get("id"), call.get("query_key"))
+        for call in state.get("tool_calls", [])
+        if isinstance(call.get("id"), str)
+        and bool(call["id"])
+        and call.get("status") == "completed"
+        and call.get("tool") == "aws_cloudwatch_diagnostics"
+        and call.get("query_key") in allowed_query_keys
+    }
     for observation in state.get("observations", []):
         datapoint_count = observation.get("datapoint_count")
+        tool_call_id = observation.get("tool_call_id")
         if (
-            observation.get("status") == "available"
+            isinstance(tool_call_id, str)
+            and bool(tool_call_id)
+            and observation.get("status") == "available"
+            and observation.get("tool") == "aws_cloudwatch_diagnostics"
+            and observation.get("query_key") in allowed_query_keys
+            and (tool_call_id, observation.get("query_key")) in completed_calls
             and type(datapoint_count) is int
             and datapoint_count > 0
         ):
@@ -1679,13 +1983,19 @@ def _decision_prompt(
     *,
     allowed_query_keys: set[str],
     operational_action_contract: str | None = None,
+    governed_memory_lines: list[str] | None = None,
+    decision_contract_name: str | None = None,
 ) -> str:
     observations = state.get("observations", [])
     remaining_turns = MAX_MODEL_TURNS - int(state.get("model_turn_count") or 0)
     query_keys = sorted(allowed_query_keys)
     return "\n".join(
         [
-            _plan_prompt(state),
+            _plan_prompt(
+                state,
+                governed_memory_lines=governed_memory_lines,
+                decision_contract_name=decision_contract_name,
+            ),
             "",
             "Recorded diagnostic observations:",
             json.dumps(observations, sort_keys=True, default=str) if observations else "None.",
@@ -1716,7 +2026,7 @@ def _decision_plan_text(decision: AgentDecisionV2 | AgentDecisionV3) -> str:
     verification = "; ".join(decision.verification)
     safety = "; ".join(decision.safety_constraints)
     action = (
-        decision.recommendation
+        _recommendation_action_text(decision)
         or (
             f"Retract recalled memory {decision.remediation_action.target_memory_id}: "
             f"{decision.remediation_action.reason}"
@@ -1739,6 +2049,12 @@ def _decision_plan_text(decision: AgentDecisionV2 | AgentDecisionV3) -> str:
     )
 
 
+def _recommendation_action_text(decision: AgentDecisionV2 | AgentDecisionV3) -> str:
+    if isinstance(decision, AgentDecisionV3) and decision.operational_action is not None:
+        return operational_action_directive(decision.operational_action)
+    return decision.recommendation or ""
+
+
 def _recommendation_trace(
     *,
     state: IncidentAgentState,
@@ -1748,8 +2064,19 @@ def _recommendation_trace(
     operational_action = (
         decision.operational_action if isinstance(decision, AgentDecisionV3) else None
     )
+    rendered_directive = (
+        operational_action_directive(operational_action) if operational_action is not None else None
+    )
+    causal_envelope = (
+        _recommendation_causal_envelope(state=state, decision=decision)
+        if operational_action is not None and _controlled_replay_context(state) is not None
+        else None
+    )
+    redacted_causal_envelope = (
+        _redacted_causal_envelope(causal_envelope) if causal_envelope is not None else None
+    )
     return {
-        "schema_version": 3 if operational_action is not None else 2,
+        "schema_version": 4 if operational_action is not None else 2,
         "mode": "recommendation_only",
         "selection": {
             "fingerprint": state["selection_fingerprint"],
@@ -1764,9 +2091,16 @@ def _recommendation_trace(
         "reasoning_steps": state.get("reasoning_steps", []),
         "tool_calls": state.get("tool_calls", []),
         "observations": state.get("observations", []),
+        "observation_fingerprint": state.get("observation_fingerprint"),
+        **({"causal_envelope": causal_envelope} if causal_envelope is not None else {}),
+        **(
+            {"redacted_causal_envelope": redacted_causal_envelope}
+            if redacted_causal_envelope is not None
+            else {}
+        ),
         "recommendation": {
             "id": recommendation_identity,
-            "summary": decision.recommendation,
+            "summary": rendered_directive or decision.recommendation,
             "diagnosis": decision.diagnosis,
             "rationale": decision.rationale,
             "rollback": decision.rollback,
@@ -1777,6 +2111,9 @@ def _recommendation_trace(
                 {
                     "operational_action": {
                         **operational_action.model_dump(mode="json"),
+                        "primary_action": operational_action.action_id,
+                        "directive": rendered_directive,
+                        "consistency_status": "consistent",
                         "fingerprint": operational_action_fingerprint(operational_action),
                     }
                 }
@@ -1789,6 +2126,626 @@ def _recommendation_trace(
             "mode": "recommendation_only",
         },
     }
+
+
+def _recommendation_causal_envelope(
+    *,
+    state: IncidentAgentState,
+    decision: AgentDecisionV3,
+) -> dict[str, Any]:
+    replay = _controlled_replay_context(state)
+    if replay is None or decision.operational_action is None:
+        raise AgentDecisionError("controlled recommendation evidence is incomplete")
+    requests: list[dict[str, Any]] = []
+    for step in state.get("reasoning_steps", []):
+        step_requests = step.get("requests") if isinstance(step, dict) else None
+        if isinstance(step_requests, list) and step_requests:
+            if any(not isinstance(request, dict) for request in step_requests):
+                raise AgentDecisionError(
+                    "controlled recommendation contains an invalid model request input"
+                )
+            requests.extend(step_requests)
+            continue
+        request = step.get("request") if isinstance(step, dict) else None
+        if not isinstance(request, dict):
+            raise AgentDecisionError("controlled recommendation omitted a model request input")
+        requests.append(request)
+    if not requests:
+        raise AgentDecisionError("controlled recommendation omitted its model request inputs")
+
+    catalog = operational_action_catalog(decision.operational_action.contract)
+    tool_calls = list(state.get("tool_calls") or [])
+    observations = list(state.get("observations") or [])
+    normalized_incident = str(state.get("user_input") or "").strip()
+    incident = {
+        "incident_id": state.get("incident_id"),
+        "namespace": state.get("namespace"),
+        "service_slug": (state.get("triage") or {}).get("service_slug")
+        or state.get("service_slug"),
+        "severity": (state.get("triage") or {}).get("severity") or state.get("severity"),
+        "title": (state.get("triage") or {}).get("title") or state.get("title"),
+        "normalized_user_incident": normalized_incident,
+    }
+    memory_intervention = []
+    for ordinal, memory in enumerate(state.get("recalled_memories", []), start=1):
+        envelope = _governed_guidance_envelope(memory)
+        prompt_fragment = f"{ordinal}. {json.dumps(envelope, sort_keys=True)}"
+        memory_intervention.append(
+            {
+                "ordinal": ordinal,
+                "memory": envelope,
+                "memory_sha256": canonical_sha256(envelope),
+                "prompt_fragment_sha256": text_sha256(prompt_fragment),
+            }
+        )
+    release_revision = os.environ.get("HINDSIGHT_DEPLOYED_REVISION", "unknown")
+    if re.fullmatch(r"[0-9a-f]{40}", release_revision) is None:
+        raise AgentDecisionError("controlled recommendation requires an exact release revision")
+    tool_contract = {
+        "schema_version": 1,
+        "diagnostic_tool": "aws_cloudwatch_diagnostics",
+        "observation_schema_version": 1,
+        "allowed_query_keys": [PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY],
+        "max_diagnostic_calls": MAX_DIAGNOSTIC_CALLS,
+    }
+    invariant_inputs = {
+        "normalized_user_incident": normalized_incident,
+        "prompt_templates": {
+            "triage": {
+                "id": TRIAGE_PROMPT_TEMPLATE_ID,
+                "sha256": text_sha256(TRIAGE_PROMPT_TEMPLATE),
+            },
+            "decision": {
+                "id": DECISION_PROMPT_TEMPLATE_ID,
+                "sha256": text_sha256(DECISION_PROMPT_TEMPLATE),
+            },
+            "system": {
+                "id": "hindsight.incident-system.v3",
+                "sha256": text_sha256(str(requests[-1].get("system") or "")),
+            },
+        },
+        "triage_result": state.get("triage") or {},
+        "ordered_tool_calls": tool_calls,
+        "ordered_observations": observations,
+        "ordered_model_request_configuration": [
+            _model_request_invariant(request) for request in requests
+        ],
+        "tool_contract": tool_contract,
+        "embedding_profile": state.get("embedding_profile") or {},
+        "release_revision": release_revision,
+        "action_catalog": catalog,
+        "tenant_id": str(current_tenant_id() or ""),
+        "namespace": state.get("namespace"),
+        "scenario_id": replay["scenario_id"],
+        "replay_anchor": replay["replay_anchor"],
+        "retrieval_policy": (state.get("metadata") or {}).get("retrieval_policy"),
+        "retrieval_policy_version": 1,
+    }
+    correction = replay.get("correction_operation")
+    correction_operation = correction if isinstance(correction, dict) else None
+    permitted_intervention = {
+        "kind": "governed_memory_version_selection.v1",
+        "ordered_memory_versions": memory_intervention,
+        "selection_fingerprint": state.get("selection_fingerprint"),
+        "expected_changed_prompt_fragments": [
+            item["prompt_fragment_sha256"] for item in memory_intervention
+        ],
+        "correction_operation_id": (
+            correction_operation.get("id") if correction_operation is not None else None
+        ),
+        "correction_target_timestamp": (
+            correction_operation.get("target_timestamp")
+            if correction_operation is not None
+            else None
+        ),
+        "operation_effects": (
+            correction_operation.get("effects") or [] if correction_operation is not None else []
+        ),
+        "invalidated_memory_fingerprints": [
+            canonical_sha256(memory_id)
+            for memory_id in (
+                correction_operation.get("invalidated_memory_ids") or []
+                if correction_operation is not None
+                else []
+            )
+        ],
+        "restored_memory_fingerprints": [
+            canonical_sha256(memory_id)
+            for memory_id in (
+                correction_operation.get("restored_memory_ids") or []
+                if correction_operation is not None
+                else []
+            )
+        ],
+    }
+    actual_decision_inputs = {
+        "incident": incident,
+        "triage": state.get("triage") or {},
+        "retrieval_policy": (state.get("metadata") or {}).get("retrieval_policy"),
+        "embedding_profile": state.get("embedding_profile") or {},
+        "ordered_governed_memories": memory_intervention,
+        "ordered_tool_calls": tool_calls,
+        "ordered_observations": observations,
+        "ordered_model_requests": requests,
+        "tool_contract": tool_contract,
+        "action_catalog": catalog,
+    }
+    identity = {
+        "scenario_id": replay["scenario_id"],
+        "namespace": replay["namespace"],
+        "replay_anchor": replay["replay_anchor"],
+        "scenario_routing_key": replay["scenario_routing_key"],
+        "run_id": state.get("run_id"),
+        "decision_id": state.get("decision_id"),
+        "release_revision": release_revision,
+    }
+    return build_causal_envelope(
+        identity=identity,
+        invariant_inputs=invariant_inputs,
+        permitted_intervention=permitted_intervention,
+        actual_decision_inputs=actual_decision_inputs,
+        rendered_prompt_sha256=[
+            text_sha256(request["prompt"])
+            for request in actual_decision_inputs["ordered_model_requests"]
+        ],
+        decision_output=controlled_action_selection_from_decision(decision).model_dump(
+            mode="json"
+        ),
+    )
+
+
+def _redacted_causal_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Build a digest-valid allowlisted public projection of exact internal evidence."""
+
+    source_identity = envelope["identity"]
+    source_invariants = envelope["invariant_inputs"]
+    source_intervention = envelope["permitted_intervention"]
+    source_actual = envelope["actual_decision_inputs"]
+    public_namespace = "[redacted-namespace]"
+    public_scenario_id = _public_identifier(
+        source_identity.get("scenario_id"),
+        kind="scenario",
+    )
+    public_identity = {
+        "scenario_id": public_scenario_id,
+        "namespace": public_namespace,
+        "replay_anchor": source_identity["replay_anchor"],
+        "scenario_routing_key": source_identity["scenario_routing_key"],
+        "run_id": _public_identifier(source_identity.get("run_id"), kind="run"),
+        "decision_id": _public_identifier(
+            source_identity.get("decision_id"),
+            kind="decision",
+        ),
+        "release_revision": source_identity["release_revision"],
+    }
+
+    source_memories = source_intervention.get("ordered_memory_versions") or []
+    public_memories = [
+        _public_memory_intervention(item, ordinal=ordinal)
+        for ordinal, item in enumerate(source_memories, start=1)
+    ]
+    public_tool_calls = [
+        {
+            "id": f"diagnostic:{index}",
+            "tool": call["tool"],
+            "query_key": call["query_key"],
+            "status": call["status"],
+        }
+        for index, call in enumerate(
+            source_invariants.get("ordered_tool_calls") or [],
+            start=1,
+        )
+    ]
+    public_observations = [
+        _public_controlled_observation(item, ordinal=ordinal)
+        for ordinal, item in enumerate(
+            source_invariants.get("ordered_observations") or [],
+            start=1,
+        )
+    ]
+    public_requests = []
+    diagnostic_groups_seen = 0
+    for item in source_actual.get("ordered_model_requests") or []:
+        if item.get("decision_contract") == "AgentDecisionV3":
+            if item.get("attempt") == 1:
+                diagnostic_calls_used = diagnostic_groups_seen
+                diagnostic_groups_seen += 1
+            else:
+                diagnostic_calls_used = max(0, diagnostic_groups_seen - 1)
+        else:
+            diagnostic_calls_used = diagnostic_groups_seen
+        public_requests.append(
+            _public_model_request(
+                item,
+                memories=public_memories,
+                diagnostic_calls_used=diagnostic_calls_used,
+                allowed_query_keys=set(
+                    (source_invariants.get("tool_contract") or {}).get(
+                        "allowed_query_keys"
+                    )
+                    or []
+                ),
+            )
+        )
+    public_request_configurations = [
+        _model_request_invariant(item) for item in public_requests
+    ]
+    source_triage = source_invariants.get("triage_result") or {}
+    public_incident_id = _public_identifier(
+        source_triage.get("incident_id"),
+        kind="incident",
+    )
+    public_triage = {
+        "incident_id": public_incident_id,
+        "namespace": public_namespace,
+        "service_slug": _public_contract_label(
+            source_triage.get("service_slug"),
+            fallback="redacted-service",
+        ),
+        "severity": _public_contract_label(
+            source_triage.get("severity"),
+            fallback="redacted-severity",
+        ),
+        "title": "[redacted-title]",
+        "summary": "[redacted-incident]",
+        "prior_chat_messages": source_triage.get("prior_chat_messages", 0),
+    }
+    source_embedding = source_invariants.get("embedding_profile") or {}
+    public_embedding = {
+        "profile_id": _public_identifier(
+            source_embedding.get("profile_id"),
+            kind="embedding-profile",
+        ),
+        "provider": _public_contract_label(
+            source_embedding.get("provider"),
+            fallback="redacted-provider",
+        ),
+        "model": _public_contract_label(
+            source_embedding.get("model"),
+            fallback="redacted-model",
+        ),
+        "dimensions": source_embedding.get("dimensions"),
+        "capability": _public_contract_label(
+            source_embedding.get("capability"),
+            fallback="redacted-capability",
+        ),
+        "encoder_revision": _public_contract_label(
+            source_embedding.get("encoder_revision"),
+            fallback="redacted-encoder",
+        ),
+        "configuration": {},
+        "max_distance": source_embedding.get("max_distance"),
+    }
+    public_templates = json.loads(
+        json.dumps(source_invariants.get("prompt_templates") or {}, sort_keys=True)
+    )
+    if isinstance(public_templates.get("system"), dict) and public_requests:
+        public_templates["system"]["sha256"] = text_sha256(public_requests[-1]["system"])
+    public_invariants = {
+        "normalized_user_incident": "[redacted-incident]",
+        "prompt_templates": public_templates,
+        "triage_result": public_triage,
+        "ordered_tool_calls": public_tool_calls,
+        "ordered_observations": public_observations,
+        "ordered_model_request_configuration": public_request_configurations,
+        "tool_contract": source_invariants["tool_contract"],
+        "embedding_profile": public_embedding,
+        "release_revision": source_identity["release_revision"],
+        "action_catalog": source_invariants["action_catalog"],
+        "tenant_id": "[redacted-tenant]",
+        "namespace": public_namespace,
+        "scenario_id": public_scenario_id,
+        "replay_anchor": source_identity["replay_anchor"],
+        "retrieval_policy": source_invariants["retrieval_policy"],
+        "retrieval_policy_version": source_invariants["retrieval_policy_version"],
+    }
+    public_effects = [
+        _public_operation_effect(item, ordinal=ordinal)
+        for ordinal, item in enumerate(
+            source_intervention.get("operation_effects") or [],
+            start=1,
+        )
+    ]
+    public_intervention = {
+        "kind": source_intervention["kind"],
+        "ordered_memory_versions": public_memories,
+        "selection_fingerprint": source_intervention["selection_fingerprint"],
+        "expected_changed_prompt_fragments": [
+            item["prompt_fragment_sha256"] for item in public_memories
+        ],
+        "correction_operation_id": (
+            _public_identifier(
+                source_intervention.get("correction_operation_id"),
+                kind="operation",
+            )
+            if source_intervention.get("correction_operation_id") is not None
+            else None
+        ),
+        "correction_target_timestamp": source_intervention.get(
+            "correction_target_timestamp"
+        ),
+        "operation_effects": public_effects,
+        "invalidated_memory_fingerprints": list(
+            source_intervention.get("invalidated_memory_fingerprints") or []
+        ),
+        "restored_memory_fingerprints": list(
+            source_intervention.get("restored_memory_fingerprints") or []
+        ),
+    }
+    public_actual = {
+        "incident": {
+            "incident_id": public_incident_id,
+            "namespace": public_namespace,
+            "service_slug": public_triage["service_slug"],
+            "severity": public_triage["severity"],
+            "title": public_triage["title"],
+            "normalized_user_incident": public_triage["summary"],
+        },
+        "triage": public_triage,
+        "retrieval_policy": public_invariants["retrieval_policy"],
+        "embedding_profile": public_embedding,
+        "ordered_governed_memories": public_memories,
+        "ordered_tool_calls": public_tool_calls,
+        "ordered_observations": public_observations,
+        "ordered_model_requests": public_requests,
+        "tool_contract": public_invariants["tool_contract"],
+        "action_catalog": public_invariants["action_catalog"],
+    }
+    source_selection = controlled_action_selection_from_decision(
+        controlled_decision_from_selection(
+            envelope["decision_output"],
+            contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+        )
+    )
+    public_selection = {
+        "action_id": source_selection.action_id,
+        "disposition": source_selection.disposition,
+        "parameters": source_selection.parameters.model_dump(mode="json"),
+        "rationale": CONTROLLED_ACTION_SELECTION_RATIONALES[0],
+    }
+    return build_causal_envelope(
+        identity=public_identity,
+        invariant_inputs=public_invariants,
+        permitted_intervention=public_intervention,
+        actual_decision_inputs=public_actual,
+        rendered_prompt_sha256=[
+            text_sha256(request["prompt"])
+            for request in public_requests
+        ],
+        decision_output=public_selection,
+    )
+
+
+def _public_identifier(value: Any, *, kind: str) -> str:
+    return f"{kind}:{canonical_sha256(str(value)).removeprefix('sha256:')}"
+
+
+def _public_contract_label(value: Any, *, fallback: str) -> str:
+    text = str(value or "")
+    return text if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", text) else fallback
+
+
+def _public_memory_intervention(item: dict[str, Any], *, ordinal: int) -> dict[str, Any]:
+    source = item.get("memory") if isinstance(item.get("memory"), dict) else {}
+    public_memory = {
+        "memory_id": _public_identifier(source.get("memory_id"), kind="memory"),
+        "belief_id": _public_identifier(source.get("belief_id"), kind="belief"),
+        "version": source.get("version"),
+        "content": "[redacted-memory-content]",
+        "kind": _public_contract_label(source.get("kind"), fallback="redacted-kind"),
+        "status": _public_contract_label(source.get("status"), fallback="redacted-status"),
+        "trust": _public_contract_label(source.get("trust"), fallback="redacted-trust"),
+        "transition": _public_contract_label(
+            source.get("transition"),
+            fallback="redacted-transition",
+        ),
+        "operator_disposition": _public_contract_label(
+            source.get("operator_disposition"),
+            fallback="redacted-disposition",
+        ),
+        "safety_status": _public_contract_label(
+            source.get("safety_status"),
+            fallback="redacted-safety",
+        ),
+        "contradiction_status": _public_contract_label(
+            source.get("contradiction_status"),
+            fallback="redacted-contradiction",
+        ),
+        "applicability": None,
+        "evidence_quality": _public_contract_label(
+            source.get("evidence_quality"),
+            fallback="redacted-evidence-quality",
+        ),
+        "evidence": [
+            {
+                "writer": "[redacted-writer]",
+                "source_ref": "[redacted-source]",
+                "justification": "[redacted-justification]",
+            }
+        ],
+        "usage_instruction": _public_contract_label(
+            source.get("usage_instruction"),
+            fallback="audit_only",
+        ),
+        "source_memory_sha256": item.get("memory_sha256"),
+    }
+    prompt_fragment = f"{ordinal}. {json.dumps(public_memory, sort_keys=True)}"
+    return {
+        "ordinal": ordinal,
+        "memory": public_memory,
+        "memory_sha256": canonical_sha256(public_memory),
+        "prompt_fragment_sha256": text_sha256(prompt_fragment),
+    }
+
+
+def _public_controlled_observation(item: dict[str, Any], *, ordinal: int) -> dict[str, Any]:
+    metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
+    dimensions = []
+    for index, dimension in enumerate(metric.get("dimensions") or [], start=1):
+        name = _public_contract_label(
+            dimension.get("name") if isinstance(dimension, dict) else None,
+            fallback=f"Dimension{index:02d}",
+        )
+        source_value = dimension.get("value") if isinstance(dimension, dict) else None
+        value = (
+            str(source_value)
+            if name == "Scenario" and source_value == "payments-checkout-latency"
+            else str(source_value)
+            if name == "Service" and source_value == "payments-api"
+            else "[redacted-dimension]"
+        )
+        dimensions.append({"name": name, "value": value})
+    dimensions.sort(key=lambda dimension: (dimension["name"], dimension["value"]))
+    return {
+        "id": f"observation:{ordinal}",
+        "tool_call_id": f"diagnostic:{ordinal}",
+        "schema_version": item.get("schema_version"),
+        "tool": item.get("tool"),
+        "query_key": item.get("query_key"),
+        "query_fingerprint": item.get("query_fingerprint"),
+        "status": item.get("status"),
+        "region": _public_contract_label(item.get("region"), fallback="redacted-region"),
+        "metric": {
+            "namespace": _public_contract_label(
+                metric.get("namespace"),
+                fallback="redacted/metric",
+            ),
+            "name": _public_contract_label(metric.get("name"), fallback="redacted-metric"),
+            "dimensions": dimensions,
+            "statistic": metric.get("statistic"),
+            "unit": metric.get("unit"),
+            "period_seconds": metric.get("period_seconds"),
+        },
+        "window": item.get("window"),
+        "datapoints": item.get("datapoints"),
+        "datapoint_count": item.get("datapoint_count"),
+        "truncated": item.get("truncated"),
+    }
+
+
+def _public_model_request(
+    item: dict[str, Any],
+    *,
+    memories: list[dict[str, Any]],
+    diagnostic_calls_used: int,
+    allowed_query_keys: set[str],
+) -> dict[str, Any]:
+    prompt_invariant = (
+        "Public controlled replay input.\n"
+        f"{GOVERNED_MEMORY_PROMPT_MARKER}\n"
+        "All non-memory inputs are bound by the invariant envelope digest."
+    )
+    memory_block = (
+        "\n".join(
+            f"{ordinal}. {json.dumps(memory['memory'], sort_keys=True)}"
+            for ordinal, memory in enumerate(memories, start=1)
+        )
+        if memories
+        else "No prior memories were recalled."
+    )
+    recalled_memory_ids = {
+        str(memory["memory"].get("memory_id") or memory["memory"].get("id"))
+        for memory in memories
+        if isinstance(memory.get("memory"), dict)
+        and (memory["memory"].get("memory_id") or memory["memory"].get("id"))
+    }
+    decision_contract = item.get("decision_contract")
+    response_schema = (
+        controlled_action_selection_provider_schema(
+            contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT
+        )
+        if decision_contract == "ControlledActionSelectionV1"
+        else agent_decision_provider_schema(
+            recalled_memory_ids=recalled_memory_ids,
+            allowed_query_keys=allowed_query_keys,
+            diagnostic_calls_used=diagnostic_calls_used,
+            diagnostic_observation_available=False,
+            model_turn=int(item.get("logical_turn")),
+            operational_action_contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+        )
+    )
+    return {
+        "schema_version": item.get("schema_version"),
+        "attempt": item.get("attempt"),
+        "repair_reason": (
+            "redacted_repair_reason" if item.get("repair_reason") is not None else None
+        ),
+        "logical_turn": item.get("logical_turn"),
+        "provider": _public_contract_label(item.get("provider"), fallback="redacted-provider"),
+        "model": _public_contract_label(item.get("model"), fallback="redacted-model"),
+        "system": "Controlled replay system prompt; public text redacted.",
+        "prompt": prompt_invariant.replace(GOVERNED_MEMORY_PROMPT_MARKER, memory_block),
+        "prompt_invariant": prompt_invariant,
+        "prompt_invariant_sha256": text_sha256(prompt_invariant),
+        "temperature": item.get("temperature"),
+        "max_output_tokens": item.get("max_output_tokens"),
+        "routing_key": item.get("routing_key"),
+        "decision_contract": decision_contract,
+        "response_schema_version": item.get("response_schema_version"),
+        "response_json_schema": response_schema,
+    }
+
+
+def _public_operation_effect(item: dict[str, Any], *, ordinal: int) -> dict[str, Any]:
+    return {
+        "sequence": ordinal,
+        "effect_type": _public_contract_label(
+            item.get("effect_type"),
+            fallback="redacted-effect",
+        ),
+        "source_memory_id": (
+            _public_identifier(item.get("source_memory_id"), kind="memory")
+            if item.get("source_memory_id") is not None
+            else None
+        ),
+        "result_memory_id": (
+            _public_identifier(item.get("result_memory_id"), kind="memory")
+            if item.get("result_memory_id") is not None
+            else None
+        ),
+        "belief_id": (
+            _public_identifier(item.get("belief_id"), kind="belief")
+            if item.get("belief_id") is not None
+            else None
+        ),
+        "namespace": "[redacted-namespace]",
+    }
+
+
+def _model_request_invariant(request: dict[str, Any]) -> dict[str, Any]:
+    schema = request.get("response_json_schema")
+    if not isinstance(schema, dict):
+        raise AgentDecisionError("controlled model request omitted its response schema")
+    normalized_schema = json.loads(json.dumps(schema, sort_keys=True))
+    definitions = normalized_schema.get("$defs")
+    if isinstance(definitions, dict):
+        definitions["MemoryCitation"] = {
+            "bound_to": "permitted_intervention.ordered_memory_versions"
+        }
+    properties = normalized_schema.get("properties")
+    if isinstance(properties, dict):
+        properties["recalled_memory_citations"] = {
+            "bound_to": "permitted_intervention.ordered_memory_versions"
+        }
+    return {
+        key: request.get(key)
+        for key in (
+            "schema_version",
+            "attempt",
+            "repair_reason",
+            "logical_turn",
+            "provider",
+            "model",
+            "system",
+            "prompt_invariant",
+            "prompt_invariant_sha256",
+            "temperature",
+            "max_output_tokens",
+            "routing_key",
+            "decision_contract",
+            "response_schema_version",
+        )
+    } | {"response_json_schema": normalized_schema}
 
 
 def _validate_approval(

@@ -27,6 +27,11 @@ requires_browser = pytest.mark.skipif(
     reason="browser URL and operator identity are not configured",
 )
 
+requires_local_browser_fixture = pytest.mark.skipif(
+    not BASE_URL or not LOCAL_AUTH_AUTO,
+    reason="local browser fixture shell is not configured",
+)
+
 requires_hosted_remediation = pytest.mark.skipif(
     os.environ.get("RUN_HOSTED_ACCEPTANCE") != "1"
     or not BASE_URL
@@ -66,6 +71,34 @@ CONTROLLED_DIAGNOSTIC_CONTRACTS = {
         "elevated_floor": 8.0,
     },
 }
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    [
+        ("changed", "changed"),
+        ("unchanged", "unchanged"),
+        ("unavailable", "unavailable"),
+        ("mismatched", "changed"),
+        ("corrected-only", "unavailable"),
+    ],
+)
+def test_causal_evidence_browser_fixture_states_are_distinct(state, expected_status):
+    from tests.local_product_app import causal_evidence_browser_fixture
+
+    fixture = causal_evidence_browser_fixture(state)
+
+    assert fixture["scenario_id"] == f"browser-fixture-{state}"
+    assert fixture["action_comparison"]["status"] == expected_status
+    assert fixture["causal_evidence"]["scope"] == "recommendation_only"
+    if state == "corrected-only":
+        assert fixture["action_comparison"]["before"] is None
+        assert fixture["causal_evidence"]["before_envelope_sha256"] is None
+    elif state == "unavailable":
+        assert "causal_envelope" not in fixture["runs"][1]["action_trace"]
+    else:
+        assert fixture["causal_evidence"]["before_envelope_sha256"]
+        assert fixture["causal_evidence"]["after_envelope_sha256"]
 
 
 def test_signature_trace_selected_action_id_follows_valid_modes():
@@ -561,6 +594,93 @@ def test_firefox_uses_remote_isolated_service_when_configured(monkeypatch, tmp_p
     assert sleeps == [2]
     evidence = json.loads((tmp_path / "firefox-startup.json").read_text())
     assert evidence["failures"][0]["error"].startswith("TimeoutError:")
+
+
+@pytest.mark.parametrize(
+    ("state", "label"),
+    [
+        ("changed", "Controlled action change"),
+        ("unchanged", "Controlled action unchanged"),
+        ("unavailable", "Evidence unavailable"),
+        ("mismatched", "Invariant mismatch"),
+        ("corrected-only", "Corrected result only"),
+    ],
+)
+@requires_local_browser_fixture
+def test_causal_evidence_states_render_fail_closed_in_browser(state, label):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as expected
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    driver = _start_firefox_driver()
+    wait = WebDriverWait(driver, 45)
+    try:
+        driver.set_window_size(1440, 1000)
+        driver.get(_browser_scenario_url(f"browser-fixture-{state}"))
+        panel = wait.until(
+            expected.presence_of_element_located(
+                (By.CSS_SELECTOR, f'.causal-evidence[data-evidence-state="{state}"]')
+            )
+        )
+        _capture_console_errors(driver)
+
+        assert panel.get_attribute("data-evidence-state") == state
+        assert label.casefold() in panel.text.casefold()
+        assert "recommendation behavior only" in panel.text.casefold()
+        assert "service recovered" not in panel.text.casefold()
+
+        if state == "changed":
+            before_memories = panel.find_element(
+                By.CSS_SELECTOR,
+                'table[aria-label="Before correction allowed memory versions"]',
+            )
+            after_memories = panel.find_element(
+                By.CSS_SELECTOR,
+                'table[aria-label="After correction allowed memory versions"]',
+            )
+            assert "memory-compromised" in before_memories.text
+            assert "memory-restored" in after_memories.text
+            delta = panel.find_element(By.CSS_SELECTOR, 'table[aria-label="Allowed memory delta"]')
+            assert delta.find_element(
+                By.CSS_SELECTOR, 'tr[data-delta-status="removed"]'
+            ).get_attribute("data-memory-id") == "memory-compromised"
+            assert delta.find_element(
+                By.CSS_SELECTOR, 'tr[data-delta-status="added"]'
+            ).get_attribute("data-memory-id") == "memory-restored"
+            assert "2026-07-17T10:30:00Z" in panel.find_element(
+                By.CSS_SELECTOR, ".declared-intervention"
+            ).text
+            assert "reasserted" in panel.find_element(
+                By.CSS_SELECTOR, 'table[aria-label="Correction operation effects"]'
+            ).text
+            assert panel.find_element(
+                By.CSS_SELECTOR, '.post-correction-exclusion[data-proof-status="proven"]'
+            )
+        elif state == "unchanged":
+            assert "catalog action unchanged" in panel.text.casefold()
+            assert "controlled action change" not in panel.text.casefold()
+        elif state == "unavailable":
+            assert "Complete telemetry unavailable" in panel.text
+            assert "Correction binding unavailable" in panel.text
+            assert panel.find_element(
+                By.CSS_SELECTOR, '.post-correction-exclusion[data-proof-status="unavailable"]'
+            )
+        elif state == "mismatched":
+            assert panel.find_element(
+                By.CSS_SELECTOR, 'tr[data-check-status="mismatched"]'
+            )
+            assert "controlled action change" not in panel.text.casefold()
+        else:
+            before = panel.find_elements(By.CSS_SELECTOR, ".causal-envelope-details")[0]
+            assert "Complete telemetry unavailable" in before.text
+            assert "memory-restored" in panel.find_element(
+                By.CSS_SELECTOR,
+                'table[aria-label="After correction allowed memory versions"]',
+            ).text
+            assert "controlled action" not in panel.text.casefold()
+        _assert_no_browser_errors(driver)
+    finally:
+        driver.quit()
 
 
 @requires_browser
@@ -2577,6 +2697,15 @@ def _browser_url(*, namespace: str, as_of: str | None = None) -> str:
         query.pop("as_of", None)
     else:
         query["as_of"] = as_of
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _browser_scenario_url(scenario_id: str) -> str:
+    parts = urlsplit(BASE_URL)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("namespace", None)
+    query.pop("as_of", None)
+    query["scenario_id"] = scenario_id
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 

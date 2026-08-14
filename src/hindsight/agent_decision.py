@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from hindsight.causal_evidence import CausalEvidenceError, strict_json_loads
+
 
 AGENT_DECISION_SCHEMA_VERSION = 2
 CONTROLLED_ACTION_DECISION_SCHEMA_VERSION = 3
@@ -18,7 +20,36 @@ MAX_DIAGNOSTIC_CALLS = 3
 CLOUDWATCH_DIAGNOSTIC_TOOL = "aws_cloudwatch_diagnostics"
 MIN_CITATION_QUOTE_LENGTH = 12
 PAYMENTS_OPERATIONAL_ACTION_CONTRACT = "payments_retry_amplification.v1"
+PAYMENTS_OPERATIONAL_ACTION_CATALOG_ID = "payments_retry_amplification.actions.v1"
 PrimaryOperationalAction = Literal["scale_workers", "throttle_retries", "inspect_only"]
+PAYMENTS_OPERATIONAL_ACTIONS: tuple[PrimaryOperationalAction, ...] = (
+    "scale_workers",
+    "throttle_retries",
+    "inspect_only",
+)
+_ACTION_DIRECTIVES = {
+    "scale_workers": "Scale payment workers.",
+    "throttle_retries": "Throttle retry fanout.",
+    "inspect_only": "Inspect current telemetry.",
+}
+CONTROLLED_ACTION_DIAGNOSIS = (
+    "The recorded telemetry and governed memory support one catalog classification."
+)
+CONTROLLED_ACTION_RATIONALE = (
+    "This classification is evidence for operator review and executes no operational change."
+)
+CONTROLLED_ACTION_SELECTION_RATIONALES = (
+    "Recorded evidence supports this catalog selection.",
+    "The current telemetry supports the selected catalog action.",
+    "The recorded evidence is consistent with this catalog classification.",
+)
+CONTROLLED_ACTION_ROLLBACK = (
+    "No rollback is required because this workflow executes no operational change."
+)
+CONTROLLED_ACTION_VERIFICATION = (
+    "Review the recorded telemetry, memory versions, and action fingerprint before acting."
+)
+CONTROLLED_ACTION_SAFETY_CONSTRAINT = "Treat this as recommendation evidence only."
 
 
 class AgentDecisionError(RuntimeError):
@@ -70,13 +101,42 @@ class RetractRecalledMemoryAction(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class OperationalActionParameters(BaseModel):
+    """The controlled catalog currently permits no free-form action parameters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class OperationalAction(BaseModel):
     """One model-produced, comparison-safe operator action classification."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+    catalog_id: Literal["payments_retry_amplification.actions.v1"]
     contract: Literal["payments_retry_amplification.v1"]
-    primary_action: PrimaryOperationalAction
+    action_id: PrimaryOperationalAction
+    disposition: Literal["recommend"]
+    parameters: OperationalActionParameters
+
+    @model_validator(mode="after")
+    def validate_server_catalog(self) -> OperationalAction:
+        catalog = operational_action_catalog(self.contract)
+        if self.catalog_id != catalog["catalog_id"]:
+            raise ValueError("operational action catalog does not match its contract")
+        if self.action_id not in catalog["actions"]:
+            raise ValueError("operational action is not in the server-owned catalog")
+        return self
+
+
+class ControlledActionSelection(BaseModel):
+    """The complete model-authored surface for a controlled terminal action."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    action_id: PrimaryOperationalAction
+    disposition: Literal["recommend"]
+    parameters: OperationalActionParameters
+    rationale: str = Field(min_length=1, max_length=4_000)
 
 
 class AgentDecisionV1(BaseModel):
@@ -177,7 +237,119 @@ class AgentDecisionV3(AgentDecisionV2):
 
 AGENT_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV2.model_json_schema()
 CONTROLLED_ACTION_DECISION_JSON_SCHEMA: dict[str, Any] = AgentDecisionV3.model_json_schema()
+CONTROLLED_ACTION_SELECTION_JSON_SCHEMA: dict[str, Any] = (
+    ControlledActionSelection.model_json_schema()
+)
 _PROVIDER_BRANCH_FIELDS = ("tool_call", "recommendation", "remediation_action")
+
+
+def controlled_action_selection_provider_schema(*, contract: str) -> dict[str, Any]:
+    """Return the exact four-field schema exposed to a controlled terminal call."""
+
+    catalog = operational_action_catalog(contract)
+    schema = deepcopy(CONTROLLED_ACTION_SELECTION_JSON_SCHEMA)
+    schema["properties"]["action_id"]["enum"] = list(catalog["actions"])
+    schema["properties"]["rationale"]["enum"] = list(
+        CONTROLLED_ACTION_SELECTION_RATIONALES
+    )
+    _replace_provider_consts(schema)
+    return schema
+
+
+def parse_controlled_action_selection(
+    text: str,
+    *,
+    contract: str,
+) -> ControlledActionSelection:
+    """Parse the narrow model selection and reject contradictory rationale."""
+
+    operational_action_catalog(contract)
+    try:
+        selection = ControlledActionSelection.model_validate(strict_json_loads(text))
+    except (CausalEvidenceError, ValidationError, TypeError) as exc:
+        raise AgentDecisionError(
+            "model response did not satisfy ControlledActionSelectionV1"
+        ) from exc
+    _validate_controlled_selection_rationale(selection)
+    return selection
+
+
+def controlled_action_selection_from_payload(
+    payload: Mapping[str, Any],
+) -> ControlledActionSelection:
+    """Validate a persisted four-field controlled selection."""
+
+    selection = ControlledActionSelection.model_validate(payload)
+    _validate_controlled_selection_rationale(selection)
+    return selection
+
+
+def canonicalize_operational_action(
+    selection: ControlledActionSelection | Mapping[str, Any],
+    *,
+    contract: str,
+) -> OperationalAction:
+    """Inject server-owned catalog identity around one model selection."""
+
+    validated = (
+        selection
+        if isinstance(selection, ControlledActionSelection)
+        else controlled_action_selection_from_payload(selection)
+    )
+    catalog = operational_action_catalog(contract)
+    return OperationalAction.model_validate(
+        {
+            "catalog_id": catalog["catalog_id"],
+            "contract": catalog["contract"],
+            "action_id": validated.action_id,
+            "disposition": validated.disposition,
+            "parameters": validated.parameters.model_dump(mode="json"),
+        }
+    )
+
+
+def controlled_decision_from_selection(
+    selection: ControlledActionSelection | Mapping[str, Any],
+    *,
+    contract: str,
+) -> AgentDecisionV3:
+    """Create the canonical internal decision without trusting model directive prose."""
+
+    validated = (
+        selection
+        if isinstance(selection, ControlledActionSelection)
+        else controlled_action_selection_from_payload(selection)
+    )
+    action = canonicalize_operational_action(validated, contract=contract)
+    return AgentDecisionV3(
+        schema_version=CONTROLLED_ACTION_DECISION_SCHEMA_VERSION,
+        diagnosis=CONTROLLED_ACTION_DIAGNOSIS,
+        recalled_memory_citations=[],
+        next_step_kind="recommendation",
+        tool_call=None,
+        recommendation=operational_action_directive(action),
+        remediation_action=None,
+        operational_action=action,
+        rationale=validated.rationale,
+        rollback=CONTROLLED_ACTION_ROLLBACK,
+        verification=[CONTROLLED_ACTION_VERIFICATION],
+        safety_constraints=[CONTROLLED_ACTION_SAFETY_CONSTRAINT],
+    )
+
+
+def controlled_action_selection_from_decision(
+    decision: AgentDecisionV3,
+) -> ControlledActionSelection:
+    """Project the original four model-authored fields from an internal decision."""
+
+    if decision.operational_action is None:
+        raise AgentDecisionError("controlled decision omitted its operational action")
+    return ControlledActionSelection(
+        action_id=decision.operational_action.action_id,
+        disposition=decision.operational_action.disposition,
+        parameters=decision.operational_action.parameters,
+        rationale=decision.rationale,
+    )
 
 
 def agent_decision_provider_schema(
@@ -202,15 +374,61 @@ def agent_decision_provider_schema(
     if operational_action_contract not in {None, PAYMENTS_OPERATIONAL_ACTION_CONTRACT}:
         raise ValueError("unsupported operational action contract")
     controlled_action = operational_action_contract is not None
+    if controlled_action and (
+        not allowed_query_keys
+        or diagnostic_observation_available
+        or diagnostic_calls_used >= MAX_DIAGNOSTIC_CALLS
+        or model_turn >= MAX_MODEL_TURNS
+    ):
+        raise ValueError(
+            "controlled AgentDecisionV3 is diagnostic-only; use ControlledActionSelectionV1"
+        )
     schema = deepcopy(
-        CONTROLLED_ACTION_DECISION_JSON_SCHEMA
-        if controlled_action
-        else AGENT_DECISION_JSON_SCHEMA
+        CONTROLLED_ACTION_DECISION_JSON_SCHEMA if controlled_action else AGENT_DECISION_JSON_SCHEMA
     )
     schema.pop("anyOf", None)
     properties = schema["properties"]
     definitions = schema["$defs"]
     required = schema["required"]
+
+    controlled_recommendations: list[str] | None = None
+    if controlled_action:
+        catalog = operational_action_catalog(operational_action_contract)
+        action_properties = definitions["OperationalAction"]["properties"]
+        action_properties["catalog_id"]["enum"] = [catalog["catalog_id"]]
+        action_properties["contract"]["enum"] = [catalog["contract"]]
+        action_properties["action_id"]["enum"] = list(catalog["actions"])
+        controlled_recommendations = list(catalog["directives"].values())
+        properties["diagnosis"]["enum"] = [CONTROLLED_ACTION_DIAGNOSIS]
+        properties["rationale"]["enum"] = [CONTROLLED_ACTION_RATIONALE]
+        properties["rollback"]["enum"] = [CONTROLLED_ACTION_ROLLBACK]
+        properties["verification"].update(
+            {
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {"type": "string", "enum": [CONTROLLED_ACTION_VERIFICATION]},
+            }
+        )
+        properties["safety_constraints"].update(
+            {
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {
+                    "type": "string",
+                    "enum": [CONTROLLED_ACTION_SAFETY_CONSTRAINT],
+                },
+            }
+        )
+
+    def recommendation_schema() -> dict[str, Any]:
+        field_schema: dict[str, Any] = {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4_000,
+        }
+        if controlled_recommendations is not None:
+            field_schema["enum"] = controlled_recommendations
+        return field_schema
 
     def omit_field(name: str) -> None:
         properties.pop(name, None)
@@ -269,7 +487,7 @@ def agent_decision_provider_schema(
         allow_optional_field("tool_call", {"$ref": "#/$defs/DiagnosticToolCall"})
         allow_optional_field(
             "recommendation",
-            {"type": "string", "minLength": 1, "maxLength": 4_000},
+            recommendation_schema(),
         )
         if action_available:
             allow_optional_field(
@@ -292,7 +510,7 @@ def agent_decision_provider_schema(
         if action_available:
             allow_optional_field(
                 "recommendation",
-                {"type": "string", "minLength": 1, "maxLength": 4_000},
+                recommendation_schema(),
             )
             allow_optional_field(
                 "remediation_action",
@@ -301,11 +519,7 @@ def agent_decision_provider_schema(
         else:
             require_field(
                 "recommendation",
-                {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4_000,
-                },
+                recommendation_schema(),
             )
             omit_field("remediation_action")
         if controlled_action:
@@ -334,8 +548,8 @@ def normalize_agent_decision_provider_text(text: str) -> str:
     """Restore omitted branch siblings before the strict decision parser runs."""
 
     try:
-        payload = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
+        payload = strict_json_loads(text)
+    except (CausalEvidenceError, TypeError):
         return text
     if not isinstance(payload, dict):
         return text
@@ -361,7 +575,7 @@ def parse_agent_decision(
     """Parse and enforce constraints that cannot be represented in JSON Schema."""
 
     try:
-        payload = json.loads(text)
+        payload = strict_json_loads(text)
         if operational_action_contract is None:
             decision: AgentDecisionV2 | AgentDecisionV3 = AgentDecisionV2.model_validate(payload)
             schema_name = "AgentDecisionV2"
@@ -370,11 +584,16 @@ def parse_agent_decision(
             schema_name = "AgentDecisionV3"
         else:
             raise ValueError("unsupported operational action contract")
-    except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+    except (CausalEvidenceError, ValidationError, TypeError) as exc:
         schema_name = (
             "AgentDecisionV3" if operational_action_contract is not None else "AgentDecisionV2"
         )
         raise AgentDecisionError(f"model response did not satisfy {schema_name}") from exc
+
+    if operational_action_contract is not None and decision.next_step_kind != "diagnostic_tool":
+        raise AgentDecisionError(
+            "controlled AgentDecisionV3 is diagnostic-only; use ControlledActionSelectionV1"
+        )
 
     cited_ids = [citation.memory_id for citation in decision.recalled_memory_citations]
     if len(cited_ids) != len(set(cited_ids)):
@@ -405,6 +624,8 @@ def parse_agent_decision(
         cited = {citation.memory_id for citation in decision.recalled_memory_citations}
         if decision.remediation_action.target_memory_id not in cited:
             raise AgentDecisionError("remediation target must be cited verbatim")
+    if isinstance(decision, AgentDecisionV3) and decision.operational_action is not None:
+        _validate_controlled_action_text(decision)
 
     return decision
 
@@ -413,7 +634,10 @@ def agent_decision_from_payload(payload: Mapping[str, Any]) -> AgentDecisionV2 |
     """Load current decisions while preserving resumability of V1 checkpoints."""
 
     if payload.get("schema_version") == 3:
-        return AgentDecisionV3.model_validate(payload)
+        decision = AgentDecisionV3.model_validate(payload)
+        if decision.operational_action is not None:
+            _validate_controlled_action_text(decision)
+        return decision
     if payload.get("schema_version") == 2:
         return AgentDecisionV2.model_validate(payload)
     legacy = AgentDecisionV1.model_validate(payload)
@@ -487,8 +711,62 @@ def operational_action_fingerprint(
 ) -> str:
     """Return a stable identity for a validated operational action."""
 
-    validated = action if isinstance(action, OperationalAction) else OperationalAction.model_validate(action)
+    validated = (
+        action
+        if isinstance(action, OperationalAction)
+        else OperationalAction.model_validate(action)
+    )
     return f"operational_action:{_digest(validated.model_dump(mode='json'))}"
+
+
+def operational_action_catalog(contract: str) -> dict[str, Any]:
+    """Return the immutable server-owned selection catalog for one contract."""
+
+    if contract != PAYMENTS_OPERATIONAL_ACTION_CONTRACT:
+        raise ValueError("unsupported operational action contract")
+    return {
+        "catalog_id": PAYMENTS_OPERATIONAL_ACTION_CATALOG_ID,
+        "contract": PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+        "actions": list(PAYMENTS_OPERATIONAL_ACTIONS),
+        "directives": dict(_ACTION_DIRECTIVES),
+    }
+
+
+def operational_action_directive(action: OperationalAction | Mapping[str, Any]) -> str:
+    """Render the directive from the server catalog, never from model prose."""
+
+    validated = (
+        action
+        if isinstance(action, OperationalAction)
+        else OperationalAction.model_validate(action)
+    )
+    return _ACTION_DIRECTIVES[validated.action_id]
+
+
+def _validate_controlled_action_text(decision: AgentDecisionV3) -> None:
+    action = decision.operational_action
+    assert action is not None
+    if (
+        decision.recommendation != operational_action_directive(action)
+        or decision.diagnosis != CONTROLLED_ACTION_DIAGNOSIS
+        or decision.rollback != CONTROLLED_ACTION_ROLLBACK
+        or decision.verification != [CONTROLLED_ACTION_VERIFICATION]
+        or decision.safety_constraints != [CONTROLLED_ACTION_SAFETY_CONSTRAINT]
+    ):
+        raise AgentDecisionError("recommendation prose contradicts server-owned operational action")
+    selection = controlled_action_selection_from_decision(decision)
+    _validate_controlled_selection_rationale(selection)
+
+
+def _validate_controlled_selection_rationale(
+    selection: ControlledActionSelection,
+) -> None:
+    """Accept only neutral explanatory prose that cannot encode a directive."""
+
+    if selection.rationale not in CONTROLLED_ACTION_SELECTION_RATIONALES:
+        raise AgentDecisionError(
+            "controlled action rationale is outside server-approved explanatory prose"
+        )
 
 
 def remediation_action_id(

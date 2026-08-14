@@ -8,6 +8,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const styles = fs.readFileSync(path.join(root, "src/styles.css"), "utf8");
 const visibleSources = [
   "src/App.tsx",
+  "src/components/causal-evidence-panel.tsx",
   "src/components/cockpit.tsx",
   "src/components/identity-access.tsx",
   "src/components/operator-console.tsx",

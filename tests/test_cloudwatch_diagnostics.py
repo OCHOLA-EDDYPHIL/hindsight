@@ -50,7 +50,11 @@ def _config(queries=None):
 
 
 def test_exact_allowlisted_query_returns_deterministic_bounded_observation():
-    from hindsight.cloudwatch_diagnostics import CloudWatchCallBudget, CloudWatchDiagnostics
+    from hindsight.cloudwatch_diagnostics import (
+        CloudWatchCallBudget,
+        CloudWatchDiagnostics,
+        cloudwatch_query_fingerprint,
+    )
 
     client = FakeCloudWatch(
         {
@@ -73,7 +77,7 @@ def test_exact_allowlisted_query_returns_deterministic_bounded_observation():
     config = _config(
         {
             "worker.errors": _query(metric_name="Errors", statistic="Sum"),
-            "worker.duration": _query(),
+            "worker.duration": _query(unit="Milliseconds"),
         }
     )
     diagnostics = CloudWatchDiagnostics(
@@ -106,12 +110,18 @@ def test_exact_allowlisted_query_returns_deterministic_bounded_observation():
             "EndTime": datetime(2026, 8, 9, 10, 7, tzinfo=UTC),
             "Period": 60,
             "Statistics": ["Maximum"],
+            "Unit": "Milliseconds",
         }
     ]
     assert observation == {
         "schema_version": 1,
         "tool": "aws_cloudwatch_diagnostics",
         "query_key": "worker.duration",
+        "query_fingerprint": cloudwatch_query_fingerprint(
+            config=config,
+            query_key="worker.duration",
+            query=config.queries["worker.duration"],
+        ),
         "status": "available",
         "region": "us-east-1",
         "metric": {
@@ -122,6 +132,7 @@ def test_exact_allowlisted_query_returns_deterministic_bounded_observation():
                 {"name": "Stage", "value": "demo"},
             ],
             "statistic": "Maximum",
+            "unit": "Milliseconds",
             "period_seconds": 60,
         },
         "window": {
@@ -136,6 +147,42 @@ def test_exact_allowlisted_query_returns_deterministic_bounded_observation():
         "datapoint_count": 2,
         "truncated": False,
     }
+
+
+def test_replay_anchor_pins_repeated_reads_to_the_same_metric_window():
+    from hindsight.cloudwatch_diagnostics import CloudWatchCallBudget, CloudWatchDiagnostics
+
+    client = FakeCloudWatch(
+        {
+            "Datapoints": [
+                {
+                    "Timestamp": datetime(2026, 8, 9, 10, 6, tzinfo=UTC),
+                    "Maximum": 8.0,
+                }
+            ]
+        }
+    )
+    diagnostics = CloudWatchDiagnostics(
+        _config(),
+        client=client,
+        clock=lambda: datetime(2030, 1, 1, tzinfo=UTC),
+    )
+    anchor = datetime(2026, 8, 9, 10, 7, 42, tzinfo=UTC)
+
+    first = diagnostics.observe_at_replay_anchor(
+        "worker.duration",
+        budget=CloudWatchCallBudget(),
+        replay_anchor=anchor,
+    )
+    second = diagnostics.observe_at_replay_anchor(
+        "worker.duration",
+        budget=CloudWatchCallBudget(),
+        replay_anchor=anchor,
+    )
+
+    assert first == second
+    assert client.calls[0]["StartTime"] == client.calls[1]["StartTime"]
+    assert client.calls[0]["EndTime"] == client.calls[1]["EndTime"]
 
 
 def test_query_allowlist_is_immutable_and_unknown_keys_do_not_consume_budget():

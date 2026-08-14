@@ -12,7 +12,124 @@ import {
   StoryHeader,
   Timeline,
 } from "@/components/cockpit";
-import type { Run, SignatureScenario, Snapshot } from "@/types";
+import { CausalEvidencePanel } from "@/components/causal-evidence-panel";
+import type {
+  CausalEnvelope,
+  DiagnosticObservation,
+  OperationEffect,
+  Run,
+  SignatureScenario,
+  Snapshot,
+} from "@/types";
+
+const BEFORE_ENVELOPE_SHA = `sha256:${"1".repeat(64)}`;
+const AFTER_ENVELOPE_SHA = `sha256:${"2".repeat(64)}`;
+const COMPROMISED_MEMORY_SHA = `sha256:${"3".repeat(64)}`;
+const RESTORED_MEMORY_SHA = `sha256:${"4".repeat(64)}`;
+const COMPROMISED_FRAGMENT_SHA = `sha256:${"5".repeat(64)}`;
+const RESTORED_FRAGMENT_SHA = `sha256:${"6".repeat(64)}`;
+const BEFORE_SELECTION_FINGERPRINT = `selection:${"9".repeat(64)}`;
+const AFTER_SELECTION_FINGERPRINT = `selection:${"8".repeat(64)}`;
+
+const controlledObservation: DiagnosticObservation = {
+  id: "observation-controlled",
+  tool_call_id: "diagnostic-controlled",
+  schema_version: 1,
+  tool: "aws_cloudwatch_diagnostics",
+  query_key: "payments.retry_fanout",
+  query_fingerprint: `cloudwatch_query:${"b".repeat(64)}`,
+  region: "us-east-1",
+  metric: {
+    namespace: "Hindsight/ControlledIncidentTelemetry",
+    name: "RetryFanout",
+    dimensions: [{ name: "Service", value: "payments-api" }],
+    statistic: "Maximum",
+    unit: "Count",
+    period_seconds: 60,
+  },
+  window: {
+    start: "2026-07-17T10:15:00Z",
+    end: "2026-07-17T10:30:00Z",
+    seconds: 900,
+  },
+  datapoints: [
+    { timestamp: "2026-07-17T10:28:00Z", value: 7 },
+    { timestamp: "2026-07-17T10:29:00Z", value: 8 },
+  ],
+  datapoint_count: 2,
+  truncated: false,
+};
+
+const correctionEffects: OperationEffect[] = [
+  {
+    sequence: 1,
+    effect_type: "closed",
+    source_memory_id: "memory-compromised",
+    result_memory_id: null,
+    belief_id: "belief-payments-guidance",
+    namespace: "demo:payments-poison-rewind:session:49109a44",
+  },
+  {
+    sequence: 2,
+    effect_type: "reasserted",
+    source_memory_id: "memory-baseline",
+    result_memory_id: "memory-restored",
+    belief_id: "belief-payments-guidance",
+    namespace: "demo:payments-poison-rewind:session:49109a44",
+  },
+];
+
+function controlledEnvelope(afterCorrection: boolean): CausalEnvelope {
+  const memoryId = afterCorrection ? "memory-restored" : "memory-compromised";
+  const memorySha = afterCorrection ? RESTORED_MEMORY_SHA : COMPROMISED_MEMORY_SHA;
+  const fragmentSha = afterCorrection ? RESTORED_FRAGMENT_SHA : COMPROMISED_FRAGMENT_SHA;
+  return {
+    schema_version: 4,
+    canonicalization: "hindsight.canonical-json.v1",
+    identity: {
+      scenario_id: "49109a44-43e7-40de-b547-b4f9d0a387a2",
+      namespace: "demo:payments-poison-rewind:session:49109a44",
+      replay_anchor: "2026-07-17T10:30:00Z",
+      scenario_routing_key: "signature:controlled",
+      release_revision: "a".repeat(40),
+    },
+    invariant_inputs: {
+      ordered_observations: [structuredClone(controlledObservation)],
+      release_revision: "a".repeat(40),
+    },
+    invariant_inputs_sha256: `sha256:${"7".repeat(64)}`,
+    permitted_intervention: {
+      kind: "governed_memory_version_selection.v1",
+      ordered_memory_versions: [
+        {
+          ordinal: 1,
+          memory: {
+            memory_id: memoryId,
+            belief_id: "belief-payments-guidance",
+            version: afterCorrection ? 3 : 2,
+          },
+          memory_sha256: memorySha,
+          prompt_fragment_sha256: fragmentSha,
+        },
+      ],
+      selection_fingerprint: afterCorrection
+        ? AFTER_SELECTION_FINGERPRINT
+        : BEFORE_SELECTION_FINGERPRINT,
+      expected_changed_prompt_fragments: [fragmentSha],
+      correction_operation_id: afterCorrection ? "operation-rewind" : null,
+      correction_target_timestamp: afterCorrection ? "2026-07-17T10:30:00Z" : null,
+      operation_effects: afterCorrection ? structuredClone(correctionEffects) : [],
+      invalidated_memory_fingerprints: afterCorrection
+        ? [`sha256:${"c".repeat(64)}`]
+        : [],
+      restored_memory_fingerprints: afterCorrection
+        ? [`sha256:${"d".repeat(64)}`]
+        : [],
+    },
+    rendered_prompt_sha256: [afterCorrection ? RESTORED_FRAGMENT_SHA : COMPROMISED_FRAGMENT_SHA],
+    envelope_sha256: afterCorrection ? AFTER_ENVELOPE_SHA : BEFORE_ENVELOPE_SHA,
+  };
+}
 
 const scenario: SignatureScenario = {
   scenario_id: "49109a44-43e7-40de-b547-b4f9d0a387a2",
@@ -50,6 +167,8 @@ const scenario: SignatureScenario = {
           {
             id: "read-compromised",
             memory_id: "memory-compromised",
+            belief_id: "belief-payments-guidance",
+            version_number: 2,
             retrieval_id: "retrieval-rejected",
             embedding_profile_id: "profile-gemini-001",
             writer: "demo.fixture-import",
@@ -60,7 +179,7 @@ const scenario: SignatureScenario = {
         ],
       },
       action_trace: {
-        schema_version: 3,
+        schema_version: 4,
         mode: "recommendation_only",
         selection: {
           fingerprint: "b".repeat(64),
@@ -72,31 +191,29 @@ const scenario: SignatureScenario = {
           summary: "Scale payment workers while retry fanout remains elevated.",
           status: "awaiting_approval",
           operational_action: {
+            catalog_id: "payments_retry_amplification.actions.v1",
             contract: "payments_retry_amplification.v1",
+            action_id: "scale_workers",
+            disposition: "recommend",
+            parameters: {},
             primary_action: "scale_workers",
+            directive: "Scale payment workers.",
+            consistency_status: "consistent",
             fingerprint: "operational_action:before",
           },
         },
         execution: { status: "not_executed", mode: "recommendation_only" },
+        observation_fingerprint: `telemetry:${"e".repeat(64)}`,
+        causal_envelope: controlledEnvelope(false),
         tool_calls: [
           {
-            id: "diagnostic-rejected",
+            id: "diagnostic-controlled",
             tool: "aws_cloudwatch_diagnostics",
             query_key: "payments.retry_fanout",
             status: "completed",
           },
         ],
-        observations: [
-          {
-            id: "observation-rejected",
-            tool_call_id: "diagnostic-rejected",
-            schema_version: 1,
-            tool: "aws_cloudwatch_diagnostics",
-            query_key: "payments.retry_fanout",
-            metric: { namespace: "Hindsight/ControlledIncidentTelemetry", name: "RetryFanout" },
-            datapoint_count: 12,
-          },
-        ],
+        observations: [structuredClone(controlledObservation)],
       },
     },
     {
@@ -119,7 +236,9 @@ const scenario: SignatureScenario = {
         reads: [
           {
             id: "read-baseline",
-            memory_id: "memory-baseline",
+            memory_id: "memory-restored",
+            belief_id: "belief-payments-guidance",
+            version_number: 3,
             retrieval_id: "retrieval-corrected",
             embedding_profile_id: "profile-gemini-002",
             writer: "demo.seed",
@@ -130,7 +249,7 @@ const scenario: SignatureScenario = {
         ],
       },
       action_trace: {
-        schema_version: 3,
+        schema_version: 4,
         mode: "recommendation_only",
         selection: {
           fingerprint: "d".repeat(64),
@@ -142,34 +261,29 @@ const scenario: SignatureScenario = {
           summary: "Throttle retry fanout while processor health recovers.",
           status: "awaiting_approval",
           operational_action: {
+            catalog_id: "payments_retry_amplification.actions.v1",
             contract: "payments_retry_amplification.v1",
+            action_id: "throttle_retries",
+            disposition: "recommend",
+            parameters: {},
             primary_action: "throttle_retries",
+            directive: "Throttle retry fanout.",
+            consistency_status: "consistent",
             fingerprint: "operational_action:after",
           },
         },
         execution: { status: "recommendation_approved", mode: "recommendation_only" },
+        observation_fingerprint: `telemetry:${"e".repeat(64)}`,
+        causal_envelope: controlledEnvelope(true),
         tool_calls: [
           {
-            id: "diagnostic-corrected",
+            id: "diagnostic-controlled",
             tool: "aws_cloudwatch_diagnostics",
-            query_key: "payments.processor_queue_depth",
+            query_key: "payments.retry_fanout",
             status: "completed",
           },
         ],
-        observations: [
-          {
-            id: "observation-corrected",
-            tool_call_id: "diagnostic-corrected",
-            schema_version: 1,
-            tool: "aws_cloudwatch_diagnostics",
-            query_key: "payments.processor_queue_depth",
-            metric: {
-              namespace: "Hindsight/ControlledIncidentTelemetry",
-              name: "ProcessorQueueDepth",
-            },
-            datapoint_count: 10,
-          },
-        ],
+        observations: [structuredClone(controlledObservation)],
       },
     },
   ],
@@ -177,26 +291,87 @@ const scenario: SignatureScenario = {
     id: "operation-rewind",
     operation_type: "rewind",
     status: "completed",
+    target_timestamp: "2026-07-17T10:30:00Z",
+    invalidated_memory_ids: ["memory-compromised"],
+    restored_memory_ids: ["memory-restored"],
+    effects: structuredClone(correctionEffects),
   },
+  operation_effects: structuredClone(correctionEffects),
   memories: [],
   action_comparison: {
     status: "changed",
     contract: "payments_retry_amplification.v1",
     before: {
       decision_id: "decision-rejected",
+      catalog_id: "payments_retry_amplification.actions.v1",
       contract: "payments_retry_amplification.v1",
+      action_id: "scale_workers",
+      disposition: "recommend",
+      parameters: {},
       primary_action: "scale_workers",
+      directive: "Scale payment workers.",
+      consistency_status: "consistent",
       fingerprint: "operational_action:before",
     },
     after: {
       decision_id: "decision-corrected",
+      catalog_id: "payments_retry_amplification.actions.v1",
       contract: "payments_retry_amplification.v1",
+      action_id: "throttle_retries",
+      disposition: "recommend",
+      parameters: {},
       primary_action: "throttle_retries",
+      directive: "Throttle retry fanout.",
+      consistency_status: "consistent",
       fingerprint: "operational_action:after",
     },
     context: { prompt_equal: true, normalized_telemetry_equal: true },
     memory_correction_proven: true,
     controlled_pair: true,
+  },
+  causal_evidence: {
+    schema_version: 1,
+    canonicalization: "hindsight.canonical-json.v1",
+    scope: "recommendation_only",
+    proof_states: {
+      memory_correction_proven: {
+        status: "proven",
+        reason: "rewind_lineage_and_reads_verified",
+      },
+      action_delta_proven: { status: "proven", reason: "catalog_action_changed" },
+      controlled_pair_eligible: {
+        status: "proven",
+        reason: "fixed_context_and_memory_delta_verified",
+      },
+      repeatable_causal_effect_supported: {
+        status: "unavailable",
+        reason: "repeated_trials_not_measured",
+      },
+      service_recovery_proven: {
+        status: "unavailable",
+        reason: "service_recovery_not_measured",
+      },
+    },
+    controlled_pair_checks: [
+      {
+        field: "invariant_inputs.ordered_observations",
+        status: "matched",
+        reason: "invariant_inputs_ordered_observations_matched",
+      },
+      {
+        field: "permitted_intervention.ordered_memory_versions",
+        status: "matched",
+        reason: "declared_memory_intervention_changed",
+      },
+    ],
+    before_envelope_sha256: BEFORE_ENVELOPE_SHA,
+    after_envelope_sha256: AFTER_ENVELOPE_SHA,
+    download: {
+      url: "/v1/signature-scenarios/49109a44-43e7-40de-b547-b4f9d0a387a2/evidence",
+      protected_url: "/v2/signature-scenarios/49109a44-43e7-40de-b547-b4f9d0a387a2/evidence",
+      sha256: `sha256:${"a".repeat(64)}`,
+      media_type: "application/json",
+    },
   },
   stages: {
     baseline_memory_id: "memory-baseline",
@@ -275,6 +450,181 @@ const remediationActionTrace: NonNullable<Run["action_trace"]> = {
 };
 
 describe("guided replay cockpit", () => {
+  it("renders digest-bound changed evidence with exact memory, operation, and exclusion proof", () => {
+    const onDownload = vi.fn();
+    const { container } = render(
+      <CausalEvidencePanel scenario={scenario} onDownload={onDownload} />,
+    );
+
+    expect(container.querySelector(".causal-evidence")).toHaveAttribute(
+      "data-evidence-state",
+      "changed",
+    );
+    expect(screen.getByText("Controlled action change")).toBeVisible();
+    const states = screen.getByRole("list", { name: "Causal evidence proof states" });
+    expect(within(states).getByText("Memory correction")).toBeVisible();
+    expect(within(states).getByText("Recommendation action delta")).toBeVisible();
+    expect(within(states).getByText("Repeatability")).toBeVisible();
+    expect(within(states).getByText("Service recovery")).toBeVisible();
+    expect(within(states).getAllByText("unavailable")).toHaveLength(2);
+    expect(screen.getByText(/recommendation behavior only/i)).toBeVisible();
+    expect(screen.getByText("Invariant comparison matrix")).toBeVisible();
+    expect(screen.getByText("invariant_inputs.ordered_observations")).toBeVisible();
+    expect(screen.getAllByText("2026-07-17T10:29:00Z")).toHaveLength(2);
+    expect(screen.getAllByText("Service=payments-api")).toHaveLength(2);
+    expect(screen.getAllByText("8")).toHaveLength(2);
+
+    const beforeMemories = screen.getByRole("table", {
+      name: "Before correction allowed memory versions",
+    });
+    expect(within(beforeMemories).getByText("memory-compromised")).toBeVisible();
+    expect(within(beforeMemories).getByText("belief-payments-guidance / v2")).toBeVisible();
+    expect(within(beforeMemories).getByText(COMPROMISED_MEMORY_SHA)).toBeVisible();
+    expect(within(beforeMemories).getByText(COMPROMISED_FRAGMENT_SHA)).toBeVisible();
+    expect(screen.getByText(BEFORE_SELECTION_FINGERPRINT)).toBeVisible();
+    const afterMemories = screen.getByRole("table", {
+      name: "After correction allowed memory versions",
+    });
+    expect(within(afterMemories).getByText("memory-restored")).toBeVisible();
+    expect(within(afterMemories).getByText("belief-payments-guidance / v3")).toBeVisible();
+    expect(within(afterMemories).getByText(RESTORED_MEMORY_SHA)).toBeVisible();
+    expect(screen.getByText(AFTER_SELECTION_FINGERPRINT)).toBeVisible();
+
+    const delta = screen.getByRole("table", { name: "Allowed memory delta" });
+    expect(within(delta).getByText("removed")).toBeVisible();
+    expect(within(delta).getByText("added")).toBeVisible();
+    const correction = screen.getByRole("region", { name: "Declared memory intervention" });
+    expect(correction).toHaveTextContent("operation-rewind");
+    expect(correction).toHaveTextContent("2026-07-17T10:30:00Z");
+    expect(correction).toHaveTextContent("memory-compromised");
+    expect(correction).toHaveTextContent("memory-restored");
+    const effects = screen.getByRole("table", { name: "Correction operation effects" });
+    expect(effects).toHaveTextContent("reasserted");
+    expect(effects).toHaveTextContent("demo:payments-poison-rewind:session:49109a44");
+    const exclusion = screen.getByRole("region", { name: "memory-compromised" });
+    expect(exclusion).toHaveAttribute("data-proof-status", "proven");
+    expect(exclusion).toHaveTextContent("After selection");
+    expect(exclusion).toHaveTextContent("verified");
+    fireEvent.click(screen.getByRole("button", { name: "Download JSON" }));
+    expect(onDownload).toHaveBeenCalledOnce();
+  });
+
+  it("renders an unchanged controlled comparison without claiming an action delta", () => {
+    const unchanged = structuredClone(scenario);
+    unchanged.action_comparison!.status = "unchanged";
+    unchanged.action_comparison!.after = {
+      ...unchanged.action_comparison!.before!,
+      decision_id: "decision-corrected",
+    };
+    unchanged.action_comparison!.controlled_pair = false;
+    unchanged.causal_evidence!.proof_states.action_delta_proven = {
+      status: "not_proven",
+      reason: "catalog_action_unchanged",
+    };
+    const { container } = render(
+      <CausalEvidencePanel scenario={unchanged} onDownload={vi.fn()} />,
+    );
+
+    expect(container.querySelector(".causal-evidence")).toHaveAttribute(
+      "data-evidence-state",
+      "unchanged",
+    );
+    expect(screen.getByText("Controlled action unchanged")).toBeVisible();
+    expect(screen.getByText("catalog action unchanged")).toBeVisible();
+  });
+
+  it("renders unavailable when a receipt digest does not bind an envelope", () => {
+    const unavailable = structuredClone(scenario);
+    delete unavailable.runs[1].action_trace!.causal_envelope;
+    unavailable.action_comparison!.status = "unavailable";
+    unavailable.action_comparison!.contract = null;
+    unavailable.action_comparison!.controlled_pair = false;
+    unavailable.causal_evidence!.proof_states.controlled_pair_eligible = {
+      status: "unavailable",
+      reason: "causal_envelope_incomplete_or_invalid",
+    };
+    unavailable.causal_evidence!.controlled_pair_checks = [{
+      field: "causal_envelope",
+      status: "unavailable",
+      reason: "causal_envelope_incomplete_or_invalid",
+    }];
+    const { container } = render(
+      <CausalEvidencePanel scenario={unavailable} onDownload={vi.fn()} />,
+    );
+
+    expect(container.querySelector(".causal-evidence")).toHaveAttribute(
+      "data-evidence-state",
+      "unavailable",
+    );
+    expect(screen.getByText("Evidence unavailable")).toBeVisible();
+    expect(screen.getAllByText("Complete telemetry unavailable")).toHaveLength(1);
+    expect(screen.getByText("Correction binding unavailable")).toBeVisible();
+    expect(screen.getByRole("region", { name: "memory-compromised" })).toHaveAttribute(
+      "data-proof-status",
+      "unavailable",
+    );
+  });
+
+  it("renders mismatched when any invariant differs even if an action flag says controlled", () => {
+    const mismatched = structuredClone(scenario);
+    mismatched.causal_evidence!.proof_states.controlled_pair_eligible = {
+      status: "not_proven",
+      reason: "invariant_inputs_ordered_observations_mismatch",
+    };
+    mismatched.causal_evidence!.controlled_pair_checks = [{
+      field: "invariant_inputs.ordered_observations",
+      status: "mismatched",
+      reason: "invariant_inputs_ordered_observations_mismatch",
+    }];
+    mismatched.action_comparison!.controlled_pair = true;
+    const { container, rerender } = render(
+      <CausalEvidencePanel scenario={mismatched} onDownload={vi.fn()} />,
+    );
+
+    expect(container.querySelector(".causal-evidence")).toHaveAttribute(
+      "data-evidence-state",
+      "mismatched",
+    );
+    expect(screen.getByText("Invariant mismatch")).toBeVisible();
+    expect(screen.queryByText("Controlled action change")).not.toBeInTheDocument();
+    rerender(<CausalRail scenario={mismatched} snapshot={snapshot} activeRun={null} />);
+    expect(screen.getByRole("heading", {
+      name: "Action comparison withheld; invariants differ.",
+    })).toBeVisible();
+  });
+
+  it("renders a corrected-only result without inventing a before comparison", () => {
+    const correctedOnly = structuredClone(scenario);
+    correctedOnly.runs = [correctedOnly.runs[1]];
+    correctedOnly.stages.influenced_decision_id = null;
+    correctedOnly.action_comparison!.status = "unavailable";
+    correctedOnly.action_comparison!.contract = null;
+    correctedOnly.action_comparison!.before = null;
+    correctedOnly.action_comparison!.controlled_pair = false;
+    correctedOnly.causal_evidence!.before_envelope_sha256 = null;
+    correctedOnly.causal_evidence!.proof_states.controlled_pair_eligible = {
+      status: "unavailable",
+      reason: "causal_envelope_incomplete_or_invalid",
+    };
+    correctedOnly.causal_evidence!.controlled_pair_checks = [{
+      field: "causal_envelope",
+      status: "unavailable",
+      reason: "causal_envelope_incomplete_or_invalid",
+    }];
+    const { container } = render(
+      <CausalEvidencePanel scenario={correctedOnly} onDownload={vi.fn()} />,
+    );
+
+    expect(container.querySelector(".causal-evidence")).toHaveAttribute(
+      "data-evidence-state",
+      "corrected-only",
+    );
+    expect(screen.getByText("Corrected result only")).toBeVisible();
+    expect(screen.getByRole("table", {
+      name: "After correction allowed memory versions",
+    })).toHaveTextContent("memory-restored");
+  });
+
   it("renders the four recorded causal nodes before any raw identity", () => {
     render(<CausalRail scenario={scenario} snapshot={snapshot} activeRun={null} />);
 
@@ -341,7 +691,7 @@ describe("guided replay cockpit", () => {
 
     expect(
       screen.getByRole("heading", {
-        name: "History preserved; active memory changed.",
+        name: "Causal comparison unavailable.",
       }),
     ).toBeVisible();
     expect(
@@ -407,9 +757,10 @@ describe("guided replay cockpit", () => {
     expect(screen.getByText("not executed")).toBeVisible();
     expect(screen.getByText("recommendation approved")).toBeVisible();
     expect(screen.getAllByText(/gemini \/ gemini-2.5-flash/)).toHaveLength(2);
-    expect(screen.getByText("payments.retry_fanout")).toBeVisible();
-    expect(screen.getByText(/Hindsight\/ControlledIncidentTelemetry \/ RetryFanout \/ 12 datapoints/)).toBeVisible();
-    expect(screen.getByText("payments.processor_queue_depth")).toBeVisible();
+    expect(screen.getAllByText("payments.retry_fanout")).toHaveLength(2);
+    expect(
+      screen.getAllByText(/Hindsight\/ControlledIncidentTelemetry \/ RetryFanout \/ 2 datapoints/),
+    ).toHaveLength(2);
     expect(screen.getByText(/Throttle retry fanout while processor health recovers/)).toBeVisible();
     expect(screen.getByText("demo.fixture-import")).toBeVisible();
     expect(screen.getByText("demo:stale-runbook-import")).toBeVisible();
@@ -422,7 +773,7 @@ describe("guided replay cockpit", () => {
     );
     expect(screen.getByLabelText(/Copy current cited memory/)).toHaveAttribute(
       "title",
-      "memory-baseline",
+      "memory-restored",
     );
   });
 

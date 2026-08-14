@@ -34,16 +34,17 @@ export default defineConfig({
   build: {
     outDir: path.resolve(root, "../src/hindsight/web"),
     emptyOutDir: true,
-    cssCodeSplit: false,
+    cssCodeSplit: true,
     sourcemap: false,
     rollupOptions: {
       output: {
         entryFileNames: "assets/app.js",
         chunkFileNames: "assets/chunk-[name].js",
-        assetFileNames: (assetInfo) =>
-          assetInfo.name?.endsWith(".css")
-            ? "assets/styles.css"
-            : "assets/[name][extname]",
+        assetFileNames: (assetInfo) => {
+          if (assetInfo.name === "index.css") return "assets/styles.css";
+          if (assetInfo.name?.endsWith(".css")) return "assets/chunk-[name][extname]";
+          return "assets/[name][extname]";
+        },
       },
     },
   },

@@ -19,6 +19,7 @@ import { SafeMarkdown } from "@/components/safe-markdown";
 import { humanStatus, formatTime, shortId, structurePlan } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type {
+  CausalEnvelope,
   Incident,
   InfluenceItem,
   MemoryOperation,
@@ -106,7 +107,7 @@ export function ConnectionState({ state }: { state: string }) {
   );
 }
 
-function rejectedRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
+export function rejectedRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
   const stageId = scenario?.stages.influenced_decision_id;
   return (
     scenario?.runs.find((item) => stageId && item.decision_id === stageId) ||
@@ -115,7 +116,7 @@ function rejectedRun(scenario: SignatureScenario | null, activeRun?: Run | null)
   );
 }
 
-function postCorrectionRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
+export function postCorrectionRun(scenario: SignatureScenario | null, activeRun?: Run | null) {
   const stageId = scenario?.stages.corrected_decision_id;
   return (
     scenario?.runs.find((item) => stageId && item.decision_id === stageId) ||
@@ -162,15 +163,76 @@ function decisionDisposition(
     : humanStatus(run.status);
 }
 
-function causalClaim(scenario: SignatureScenario | null) {
+type CausalEvidenceState =
+  | "changed"
+  | "unchanged"
+  | "unavailable"
+  | "mismatched"
+  | "corrected-only";
+
+export function boundCausalEnvelope(
+  run: Run | null | undefined,
+  expectedSha256?: string | null,
+): CausalEnvelope | null {
+  const envelope = run?.action_trace?.causal_envelope;
+  return expectedSha256 && envelope?.envelope_sha256 === expectedSha256 ? envelope : null;
+}
+
+export function evidenceState(scenario: SignatureScenario | null): CausalEvidenceState {
+  const evidence = scenario?.causal_evidence;
   const comparison = scenario?.action_comparison;
-  if (comparison?.controlled_pair) {
+  const before = boundCausalEnvelope(rejectedRun(scenario), evidence?.before_envelope_sha256);
+  const after = boundCausalEnvelope(postCorrectionRun(scenario), evidence?.after_envelope_sha256);
+  if (
+    !scenario?.stages.influenced_decision_id &&
+    !comparison?.before &&
+    Boolean(after)
+  ) {
+    return "corrected-only";
+  }
+
+  const checks = evidence?.controlled_pair_checks || [];
+  if (
+    checks.some((check) => check.status === "mismatched") ||
+    comparison?.context.prompt_equal === false ||
+    comparison?.context.normalized_telemetry_equal === false
+  ) {
+    return "mismatched";
+  }
+  const allChecksMatched = checks.length > 0 && checks.every((check) => check.status === "matched");
+  const pairProven = evidence?.proof_states.controlled_pair_eligible.status === "proven";
+  if (
+    !before ||
+    !after ||
+    !comparison?.before ||
+    !comparison.after ||
+    comparison.status === "unavailable" ||
+    !allChecksMatched ||
+    !pairProven
+  ) {
+    return "unavailable";
+  }
+  if (comparison.status === "unchanged") return "unchanged";
+  return comparison.controlled_pair && evidence?.proof_states.action_delta_proven.status === "proven"
+    ? "changed"
+    : "unavailable";
+}
+
+function causalClaim(scenario: SignatureScenario | null) {
+  const state = evidenceState(scenario);
+  if (state === "changed") {
     return "Recorded action changed after correction.";
   }
-  if (comparison?.status === "unchanged" && comparison.memory_correction_proven) {
+  if (state === "unchanged") {
     return "Active memory changed; primary action did not.";
   }
-  return "History preserved; active memory changed.";
+  if (state === "mismatched") {
+    return "Action comparison withheld; invariants differ.";
+  }
+  if (state === "corrected-only") {
+    return "Corrected recommendation recorded; before evidence unavailable.";
+  }
+  return "Causal comparison unavailable.";
 }
 
 function findCitedRead(run: Run | null | undefined, memoryId?: string | null) {

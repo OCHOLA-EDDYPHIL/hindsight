@@ -71,6 +71,9 @@ HISTORICAL_NAMESPACE_BROWSER_CONTRACT_SELECTOR = (
 GOVERNED_REMEDIATION_BROWSER_CONTRACT_SELECTOR = (
     "tests/test_browser_ui.py::test_operator_can_approve_model_selected_governed_memory_retraction"
 )
+CAUSAL_EVIDENCE_BROWSER_STATES_SELECTOR = (
+    "tests/test_browser_ui.py::test_causal_evidence_states_render_fail_closed_in_browser"
+)
 SHARED_BROWSER_CONTRACT_SELECTORS = (
     SIGNATURE_BROWSER_CONTRACT_SELECTOR,
     HISTORICAL_NAMESPACE_BROWSER_CONTRACT_SELECTOR,
@@ -92,6 +95,7 @@ LOCAL_BROWSER_PRODUCT_SELECTORS = (
     "tests/test_api.py",
     "tests/test_snapshots.py",
     "tests/test_queueing.py",
+    CAUSAL_EVIDENCE_BROWSER_STATES_SELECTOR,
     *SHARED_BROWSER_CONTRACT_SELECTORS,
 )
 HOSTED_BROWSER_PRODUCT_SELECTORS = (

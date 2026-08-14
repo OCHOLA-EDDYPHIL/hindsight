@@ -13,6 +13,7 @@ from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from hindsight.causal_evidence import validated_causal_envelope
 from hindsight.db import connect
 from hindsight.redaction import redact_account_identifiers
 
@@ -574,7 +575,88 @@ def _read_run(*, run_id: str | UUID, db_url: str | None) -> dict[str, Any] | Non
                 ),
                 None,
             )
-            return _jsonable(redact_account_identifiers(run))
+            return _jsonable(_public_run_response(run))
+
+
+def _public_run_response(value: Any) -> Any:
+    """Return a recursively redacted run without exact model-input traces."""
+
+    return _project_public_action_traces(redact_account_identifiers(value))
+
+
+def _project_public_action_traces(value: Any) -> Any:
+    if isinstance(value, dict):
+        projected: dict[Any, Any] = {}
+        for key, item in value.items():
+            if key in {"plan_payload", "reasoning_steps"}:
+                continue
+            if key == "action_trace":
+                if isinstance(item, dict):
+                    projected[key] = _project_public_action_trace(item)
+                continue
+            projected[key] = _project_public_action_traces(item)
+        return projected
+    if isinstance(value, list):
+        return [_project_public_action_traces(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_project_public_action_traces(item) for item in value)
+    return value
+
+
+def _project_public_action_trace(value: dict[str, Any]) -> dict[str, Any]:
+    candidate = _validated_public_causal_envelope(value)
+    projected = {
+        key: _project_public_action_traces(item)
+        for key, item in value.items()
+        if key
+        not in {
+            "plan_payload",
+            "reasoning_steps",
+            "causal_envelope",
+            "redacted_causal_envelope",
+        }
+    }
+    if candidate is not None:
+        projected["causal_envelope"] = candidate
+    if value.get("schema_version") == 4 and isinstance(projected.get("recommendation"), dict):
+        recommendation = projected["recommendation"]
+        projected["recommendation"] = {
+            key: recommendation[key]
+            for key in ("id", "summary", "status", "operational_action")
+            if key in recommendation
+        }
+        decision_output = candidate.get("decision_output") if candidate is not None else None
+        public_rationale = (
+            decision_output.get("rationale") if isinstance(decision_output, dict) else None
+        )
+        if isinstance(public_rationale, str) and public_rationale:
+            projected["recommendation"]["rationale"] = public_rationale
+    return projected
+
+
+def _validated_public_causal_envelope(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept only the canonical public envelope derived from the exact envelope."""
+
+    exact = validated_causal_envelope(value.get("causal_envelope"))
+    candidate = validated_causal_envelope(value.get("redacted_causal_envelope"))
+    if exact is None or candidate is None:
+        return None
+    try:
+        # Imported lazily to keep the durable-run module independent of agent startup.
+        from hindsight.agent import _redacted_causal_envelope
+        from hindsight.trace_contract import _valid_controlled_envelope
+
+        if not _valid_controlled_envelope(exact):
+            return None
+        expected = validated_causal_envelope(_redacted_causal_envelope(exact))
+    except Exception:
+        # Persisted traces are untrusted at this public projection boundary.
+        return None
+    return (
+        candidate
+        if expected is not None and _valid_controlled_envelope(expected) and candidate == expected
+        else None
+    )
 
 
 def claim_run_attempt(

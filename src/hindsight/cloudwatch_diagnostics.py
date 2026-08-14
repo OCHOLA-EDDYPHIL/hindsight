@@ -23,6 +23,8 @@ from botocore.exceptions import (
     ReadTimeoutError,
 )
 
+from hindsight.causal_evidence import canonical_sha256
+
 TOOL_NAME = "aws_cloudwatch_diagnostics"
 CONTROLLED_TELEMETRY_NAMESPACE = "Hindsight/ControlledIncidentTelemetry"
 CONTROLLED_SCENARIO = "payments-checkout-latency"
@@ -98,6 +100,7 @@ class CloudWatchMetricQuery:
     metric_name: str
     dimensions: tuple[CloudWatchDimension, ...] = ()
     statistic: str = "Average"
+    unit: str | None = None
     window_seconds: int = MAX_WINDOW_SECONDS
     period_seconds: int = MIN_PERIOD_SECONDS
 
@@ -106,6 +109,8 @@ class CloudWatchMetricQuery:
         _validate_text(self.metric_name, field_name="metric name", max_chars=255)
         if self.statistic not in _STATISTICS:
             raise ValueError("statistic is not supported")
+        if self.unit is not None:
+            _validate_text(self.unit, field_name="metric unit", max_chars=64)
         if type(self.window_seconds) is not int or not (
             MIN_PERIOD_SECONDS <= self.window_seconds <= MAX_WINDOW_SECONDS
         ):
@@ -250,6 +255,46 @@ class CloudWatchDiagnostics:
             )
 
         end_time = _aligned_utc_time(self._clock(), period_seconds=query.period_seconds)
+        return self._observe_query(
+            query_key=query_key,
+            query=query,
+            budget=budget,
+            end_time=end_time,
+        )
+
+    def observe_at_replay_anchor(
+        self,
+        query_key: str,
+        *,
+        budget: CloudWatchCallBudget,
+        replay_anchor: datetime,
+    ) -> dict[str, Any]:
+        """Read the fixed metric window shared by both sides of a controlled replay."""
+
+        query = self._config.queries.get(query_key)
+        if query is None:
+            raise CloudWatchQueryNotAllowedError(
+                "cloudwatch_query_not_allowed",
+                "CloudWatch diagnostics query is not allow-listed",
+            )
+        if replay_anchor.tzinfo is None or replay_anchor.utcoffset() is None:
+            raise ValueError("replay anchor must be timezone-aware")
+        end_time = _aligned_utc_time(replay_anchor, period_seconds=query.period_seconds)
+        return self._observe_query(
+            query_key=query_key,
+            query=query,
+            budget=budget,
+            end_time=end_time,
+        )
+
+    def _observe_query(
+        self,
+        *,
+        query_key: str,
+        query: CloudWatchMetricQuery,
+        budget: CloudWatchCallBudget,
+        end_time: datetime,
+    ) -> dict[str, Any]:
         start_time = end_time - timedelta(seconds=query.window_seconds)
         request = {
             "Namespace": query.namespace,
@@ -261,6 +306,7 @@ class CloudWatchDiagnostics:
             "EndTime": end_time,
             "Period": query.period_seconds,
             "Statistics": [query.statistic],
+            **({"Unit": query.unit} if query.unit is not None else {}),
         }
         budget.consume()
         try:
@@ -313,18 +359,21 @@ def cloudwatch_diagnostics_from_env(
             metric_name="CheckoutLatencyMs",
             dimensions=dimensions,
             statistic="Average",
+            unit="Milliseconds",
         ),
         "payments.processor_queue_depth": CloudWatchMetricQuery(
             namespace=CONTROLLED_TELEMETRY_NAMESPACE,
             metric_name="ProcessorQueueDepth",
             dimensions=dimensions,
             statistic="Maximum",
+            unit="Count",
         ),
         "payments.retry_fanout": CloudWatchMetricQuery(
             namespace=CONTROLLED_TELEMETRY_NAMESPACE,
             metric_name="RetryFanout",
             dimensions=dimensions,
             statistic="Maximum",
+            unit="Count",
         ),
     }
     return CloudWatchDiagnostics(
@@ -418,6 +467,11 @@ def _normalize_observation(
         "schema_version": 1,
         "tool": TOOL_NAME,
         "query_key": query_key,
+        "query_fingerprint": cloudwatch_query_fingerprint(
+            config=config,
+            query_key=query_key,
+            query=query,
+        ),
         "status": "available",
         "region": config.region,
         "metric": {
@@ -427,6 +481,7 @@ def _normalize_observation(
                 {"name": dimension.name, "value": dimension.value} for dimension in query.dimensions
             ],
             "statistic": query.statistic,
+            **({"unit": query.unit} if query.unit is not None else {}),
             "period_seconds": query.period_seconds,
         },
         "window": {
@@ -440,6 +495,36 @@ def _normalize_observation(
         "datapoint_count": len(datapoints),
         "truncated": truncated,
     }
+
+
+def cloudwatch_query_fingerprint(
+    *,
+    config: CloudWatchDiagnosticsConfig,
+    query_key: str,
+    query: CloudWatchMetricQuery,
+) -> str:
+    """Bind the redacted server query configuration used for one observation."""
+
+    digest = canonical_sha256(
+        {
+            "query_key": query_key,
+            "account_sha256": canonical_sha256(config.account_id),
+            "region": config.region,
+            "metric": {
+                "namespace": query.namespace,
+                "name": query.metric_name,
+                "dimensions": [
+                    {"name": dimension.name, "value": dimension.value}
+                    for dimension in query.dimensions
+                ],
+                "statistic": query.statistic,
+                "unit": query.unit,
+                "period_seconds": query.period_seconds,
+            },
+            "window_seconds": query.window_seconds,
+        }
+    )
+    return f"cloudwatch_query:{digest.removeprefix('sha256:')}"
 
 
 def _aligned_utc_time(value: datetime, *, period_seconds: int) -> datetime:

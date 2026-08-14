@@ -122,12 +122,14 @@ export interface DiagnosticObservation {
   schema_version: number;
   tool: "aws_cloudwatch_diagnostics";
   query_key: string;
+  query_fingerprint?: string;
   region?: string;
   metric?: {
     namespace?: string;
     name?: string;
     dimensions?: Array<{ name: string; value: string }>;
     statistic?: string;
+    unit?: string;
     period_seconds?: number;
   };
   window?: {
@@ -138,6 +140,48 @@ export interface DiagnosticObservation {
   datapoints?: Array<{ timestamp: string; value: number }>;
   datapoint_count: number;
   truncated?: boolean;
+}
+
+export interface CausalEnvelope {
+  schema_version: number;
+  canonicalization: string;
+  identity: {
+    scenario_id?: Identifier;
+    namespace?: string;
+    replay_anchor?: string;
+    scenario_routing_key?: string;
+    release_revision?: string;
+  };
+  invariant_inputs: {
+    ordered_observations?: DiagnosticObservation[];
+    ordered_model_request_configuration?: Array<Record<string, unknown>>;
+    embedding_profile?: Record<string, unknown>;
+    release_revision?: string;
+    action_catalog?: Record<string, unknown>;
+  };
+  invariant_inputs_sha256: string;
+  permitted_intervention: {
+    kind?: string;
+    ordered_memory_versions?: Array<{
+      ordinal?: number;
+      memory?: {
+        memory_id?: Identifier;
+        belief_id?: Identifier | null;
+        version?: number | null;
+      };
+      memory_sha256?: string;
+      prompt_fragment_sha256?: string;
+    }>;
+    selection_fingerprint?: string;
+    expected_changed_prompt_fragments?: string[];
+    correction_operation_id?: Identifier | null;
+    correction_target_timestamp?: string | null;
+    operation_effects?: OperationEffect[];
+    invalidated_memory_fingerprints?: string[];
+    restored_memory_fingerprints?: string[];
+  };
+  rendered_prompt_sha256?: string[];
+  envelope_sha256: string;
 }
 
 export interface RecommendationActionTrace {
@@ -153,10 +197,13 @@ export interface RecommendationActionTrace {
     turn?: number;
     provider?: string;
     model?: string;
+    request?: Record<string, unknown> | null;
+    requests?: Array<Record<string, unknown>>;
     decision?: Record<string, unknown>;
   }>;
   tool_calls?: DiagnosticToolCall[];
   observations?: DiagnosticObservation[];
+  causal_envelope?: CausalEnvelope;
   recommendation?: {
     id?: Identifier;
     summary?: string | null;
@@ -224,9 +271,48 @@ export interface RecommendationActionTrace {
 }
 
 export interface OperationalAction {
+  catalog_id: "payments_retry_amplification.actions.v1";
   contract: "payments_retry_amplification.v1";
+  action_id: "scale_workers" | "throttle_retries" | "inspect_only";
+  disposition: "recommend";
+  parameters: Record<string, never>;
   primary_action: "scale_workers" | "throttle_retries" | "inspect_only";
+  directive: string;
+  consistency_status: "consistent";
   fingerprint: string;
+}
+
+export interface CausalProofState {
+  status: "proven" | "not_proven" | "unavailable";
+  reason: string;
+}
+
+export interface ControlledPairCheck {
+  field: string;
+  status: "matched" | "mismatched" | "unavailable";
+  reason: string;
+}
+
+export interface CausalEvidenceSummary {
+  schema_version: 1;
+  canonicalization: "hindsight.canonical-json.v1";
+  scope: "recommendation_only";
+  proof_states: {
+    memory_correction_proven: CausalProofState;
+    action_delta_proven: CausalProofState;
+    controlled_pair_eligible: CausalProofState;
+    repeatable_causal_effect_supported: CausalProofState;
+    service_recovery_proven: CausalProofState;
+  };
+  controlled_pair_checks?: ControlledPairCheck[];
+  before_envelope_sha256?: string | null;
+  after_envelope_sha256?: string | null;
+  download?: {
+    url: string;
+    protected_url: string;
+    sha256: string;
+    media_type: "application/json";
+  };
 }
 
 export interface ActionComparison {
@@ -396,6 +482,7 @@ export interface SignatureScenario {
   operation_effects?: OperationEffect[];
   memories: MemoryRecord[];
   action_comparison?: ActionComparison;
+  causal_evidence?: CausalEvidenceSummary;
   stages: {
     baseline_memory_id?: Identifier | null;
     compromised_memory_id?: Identifier | null;
