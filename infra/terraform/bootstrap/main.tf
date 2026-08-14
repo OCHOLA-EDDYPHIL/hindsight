@@ -61,6 +61,15 @@ locals {
   ])
   observability_budget_arn        = "arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:budget/hindsight-${var.stage}-monthly-five-usd"
   observability_sampling_rule_arn = "arn:${data.aws_partition.current.partition}:xray:${var.aws_region}:${data.aws_caller_identity.current.account_id}:sampling-rule/hindsight-${var.stage}-bounded"
+  quarantine_key_arns = [
+    "arn:${data.aws_partition.current.partition}:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:key/*",
+  ]
+  quarantine_key_alias_arn      = "arn:${data.aws_partition.current.partition}:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alias/hindsight-${var.stage}-quarantine"
+  quarantine_table_arn          = "arn:${data.aws_partition.current.partition}:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/hindsight-${var.stage}-quarantine"
+  api_database_parameter_arn    = "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/hindsight/${var.stage}/api-database-url"
+  run_queue_arn                 = "arn:${data.aws_partition.current.partition}:sqs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:hindsight-${var.stage}-runs"
+  alert_receiver_queue_arn      = "arn:${data.aws_partition.current.partition}:sqs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:hindsight-${var.stage}-alert-receiver"
+  exact_release_probe_alarm_arn = "arn:${data.aws_partition.current.partition}:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:hindsight-${var.stage}-exact-release-probe"
   observability_metric_log_group_arns = [
     for name in [
       "/aws/apigateway/hindsight-${var.stage}-http",
@@ -74,6 +83,7 @@ locals {
     "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-*:*",
   ]
   github_deploy_observability_policy_name = "hindsight-github-deploy-observability"
+  github_deploy_encryption_policy_name    = "hindsight-github-deploy-encryption"
   application_resource_tags = {
     Project     = "hindsight"
     Environment = var.stage
@@ -243,6 +253,18 @@ resource "aws_iam_role" "github_deploy" {
 
 resource "aws_iam_role" "github_observability_evidence" {
   name                 = "hindsight-github-observability-evidence"
+  assume_role_policy   = data.aws_iam_policy_document.github_assume.json
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role" "github_quarantine_redrive" {
+  name                 = "hindsight-github-quarantine-redrive"
+  assume_role_policy   = data.aws_iam_policy_document.github_assume.json
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role" "github_worker_acceptance" {
+  name                 = "hindsight-github-worker-acceptance"
   assume_role_policy   = data.aws_iam_policy_document.github_assume.json
   max_session_duration = 3600
 }
@@ -614,6 +636,12 @@ resource "aws_iam_role_policy" "github_deploy" {
 
 data "aws_iam_policy_document" "github_deploy_observability" {
   statement {
+    sid       = "RawFallbackConsumerAudit"
+    actions   = ["lambda:ListEventSourceMappings"]
+    resources = ["*"]
+  }
+
+  statement {
     sid = "ObservabilityTopicLifecycle"
     actions = [
       "sns:CreateTopic",
@@ -636,12 +664,6 @@ data "aws_iam_policy_document" "github_deploy_observability" {
       "sns:Unsubscribe",
     ]
     resources = local.observability_subscription_arns
-  }
-
-  statement {
-    sid       = "ObservabilityAlertExercise"
-    actions   = ["sns:Publish"]
-    resources = [local.observability_alert_topic_arn]
   }
 
   statement {
@@ -724,6 +746,141 @@ resource "aws_iam_role_policy_attachment" "github_deploy_observability" {
   policy_arn = aws_iam_policy.github_deploy_observability.arn
 }
 
+data "aws_iam_policy_document" "github_deploy_encryption" {
+  statement {
+    sid       = "QuarantineKeyCreate"
+    actions   = ["kms:CreateKey"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Project"
+      values   = [local.application_resource_tags.Project]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Environment"
+      values   = [local.application_resource_tags.Environment]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/ManagedBy"
+      values   = [local.application_resource_tags.ManagedBy]
+    }
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = keys(local.application_resource_tags)
+    }
+  }
+
+  statement {
+    sid = "QuarantineKeyLifecycle"
+    actions = [
+      "kms:CancelKeyDeletion",
+      "kms:DescribeKey",
+      "kms:DisableKeyRotation",
+      "kms:EnableKeyRotation",
+      "kms:GetKeyPolicy",
+      "kms:GetKeyRotationStatus",
+      "kms:ListResourceTags",
+      "kms:PutKeyPolicy",
+      "kms:ScheduleKeyDeletion",
+      "kms:TagResource",
+      "kms:UntagResource",
+    ]
+    resources = local.quarantine_key_arns
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = [local.application_resource_tags.Project]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Environment"
+      values   = [local.application_resource_tags.Environment]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/ManagedBy"
+      values   = [local.application_resource_tags.ManagedBy]
+    }
+  }
+
+  statement {
+    sid       = "QuarantineKeyGrant"
+    actions   = ["kms:CreateGrant"]
+    resources = local.quarantine_key_arns
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = [local.application_resource_tags.Project]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Environment"
+      values   = [local.application_resource_tags.Environment]
+    }
+  }
+
+  statement {
+    sid = "QuarantineKeyAlias"
+    actions = [
+      "kms:CreateAlias",
+      "kms:DeleteAlias",
+      "kms:UpdateAlias",
+    ]
+    resources = concat(
+      local.quarantine_key_arns,
+      [local.quarantine_key_alias_arn],
+    )
+  }
+
+  statement {
+    sid       = "QuarantineKeyAliasRead"
+    actions   = ["kms:ListAliases"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "github_deploy_encryption" {
+  name        = local.github_deploy_encryption_policy_name
+  description = "Stage-scoped deployment access for the quarantine encryption key."
+  policy      = data.aws_iam_policy_document.github_deploy_encryption.json
+
+  tags = {
+    Project     = "hindsight"
+    Environment = var.stage
+    ManagedBy   = "terraform-bootstrap"
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(regexall("\\S", data.aws_iam_policy_document.github_deploy_encryption.json)) <= 6144
+      error_message = "The GitHub deploy encryption policy exceeds the 6,144-character customer-managed IAM policy limit."
+    }
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "github_deploy_encryption" {
+  role       = aws_iam_role.github_deploy.name
+  policy_arn = aws_iam_policy.github_deploy_encryption.arn
+}
+
 data "aws_iam_policy_document" "github_observability_evidence" {
   statement {
     sid       = "CallerIdentity"
@@ -750,9 +907,32 @@ data "aws_iam_policy_document" "github_observability_evidence" {
   }
 
   statement {
-    sid       = "StageAlertPublish"
-    actions   = ["sns:Publish"]
-    resources = [local.observability_alert_topic_arn]
+    sid = "StageAlertSubscriptions"
+    actions = [
+      "sns:GetSubscriptionAttributes",
+      "sns:ListSubscriptionsByTopic",
+    ]
+    resources = local.observability_subscription_arns
+  }
+
+  statement {
+    sid = "ExactReleaseAlarmProbe"
+    actions = [
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:SetAlarmState",
+    ]
+    resources = [local.exact_release_probe_alarm_arn]
+  }
+
+  statement {
+    sid = "ControlledAlertReceiver"
+    actions = [
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+      "sqs:ReceiveMessage",
+    ]
+    resources = [local.alert_receiver_queue_arn]
   }
 }
 
@@ -760,6 +940,52 @@ resource "aws_iam_role_policy" "github_observability_evidence" {
   name   = "hindsight-github-observability-evidence"
   role   = aws_iam_role.github_observability_evidence.id
   policy = data.aws_iam_policy_document.github_observability_evidence.json
+}
+
+data "aws_iam_policy_document" "github_quarantine_redrive" {
+  statement {
+    sid       = "ExactQuarantineRecord"
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+    resources = [local.quarantine_table_arn]
+  }
+
+  statement {
+    sid       = "ApiDatabaseCredential"
+    actions   = ["ssm:GetParameter"]
+    resources = [local.api_database_parameter_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "github_quarantine_redrive" {
+  name   = "hindsight-github-quarantine-redrive"
+  role   = aws_iam_role.github_quarantine_redrive.id
+  policy = data.aws_iam_policy_document.github_quarantine_redrive.json
+}
+
+data "aws_iam_policy_document" "github_worker_acceptance" {
+  statement {
+    sid       = "ExactWorkerSourceEnqueue"
+    actions   = ["sqs:SendMessage"]
+    resources = [local.run_queue_arn]
+  }
+
+  statement {
+    sid       = "SyntheticQuarantineReadCleanup"
+    actions   = ["dynamodb:DeleteItem", "dynamodb:GetItem"]
+    resources = [local.quarantine_table_arn]
+  }
+
+  statement {
+    sid       = "ApiDatabaseCredential"
+    actions   = ["ssm:GetParameter"]
+    resources = [local.api_database_parameter_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "github_worker_acceptance" {
+  name   = "hindsight-github-worker-acceptance"
+  role   = aws_iam_role.github_worker_acceptance.id
+  policy = data.aws_iam_policy_document.github_worker_acceptance.json
 }
 
 data "aws_iam_policy_document" "github_evidence" {

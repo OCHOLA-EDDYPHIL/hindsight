@@ -1,6 +1,7 @@
 """Deployment prerequisite tooling."""
 
 import importlib.util
+import json
 import os
 import pathlib
 import subprocess
@@ -370,6 +371,28 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
         assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in roles_job
 
 
+def test_live_acceptance_exercises_alert_delivery_in_parallel_after_deploy():
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
+    alert = workflow["jobs"]["alert_delivery"]
+
+    assert alert["needs"] == ["authorize", "deploy"]
+    assert alert["if"] == "needs.authorize.outputs.acceptance_mode == 'full'"
+    assert alert["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
+    assert alert["permissions"] == {"contents": "read", "id-token": "write"}
+    rendered = json.dumps(alert)
+    assert "hindsight-github-observability-evidence" in rendered
+    assert "scripts/exercise_alert_delivery.py" in rendered
+    for argument in (
+        "--alarm-name",
+        "--receiver-queue-name",
+        "--operational-topic-arn",
+        "--budget-topic-arn",
+        "--source-revision",
+    ):
+        assert argument in rendered
+    assert "alert-delivery-evidence-${{ needs.authorize.outputs.product_sha }}" in rendered
+
+
 def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
@@ -418,6 +441,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "acceptance_plan",
         "product_preflight",
         "deploy",
+        "alert_delivery",
         "semantic_product",
         "consolidation_product",
         "worker_product",
@@ -462,6 +486,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "exact_main_ci",
         "product_preflight",
         "deploy",
+        "alert_delivery",
         "semantic_product",
         "consolidation_product",
         "worker_product",
@@ -735,6 +760,7 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
         "EXACT_MAIN_CI_RESULT",
         "PREFLIGHT_RESULT",
         "DEPLOY_RESULT",
+        "ALERT_DELIVERY_RESULT",
         "SEMANTIC_RESULT",
         "CONSOLIDATION_RESULT",
         "WORKER_RESULT",
@@ -752,6 +778,7 @@ def test_product_completion_requires_every_product_job(tmp_path, failed_result):
         "EXACT_MAIN_CI_RESULT": "success",
         "PREFLIGHT_RESULT": "success",
         "DEPLOY_RESULT": "success",
+        "ALERT_DELIVERY_RESULT": "success",
         "SEMANTIC_RESULT": "success",
         "CONSOLIDATION_RESULT": "success",
         "WORKER_RESULT": "success",
@@ -1036,3 +1063,72 @@ def test_local_setup_enables_vector_indexing_and_disables_ssm_resolution():
     assert 'HINDSIGHT_DATABASE_URL_PARAM=""' in product_api
     assert 'HINDSIGHT_GEMINI_API_KEY_PARAM=""' in product_api
     assert 'HINDSIGHT_GEMINI_API_KEYS_PARAM=""' in product_api
+
+
+def test_quarantine_redrive_is_owner_gated_exact_main_without_free_idempotency_input(
+    tmp_path,
+):
+    workflow_path = ".github/workflows/redrive-quarantine.yml"
+    workflow = pathlib.Path(workflow_path).read_text()
+    parsed = yaml.safe_load(workflow)
+    inputs = parsed[True]["workflow_dispatch"]["inputs"]
+    jobs = parsed["jobs"]
+
+    assert set(inputs) == {"quarantine_id", "digest", "confirmation"}
+    assert all(item["required"] is True and item["type"] == "string" for item in inputs.values())
+    assert parsed["permissions"] == {}
+    assert set(jobs) == {"authorize", "redrive"}
+    assert jobs["authorize"]["permissions"] == {}
+    assert jobs["redrive"]["needs"] == "authorize"
+    assert jobs["redrive"]["environment"] == "demo"
+    assert jobs["redrive"]["permissions"] == {"contents": "read", "id-token": "write"}
+
+    quarantine_id = f"q_{'a' * 64}"
+    digest = "b" * 64
+    confirmation = f"redrive:{quarantine_id}:{digest}"
+    accepted_output = tmp_path / "accepted-output"
+    authorization_values = {
+        "ACTOR": "OCHOLA-EDDYPHIL",
+        "CONFIRMATION": confirmation,
+        "DIGEST": digest,
+        "EVENT_NAME": "workflow_dispatch",
+        "EVENT_SHA": "c" * 40,
+        "PRIVATE_REPOSITORY": "true",
+        "QUARANTINE_ID": quarantine_id,
+        "REF_NAME": "refs/heads/main",
+        "REF_PROTECTED": "true",
+        "REPOSITORY": "OCHOLA-EDDYPHIL/hindsight",
+        "REPOSITORY_OWNER": "OCHOLA-EDDYPHIL",
+        "TRIGGERING_ACTOR": "OCHOLA-EDDYPHIL",
+        "WORKFLOW_REF": (
+            "OCHOLA-EDDYPHIL/hindsight/.github/workflows/redrive-quarantine.yml@refs/heads/main"
+        ),
+    }
+    accepted = _run_authorization_script(
+        workflow_path,
+        values=authorization_values,
+        output_path=accepted_output,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert f"source_sha={'c' * 40}" in accepted_output.read_text()
+
+    rejected = _run_authorization_script(
+        workflow_path,
+        values={**authorization_values, "TRIGGERING_ACTOR": "maintainer"},
+        output_path=tmp_path / "rejected-output",
+    )
+    assert rejected.returncode != 0
+
+    redrive = workflow.split("  redrive:\n", 1)[1]
+    assert "ref: ${{ needs.authorize.outputs.source_sha }}" in redrive
+    assert 'test "$(git rev-parse HEAD)" = "$SOURCE_SHA"' in redrive
+    assert "role/hindsight-github-quarantine-redrive" in redrive
+    assert "HINDSIGHT_DATABASE_URL_PARAM: /hindsight/demo/api-database-url" in redrive
+    assert "HINDSIGHT_QUARANTINE_TABLE: hindsight-demo-quarantine" in redrive
+    assert "scripts/redrive_quarantine.py" in redrive
+    assert '--quarantine-id "$QUARANTINE_ID"' in redrive
+    assert '--digest "$DIGEST"' in redrive
+    assert '--confirm "$CONFIRMATION"' in redrive
+    assert "--idempotency-key" not in redrive
+    assert "GITHUB_RUN_ID" not in workflow
+    assert "GITHUB_RUN_ATTEMPT" not in workflow

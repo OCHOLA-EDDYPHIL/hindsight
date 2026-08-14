@@ -113,24 +113,184 @@ def test_run_dispatch_outbox_has_scheduled_worker_and_narrow_queue_permissions()
     assert api_policy.count("aws_sqs_queue.runs.arn") == 1
     assert worker_policy.count('"sqs:SendMessage"') == 1
     assert worker_policy.count("aws_sqs_queue.runs.arn") == 2
-    assert worker_policy.count("aws_sqs_queue.run_dlq.arn") == 1
+    assert worker_policy.count("aws_sqs_queue.run_dlq.arn") == 0
     assert "HINDSIGHT_RUN_QUEUE_URL" in worker_lambda
     assert "HINDSIGHT_RUN_DLQ_ARN" in worker_lambda
+    assert "HINDSIGHT_QUARANTINE_TABLE" in worker_lambda
+    assert "HINDSIGHT_QUARANTINE_INDEX" in worker_lambda
+    assert "HINDSIGHT_QUARANTINE_METRIC_NAMESPACE" in worker_lambda
+    assert "HINDSIGHT_QUARANTINE_METRIC_STAGE" in worker_lambda
     assert "HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS" in worker_lambda
     assert "HINDSIGHT_RUN_MAX_ATTEMPTS" in worker_lambda
     assert "var.validation_mode ? 45 : 180" in stack
     assert "var.validation_mode ? 60 : 300" in stack
     assert "var.validation_mode ? 270 : 1080" in stack
     assert re.search(r"run_max_attempts\s*= 3", stack)
-    assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' in stack
-    assert stack.count("message_retention_seconds  = 1209600") == 2
-    assert stack.count("batch_size              = 1") == 2
+    assert re.search(r"run_queue_max_receive_count\s*= 4", stack)
+    assert "local.run_queue_max_receive_count == local.run_max_attempts + 1" in stack
+    assert "maxReceiveCount     = local.run_queue_max_receive_count" in stack
+    redrive_allow = stack.split('resource "aws_sqs_queue_redrive_allow_policy" "run_dlq"', 1)[
+        1
+    ].split('resource "aws_sqs_queue" "scheduler_dlq"', 1)[0]
+    assert 'redrivePermission = "byQueue"' in redrive_allow
+    assert "sourceQueueArns   = [aws_sqs_queue.runs.arn]" in redrive_allow
+    assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' not in stack
+    assert stack.count("message_retention_seconds  = 1209600") == 4
+    assert stack.count("batch_size              = 1") == 1
     assert re.search(r"scaling_config\s*{\s*maximum_concurrency\s*= 2\s*}", stack)
     assert 'resource "aws_cloudwatch_event_rule" "run_dispatcher"' in stack
     assert 'command = "dispatch_run_commands"' in stack
+    assert 'resource "aws_cloudwatch_event_rule" "quarantine_metrics"' in stack
+    assert 'command = "report_quarantine_metrics"' in stack
     assert 'resource "aws_lambda_permission" "run_dispatcher"' in stack
-    assert stack.count("enabled                 = var.runtime_active") == 2
-    assert stack.count('state               = var.runtime_active ? "ENABLED" : "DISABLED"') == 2
+    assert 'resource "aws_lambda_permission" "quarantine_metrics"' in stack
+    assert stack.count("enabled                 = var.runtime_active") == 1
+    assert stack.count('state               = var.runtime_active ? "ENABLED" : "DISABLED"') == 3
+
+
+def test_poison_quarantine_and_alert_delivery_have_fail_closed_aws_boundaries():
+    stack = pathlib.Path("infra/terraform/app/main.tf").read_text()
+    outputs = pathlib.Path("infra/terraform/app/outputs.tf").read_text()
+    deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
+    live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+
+    quarantine = stack.split('resource "aws_dynamodb_table" "quarantine"', 1)[1].split(
+        'resource "aws_dynamodb_table" "connections"', 1
+    )[0]
+    assert 'hash_key     = "quarantine_id"' in quarantine
+    assert 'name            = "quarantine-status-created-at-index"' in quarantine
+    assert 'hash_key        = "status"' in quarantine
+    assert 'range_key       = "created_at"' in quarantine
+    assert "point_in_time_recovery" in quarantine
+    assert "kms_key_arn = aws_kms_key.quarantine.arn" in quarantine
+    assert 'resource "aws_kms_alias" "quarantine"' in stack
+    assert "enable_key_rotation     = true" in stack
+
+    assert 'resource "aws_lambda_event_source_mapping" "worker_dlq"' not in stack
+    worker_policy = stack.split('data "aws_iam_policy_document" "worker"', 1)[1].split(
+        'resource "aws_iam_role_policy" "worker"', 1
+    )[0]
+    queue_consume = next(
+        statement
+        for statement in worker_policy.split("  statement {")[1:]
+        if '"sqs:ReceiveMessage"' in statement
+    )
+    assert "aws_sqs_queue.runs.arn" in queue_consume
+    assert "aws_sqs_queue.run_dlq.arn" not in queue_consume
+    assert 'sid = "QuarantineLedger"' in worker_policy
+    quarantine_ledger = worker_policy.split('sid = "QuarantineLedger"', 1)[1].split(
+        "  statement {", 1
+    )[0]
+    assert '"dynamodb:GetItem"' in quarantine_ledger
+    assert '"dynamodb:PutItem"' in quarantine_ledger
+    assert '"dynamodb:Query"' in quarantine_ledger
+    assert '"dynamodb:UpdateItem"' not in quarantine_ledger
+    assert 'sid = "QuarantineEncryption"' not in worker_policy
+    assert '"kms:Decrypt"' not in worker_policy
+    assert 'sid       = "QuarantineMetrics"' in worker_policy
+    assert 'values   = ["Hindsight/Quarantine"]' in worker_policy
+
+    for target in ("operation_reaper", "run_dispatcher", "quarantine_metrics"):
+        body = stack.split(f'resource "aws_cloudwatch_event_target" "{target}"', 1)[1]
+        body = body.split("\nresource ", 1)[0]
+        assert "dead_letter_config" in body
+        assert "arn = aws_sqs_queue.scheduler_dlq.arn" in body
+        assert "maximum_event_age_in_seconds = local.scheduler_max_event_age" in body
+        assert "maximum_retry_attempts       = local.scheduler_max_retry_attempts" in body
+    scheduler_policy = stack.split('data "aws_iam_policy_document" "scheduler_dlq"', 1)[1].split(
+        'resource "aws_sqs_queue_policy" "scheduler_dlq"', 1
+    )[0]
+    assert 'identifiers = ["events.amazonaws.com"]' in scheduler_policy
+    assert 'variable = "aws:SourceArn"' in scheduler_policy
+    assert 'variable = "aws:SourceAccount"' in scheduler_policy
+
+    receiver_policy = stack.split('data "aws_iam_policy_document" "alert_receiver"', 1)[1].split(
+        'resource "aws_sqs_queue_policy" "alert_receiver"', 1
+    )[0]
+    assert 'identifiers = ["sns.amazonaws.com"]' in receiver_policy
+    assert "aws_sns_topic.alerts.arn" in receiver_policy
+    assert "aws_sns_topic.budget_alerts.arn" in receiver_policy
+    assert 'variable = "aws:SourceAccount"' in receiver_policy
+    assert stack.count('protocol  = "sqs"') == 2
+    assert stack.count('self.arn != "PendingConfirmation"') == 2
+
+    for alarm in (
+        "run_queue_age",
+        "run_dlq",
+        "run_dlq_age",
+        "scheduler_failed_invocations",
+        "scheduler_dlq",
+        "quarantine",
+        "exact_release_probe",
+        "lambda_errors",
+        "bounded",
+    ):
+        assert f'resource "aws_cloudwatch_metric_alarm" "{alarm}"' in stack
+    release_alarm = stack.split('resource "aws_cloudwatch_metric_alarm" "exact_release_probe"', 1)[
+        1
+    ].split('resource "aws_xray_sampling_rule"', 1)[0]
+    assert "alarm_actions       = local.operational_alarm_actions" in release_alarm
+    assert "ok_actions          = local.operational_alarm_actions" in release_alarm
+    assert 'treat_missing_data  = "ignore"' in release_alarm
+
+    for output in (
+        "alert_receiver_queue_name",
+        "alert_receiver_queue_url",
+        "budget_alert_topic_arn",
+        "exact_release_probe_alarm_name",
+        "quarantine_index",
+        "quarantine_table",
+        "run_fallback_queue_arn",
+        "run_queue_arn",
+        "run_queue_url",
+        "scheduler_dlq_url",
+    ):
+        assert f'output "{output}"' in outputs
+    assert (
+        "alert_receiver_queue_name: ${{ steps.stack_outputs.outputs.alert_receiver_queue_name }}"
+        in deploy
+    )
+    for output in (
+        "run_queue_url",
+        "run_queue_arn",
+        "run_fallback_queue_arn",
+        "quarantine_table",
+        "quarantine_index",
+    ):
+        assert f"value: ${{{{ jobs.apply.outputs.{output} }}}}" in deploy
+        assert f"{output}: ${{{{ steps.stack_outputs.outputs.{output} }}}}" in deploy
+        assert f"output -raw {output}" in deploy
+    fallback_audit = deploy.split("Verify raw fallback queue has no Lambda consumer", 1)[1].split(
+        "- name: Verify deployed HTTP health", 1
+    )[0]
+    assert 'get_paginator("list_event_source_mappings")' in fallback_audit
+    assert "EventSourceArn=source_arn" in fallback_audit
+    assert "FunctionName" not in fallback_audit
+    assert "  alert_delivery:\n" in live
+    assert "scripts/exercise_alert_delivery.py" in live
+    assert "ALERT_DELIVERY_RESULT" in live
+    worker_acceptance = live.split("  worker_product:\n", 1)[1].split("  browser_product:\n", 1)[0]
+    for variable, output in (
+        ("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL", "run_queue_url"),
+        ("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN", "run_queue_arn"),
+        ("HINDSIGHT_QUARANTINE_TABLE", "quarantine_table"),
+        ("HINDSIGHT_QUARANTINE_INDEX", "quarantine_index"),
+    ):
+        assert f"{variable}: ${{{{ needs.deploy.outputs.{output} }}}}" in worker_acceptance
+    assert (
+        "HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}"
+    ) in worker_acceptance
+    assert "HINDSIGHT_QUARANTINE_EVIDENCE_PATH=$EVIDENCE_DIR/quarantine-evidence.json" in (
+        worker_acceptance
+    )
+    assert "worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}" in (
+        worker_acceptance
+    )
+    assert "path: ${{ runner.temp }}/hindsight-worker-evidence/quarantine-evidence.json" in (
+        worker_acceptance
+    )
+    assert "if-no-files-found: error" in worker_acceptance
+    assert "if: always()" not in worker_acceptance
 
 
 def test_changefeed_relay_has_a_fenced_lease_and_narrow_idempotency_permissions():
@@ -364,6 +524,12 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
         bootstrap,
     )
     assert "lambda:GetFunctionConfiguration" not in application_lifecycle
+    fallback_consumer_audit = observability_policy.split(
+        'sid       = "RawFallbackConsumerAudit"', 1
+    )[1].split("\n  statement {", 1)[0]
+    assert 'actions   = ["lambda:ListEventSourceMappings"]' in fallback_consumer_audit
+    assert 'resources = ["*"]' in fallback_consumer_audit
+    assert '"lambda:ListEventSourceMappings"' not in application_lifecycle
     assert 'actions   = ["cognito-idp:CreateUserPool"]' in cognito_create
     assert 'resources = ["*"]' in cognito_create
     assert 'variable = "aws:RequestTag/Project"' in cognito_create
@@ -398,6 +564,24 @@ def test_bootstrap_prerequisites_are_isolated_and_oidc_is_narrow():
         "\n  statement {", 1
     )[0]
     assert 'actions   = ["cloudwatch:GetMetricStatistics"]' in controlled_read
+    worker_acceptance_policy = bootstrap.split(
+        'data "aws_iam_policy_document" "github_worker_acceptance"', 1
+    )[1].split('resource "aws_iam_role_policy" "github_worker_acceptance"', 1)[0]
+    worker_acceptance_enqueue = worker_acceptance_policy.split(
+        'sid       = "ExactWorkerSourceEnqueue"', 1
+    )[1].split("\n  statement {", 1)[0]
+    assert 'actions   = ["sqs:SendMessage"]' in worker_acceptance_enqueue
+    assert "resources = [local.run_queue_arn]" in worker_acceptance_enqueue
+    assert 'actions   = ["dynamodb:DeleteItem", "dynamodb:GetItem"]' in worker_acceptance_policy
+    assert "resources = [local.quarantine_table_arn]" in worker_acceptance_policy
+    assert 'actions   = ["ssm:GetParameter"]' in worker_acceptance_policy
+    assert "resources = [local.api_database_parameter_arn]" in worker_acceptance_policy
+    assert '"dynamodb:Query"' not in worker_acceptance_policy
+    assert (
+        "role/hindsight-github-worker-acceptance"
+        in pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    )
+    assert '"sqs:SendMessage"' not in application_lifecycle
     assert "logs:CreateLogDelivery" in bootstrap
     assert "logs:DeleteLogDelivery" in bootstrap
     assert "logs:GetLogDelivery" in bootstrap
@@ -741,7 +925,7 @@ def test_observability_evidence_is_owner_authorized_and_exact_main():
     assert "observability-evidence.sha256" in workflow
 
 
-def test_observability_evidence_iam_is_read_only_except_stage_alert_publish():
+def test_observability_evidence_iam_is_read_only_except_exact_alarm_exercise():
     bootstrap = pathlib.Path("infra/terraform/bootstrap/main.tf").read_text()
     policy = bootstrap.split(
         'data "aws_iam_policy_document" "github_observability_evidence" {', 1
@@ -754,11 +938,26 @@ def test_observability_evidence_iam_is_read_only_except_stage_alert_publish():
     assert '"logs:StartQuery"' in policy
     assert '"logs:GetQueryResults"' in policy
     assert '"logs:StopQuery"' in policy
-    alert = policy.split('sid       = "StageAlertPublish"', 1)[1].split(
+    subscriptions = policy.split('sid = "StageAlertSubscriptions"', 1)[1].split(
         "\n  statement {", 1
     )[0]
-    assert 'actions   = ["sns:Publish"]' in alert
-    assert "resources = [local.observability_alert_topic_arn]" in alert
+    assert '"sns:GetSubscriptionAttributes"' in subscriptions
+    assert '"sns:ListSubscriptionsByTopic"' in subscriptions
+    assert "resources = local.observability_subscription_arns" in subscriptions
+    alarm = policy.split('sid = "ExactReleaseAlarmProbe"', 1)[1].split("\n  statement {", 1)[0]
+    assert '"cloudwatch:DescribeAlarms"' in alarm
+    assert '"cloudwatch:SetAlarmState"' in alarm
+    assert "resources = [local.exact_release_probe_alarm_arn]" in alarm
+    receiver = policy.split('sid = "ControlledAlertReceiver"', 1)[1].split("\n}", 1)[0]
+    for action in (
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ReceiveMessage",
+    ):
+        assert f'"{action}"' in receiver
+    assert "resources = [local.alert_receiver_queue_arn]" in receiver
+    assert '"sns:Publish"' not in policy
     deploy_policy = bootstrap.split(
         'data "aws_iam_policy_document" "github_deploy_observability" {', 1
     )[1].split('resource "aws_iam_policy" "github_deploy_observability"', 1)[0]

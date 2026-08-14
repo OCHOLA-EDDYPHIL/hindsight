@@ -101,6 +101,7 @@ ARTIFACTS = {
             "operations.py",
             "observability.py",
             "prompt_safety.py",
+            "quarantine.py",
             "queueing.py",
             "redaction.py",
             "reasoning.py",

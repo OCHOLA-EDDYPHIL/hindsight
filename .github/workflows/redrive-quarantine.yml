@@ -1,0 +1,116 @@
+name: redrive quarantined run
+
+on:
+  workflow_dispatch:
+    inputs:
+      quarantine_id:
+        description: Exact q_ quarantine record ID
+        required: true
+        type: string
+      digest:
+        description: Exact stored raw-body SHA-256 digest
+        required: true
+        type: string
+      confirmation:
+        description: Type redrive:<quarantine_id>:<digest>
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: hindsight-quarantine-redrive-${{ inputs.quarantine_id }}-${{ inputs.digest }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    permissions: {}
+    outputs:
+      source_sha: ${{ steps.authorization.outputs.source_sha }}
+    steps:
+      - id: authorization
+        name: Require repository owner on protected exact main
+        env:
+          ACTOR: ${{ github.actor }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DIGEST: ${{ inputs.digest }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
+          QUARANTINE_ID: ${{ inputs.quarantine_id }}
+          REF_NAME: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$REPOSITORY" == "OCHOLA-EDDYPHIL/hindsight" \
+            && "$REPOSITORY_OWNER" == "OCHOLA-EDDYPHIL" \
+            && "$PRIVATE_REPOSITORY" == "true" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$REF_PROTECTED" == "true" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/redrive-quarantine.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ \
+            && "$QUARANTINE_ID" =~ ^q_[0-9a-f]{64}$ \
+            && "$DIGEST" =~ ^[0-9a-f]{64}$ \
+            && "$CONFIRMATION" == "redrive:$QUARANTINE_ID:$DIGEST" ]] || {
+            echo "Quarantine redrive requires the repository owner, protected exact main, and the exact record-bound confirmation phrase." >&2
+            exit 1
+          }
+          echo "source_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+
+  redrive:
+    needs: authorize
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    timeout-minutes: 10
+    environment: demo
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      HINDSIGHT_DATABASE_URL_PARAM: /hindsight/demo/api-database-url
+      HINDSIGHT_QUARANTINE_TABLE: hindsight-demo-quarantine
+      SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$GITHUB_REF" = "refs/heads/main"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-quarantine-redrive
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Verify exact AWS account
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_AWS_ACCOUNT_ID"
+      - name: Redrive the exact quarantined record once
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DIGEST: ${{ inputs.digest }}
+          QUARANTINE_ID: ${{ inputs.quarantine_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/redrive_quarantine.py \
+            --quarantine-id "$QUARANTINE_ID" \
+            --digest "$DIGEST" \
+            --confirm "$CONFIRMATION"

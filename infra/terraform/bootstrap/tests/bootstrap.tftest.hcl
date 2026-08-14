@@ -111,6 +111,35 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition = (
+      aws_iam_role.github_quarantine_redrive.name == "hindsight-github-quarantine-redrive" &&
+      local.quarantine_table_arn == "arn:aws:dynamodb:us-east-1:123456789012:table/hindsight-demo-quarantine" &&
+      local.api_database_parameter_arn == "arn:aws:ssm:us-east-1:123456789012:parameter/hindsight/demo/api-database-url" &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if statement.sid == "ExactQuarantineRecord"
+      ]).actions) == toset(["dynamodb:GetItem", "dynamodb:UpdateItem"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if statement.sid == "ExactQuarantineRecord"
+      ]).resources) == toset([local.quarantine_table_arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if statement.sid == "ApiDatabaseCredential"
+      ]).actions) == toset(["ssm:GetParameter"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if statement.sid == "ApiDatabaseCredential"
+      ]).resources) == toset([local.api_database_parameter_arn]) &&
+      length([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if anytrue([for action in statement.actions : startswith(action, "kms:")])
+      ]) == 0
+    )
+    error_message = "Quarantine redrive must use a dedicated OIDC role with only one exact record and the API writer database credential."
+  }
+
+  assert {
     condition     = aws_iam_role.github_evidence[0].name == "hindsight-github-evidence"
     error_message = "The evidence writer must use its dedicated GitHub OIDC role."
   }
@@ -170,6 +199,42 @@ run "isolated_bootstrap" {
   }
 
   assert {
+    condition = (
+      local.run_queue_arn == "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-runs" &&
+      aws_iam_role.github_worker_acceptance.name == "hindsight-github-worker-acceptance" &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "ExactWorkerSourceEnqueue"
+      ]).actions) == toset(["sqs:SendMessage"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "ExactWorkerSourceEnqueue"
+      ]).resources) == toset([local.run_queue_arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "SyntheticQuarantineReadCleanup"
+      ]).actions) == toset(["dynamodb:DeleteItem", "dynamodb:GetItem"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "SyntheticQuarantineReadCleanup"
+      ]).resources) == toset([local.quarantine_table_arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "ApiDatabaseCredential"
+      ]).resources) == toset([local.api_database_parameter_arn]) &&
+      length([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if contains(statement.actions, "dynamodb:Query") || contains(statement.actions, "dynamodb:UpdateItem")
+      ]) == 0 &&
+      length([
+        for statement in data.aws_iam_policy_document.github_deploy.statement : statement
+        if contains(statement.actions, "sqs:SendMessage")
+      ]) == 0
+    )
+    error_message = "Hosted worker acceptance must use a dedicated role for exact enqueue, read, and synthetic cleanup authority."
+  }
+
+  assert {
     condition = length([
       for statement in data.aws_iam_policy_document.github_deploy.statement : statement
       if statement.sid == "LambdaVersionRefresh"
@@ -196,6 +261,20 @@ run "isolated_bootstrap" {
       if statement.sid == "LambdaVersionRefresh"
     ]).resources) == toset(local.lambda_function_arns)
     error_message = "The LambdaVersionRefresh statement must use only the four scoped function ARNs."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "RawFallbackConsumerAudit"
+      ]).actions) == toset(["lambda:ListEventSourceMappings"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
+        if statement.sid == "RawFallbackConsumerAudit"
+      ]).resources) == toset(["*"])
+    )
+    error_message = "Deployment may list event-source mappings only to prove the exact raw fallback queue has no consumer."
   }
 
   assert {
@@ -338,16 +417,37 @@ run "isolated_bootstrap" {
         "sns:Subscribe",
         "sns:Unsubscribe",
       ]) &&
-      toset(one([
-        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityAlertExercise"
-      ]).resources) == toset([local.observability_alert_topic_arn]) &&
-      toset(one([
-        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement
-        if statement.sid == "ObservabilityAlertExercise"
-      ]).actions) == toset(["sns:Publish"])
+      !contains(flatten([
+        for statement in data.aws_iam_policy_document.github_deploy_observability.statement : statement.actions
+      ]), "sns:Publish")
     )
-    error_message = "Alert subscription permissions must stay on the two stage topics, and publish must stay on the operational topic."
+    error_message = "Alert subscription permissions must stay on the two stage topics without direct publish authority."
+  }
+
+  assert {
+    condition = (
+      aws_iam_policy.github_deploy_encryption.name == "hindsight-github-deploy-encryption" &&
+      aws_iam_policy.github_deploy_encryption.policy == data.aws_iam_policy_document.github_deploy_encryption.json &&
+      aws_iam_role_policy_attachment.github_deploy_encryption.role == aws_iam_role.github_deploy.name &&
+      aws_iam_role_policy_attachment.github_deploy_encryption.policy_arn == aws_iam_policy.github_deploy_encryption.arn &&
+      local.quarantine_key_alias_arn == "arn:aws:kms:us-east-1:123456789012:alias/hindsight-demo-quarantine" &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_encryption.statement : statement
+        if statement.sid == "QuarantineKeyCreate"
+      ]).actions) == toset(["kms:CreateKey"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_encryption.statement : statement
+        if statement.sid == "QuarantineKeyLifecycle"
+      ]).resources) == toset(local.quarantine_key_arns) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_deploy_encryption.statement : statement
+        if statement.sid == "QuarantineKeyAlias"
+        ]).resources) == toset(concat(
+        local.quarantine_key_arns,
+        [local.quarantine_key_alias_arn],
+      ))
+    )
+    error_message = "The deployment role needs a separate stage-scoped policy for the quarantine key and exact alias."
   }
 
   assert {
@@ -413,7 +513,14 @@ run "isolated_bootstrap" {
         "logs:GetQueryResults",
         "logs:StopQuery",
         "xray:BatchGetTraces",
-        "sns:Publish",
+        "sns:GetSubscriptionAttributes",
+        "sns:ListSubscriptionsByTopic",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:SetAlarmState",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ReceiveMessage",
       ]) &&
       toset(one([
         for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement
@@ -421,10 +528,18 @@ run "isolated_bootstrap" {
       ]).resources) == toset(local.observability_metric_log_group_arns) &&
       toset(one([
         for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement
-        if statement.sid == "StageAlertPublish"
-      ]).resources) == toset([local.observability_alert_topic_arn])
+        if statement.sid == "StageAlertSubscriptions"
+      ]).resources) == toset(local.observability_subscription_arns) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement
+        if statement.sid == "ExactReleaseAlarmProbe"
+      ]).resources) == toset([local.exact_release_probe_alarm_arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_observability_evidence.statement : statement
+        if statement.sid == "ControlledAlertReceiver"
+      ]).resources) == toset([local.alert_receiver_queue_arn])
     )
-    error_message = "The dedicated evidence role must contain only bounded reads and stage alert publication."
+    error_message = "The dedicated evidence role must contain only bounded reads and the exact alarm/receiver exercise authority."
   }
 
   assert {

@@ -14,6 +14,14 @@ output "github_observability_evidence_role_arn" {
   value = aws_iam_role.github_observability_evidence.arn
 }
 
+output "github_quarantine_redrive_role_arn" {
+  value = aws_iam_role.github_quarantine_redrive.arn
+}
+
+output "github_worker_acceptance_role_arn" {
+  value = aws_iam_role.github_worker_acceptance.arn
+}
+
 output "github_evidence_role_arn" {
   value = try(aws_iam_role.github_evidence[0].arn, null)
 }

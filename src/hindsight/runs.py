@@ -553,6 +553,49 @@ def get_run(*, run_id: str | UUID, db_url: str | None = None) -> dict[str, Any] 
     raise AssertionError("unreachable run read retry state")
 
 
+def redrive_exhausted_run(
+    *,
+    run_id: str | UUID,
+    command: str,
+    command_generation: int,
+    idempotency_key: str,
+    db_url: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Create one idempotent fresh run from an exact exhausted source."""
+
+    if command not in {"start", "resume"}:
+        raise ValueError(f"unsupported worker command: {command}")
+    if type(command_generation) is not int or command_generation < 0:
+        raise ValueError("command_generation must be a non-negative integer")
+    with connect(db_url, application_name="hindsight-quarantine-redrive") as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM agent_runs WHERE id = %s", (run_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise RunNotFoundError(str(run_id))
+            source = dict(row)
+    if source["status"] != "failed" or source.get("failure_code") != "RunAttemptsExhausted":
+        raise RunConflictError("quarantine source run is not terminally exhausted")
+    if source.get("worker_attempt_command") != command:
+        raise RunConflictError("quarantine command does not match the source run")
+    if int(source.get("command_generation") or 0) != command_generation:
+        raise RunConflictError("quarantine generation does not match the source run")
+    for field in ("incident_slug", "namespace", "user_input"):
+        if not isinstance(source.get(field), str) or not source[field]:
+            raise RunConflictError("quarantine source run is missing required input")
+    return create_run(
+        incident_slug=str(source["incident_slug"]),
+        namespace=str(source["namespace"]),
+        user_input=str(source["user_input"]),
+        service_slug=(
+            str(source["service_slug"]) if source.get("service_slug") is not None else None
+        ),
+        idempotency_key=idempotency_key,
+        retrieval_policy=str(source.get("retrieval_policy") or "semantic_strict"),
+        db_url=db_url,
+    )
+
+
 def _read_run(*, run_id: str | UUID, db_url: str | None) -> dict[str, Any] | None:
     with connect(db_url, application_name="hindsight-api") as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -1226,9 +1269,10 @@ def finalize_exhausted_run(
     run_id: str | UUID,
     command: str,
     max_attempts: int,
+    attempt_id: str | UUID | None = None,
     db_url: str | None = None,
 ) -> dict[str, Any] | None:
-    """Atomically fail and seal a run after its final attempt expires."""
+    """Atomically fail and seal a run after its final owned or expired attempt."""
 
     if command not in {"start", "resume"}:
         raise ValueError(f"unsupported worker command: {command}")
@@ -1247,7 +1291,13 @@ def finalize_exhausted_run(
                 if run["worker_attempt_command"] != command:
                     return _jsonable(run)
                 lease_expiry = run["worker_attempt_lease_expires_at"]
-                if lease_expiry is not None and lease_expiry > current_time:
+                if attempt_id is not None and str(run.get("worker_attempt_id") or "") != str(
+                    attempt_id
+                ):
+                    raise RunAttemptLeaseLostError(
+                        f"agent run attempt is no longer current: {run_id}"
+                    )
+                if attempt_id is None and lease_expiry is not None and lease_expiry > current_time:
                     raise RunAttemptBusyError(f"agent run attempt is still live: {run_id}")
                 if int(run["worker_attempt_count"] or 0) < max_attempts:
                     raise RunAttemptsExhaustedError(

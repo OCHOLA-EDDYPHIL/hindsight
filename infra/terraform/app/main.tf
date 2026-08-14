@@ -5,8 +5,11 @@ locals {
   run_attempt_lease_seconds     = var.validation_mode ? 60 : 300
   run_queue_visibility_seconds  = var.validation_mode ? 270 : 1080
   run_max_attempts              = 3
+  run_queue_max_receive_count   = 4
   run_dispatch_schedule         = "rate(1 minute)"
   run_dispatch_schedule_seconds = 60
+  scheduler_max_event_age       = 3600
+  scheduler_max_retry_attempts  = 2
   operation_poll_seconds        = (local.run_max_attempts - 1) * local.run_queue_visibility_seconds + local.worker_timeout_seconds + 60
   changefeed_timeout_seconds    = 30
   changefeed_lease_seconds      = 60
@@ -52,18 +55,37 @@ locals {
     ".svg"  = "image/svg+xml"
   }
 
-  custom_metric_series = {
-    api_5xx          = { log_group = aws_cloudwatch_log_group.http_access.name, pattern = "{ $.status >= 500 }" }
+  required_log_metric_series = {
+    api_5xx       = { log_group = aws_cloudwatch_log_group.http_access.name, pattern = "{ $.status >= 500 }" }
+    worker_failed = { log_group = aws_cloudwatch_log_group.lambda["worker"].name, pattern = "{ $.event = \"worker_record\" && $.status = \"failed\" }" }
+  }
+  bounded_log_metric_series = {
     websocket_5xx    = { log_group = aws_cloudwatch_log_group.websocket_access.name, pattern = "{ $.status >= 500 }" }
-    worker_failed    = { log_group = aws_cloudwatch_log_group.lambda["worker"].name, pattern = "{ $.event = \"worker_record\" && $.status = \"failed\" }" }
     api_error        = { log_group = aws_cloudwatch_log_group.lambda["api"].name, pattern = "?ERROR ?Task timed out" }
     changefeed_error = { log_group = aws_cloudwatch_log_group.lambda["changefeed"].name, pattern = "?ERROR ?Task timed out" }
+  }
+  log_metric_series = merge(
+    local.required_log_metric_series,
+    var.enable_bounded_observability ? local.bounded_log_metric_series : {},
+  )
+  operational_alarm_actions = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
+  scheduled_rules = {
+    operation_reaper   = aws_cloudwatch_event_rule.operation_reaper
+    quarantine_metrics = aws_cloudwatch_event_rule.quarantine_metrics
+    run_dispatcher     = aws_cloudwatch_event_rule.run_dispatcher
+  }
+}
+
+check "run_queue_terminalization_budget" {
+  assert {
+    condition     = local.run_queue_max_receive_count == local.run_max_attempts + 1
+    error_message = "The source queue needs one delivery after the database attempt budget to terminalize exhausted work."
   }
 }
 
 check "bounded_observability" {
   assert {
-    condition     = length(local.custom_metric_series) <= 5
+    condition     = length(local.log_metric_series) <= 5
     error_message = "The bounded profile permits at most five custom metric series."
   }
   assert {
@@ -288,8 +310,80 @@ resource "aws_sqs_queue" "runs" {
   sqs_managed_sse_enabled    = true
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.run_dlq.arn
-    maxReceiveCount     = local.run_max_attempts
+    maxReceiveCount     = local.run_queue_max_receive_count
   })
+}
+
+resource "aws_sqs_queue_redrive_allow_policy" "run_dlq" {
+  queue_url = aws_sqs_queue.run_dlq.url
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.runs.arn]
+  })
+}
+
+resource "aws_sqs_queue" "scheduler_dlq" {
+  name                       = "${local.name}-scheduler-dlq"
+  message_retention_seconds  = 1209600
+  receive_wait_time_seconds  = 20
+  sqs_managed_sse_enabled    = true
+  visibility_timeout_seconds = 60
+}
+
+resource "aws_sqs_queue" "alert_receiver" {
+  name                       = "${local.name}-alert-receiver"
+  message_retention_seconds  = 1209600
+  receive_wait_time_seconds  = 20
+  sqs_managed_sse_enabled    = true
+  visibility_timeout_seconds = 60
+}
+
+resource "aws_kms_key" "quarantine" {
+  description             = "${local.name} poison-work quarantine ledger"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+}
+
+resource "aws_kms_alias" "quarantine" {
+  name          = "alias/${local.name}-quarantine"
+  target_key_id = aws_kms_key.quarantine.key_id
+}
+
+resource "aws_dynamodb_table" "quarantine" {
+  name         = "${local.name}-quarantine"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "quarantine_id"
+
+  attribute {
+    name = "quarantine_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "quarantine-status-created-at-index"
+    hash_key        = "status"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.quarantine.arn
+  }
 }
 
 resource "aws_dynamodb_table" "connections" {
@@ -549,7 +643,7 @@ data "aws_iam_policy_document" "worker" {
       "sqs:ChangeMessageVisibility",
       "sqs:GetQueueAttributes"
     ]
-    resources = [aws_sqs_queue.runs.arn, aws_sqs_queue.run_dlq.arn]
+    resources = [aws_sqs_queue.runs.arn]
   }
   statement {
     actions   = ["sqs:SendMessage"]
@@ -558,6 +652,29 @@ data "aws_iam_policy_document" "worker" {
   statement {
     actions   = ["cloudwatch:GetMetricStatistics"]
     resources = ["*"]
+  }
+  statement {
+    sid = "QuarantineLedger"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:Query",
+    ]
+    resources = [
+      aws_dynamodb_table.quarantine.arn,
+      "${aws_dynamodb_table.quarantine.arn}/index/quarantine-status-created-at-index",
+    ]
+  }
+  statement {
+    sid       = "QuarantineMetrics"
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["Hindsight/Quarantine"]
+    }
   }
 }
 
@@ -715,28 +832,32 @@ resource "aws_lambda_function" "worker" {
 
   environment {
     variables = {
-      HINDSIGHT_DATABASE_URL_PARAM        = var.worker_database_url_parameter_name
-      HINDSIGHT_GEMINI_API_KEYS_PARAM     = var.gemini_api_keys_parameter_name
-      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE   = aws_dynamodb_table.gemini_key_health.name
-      HINDSIGHT_RUN_QUEUE_URL             = aws_sqs_queue.runs.url
-      HINDSIGHT_RUN_DLQ_ARN               = aws_sqs_queue.run_dlq.arn
-      HINDSIGHT_RUN_MAX_ATTEMPTS          = tostring(local.run_max_attempts)
-      HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS = tostring(local.run_attempt_lease_seconds)
-      HINDSIGHT_AWS_ACCOUNT_ID            = data.aws_caller_identity.current.account_id
-      HINDSIGHT_STAGE                     = var.stage
-      HINDSIGHT_REQUIRE_TENANT_CONTEXT    = "1"
-      HINDSIGHT_WORKER_TENANT_ID          = "00000000-0000-0000-0000-000000000002"
-      LLM_PROVIDER                        = var.llm_provider
-      EMBEDDING_PROVIDER                  = var.embedding_provider
-      GEMINI_MODEL                        = var.gemini_model
-      GEMINI_EMBEDDING_MODEL              = var.gemini_embedding_model
-      HINDSIGHT_GEMINI_REPRESENTATION     = var.gemini_embedding_representation
-      REASONING_MAX_ATTEMPTS              = tostring(var.reasoning_max_attempts)
-      HINDSIGHT_OTEL_ENABLED              = var.enable_bounded_observability ? "1" : "0"
-      OTEL_EXPORTER_OTLP_ENDPOINT         = "http://localhost:4317"
-      OTEL_PROPAGATORS                    = "xray,tracecontext"
-      OTEL_TRACES_SAMPLER                 = "xray"
-      OTEL_TRACES_SAMPLER_ARG             = "endpoint=http://localhost:2000"
+      HINDSIGHT_DATABASE_URL_PARAM          = var.worker_database_url_parameter_name
+      HINDSIGHT_GEMINI_API_KEYS_PARAM       = var.gemini_api_keys_parameter_name
+      HINDSIGHT_GEMINI_KEY_HEALTH_TABLE     = aws_dynamodb_table.gemini_key_health.name
+      HINDSIGHT_QUARANTINE_INDEX            = "quarantine-status-created-at-index"
+      HINDSIGHT_QUARANTINE_METRIC_NAMESPACE = "Hindsight/Quarantine"
+      HINDSIGHT_QUARANTINE_METRIC_STAGE     = var.stage
+      HINDSIGHT_QUARANTINE_TABLE            = aws_dynamodb_table.quarantine.name
+      HINDSIGHT_RUN_DLQ_ARN                 = aws_sqs_queue.run_dlq.arn
+      HINDSIGHT_RUN_QUEUE_URL               = aws_sqs_queue.runs.url
+      HINDSIGHT_RUN_MAX_ATTEMPTS            = tostring(local.run_max_attempts)
+      HINDSIGHT_RUN_ATTEMPT_LEASE_SECONDS   = tostring(local.run_attempt_lease_seconds)
+      HINDSIGHT_AWS_ACCOUNT_ID              = data.aws_caller_identity.current.account_id
+      HINDSIGHT_STAGE                       = var.stage
+      HINDSIGHT_REQUIRE_TENANT_CONTEXT      = "1"
+      HINDSIGHT_WORKER_TENANT_ID            = "00000000-0000-0000-0000-000000000002"
+      LLM_PROVIDER                          = var.llm_provider
+      EMBEDDING_PROVIDER                    = var.embedding_provider
+      GEMINI_MODEL                          = var.gemini_model
+      GEMINI_EMBEDDING_MODEL                = var.gemini_embedding_model
+      HINDSIGHT_GEMINI_REPRESENTATION       = var.gemini_embedding_representation
+      REASONING_MAX_ATTEMPTS                = tostring(var.reasoning_max_attempts)
+      HINDSIGHT_OTEL_ENABLED                = var.enable_bounded_observability ? "1" : "0"
+      OTEL_EXPORTER_OTLP_ENDPOINT           = "http://localhost:4317"
+      OTEL_PROPAGATORS                      = "xray,tracecontext"
+      OTEL_TRACES_SAMPLER                   = "xray"
+      OTEL_TRACES_SAMPLER_ARG               = "endpoint=http://localhost:2000"
     }
   }
 }
@@ -826,14 +947,6 @@ resource "aws_lambda_event_source_mapping" "worker" {
   }
 }
 
-resource "aws_lambda_event_source_mapping" "worker_dlq" {
-  event_source_arn        = aws_sqs_queue.run_dlq.arn
-  function_name           = aws_lambda_function.worker.arn
-  batch_size              = 1
-  function_response_types = ["ReportBatchItemFailures"]
-  enabled                 = var.runtime_active
-}
-
 resource "aws_cloudwatch_event_rule" "operation_reaper" {
   name                = "${local.name}-operation-reaper"
   description         = "Terminalize expired final governed-memory operation attempts"
@@ -846,6 +959,17 @@ resource "aws_cloudwatch_event_target" "operation_reaper" {
   target_id = "memory-operation-reaper"
   arn       = aws_lambda_function.worker.arn
   input     = jsonencode({ command = "reap_memory_operations" })
+
+  dead_letter_config {
+    arn = aws_sqs_queue.scheduler_dlq.arn
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = local.scheduler_max_event_age
+    maximum_retry_attempts       = local.scheduler_max_retry_attempts
+  }
+
+  depends_on = [aws_sqs_queue_policy.scheduler_dlq]
 }
 
 resource "aws_lambda_permission" "operation_reaper" {
@@ -868,6 +992,17 @@ resource "aws_cloudwatch_event_target" "run_dispatcher" {
   target_id = "agent-run-dispatcher"
   arn       = aws_lambda_function.worker.arn
   input     = jsonencode({ command = "dispatch_run_commands" })
+
+  dead_letter_config {
+    arn = aws_sqs_queue.scheduler_dlq.arn
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = local.scheduler_max_event_age
+    maximum_retry_attempts       = local.scheduler_max_retry_attempts
+  }
+
+  depends_on = [aws_sqs_queue_policy.scheduler_dlq]
 }
 
 resource "aws_lambda_permission" "run_dispatcher" {
@@ -876,6 +1011,73 @@ resource "aws_lambda_permission" "run_dispatcher" {
   function_name = aws_lambda_function.worker.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.run_dispatcher.arn
+}
+
+resource "aws_cloudwatch_event_rule" "quarantine_metrics" {
+  name                = "${local.name}-quarantine-metrics"
+  description         = "Report low-cardinality poison-work quarantine metrics"
+  schedule_expression = local.run_dispatch_schedule
+  state               = var.runtime_active ? "ENABLED" : "DISABLED"
+}
+
+resource "aws_cloudwatch_event_target" "quarantine_metrics" {
+  rule      = aws_cloudwatch_event_rule.quarantine_metrics.name
+  target_id = "quarantine-metrics"
+  arn       = aws_lambda_function.worker.arn
+  input     = jsonencode({ command = "report_quarantine_metrics" })
+
+  dead_letter_config {
+    arn = aws_sqs_queue.scheduler_dlq.arn
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = local.scheduler_max_event_age
+    maximum_retry_attempts       = local.scheduler_max_retry_attempts
+  }
+
+  depends_on = [aws_sqs_queue_policy.scheduler_dlq]
+}
+
+resource "aws_lambda_permission" "quarantine_metrics" {
+  statement_id  = "AllowQuarantineMetrics"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.worker.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.quarantine_metrics.arn
+}
+
+data "aws_iam_policy_document" "scheduler_dlq" {
+  statement {
+    sid       = "EventBridgeScheduledTargets"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.scheduler_dlq.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values = [
+        aws_cloudwatch_event_rule.operation_reaper.arn,
+        aws_cloudwatch_event_rule.quarantine_metrics.arn,
+        aws_cloudwatch_event_rule.run_dispatcher.arn,
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "scheduler_dlq" {
+  queue_url = aws_sqs_queue.scheduler_dlq.url
+  policy    = data.aws_iam_policy_document.scheduler_dlq.json
 }
 
 resource "aws_apigatewayv2_api" "http" {
@@ -1328,13 +1530,13 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
-  alarm_actions       = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
+  alarm_actions       = local.operational_alarm_actions
   dimensions          = { FunctionName = each.value }
 }
 
 resource "aws_cloudwatch_metric_alarm" "run_dlq" {
   alarm_name          = "${local.name}-run-dlq-not-empty"
-  alarm_description   = "An agent run exhausted its bounded retries"
+  alarm_description   = "Raw poison work remains in the terminal fallback queue"
   namespace           = "AWS/SQS"
   metric_name         = "ApproximateNumberOfMessagesVisible"
   statistic           = "Maximum"
@@ -1343,8 +1545,120 @@ resource "aws_cloudwatch_metric_alarm" "run_dlq" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
-  alarm_actions       = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
+  alarm_actions       = local.operational_alarm_actions
   dimensions          = { QueueName = aws_sqs_queue.run_dlq.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "run_queue_age" {
+  alarm_name          = "${local.name}-run-queue-age"
+  alarm_description   = "Source work has exceeded the durable attempt lease"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = local.run_attempt_lease_seconds
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.operational_alarm_actions
+  dimensions          = { QueueName = aws_sqs_queue.runs.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "run_dlq_age" {
+  alarm_name          = "${local.name}-run-dlq-age"
+  alarm_description   = "Raw poison work remains unquarantined in the terminal fallback queue"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = local.run_queue_visibility_seconds
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.operational_alarm_actions
+  dimensions          = { QueueName = aws_sqs_queue.run_dlq.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scheduler_failed_invocations" {
+  for_each = local.scheduled_rules
+
+  alarm_name          = "${each.value.name}-failed-invocations"
+  alarm_description   = "A scheduled worker target exhausted an invocation"
+  namespace           = "AWS/Events"
+  metric_name         = "FailedInvocations"
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.operational_alarm_actions
+  dimensions          = { RuleName = each.value.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scheduler_dlq" {
+  alarm_name          = "${local.name}-scheduler-dlq-not-empty"
+  alarm_description   = "A scheduled worker target exhausted bounded EventBridge delivery"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.operational_alarm_actions
+  dimensions          = { QueueName = aws_sqs_queue.scheduler_dlq.name }
+}
+
+resource "aws_cloudwatch_metric_alarm" "quarantine" {
+  for_each = {
+    count = {
+      metric_name = "QuarantineRecordCount"
+      threshold   = 1
+    }
+    age = {
+      metric_name = "OldestRecordAgeSeconds"
+      threshold   = local.run_queue_visibility_seconds
+    }
+  }
+
+  alarm_name          = "${local.name}-quarantine-${each.key}"
+  alarm_description   = "Poison-work quarantine ${each.key} requires owner review"
+  namespace           = "Hindsight/Quarantine"
+  metric_name         = each.value.metric_name
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = each.value.threshold
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.operational_alarm_actions
+  dimensions          = { Stage = var.stage }
+}
+
+resource "aws_cloudwatch_metric_alarm" "exact_release_probe" {
+  alarm_name          = "${local.name}-exact-release-probe"
+  alarm_description   = "Controlled alarm-delivery probe for the exact deployed release"
+  namespace           = "Hindsight/Release"
+  metric_name         = "ExactReleaseProbe"
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "ignore"
+  alarm_actions       = local.operational_alarm_actions
+  ok_actions          = local.operational_alarm_actions
+  dimensions = {
+    ReleaseRevision = var.deployed_revision
+    Stage           = var.stage
+  }
 }
 
 resource "aws_xray_sampling_rule" "bounded" {
@@ -1439,6 +1753,71 @@ resource "aws_sns_topic_policy" "budget_alerts" {
   policy = data.aws_iam_policy_document.budget_alerts.json
 }
 
+data "aws_iam_policy_document" "alert_receiver" {
+  statement {
+    sid       = "ExactStageAlertTopics"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.alert_receiver.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["sns.amazonaws.com"]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values = [
+        aws_sns_topic.alerts.arn,
+        aws_sns_topic.budget_alerts.arn,
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "alert_receiver" {
+  queue_url = aws_sqs_queue.alert_receiver.url
+  policy    = data.aws_iam_policy_document.alert_receiver.json
+}
+
+resource "aws_sns_topic_subscription" "alert_receiver" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "sqs"
+  endpoint  = aws_sqs_queue.alert_receiver.arn
+
+  depends_on = [aws_sqs_queue_policy.alert_receiver]
+
+  lifecycle {
+    postcondition {
+      condition     = self.arn != "PendingConfirmation" && self.arn != "Deleted"
+      error_message = "The controlled operational alert receiver must be confirmed."
+    }
+  }
+}
+
+resource "aws_sns_topic_subscription" "budget_alert_receiver" {
+  provider = aws.us_east_1
+
+  topic_arn = aws_sns_topic.budget_alerts.arn
+  protocol  = "sqs"
+  endpoint  = aws_sqs_queue.alert_receiver.arn
+
+  depends_on = [aws_sqs_queue_policy.alert_receiver]
+
+  lifecycle {
+    postcondition {
+      condition     = self.arn != "PendingConfirmation" && self.arn != "Deleted"
+      error_message = "The controlled budget alert receiver must be confirmed."
+    }
+  }
+}
+
 resource "aws_sns_topic_subscription" "alert_email" {
   count = var.alert_email == null ? 0 : 1
 
@@ -1461,6 +1840,7 @@ resource "aws_budgets_budget" "monthly" {
 
   depends_on = [
     aws_sns_topic_policy.budget_alerts,
+    aws_sns_topic_subscription.budget_alert_receiver,
     aws_sns_topic_subscription.budget_alert_email,
   ]
 
@@ -1488,7 +1868,7 @@ resource "aws_budgets_budget" "monthly" {
 }
 
 resource "aws_cloudwatch_log_metric_filter" "bounded" {
-  for_each = var.enable_bounded_observability ? local.custom_metric_series : {}
+  for_each = local.log_metric_series
 
   name           = "${local.name}-${replace(each.key, "_", "-")}"
   log_group_name = each.value.log_group
@@ -1515,12 +1895,18 @@ resource "aws_cloudwatch_metric_alarm" "bounded" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
-  alarm_actions       = distinct(concat([aws_sns_topic.alerts.arn], var.alarm_actions))
+  alarm_actions       = local.operational_alarm_actions
 }
 
 check "alarm_metric_cap" {
   assert {
-    condition     = length(aws_cloudwatch_metric_alarm.lambda_errors) + 1 + length(aws_cloudwatch_metric_alarm.bounded) <= 10
-    error_message = "The deployment permits at most ten alarm metrics."
+    condition = (
+      length(aws_cloudwatch_metric_alarm.lambda_errors) +
+      length(aws_cloudwatch_metric_alarm.scheduler_failed_invocations) +
+      length(aws_cloudwatch_metric_alarm.quarantine) +
+      length(aws_cloudwatch_metric_alarm.bounded) +
+      5 <= 20
+    )
+    error_message = "The deployment permits at most twenty bounded alarm metrics."
   }
 }

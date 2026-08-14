@@ -9,13 +9,15 @@ import pytest
 
 
 RUN_DELIVERY = {
-    "dispatch_id": "dispatch-1",
-    "dispatch_attempt_id": "dispatch-attempt-1",
+    "dispatch_id": "11111111-1111-4111-8111-111111111111",
+    "dispatch_attempt_id": "22222222-2222-4222-8222-222222222222",
     "dispatch_sequence": 1,
 }
+RUN_ID = "33333333-3333-4333-8333-333333333333"
+OPERATION_ID = "44444444-4444-4444-8444-444444444444"
 
 
-def _run_message(*, command="start", run_id="run-1", **fields):
+def _run_message(*, command="start", run_id=RUN_ID, **fields):
     return {
         "command": command,
         "run_id": run_id,
@@ -35,6 +37,10 @@ def _stub_runtime_providers(monkeypatch):
     monkeypatch.setattr(
         "hindsight.worker.embedding_provider_from_env",
         lambda *_args, **_kwargs: DeterministicEmbeddingProvider(),
+    )
+    monkeypatch.setattr(
+        "hindsight.worker.runtime_database_url",
+        lambda: "postgresql://db",
     )
 
 
@@ -88,6 +94,41 @@ def test_scheduled_worker_dispatches_pending_run_commands(monkeypatch):
     }
 
 
+def test_scheduled_worker_reports_quarantine_metrics_without_provider_settings(monkeypatch):
+    import hindsight.worker as worker
+
+    table = object()
+    cloudwatch = object()
+    calls = []
+    monkeypatch.setenv(worker.QUARANTINE_METRIC_STAGE_ENV, "demo")
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(worker, "quarantine_table_from_env", lambda: table)
+    monkeypatch.setattr(worker.boto3, "client", lambda *args, **kwargs: cloudwatch)
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: pytest.fail("provider settings resolved during quarantine metric report"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "report_quarantine_metrics",
+        lambda **kwargs: calls.append(kwargs) or {"count": 2, "oldest_age_seconds": 60},
+    )
+
+    result = worker.handler({"command": "report_quarantine_metrics"}, None)
+
+    assert result == {"count": 2, "oldest_age_seconds": 60}
+    assert calls == [
+        {
+            "table": table,
+            "cloudwatch_client": cloudwatch,
+            "stage": "demo",
+            "index_name": "quarantine-status-created-at-index",
+            "namespace": "Hindsight/Quarantine",
+        }
+    ]
+
+
 def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypatch):
     import hindsight.worker as worker
 
@@ -101,6 +142,7 @@ def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypat
         lambda: SimpleNamespace(provider_env={}),
     )
     monkeypatch.setattr(worker, "embedding_provider_from_env", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(worker, "uuid4", lambda: OPERATION_ID)
 
     def execute(**kwargs):
         captured.update(kwargs)
@@ -108,11 +150,52 @@ def test_memory_operation_claim_precedes_runtime_provider_construction(monkeypat
 
     monkeypatch.setattr(worker, "execute_operation", execute)
 
-    result = worker.process_message({"command": "memory_operation", "operation_id": "operation-1"})
+    result = worker.process_message(
+        {
+            "command": "memory_operation",
+            "operation_id": OPERATION_ID,
+            "worker_id": "attacker-controlled worker prose",
+        }
+    )
 
     assert result == {"provider": provider}
     assert captured["db_url"] == "postgresql://db"
     assert captured["embedding_provider_factory"] is not None
+    assert captured["worker_id"] == f"sqs-worker:{OPERATION_ID}"
+
+
+def test_worker_trace_attributes_drop_noncanonical_envelope_values(monkeypatch):
+    from contextlib import nullcontext
+
+    import hindsight.worker as worker
+
+    captured = []
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "start_span",
+        lambda _name, attributes, **_kwargs: captured.append(attributes) or nullcontext(),
+    )
+    monkeypatch.setattr(worker, "reap_exhausted_operations", lambda **_kwargs: {"failed": 0})
+
+    result = worker.process_message(
+        {
+            "command": "reap_memory_operations",
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "run_id": RUN_ID,
+            "dispatch_id": "attacker prose and secrets",
+            "dispatch_attempt_id": RUN_DELIVERY["dispatch_attempt_id"],
+        }
+    )
+
+    assert result == {"failed": 0}
+    assert captured == [
+        {
+            "hindsight.tenant_id": "00000000-0000-0000-0000-000000000001",
+            "hindsight.run_id": RUN_ID,
+            "hindsight.dispatch_attempt_id": RUN_DELIVERY["dispatch_attempt_id"],
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -129,7 +212,6 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
     import hindsight.worker as worker
 
     parameter_calls = []
-    settings_calls = []
     database_calls = []
 
     class FakeSsm:
@@ -144,16 +226,19 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
         "EMBEDDING_PROVIDER": "gemini",
     }
 
-    def resolve_settings():
-        settings_calls.append(True)
-        return runtime.runtime_settings(
+    def resolve_database():
+        return runtime.runtime_database_url(
             environ=environ,
             ssm_client=FakeSsm(),
-            use_cache=False,
         )
 
     monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
-    monkeypatch.setattr(worker, "runtime_settings", resolve_settings)
+    monkeypatch.setattr(worker, "runtime_database_url", resolve_database)
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: pytest.fail("provider settings must not resolve for a duplicate delivery"),
+    )
     monkeypatch.setattr(
         worker,
         "claim_run_attempt",
@@ -172,26 +257,25 @@ def test_run_claim_and_duplicate_lookup_share_hosted_database_parameter(
 
     result = worker.process_message(_run_message(command=command))
 
-    assert result == {"id": "run-1", "status": "existing"}
-    assert settings_calls == [True]
+    assert result == {"id": RUN_ID, "status": "existing"}
     assert parameter_calls == [("/hindsight/test/database-url", True)]
     assert database_calls == [
         (
             "claim",
             {
-                "run_id": "run-1",
+                "run_id": RUN_ID,
                 "command": command,
                 "command_generation": 0,
                 "lease_ttl": timedelta(seconds=300),
                 "max_attempts": 3,
                 **RUN_DELIVERY,
-                "worker_message_id": "direct:dispatch-attempt-1",
+                "worker_message_id": f"direct:{RUN_DELIVERY['dispatch_attempt_id']}",
                 "db_url": "postgresql://hosted/database",
             },
         ),
         (
             "get",
-            {"run_id": "run-1", "db_url": "postgresql://hosted/database"},
+            {"run_id": RUN_ID, "db_url": "postgresql://hosted/database"},
         ),
     ]
 
@@ -297,7 +381,7 @@ def test_sqs_message_id_is_passed_to_run_delivery_claim(monkeypatch):
     assert result == {"batchItemFailures": []}
     assert claims == [
         {
-            "run_id": "run-1",
+            "run_id": RUN_ID,
             "command": "start",
             "command_generation": 0,
             "lease_ttl": timedelta(seconds=300),
@@ -307,6 +391,52 @@ def test_sqs_message_id_is_passed_to_run_delivery_claim(monkeypatch):
             "db_url": "postgresql://db",
         }
     ]
+
+
+def test_run_claim_precedes_provider_settings_resolution(monkeypatch):
+    import hindsight.worker as worker
+
+    order = []
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "runtime_database_url",
+        lambda: order.append("database") or "postgresql://db",
+    )
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **_kwargs: (
+            order.append("claim")
+            or SimpleNamespace(
+                outcome="claimed",
+                attempt_id="attempt-1",
+                run={
+                    "id": "run-1",
+                    "thread_id": "thread-1",
+                    "decision_id": "agent:run-1:plan",
+                    "incident_slug": "incident-1",
+                    "namespace": "demo:payments",
+                    "service_slug": None,
+                    "user_input": "latency",
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: (
+            order.append("provider_settings")
+            or (_ for _ in ()).throw(RuntimeError("provider unavailable"))
+        ),
+    )
+    monkeypatch.setattr(worker, "record_run_attempt_failure", lambda **_kwargs: {})
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        worker.process_message(_run_message())
+
+    assert order == ["database", "claim", "provider_settings"]
 
 
 def test_worker_records_progress_and_awaiting_approval(monkeypatch):
@@ -405,13 +535,13 @@ def test_worker_records_progress_and_awaiting_approval(monkeypatch):
 
     assert claim_calls == [
         {
-            "run_id": "run-1",
+            "run_id": RUN_ID,
             "command": "start",
             "command_generation": 0,
             "lease_ttl": timedelta(seconds=300),
             "max_attempts": 3,
             **RUN_DELIVERY,
-            "worker_message_id": "direct:dispatch-attempt-1",
+            "worker_message_id": f"direct:{RUN_DELIVERY['dispatch_attempt_id']}",
             "db_url": "postgresql://db",
         }
     ]
@@ -481,6 +611,81 @@ def test_provider_setup_failure_uses_durable_attempt_retry_path(monkeypatch):
 
     assert failures[-1]["attempt_id"] == "attempt-1"
     assert failures[-1]["error_type"] == "RuntimeError"
+
+
+@pytest.mark.parametrize("ledger_fails", [False, True])
+def test_final_provider_setup_failure_terminalizes_before_source_ack(monkeypatch, ledger_fails):
+    import hindsight.worker as worker
+
+    order = []
+    run = {
+        "id": "run-1",
+        "thread_id": "thread-1",
+        "decision_id": "agent:run-1:plan",
+        "incident_slug": "incident-1",
+        "namespace": "demo:payments",
+        "service_slug": None,
+        "user_input": "latency",
+        "worker_attempt_count": 3,
+    }
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **_kwargs: (
+            order.append("claim")
+            or SimpleNamespace(outcome="claimed", attempt_id="attempt-3", run=run)
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: (
+            order.append("provider_settings")
+            or (_ for _ in ()).throw(RuntimeError("provider unavailable"))
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "record_run_attempt_failure",
+        lambda **_kwargs: order.append("record_failure") or run,
+    )
+    finalized = []
+    monkeypatch.setattr(
+        worker,
+        "finalize_exhausted_run",
+        lambda **kwargs: (
+            order.append("finalize") or finalized.append(kwargs) or {**run, "status": "failed"}
+        ),
+    )
+    monkeypatch.setattr(worker, "quarantine_table_from_env", lambda: object())
+
+    def persist(**kwargs):
+        order.append("persist")
+        if ledger_fails:
+            raise RuntimeError("ledger unavailable")
+        return SimpleNamespace(item={"quarantine_id": "q_" + "2" * 64}, created=True)
+
+    monkeypatch.setattr(worker, "persist_quarantine_record", persist)
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "message-3",
+                    "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:runs",
+                    "attributes": {"ApproximateReceiveCount": "3"},
+                    "body": json.dumps(_run_message()),
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-3"),
+    )
+
+    assert order == ["claim", "provider_settings", "record_failure", "finalize", "persist"]
+    assert finalized[0]["attempt_id"] == "attempt-3"
+    assert result == {
+        "batchItemFailures": ([{"itemIdentifier": "message-3"}] if ledger_fails else [])
+    }
 
 
 def test_resume_attempt_can_replan_and_return_to_approval(monkeypatch):
@@ -596,8 +801,177 @@ def test_handler_identifies_dlq_records_by_source_arn(monkeypatch):
         None,
     )
 
+    assert result == {"batchItemFailures": [{"itemIdentifier": "dlq-message"}]}
+    assert calls == [
+        (
+            {"command": "start", "run_id": "run-1"},
+            {"worker_message_id": "source-message"},
+        )
+    ]
+
+
+def test_handler_quarantines_malformed_body_without_database_work(monkeypatch):
+    import hindsight.worker as worker
+
+    writes = []
+    monkeypatch.setattr(worker, "quarantine_table_from_env", lambda: object())
+    monkeypatch.setattr(
+        worker,
+        "persist_quarantine_record",
+        lambda **kwargs: (
+            writes.append(kwargs)
+            or SimpleNamespace(item={"quarantine_id": "q_" + "1" * 64}, created=True)
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "process_message",
+        lambda *_args, **_kwargs: pytest.fail("malformed work reached database processing"),
+    )
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "message-1",
+                    "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:runs",
+                    "attributes": {"ApproximateReceiveCount": "2"},
+                    "body": '{"command":',
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-1"),
+    )
+
     assert result == {"batchItemFailures": []}
-    assert [kwargs["dead_letter"] for _, kwargs in calls] == [False, True]
+    assert writes[0]["raw_body"] == '{"command":'
+    assert writes[0]["reason_code"] == "malformed_json"
+    assert writes[0]["work_kind"] == "unknown"
+    assert writes[0]["receive_count"] == 2
+
+
+def test_handler_preserves_raw_message_when_quarantine_persistence_fails(monkeypatch):
+    import hindsight.worker as worker
+
+    monkeypatch.setattr(worker, "quarantine_table_from_env", lambda: object())
+    monkeypatch.setattr(
+        worker,
+        "persist_quarantine_record",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("ledger unavailable")),
+    )
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "message-1",
+                    "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:runs",
+                    "body": "not-json",
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-1"),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "message-1"}]}
+
+
+def test_malformed_identity_is_not_logged_or_used_for_database_work(monkeypatch, caplog):
+    import hindsight.worker as worker
+
+    untrusted = "noncanonical-id arbitrary operator prose"
+    writes = []
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker,
+        "runtime_database_url",
+        lambda: pytest.fail("malformed identity reached database resolution"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **_kwargs: pytest.fail("malformed identity reached a database claim"),
+    )
+    monkeypatch.setattr(worker, "quarantine_table_from_env", lambda: object())
+    monkeypatch.setattr(
+        worker,
+        "persist_quarantine_record",
+        lambda **kwargs: (
+            writes.append(kwargs)
+            or SimpleNamespace(item={"quarantine_id": "q_" + "4" * 64}, created=True)
+        ),
+    )
+    caplog.set_level(logging.INFO, logger=worker.__name__)
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "message-untrusted",
+                    "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:runs",
+                    "body": json.dumps(
+                        {
+                            "command": "start",
+                            "run_id": untrusted,
+                            **RUN_DELIVERY,
+                        }
+                    ),
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-untrusted"),
+    )
+
+    assert result == {"batchItemFailures": []}
+    assert writes[0]["run_id"] is None
+    assert writes[0]["work_kind"] == "unknown"
+    assert untrusted not in caplog.text
+
+
+def test_delivery_identity_conflict_is_quarantined_without_provider_resolution(monkeypatch):
+    import hindsight.worker as worker
+
+    writes = []
+    monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **_kwargs: None)
+    monkeypatch.setattr(worker, "runtime_database_url", lambda: "postgresql://db")
+    monkeypatch.setattr(
+        worker,
+        "claim_run_attempt",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ValueError("dispatch delivery identity does not match the run")
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "runtime_settings",
+        lambda: pytest.fail("provider settings resolved after an invalid delivery"),
+    )
+    monkeypatch.setattr(worker, "quarantine_table_from_env", lambda: object())
+    monkeypatch.setattr(
+        worker,
+        "persist_quarantine_record",
+        lambda **kwargs: (
+            writes.append(kwargs)
+            or SimpleNamespace(item={"quarantine_id": "q_" + "5" * 64}, created=True)
+        ),
+    )
+
+    result = worker.handler(
+        {
+            "Records": [
+                {
+                    "messageId": "message-conflict",
+                    "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:runs",
+                    "body": json.dumps(_run_message()),
+                }
+            ]
+        },
+        SimpleNamespace(aws_request_id="request-conflict"),
+    )
+
+    assert result == {"batchItemFailures": []}
+    assert writes[0]["reason_code"] == "invalid_envelope"
+    assert writes[0]["run_id"] is None
 
 
 def test_handler_logs_safe_sqs_failure_context(monkeypatch, caplog):
@@ -619,7 +993,9 @@ def test_handler_logs_safe_sqs_failure_context(monkeypatch, caplog):
                     "messageId": "message-1",
                     "eventSourceARN": "arn:aws:sqs:region:account:runs",
                     "attributes": {"ApproximateReceiveCount": "3"},
-                    "body": '{"command":"memory_operation","operation_id":"operation-1"}',
+                    "body": json.dumps(
+                        {"command": "memory_operation", "operation_id": OPERATION_ID}
+                    ),
                 }
             ]
         },
@@ -635,14 +1011,14 @@ def test_handler_logs_safe_sqs_failure_context(monkeypatch, caplog):
         "event": "worker_record",
         "lambda_request_id": "request-1",
         "message_id": "message-1",
-        "operation_id": "operation-1",
+        "operation_id": OPERATION_ID,
         "receive_count": "3",
         "source_arn": "arn:aws:sqs:region:account:runs",
         "status": "failed",
     }
 
 
-def test_exhausted_source_retries_and_dlq_finalizes(monkeypatch):
+def test_exhausted_source_finalizes_before_quarantine(monkeypatch):
     import hindsight.worker as worker
 
     monkeypatch.setattr(worker, "configure_tracing_from_env", lambda **kwargs: None)
@@ -663,9 +1039,9 @@ def test_exhausted_source_retries_and_dlq_finalizes(monkeypatch):
         lambda **kwargs: finalized.append(kwargs) or {"status": "failed"},
     )
 
-    with pytest.raises(worker.RunAttemptsExhaustedError):
+    with pytest.raises(worker.TerminalWorkerMessage) as terminal:
         worker.process_message(_run_message())
-    result = worker.process_message(_run_message(), dead_letter=True)
 
-    assert result == {"status": "failed"}
+    assert terminal.value.reason_code == "run_attempts_exhausted"
+    assert terminal.value.work_kind == "run"
     assert finalized[0]["max_attempts"] == 3
