@@ -72,8 +72,10 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
     assert any(dependency.startswith("google-genai") for dependency in api["dependencies"])
     assert "embedding_index.py" in api["modules"]
     assert "operations.py" in api["modules"]
+    assert "consolidation.py" in api["modules"]
     assert "prompt_safety.py" in api["modules"]
     assert "redaction.py" in api["modules"]
+    assert "reasoning.py" in api["modules"]
     assert "run_dispatch.py" in api["modules"]
     assert "snapshots.py" in api["modules"]
     assert "trace_contract.py" in api["modules"]
