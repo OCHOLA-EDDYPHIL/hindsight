@@ -9,12 +9,14 @@ CREATE ROLE IF NOT EXISTS hindsight_dashboard_reader LOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_archive NOLOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_cdc NOLOGIN;
 CREATE ROLE IF NOT EXISTS hindsight_lifecycle NOLOGIN;
+CREATE ROLE IF NOT EXISTS hindsight_infrastructure_auditor NOLOGIN;
 
 ALTER ROLE hindsight_agent_writer NOLOGIN;
 ALTER ROLE hindsight_memory_worker NOLOGIN;
 ALTER ROLE hindsight_archive NOLOGIN;
 ALTER ROLE hindsight_cdc NOLOGIN;
 ALTER ROLE hindsight_lifecycle NOLOGIN;
+ALTER ROLE hindsight_infrastructure_auditor NOLOGIN;
 ALTER ROLE hindsight_agent_writer NOBYPASSRLS;
 ALTER ROLE hindsight_memory_worker NOBYPASSRLS;
 ALTER ROLE hindsight_mcp_readonly NOBYPASSRLS;
@@ -22,13 +24,35 @@ ALTER ROLE hindsight_dashboard_reader NOBYPASSRLS;
 ALTER ROLE hindsight_archive NOBYPASSRLS;
 ALTER ROLE hindsight_cdc NOBYPASSRLS;
 ALTER ROLE hindsight_lifecycle NOBYPASSRLS;
+ALTER ROLE hindsight_infrastructure_auditor NOBYPASSRLS;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM hindsight_infrastructure_auditor;
+REVOKE ALL ON SCHEMA public FROM hindsight_infrastructure_auditor;
 GRANT USAGE ON SCHEMA public TO
     hindsight_agent_writer,
     hindsight_memory_worker,
     hindsight_archive,
     hindsight_cdc,
-    hindsight_lifecycle;
+    hindsight_lifecycle,
+    hindsight_infrastructure_auditor;
+
+-- The infrastructure auditor executes the application-owned read-only
+-- catalog. It receives only the tables needed to establish the tenant-bound
+-- session -> run -> memory-read -> memory/checkpoint provenance chain.
+GRANT SELECT ON TABLE
+    demo_sessions,
+    agent_runs,
+    memory_reads,
+    semantic_memories,
+    checkpoints
+TO hindsight_infrastructure_auditor;
+REVOKE INSERT, UPDATE, DELETE ON TABLE
+    demo_sessions,
+    agent_runs,
+    memory_reads,
+    semantic_memories,
+    checkpoints
+FROM hindsight_infrastructure_auditor;
 
 GRANT SELECT ON TABLE
     tenants,
@@ -203,7 +227,8 @@ GRANT INSERT ON TABLE
 TO hindsight_memory_worker;
 
 REVOKE DELETE ON ALL TABLES IN SCHEMA public
-FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive, hindsight_cdc;
+FROM hindsight_agent_writer, hindsight_memory_worker, hindsight_archive, hindsight_cdc,
+    hindsight_infrastructure_auditor;
 
 GRANT UPDATE ON TABLE
     episodic_memories,
@@ -362,7 +387,7 @@ REVOKE ALL ON TABLE tenant_lifecycle_operations, tenant_lifecycle_tables,
     tenant_lifecycle_schema_change_blockers
 FROM hindsight_agent_writer, hindsight_memory_worker,
     hindsight_mcp_readonly, hindsight_dashboard_reader,
-    hindsight_archive, hindsight_cdc;
+    hindsight_archive, hindsight_cdc, hindsight_infrastructure_auditor;
 
 GRANT SELECT ON TABLE
     tenants,
@@ -494,4 +519,5 @@ TO hindsight_lifecycle;
 
 REVOKE DELETE ON TABLE tenants FROM hindsight_agent_writer,
     hindsight_memory_worker, hindsight_mcp_readonly,
-    hindsight_dashboard_reader, hindsight_archive, hindsight_cdc;
+    hindsight_dashboard_reader, hindsight_archive, hindsight_cdc,
+    hindsight_infrastructure_auditor;

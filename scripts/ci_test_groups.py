@@ -45,6 +45,7 @@ DATABASE_GROUPS = {
         "tests/test_agent.py",
         "tests/test_consolidation.py",
         "tests/test_governed_memory.py",
+        "tests/test_infrastructure_auditor_database.py",
         "tests/test_memory.py",
         "tests/test_operation_retries.py",
         "tests/test_poison_rewind_demo.py",
