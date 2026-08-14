@@ -32,6 +32,10 @@ from psycopg import errors as psycopg_errors
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hindsight.db import connect
+from hindsight.consolidation import (
+    get_consolidation_candidate,
+    list_consolidation_candidates,
+)
 from hindsight.demo_state import (
     DEMO_NAMESPACE,
     ensure_poison_rewind_incident,
@@ -54,6 +58,7 @@ from hindsight.operations import (
     OperationConflictError,
     enqueue_operation,
     get_operation,
+    preview_consolidation_review,
     preview_retraction,
     preview_review_resolution,
     preview_rewind,
@@ -332,6 +337,11 @@ class ReviewResolutionPreviewRequest(StrictRequestModel):
     action: Literal["confirmed", "retracted"]
     reason: str = Field(min_length=1, max_length=500)
     authorized_namespaces: list[str] = Field(min_length=1)
+
+
+class ConsolidationReviewPreviewRequest(StrictRequestModel):
+    action: Literal["approve", "reject"]
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class DemoResetRequest(StrictRequestModel):
@@ -891,6 +901,64 @@ def review_resolution_preview(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except OperationAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.get(
+    f"{V2_PREFIX}/memory/consolidation-candidates",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
+)
+def consolidation_candidates_list(
+    review_status: Literal["pending", "approved", "rejected"] | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    candidates = list_consolidation_candidates(
+        review_status=review_status,
+        limit=limit,
+        db_url=_api_database_url(),
+    )
+    return {"count": len(candidates), "candidates": _jsonable(candidates)}
+
+
+@app.get(
+    f"{V2_PREFIX}/memory/consolidation-candidates/{{candidate_id}}",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
+)
+def consolidation_candidates_get(candidate_id: str) -> dict[str, Any]:
+    candidate = get_consolidation_candidate(
+        candidate_id=candidate_id,
+        db_url=_api_database_url(),
+    )
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="consolidation candidate not found")
+    return _jsonable(candidate)
+
+
+@app.post(
+    f"{V2_PREFIX}/memory/consolidation-candidates/{{candidate_id}}/review-preview",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("write"))],
+)
+def consolidation_candidate_review_preview(
+    candidate_id: str,
+    payload: ConsolidationReviewPreviewRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return _jsonable(
+            preview_consolidation_review(
+                candidate_id=candidate_id,
+                action=payload.action,
+                actor=_current_identity(request).actor,
+                reason=payload.reason,
+                db_url=_api_database_url(),
+            )
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post(

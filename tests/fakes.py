@@ -118,6 +118,28 @@ def retraction_decision(
     )
 
 
+def lesson_validation_decision(lesson: dict[str, Any]) -> str:
+    """Return a strict positive validator result for a fixture lesson."""
+
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "claims": [
+                {
+                    "claim_index": index,
+                    "entailed": True,
+                    "safe": True,
+                    "reason_code": "supported",
+                }
+                for index, _claim in enumerate(lesson["claims"])
+            ],
+            "overall_entailed": True,
+            "overall_safe": True,
+        },
+        sort_keys=True,
+    )
+
+
 class DeterministicReasoningProvider:
     """Return one fixed JSON response from a test-only reasoning provider."""
 
@@ -166,6 +188,13 @@ class FixtureLessonReasoningProvider(DeterministicReasoningProvider):
     def generate(self, request: ReasoningRequest) -> ReasoningResponse:
         self.requests.append(request)
         prompt = json.loads(request.prompt)
+        if prompt.get("validation_kind") == "procedural_lesson_entailment.v1":
+            return ReasoningResponse(
+                text=lesson_validation_decision(prompt["lesson"]),
+                provider=self.provider_name,
+                model=self.model_name,
+                usage={"prompt_characters": len(request.prompt)},
+            )
         evidence = prompt["evidence"]
         event_id = next(key for key in evidence if key.startswith("event:"))
         memory_id = next(key for key in evidence if key.startswith("memory:"))

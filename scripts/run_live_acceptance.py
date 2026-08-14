@@ -39,7 +39,7 @@ SEMANTIC_RETRIEVAL_SELECTORS = (
 )
 DIRECT_CONSOLIDATION_SELECTOR = (
     "tests/test_live_semantic_acceptance.py::"
-    "test_live_gemini_consolidation_publishes_cited_retrievable_lesson"
+    "test_live_gemini_consolidation_requires_review_before_retrieval"
 )
 LOCAL_SEMANTIC_SELECTORS = (*SEMANTIC_RETRIEVAL_SELECTORS, DIRECT_CONSOLIDATION_SELECTOR)
 RESILIENCE_SELECTORS = (

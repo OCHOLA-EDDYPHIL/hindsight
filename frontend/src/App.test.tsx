@@ -70,15 +70,21 @@ describe("product access rendering", () => {
     expect(screen.queryByRole("button", { name: "Analyze incident" })).not.toBeInTheDocument();
   });
 
-  it("renders mutation controls only for effective write access", () => {
+  it("renders mutation controls only for effective write access", async () => {
     useCockpitMock.mockReturnValue(cockpit(true));
     render(<App />);
 
-    expect(screen.getByRole("region", { name: "Protected operator controls" })).toBeVisible();
+    expect(
+      await screen.findByRole(
+        "region",
+        { name: "Protected operator controls" },
+        { timeout: 5_000 },
+      ),
+    ).toBeVisible();
     expect(screen.getByRole("button", { name: "Analyze incident" })).toBeEnabled();
   });
 
-  it("withholds mutation controls until the authenticated replay is ready", () => {
+  it("withholds mutation controls until the authenticated replay is ready", async () => {
     useCockpitMock.mockReturnValue(cockpit(true, "loading"));
     const { rerender } = render(<App />);
 
@@ -89,14 +95,24 @@ describe("product access rendering", () => {
     useCockpitMock.mockReturnValue(cockpit(true, "ready"));
     rerender(<App />);
 
-    expect(screen.getByRole("region", { name: "Protected operator controls" })).toBeVisible();
+    expect(
+      await screen.findByRole(
+        "region",
+        { name: "Protected operator controls" },
+        { timeout: 5_000 },
+      ),
+    ).toBeVisible();
     expect(screen.getByRole("button", { name: "Analyze incident" })).toBeEnabled();
   });
 
-  it("preserves an open walkthrough across ready replay refreshes", () => {
+  it("preserves an open walkthrough across ready replay refreshes", async () => {
     useCockpitMock.mockReturnValue(cockpit(true, "ready"));
     const { rerender } = render(<App />);
-    const toggle = screen.getByRole("button", { name: "Walkthrough" });
+    const toggle = await screen.findByRole(
+      "button",
+      { name: "Walkthrough" },
+      { timeout: 5_000 },
+    );
 
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");

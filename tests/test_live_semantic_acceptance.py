@@ -8,8 +8,7 @@ from uuid import uuid4
 import pytest
 
 requires_live_gemini = pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_GEMINI_ACCEPTANCE") != "1"
-    or not os.environ.get("DATABASE_URL"),
+    os.environ.get("RUN_LIVE_GEMINI_ACCEPTANCE") != "1" or not os.environ.get("DATABASE_URL"),
     reason="live Gemini acceptance and an isolated DATABASE_URL are required",
 )
 
@@ -220,11 +219,16 @@ def test_live_gemini_cutoff_generalizes_across_calibration_mechanisms(
 
 
 @requires_live_gemini
-def test_live_gemini_consolidation_publishes_cited_retrievable_lesson():
+def test_live_gemini_consolidation_requires_review_before_retrieval():
     from hindsight.consolidation import consolidate_resolved_incident
     from hindsight.db import connect, database_url
     from hindsight.memory import MemoryStore, Provenance
     from hindsight.runs import create_incident, resolve_incident
+    from hindsight.operations import (
+        enqueue_operation,
+        execute_operation,
+        preview_consolidation_review,
+    )
 
     embeddings, reasoning = _providers()
     token = uuid4()
@@ -297,11 +301,55 @@ def test_live_gemini_consolidation_publishes_cited_retrievable_lesson():
     assert result.created is True
     assert result.memory is not None
     assert result.memory["content_schema"] == "procedural_lesson.v1"
-    assert result.memory["trust_status"] == "active"
+    assert result.memory["trust_status"] == "review_required"
     claims = result.memory["structured_payload"]["claims"]
     assert claims
     assert all(claim["citations"] for claim in claims)
     assert str(source["id"]) in result.source_memory_ids
+
+    excluded_decision_id = f"live-candidate-exclusion:{uuid4()}"
+    with MemoryStore(url=database_url(), embedding_provider=embeddings) as store:
+        excluded = store.retrieve_semantic(
+            namespace=lesson_namespace,
+            query=(
+                "Purchases freeze whenever the remote acquirer hesitates, and repeated "
+                "attempts compound the backlog."
+            ),
+            decision_id=excluded_decision_id,
+            reader="live.acceptance",
+            purpose="Verify the generated candidate is not semantically retrievable",
+            policy="semantic_strict",
+            limit=1,
+        )
+        store.seal_decision(decision_id=excluded_decision_id)
+    assert str(result.memory["id"]) not in {str(hit["id"]) for hit in excluded.hits}
+
+    preview = preview_consolidation_review(
+        candidate_id=str(result.job_id),
+        action="approve",
+        actor="live.acceptance",
+        reason="Citations, entailment, and operational safety reviewed",
+        db_url=database_url(),
+    )
+    operation, _created = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=str(preview["fingerprint"]),
+        idempotency_key=str(uuid4()),
+        actor="live.acceptance",
+        db_url=database_url(),
+    )
+    completed = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=embeddings,
+        worker_id="live-consolidation-approval",
+        db_url=database_url(),
+    )
+    assert completed["status"] == "completed"
+    with connect(database_url()) as conn:
+        approved_memory_id = conn.execute(
+            "SELECT approved_memory_id FROM consolidation_jobs WHERE id = %s",
+            (result.job_id,),
+        ).fetchone()[0]
 
     decision_id = f"live-lesson-retrieval:{uuid4()}"
     with MemoryStore(url=database_url(), embedding_provider=embeddings) as store:
@@ -313,12 +361,12 @@ def test_live_gemini_consolidation_publishes_cited_retrievable_lesson():
             ),
             decision_id=decision_id,
             reader="live.acceptance",
-            purpose="Verify the generated lesson is semantically retrievable",
+            purpose="Verify the approved successor is semantically retrievable",
             policy="semantic_strict",
             limit=1,
         )
         store.seal_decision(decision_id=decision_id)
-    assert [str(hit["id"]) for hit in retrieval.hits] == [str(result.memory["id"])]
+    assert [str(hit["id"]) for hit in retrieval.hits] == [str(approved_memory_id)]
 
     with connect(database_url()) as conn:
         read_ids = {

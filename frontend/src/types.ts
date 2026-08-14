@@ -311,6 +311,60 @@ export interface MemoryOperation {
   failure_detail?: string | null;
 }
 
+export interface ConsolidationCandidate {
+  candidate_id: Identifier;
+  candidate_memory_id: Identifier;
+  incident_id: Identifier;
+  incident_slug: string;
+  incident_title: string;
+  namespace: string;
+  content: string;
+  content_schema: "procedural_lesson.v1";
+  structured_payload: Record<string, unknown>;
+  trust_status: "review_required";
+  review_status: "pending" | "approved" | "rejected";
+  candidate_fingerprint: string;
+  evidence_fingerprint: string;
+  evidence: Array<{
+    evidence_id: Identifier;
+    relationship: string;
+    content: string | null;
+    sha256: string;
+    current_sha256: string | null;
+    matches_manifest: boolean;
+    trust_status?: string;
+    lineage_status?: string;
+    current: boolean;
+  }>;
+  reviewed_by?: string | null;
+  review_reason?: string | null;
+  reviewed_at?: string | null;
+  approved_memory_id?: Identifier | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConsolidationReviewPreview {
+  id: Identifier;
+  operation_type: "consolidation_approval";
+  fingerprint: string;
+  expires_at: string;
+  request_payload: {
+    candidate_id: Identifier;
+    candidate_memory_id: Identifier;
+    candidate_fingerprint: string;
+    evidence_fingerprint: string;
+    namespace: string;
+    action: "approve" | "reject";
+    reason: string;
+  };
+  effect_payload: {
+    candidate_memory_id: Identifier;
+    review_action: "approve" | "reject";
+    namespace: string;
+  };
+}
+
 export interface Snapshot {
   mode: "current" | "as_of";
   namespace: string;

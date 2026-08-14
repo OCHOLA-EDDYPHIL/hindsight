@@ -1,9 +1,19 @@
 import { ListChecks, SignOut, Warning } from "@phosphor-icons/react";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { formatTime } from "@/lib/format";
-import type { Incident, RewindPreview, Run, SignatureScenario, Snapshot } from "@/types";
+import type {
+  ConsolidationCandidate,
+  ConsolidationReviewPreview,
+  Incident,
+  RewindPreview,
+  Run,
+  SignatureScenario,
+  Snapshot,
+} from "@/types";
+
+const LessonCandidateConsole = lazy(() => import("@/components/lesson-candidate-console"));
 
 const phases = [
   { key: "triage", label: "triage" },
@@ -113,6 +123,8 @@ export function OperatorConsole({
   rewindTimestamp,
   rewindReason,
   rewindPreview,
+  consolidationCandidates = [],
+  consolidationPreview = null,
   onIncident,
   onIncidentInput,
   onReset,
@@ -123,6 +135,9 @@ export function OperatorConsole({
   onRewindReason,
   onPreview,
   onExecute,
+  onLoadCandidates = () => undefined,
+  onPreviewCandidateReview = () => undefined,
+  onExecuteCandidateReview = () => undefined,
   onSignOut,
 }: {
   incidents: Incident[];
@@ -136,6 +151,8 @@ export function OperatorConsole({
   rewindTimestamp: string;
   rewindReason: string;
   rewindPreview: RewindPreview | null;
+  consolidationCandidates?: ConsolidationCandidate[];
+  consolidationPreview?: ConsolidationReviewPreview | null;
   onIncident: (slug: string) => void;
   onIncidentInput: (value: string) => void;
   onReset: () => void;
@@ -146,6 +163,13 @@ export function OperatorConsole({
   onRewindReason: (value: string) => void;
   onPreview: () => void;
   onExecute: () => void;
+  onLoadCandidates?: () => void;
+  onPreviewCandidateReview?: (
+    candidateId: string,
+    action: "approve" | "reject",
+    reason: string,
+  ) => void;
+  onExecuteCandidateReview?: () => void;
   onSignOut: () => void;
 }) {
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
@@ -390,6 +414,19 @@ export function OperatorConsole({
           {remediation ? "Approve retraction" : "Approve recommendation"}
         </Button>
       </div>
+
+      <Suspense
+        fallback={<p className="phase-trace-unavailable">Loading lesson candidates…</p>}
+      >
+        <LessonCandidateConsole
+          busy={busy}
+          candidates={consolidationCandidates}
+          preview={consolidationPreview}
+          onLoad={onLoadCandidates}
+          onPreview={onPreviewCandidateReview}
+          onExecute={onExecuteCandidateReview}
+        />
+      </Suspense>
 
       <div className="rewind-console">
         <div>

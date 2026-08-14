@@ -25,9 +25,16 @@ from hindsight.memory import (
 from hindsight.prompt_safety import PROMPT_SAFETY_METADATA_KEYS
 from hindsight.security import safe_error_detail
 
-OperationType = Literal["rewind", "retraction", "supersession", "review_resolution"]
+OperationType = Literal[
+    "rewind",
+    "retraction",
+    "supersession",
+    "review_resolution",
+    "consolidation_approval",
+]
 SupersessionIntent = Literal["correction", "evolution"]
 ReviewAction = Literal["confirmed", "retracted"]
+ConsolidationReviewAction = Literal["approve", "reject"]
 PREVIEW_TTL = timedelta(minutes=15)
 MAX_OPERATION_ATTEMPTS = 3
 MAX_OPERATION_TRANSACTION_ATTEMPTS = 3
@@ -158,9 +165,7 @@ def preview_supersession(
         root = closure[0]
         descendants = [row for row in closure if str(row["id"]) != root_memory_id]
         close_ids = (
-            [str(row["id"]) for row in closure]
-            if intent == "correction"
-            else [root_memory_id]
+            [str(row["id"]) for row in closure] if intent == "correction" else [root_memory_id]
         )
         return (
             {
@@ -232,9 +237,7 @@ def preview_review_resolution(
         if item is None:
             raise LookupError(f"open review item not found: {review_item_id}")
         reviewed_memory_id = str(item["semantic_memory_id"])
-        closure = _causal_closure_with_cursor(
-            cur, root_memory_id=reviewed_memory_id
-        )
+        closure = _causal_closure_with_cursor(cur, root_memory_id=reviewed_memory_id)
         if not closure or str(closure[0]["id"]) != reviewed_memory_id:
             raise OperationConflictError("reviewed memory is no longer current")
         _require_complete_lineage(closure)
@@ -247,9 +250,7 @@ def preview_review_resolution(
         )
         _require_authorized(affected, authorized_namespaces)
         close_ids = (
-            [str(row["id"]) for row in closure]
-            if action == "retracted"
-            else [reviewed_memory_id]
+            [str(row["id"]) for row in closure] if action == "retracted" else [reviewed_memory_id]
         )
         resolutions = _review_resolutions(
             cur,
@@ -285,6 +286,217 @@ def preview_review_resolution(
         build=build,
         db_url=resolved_url,
     )
+
+
+def preview_consolidation_review(
+    *,
+    candidate_id: str,
+    action: ConsolidationReviewAction,
+    actor: str,
+    reason: str,
+    db_url: str | None = None,
+) -> dict[str, Any]:
+    """Bind an approval or rejection to one immutable generated candidate."""
+
+    if action not in {"approve", "reject"}:
+        raise ValueError(f"unsupported consolidation review action: {action}")
+    resolved_url = db_url or database_url()
+    with connect(resolved_url, application_name="hindsight-api") as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                    SELECT memory.namespace, job.evidence_manifest
+                    FROM consolidation_jobs AS job
+                    JOIN semantic_memories AS memory ON memory.id = job.lesson_memory_id
+                    WHERE job.id = %s
+                        AND job.review_status = 'pending'
+                """,
+                (candidate_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise LookupError(f"pending consolidation candidate not found: {candidate_id}")
+    namespace = str(row["namespace"])
+    evidence_manifest = dict(row["evidence_manifest"] or {})
+    lock_namespaces = [namespace]
+    if action == "approve":
+        lock_namespaces.extend(
+            str(item["namespace"])
+            for item in evidence_manifest.get("items") or []
+            if item.get("namespace")
+        )
+
+    def build(cur: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        candidate = _lock_consolidation_candidate(cur, candidate_id=candidate_id)
+        if candidate is None or candidate["review_status"] != "pending":
+            raise OperationConflictError("consolidation candidate is no longer pending")
+        metadata = dict(candidate["metadata"] or {})
+        validation = dict(candidate["validation_receipt"] or {})
+        legacy_candidate = candidate["evidence_fingerprint"] == "legacy-unavailable"
+        if (
+            candidate["trust_status"] != "review_required"
+            or candidate["t_invalid"] is not None
+            or (
+                legacy_candidate
+                and str(candidate["candidate_fingerprint"] or "")
+                != str(candidate["payload_digest"] or "")
+            )
+            or (
+                not legacy_candidate
+                and (
+                    str(candidate["candidate_fingerprint"] or "")
+                    != str(metadata.get("candidate_fingerprint") or "")
+                    or str(candidate["evidence_fingerprint"] or "")
+                    != str(metadata.get("evidence_fingerprint") or "")
+                )
+            )
+        ):
+            raise OperationConflictError("consolidation candidate identity changed")
+        if action == "approve" and validation.get("status") != "passed":
+            raise OperationConflictError("candidate validation is not approval-eligible")
+        if action == "approve":
+            _validate_consolidation_evidence(cur, candidate=candidate)
+        request = {
+            "candidate_id": candidate_id,
+            "candidate_memory_id": str(candidate["lesson_memory_id"]),
+            "candidate_fingerprint": str(candidate["candidate_fingerprint"]),
+            "evidence_fingerprint": str(candidate["evidence_fingerprint"]),
+            "namespace": str(candidate["namespace"]),
+            "action": action,
+            "reason": reason,
+        }
+        effect = {
+            "semantic_memory_id": str(candidate["lesson_memory_id"]),
+            "candidate_memory_id": str(candidate["lesson_memory_id"]),
+            "candidate_belief_id": str(candidate["belief_id"]),
+            "namespace": str(candidate["namespace"]),
+            "review_action": action,
+        }
+        return request, effect
+
+    return _persist_preview(
+        operation_type="consolidation_approval",
+        actor=actor,
+        lock_namespaces=lock_namespaces,
+        build=build,
+        db_url=resolved_url,
+    )
+
+
+def _lock_consolidation_candidate(cur: Any, *, candidate_id: str) -> dict[str, Any] | None:
+    cur.execute(
+        "SELECT * FROM consolidation_jobs WHERE id = %s FOR UPDATE",
+        (candidate_id,),
+    )
+    job = cur.fetchone()
+    if job is None or job["lesson_memory_id"] is None:
+        return None
+    cur.execute(
+        """
+            SELECT namespace, content, content_schema, structured_payload,
+                   metadata, trust_status, t_invalid, payload_digest, belief_id
+            FROM semantic_memories
+            WHERE id = %s
+            FOR UPDATE
+        """,
+        (job["lesson_memory_id"],),
+    )
+    memory = cur.fetchone()
+    if memory is None:
+        return None
+    return {**dict(job), **dict(memory)}
+
+
+def _validate_consolidation_evidence(cur: Any, *, candidate: dict[str, Any]) -> None:
+    """Revalidate every source row represented by the immutable evidence manifest."""
+
+    manifest = dict(candidate.get("evidence_manifest") or {})
+    if manifest.get("schema_version") != 1 or _digest(manifest) != str(
+        candidate.get("evidence_fingerprint") or ""
+    ):
+        raise OperationConflictError("candidate evidence manifest is invalid")
+    items = manifest.get("items")
+    if not isinstance(items, list) or not items:
+        raise OperationConflictError("candidate evidence manifest is empty")
+    seen: set[str] = set()
+    for value in items:
+        if not isinstance(value, dict):
+            raise OperationConflictError("candidate evidence item is invalid")
+        item = dict(value)
+        evidence_id = str(item.get("evidence_id") or "")
+        if not evidence_id or evidence_id in seen:
+            raise OperationConflictError("candidate evidence identities are invalid")
+        seen.add(evidence_id)
+        if evidence_id.startswith("memory:"):
+            memory_id = str(item.get("memory_id") or "")
+            if evidence_id != f"memory:{memory_id}":
+                raise OperationConflictError("candidate memory evidence identity changed")
+            cur.execute(
+                """
+                    SELECT id, namespace, content, trust_status,
+                           lineage_status, t_invalid
+                    FROM semantic_memories WHERE id = %s FOR UPDATE
+                """,
+                (memory_id,),
+            )
+            memory = cur.fetchone()
+            cur.execute(
+                """
+                    SELECT relationship FROM incident_semantic_memories
+                    WHERE incident_id = %s AND memory_id = %s
+                """,
+                (candidate["incident_id"], memory_id),
+            )
+            link = cur.fetchone()
+            if (
+                memory is None
+                or str(memory["namespace"]) != str(item.get("namespace") or "")
+                or memory["trust_status"] != "active"
+                or memory["lineage_status"] != "complete"
+                or memory["t_invalid"] is not None
+                or link is None
+                or str(link["relationship"]) != str(item.get("relationship") or "")
+                or hashlib.sha256(str(memory["content"]).encode("utf-8")).hexdigest()
+                != item.get("sha256")
+            ):
+                raise OperationConflictError("candidate memory evidence changed")
+            continue
+        event_id = str(item.get("event_id") or "")
+        if evidence_id != f"event:{event_id}":
+            raise OperationConflictError("candidate event evidence identity changed")
+        cur.execute(
+            """
+                SELECT id, incident_id, event_type, event_schema, structured_payload
+                FROM incident_events WHERE id = %s FOR UPDATE
+            """,
+            (event_id,),
+        )
+        event = cur.fetchone()
+        cur.execute(
+            """
+                SELECT id, status, resolution_event_id
+                FROM incidents WHERE id = %s FOR UPDATE
+            """,
+            (candidate["incident_id"],),
+        )
+        incident = cur.fetchone()
+        event_content = (
+            json.dumps(dict(event["structured_payload"]), sort_keys=True)
+            if event is not None
+            else ""
+        )
+        if (
+            event is None
+            or incident is None
+            or str(event["incident_id"]) != str(candidate["incident_id"])
+            or event["event_type"] != "incident_resolved"
+            or event["event_schema"] != "incident_resolution.v1"
+            or incident["status"] != "resolved"
+            or str(incident["resolution_event_id"]) != event_id
+            or str(candidate["source_event_id"]) != event_id
+            or hashlib.sha256(event_content.encode("utf-8")).hexdigest() != item.get("sha256")
+        ):
+            raise OperationConflictError("candidate resolution evidence changed")
 
 
 def enqueue_operation(
@@ -458,9 +670,7 @@ def get_operation(*, operation_id: str, db_url: str | None = None) -> dict[str, 
             return operation
 
 
-def reap_exhausted_operations(
-    *, db_url: str | None = None, limit: int = 100
-) -> dict[str, int]:
+def reap_exhausted_operations(*, db_url: str | None = None, limit: int = 100) -> dict[str, int]:
     """Fail expired final attempts even when their SQS delivery was interrupted."""
 
     if limit < 1:
@@ -548,9 +758,7 @@ def execute_operation(
         if provider is None:  # pragma: no cover - guarded by argument validation
             raise RuntimeError("embedding provider factory returned no provider")
         _, preview = _load_for_execution(operation_id=operation_id, db_url=resolved_url)
-        prepared = _precompute_embeddings(
-            preview=preview, provider=provider, db_url=resolved_url
-        )
+        prepared = _precompute_embeddings(preview=preview, provider=provider, db_url=resolved_url)
         for transaction_attempt in range(1, MAX_OPERATION_TRANSACTION_ATTEMPTS + 1):
             try:
                 _execute_operation_transaction(
@@ -619,9 +827,7 @@ def _execute_operation_transaction(
                         embeddings=prepared_embeddings,
                     )
                 elif leased["operation_type"] == "retraction":
-                    effects = _apply_retraction(
-                        store=store, operation=leased, preview=preview
-                    )
+                    effects = _apply_retraction(store=store, operation=leased, preview=preview)
                 elif leased["operation_type"] == "supersession":
                     effects = _apply_supersession(
                         store=store,
@@ -631,6 +837,13 @@ def _execute_operation_transaction(
                     )
                 elif leased["operation_type"] == "review_resolution":
                     effects = _apply_review_resolution(
+                        store=store,
+                        operation=leased,
+                        preview=preview,
+                        embeddings=prepared_embeddings,
+                    )
+                elif leased["operation_type"] == "consolidation_approval":
+                    effects = _apply_consolidation_approval(
                         store=store,
                         operation=leased,
                         preview=preview,
@@ -731,9 +944,7 @@ def _persist_preview(
                         "preview effect includes unlocked namespace state: "
                         + ", ".join(sorted(unlocked))
                     )
-                cur.execute(
-                    "SELECT generation FROM embedding_index_state WHERE singleton = true"
-                )
+                cur.execute("SELECT generation FROM embedding_index_state WHERE singleton = true")
                 state = cur.fetchone()
                 generation = int(state["generation"]) if state is not None else None
                 payload = {
@@ -923,9 +1134,7 @@ def _verify_preview(*, cur: Any, operation: dict[str, Any], preview: dict[str, A
     _verify_effect_state(cur=cur, operation=operation, preview=preview)
 
 
-def _verify_effect_state(
-    *, cur: Any, operation: dict[str, Any], preview: dict[str, Any]
-) -> None:
+def _verify_effect_state(*, cur: Any, operation: dict[str, Any], preview: dict[str, Any]) -> None:
     request = preview["request_payload"]
     effect = preview["effect_payload"]
     operation_type = operation["operation_type"]
@@ -943,9 +1152,7 @@ def _verify_effect_state(
         ):
             raise OperationConflictError("rewind effect changed after preview")
     elif operation_type in {"retraction", "supersession"}:
-        closure = _causal_closure_with_cursor(
-            cur, root_memory_id=request["root_memory_id"]
-        )
+        closure = _causal_closure_with_cursor(cur, root_memory_id=request["root_memory_id"])
         _require_complete_lineage(closure)
         _require_authorized(closure, request["authorized_namespaces"])
         closure_ids = [str(row["id"]) for row in closure]
@@ -953,23 +1160,47 @@ def _verify_effect_state(
             if closure_ids != effect["close_memory_ids"]:
                 raise OperationConflictError("causal closure changed after preview")
         else:
-            descendant_ids = [
-                value for value in closure_ids if value != request["root_memory_id"]
-            ]
+            descendant_ids = [value for value in closure_ids if value != request["root_memory_id"]]
             if descendant_ids != effect["review_memory_ids"]:
                 raise OperationConflictError("evolution descendants changed after preview")
     elif operation_type == "review_resolution":
         if request["action"] == "retracted":
-            closure = _causal_closure_with_cursor(
-                cur, root_memory_id=effect["semantic_memory_id"]
-            )
+            closure = _causal_closure_with_cursor(cur, root_memory_id=effect["semantic_memory_id"])
             _require_complete_lineage(closure)
             _require_authorized(closure, request["authorized_namespaces"])
             if [str(row["id"]) for row in closure] != effect["close_memory_ids"]:
                 raise OperationConflictError("review closure changed after preview")
-    expected_reviews = sorted(
-        effect.get("review_resolutions", []), key=lambda row: row["id"]
-    )
+    elif operation_type == "consolidation_approval":
+        candidate = _lock_consolidation_candidate(
+            cur,
+            candidate_id=request["candidate_id"],
+        )
+        if candidate is None or candidate["review_status"] != "pending":
+            raise OperationConflictError("consolidation candidate is no longer pending")
+        metadata = dict(candidate["metadata"] or {})
+        legacy_candidate = candidate["evidence_fingerprint"] == "legacy-unavailable"
+        if (
+            str(candidate["lesson_memory_id"]) != request["candidate_memory_id"]
+            or str(candidate["candidate_fingerprint"] or "") != request["candidate_fingerprint"]
+            or str(candidate["evidence_fingerprint"] or "") != request["evidence_fingerprint"]
+            or (
+                legacy_candidate
+                and str(candidate["payload_digest"] or "") != request["candidate_fingerprint"]
+            )
+            or (
+                not legacy_candidate
+                and (
+                    metadata.get("candidate_fingerprint") != request["candidate_fingerprint"]
+                    or metadata.get("evidence_fingerprint") != request["evidence_fingerprint"]
+                )
+            )
+            or candidate["trust_status"] != "review_required"
+            or candidate["t_invalid"] is not None
+        ):
+            raise OperationConflictError("consolidation candidate changed after preview")
+        if request["action"] == "approve":
+            _validate_consolidation_evidence(cur, candidate=candidate)
+    expected_reviews = sorted(effect.get("review_resolutions", []), key=lambda row: row["id"])
     current_reviews = _review_resolutions(
         cur, memory_ids=effect.get("close_memory_ids", []), status="open"
     )
@@ -977,22 +1208,23 @@ def _verify_effect_state(
     if set(current_by_id) != {row["id"] for row in expected_reviews}:
         raise OperationConflictError("open review items changed after preview")
     if any(
-        current_by_id[row["id"]]["semantic_memory_id"]
-        != row["semantic_memory_id"]
+        current_by_id[row["id"]]["semantic_memory_id"] != row["semantic_memory_id"]
         for row in expected_reviews
     ):
         raise OperationConflictError("review item target changed after preview")
 
 
 def _apply_rewind(
-    *, store: MemoryStore, operation: dict[str, Any], preview: dict[str, Any], embeddings: dict[str, list[float]]
+    *,
+    store: MemoryStore,
+    operation: dict[str, Any],
+    preview: dict[str, Any],
+    embeddings: dict[str, list[float]],
 ) -> list[dict[str, Any]]:
     effect = preview["effect_payload"]
     results = _close_memories(store, operation, effect["close_memory_ids"])
     for item in effect["reassertions"]:
-        source = store.audit_memory(
-            memory_kind="semantic", memory_id=item["source_memory_id"]
-        )
+        source = store.audit_memory(memory_kind="semantic", memory_id=item["source_memory_id"])
         if source is None:
             raise OperationConflictError("rewind source disappeared")
         decision_id = f"operation:{operation['id']}:reassert:{source['id']}"
@@ -1052,7 +1284,11 @@ def _apply_retraction(
 
 
 def _apply_supersession(
-    *, store: MemoryStore, operation: dict[str, Any], preview: dict[str, Any], embeddings: dict[str, list[float]]
+    *,
+    store: MemoryStore,
+    operation: dict[str, Any],
+    preview: dict[str, Any],
+    embeddings: dict[str, list[float]],
 ) -> list[dict[str, Any]]:
     effect = preview["effect_payload"]
     results = _close_memories(store, operation, effect["close_memory_ids"])
@@ -1159,12 +1395,8 @@ def _apply_review_resolution(
     if request["action"] == "retracted":
         results = _close_memories(store, operation, effect["close_memory_ids"])
     else:
-        source = store.audit_memory(
-            memory_kind="semantic", memory_id=effect["semantic_memory_id"]
-        )
-        anchor = store.audit_memory(
-            memory_kind="semantic", memory_id=effect["anchor_memory_id"]
-        )
+        source = store.audit_memory(memory_kind="semantic", memory_id=effect["semantic_memory_id"])
+        anchor = store.audit_memory(memory_kind="semantic", memory_id=effect["anchor_memory_id"])
         if source is None or source["t_invalid"] is not None:
             raise OperationConflictError("reviewed descendant is no longer current")
         if anchor is None or anchor["t_invalid"] is not None:
@@ -1224,9 +1456,148 @@ def _apply_review_resolution(
                     "review_status": "confirmed",
                     "anchor_memory_id": str(anchor["id"]),
                 },
-            }
+            },
         ]
     return results
+
+
+def _apply_consolidation_approval(
+    *,
+    store: MemoryStore,
+    operation: dict[str, Any],
+    preview: dict[str, Any],
+    embeddings: dict[str, list[float]],
+) -> list[dict[str, Any]]:
+    """Apply one exact candidate decision without mutating the candidate payload."""
+
+    request = preview["request_payload"]
+    candidate = store.audit_memory(
+        memory_kind="semantic",
+        memory_id=request["candidate_memory_id"],
+    )
+    if candidate is None or candidate["t_invalid"] is not None:
+        raise OperationConflictError("consolidation candidate is no longer current")
+    if request["action"] == "reject":
+        updated = store._conn.execute(  # noqa: SLF001 - same governed transaction
+            """
+                UPDATE consolidation_jobs
+                SET review_status = 'rejected', reviewed_by = %s,
+                    review_reason = %s, reviewed_at = now(),
+                    review_operation_id = %s, updated_at = now()
+                WHERE id = %s AND review_status = 'pending'
+                    AND lesson_memory_id = %s
+                    AND candidate_fingerprint = %s
+                    AND evidence_fingerprint = %s
+                RETURNING id
+            """,
+            (
+                operation["actor"],
+                operation["reason"],
+                operation["id"],
+                request["candidate_id"],
+                request["candidate_memory_id"],
+                request["candidate_fingerprint"],
+                request["evidence_fingerprint"],
+            ),
+        ).fetchone()
+        if updated is None:
+            raise OperationConflictError("consolidation candidate review changed")
+        return [
+            {
+                "effect_type": "unchanged",
+                "source_memory_id": str(candidate["id"]),
+                "belief_id": str(candidate["belief_id"]),
+                "namespace": candidate["namespace"],
+                "metadata": {"review_status": "rejected"},
+            }
+        ]
+
+    decision_id = f"operation:{operation['id']}:consolidation-approval"
+    store.open_decision(
+        decision_id=decision_id,
+        actor=operation["actor"],
+        decision_kind="consolidation_approval",
+        purpose=operation["reason"],
+        namespace=candidate["namespace"],
+        metadata={
+            "candidate_id": request["candidate_id"],
+            "candidate_fingerprint": request["candidate_fingerprint"],
+            "evidence_fingerprint": request["evidence_fingerprint"],
+        },
+    )
+    store.record_read(
+        decision_id=decision_id,
+        memory_kind="semantic",
+        memory_id=str(candidate["id"]),
+        reader=operation["actor"],
+        purpose="Approve the exact validated consolidation candidate",
+    )
+    closed = _close_memories(store, operation, [str(candidate["id"])])
+    created = store.write_semantic(
+        namespace=candidate["namespace"],
+        content=candidate["content"],
+        provenance=Provenance(
+            writer=operation["actor"],
+            source_ref=f"consolidation_candidate:{request['candidate_id']}",
+            justification=operation["reason"],
+        ),
+        metadata={
+            **_without_governance(dict(candidate.get("metadata") or {})),
+            "operator_reviewed": True,
+            "candidate_memory_id": str(candidate["id"]),
+        },
+        governance=APPROVED_POSITIVE_GUIDANCE,
+        content_schema=candidate["content_schema"],
+        structured_payload=dict(candidate["structured_payload"]),
+        producer_decision_id=decision_id,
+        parent_memory_ids=[str(candidate["id"])],
+        belief_id=str(candidate["belief_id"]),
+        previous_version_id=str(candidate["id"]),
+        transition_kind="supersession",
+        created_by_operation_id=str(operation["id"]),
+        precomputed_embedding=embeddings["consolidation_approval"],
+    )
+    updated = store._conn.execute(  # noqa: SLF001 - same governed transaction
+        """
+            UPDATE consolidation_jobs
+            SET review_status = 'approved', reviewed_by = %s,
+                review_reason = %s, reviewed_at = now(),
+                review_operation_id = %s, approved_memory_id = %s,
+                updated_at = now()
+            WHERE id = %s AND review_status = 'pending'
+                AND lesson_memory_id = %s
+                AND candidate_fingerprint = %s
+                AND evidence_fingerprint = %s
+            RETURNING id
+        """,
+        (
+            operation["actor"],
+            operation["reason"],
+            operation["id"],
+            created["id"],
+            request["candidate_id"],
+            request["candidate_memory_id"],
+            request["candidate_fingerprint"],
+            request["evidence_fingerprint"],
+        ),
+    ).fetchone()
+    if updated is None:
+        raise OperationConflictError("consolidation candidate review changed")
+    return [
+        *closed,
+        {
+            "effect_type": "created",
+            "source_memory_id": str(candidate["id"]),
+            "result_memory_id": str(created["id"]),
+            "belief_id": str(created["belief_id"]),
+            "namespace": created["namespace"],
+            "metadata": {
+                "review_status": "approved",
+                "candidate_fingerprint": request["candidate_fingerprint"],
+                "evidence_fingerprint": request["evidence_fingerprint"],
+            },
+        },
+    ]
 
 
 def _apply_review_resolutions(
@@ -1248,9 +1619,7 @@ def _apply_review_resolutions(
             ),
         )
         if cur.fetchone() is None:
-            raise OperationConflictError(
-                f"review item changed after preview: {resolution['id']}"
-            )
+            raise OperationConflictError(f"review item changed after preview: {resolution['id']}")
 
 
 def _close_memories(
@@ -1295,10 +1664,7 @@ def _precompute_embeddings(
             prepared[str(row["id"])] = provider.embed_document(row["content"])
     if effect.get("supersede"):
         prepared["supersession"] = provider.embed_document(effect["supersede"]["content"])
-    if (
-        preview["request_payload"].get("action") == "confirmed"
-        and effect.get("semantic_memory_id")
-    ):
+    if preview["request_payload"].get("action") == "confirmed" and effect.get("semantic_memory_id"):
         with connect(db_url, application_name="hindsight-memory-worker") as conn:
             row = conn.execute(
                 "SELECT content FROM semantic_memories WHERE id = %s",
@@ -1307,6 +1673,15 @@ def _precompute_embeddings(
         if row is None:
             raise OperationConflictError("reviewed descendant disappeared")
         prepared["review_confirmation"] = provider.embed_document(str(row[0]))
+    if preview["request_payload"].get("action") == "approve" and effect.get("candidate_memory_id"):
+        with connect(db_url, application_name="hindsight-memory-worker") as conn:
+            row = conn.execute(
+                "SELECT content FROM semantic_memories WHERE id = %s",
+                (effect["candidate_memory_id"],),
+            ).fetchone()
+        if row is None:
+            raise OperationConflictError("consolidation candidate disappeared")
+        prepared["consolidation_approval"] = provider.embed_document(str(row[0]))
     return prepared
 
 
@@ -1352,9 +1727,7 @@ def _rewind_effect(
     }
 
 
-def _review_resolutions(
-    cur: Any, *, memory_ids: list[str], status: str
-) -> list[dict[str, str]]:
+def _review_resolutions(cur: Any, *, memory_ids: list[str], status: str) -> list[dict[str, str]]:
     if not memory_ids:
         return []
     cur.execute(
@@ -1407,10 +1780,7 @@ def _governance_from_metadata(metadata: dict[str, Any]) -> MemoryGovernance | No
 def _effect_namespaces(cur: Any, effect: dict[str, Any]) -> set[str]:
     memory_ids = {
         *[str(value) for value in effect.get("close_memory_ids", [])],
-        *[
-            str(item["source_memory_id"])
-            for item in effect.get("reassertions", [])
-        ],
+        *[str(item["source_memory_id"]) for item in effect.get("reassertions", [])],
     }
     if effect.get("semantic_memory_id"):
         memory_ids.add(str(effect["semantic_memory_id"]))
@@ -1427,9 +1797,7 @@ def _effect_namespaces(cur: Any, effect: dict[str, Any]) -> set[str]:
     return {str(row["namespace"]) for row in cur.fetchall()}
 
 
-def _require_authorized(
-    rows: list[dict[str, Any]], authorized_namespaces: list[str]
-) -> None:
+def _require_authorized(rows: list[dict[str, Any]], authorized_namespaces: list[str]) -> None:
     missing = {str(row["namespace"]) for row in rows} - set(authorized_namespaces)
     if missing:
         raise OperationAuthorizationError(
@@ -1443,9 +1811,7 @@ def _causal_closure(*, root_memory_id: str, db_url: str) -> list[dict[str, Any]]
             return _causal_closure_with_cursor(cur, root_memory_id=root_memory_id)
 
 
-def _causal_closure_with_cursor(
-    cur: Any, *, root_memory_id: str
-) -> list[dict[str, Any]]:
+def _causal_closure_with_cursor(cur: Any, *, root_memory_id: str) -> list[dict[str, Any]]:
     cur.execute(
         """
             WITH RECURSIVE closure(id, depth) AS (
@@ -1565,9 +1931,7 @@ def _mark_terminal(
                 )
 
 
-def _mark_retry(
-    *, operation_id: str, lease_token: str, exc: Exception, db_url: str
-) -> None:
+def _mark_retry(*, operation_id: str, lease_token: str, exc: Exception, db_url: str) -> None:
     error_code = type(exc).__name__
     error_detail = safe_error_detail(exc, max_chars=1000)
     with connect(db_url, application_name="hindsight-memory-worker") as conn:

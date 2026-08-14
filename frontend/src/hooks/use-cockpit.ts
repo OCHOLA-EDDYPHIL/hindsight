@@ -16,6 +16,8 @@ import {
 } from "@/lib/replay-state";
 import type {
   AuthStatus,
+  ConsolidationCandidate,
+  ConsolidationReviewPreview,
   EffectiveIdentity,
   Incident,
   InfluenceItem,
@@ -59,6 +61,10 @@ interface ResetResponse {
 interface RewindAccepted {
   operation_id: string;
   status?: string;
+}
+
+interface ConsolidationCandidateListResponse {
+  candidates: ConsolidationCandidate[];
 }
 
 export interface UseCockpitOptions {
@@ -183,6 +189,11 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     "Replace stale operational guidance with the previously accepted belief version",
   );
   const [rewindPreview, setRewindPreview] = useState<RewindPreview | null>(null);
+  const [consolidationCandidates, setConsolidationCandidates] = useState<
+    ConsolidationCandidate[]
+  >([]);
+  const [consolidationPreview, setConsolidationPreview] =
+    useState<ConsolidationReviewPreview | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const activeRunId = useRef<string | null>(null);
@@ -1145,6 +1156,54 @@ export function useCockpit(options: UseCockpitOptions = {}) {
 
   const invalidatePreview = useCallback(() => setRewindPreview(null), []);
 
+  const loadConsolidationCandidates = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token) return;
+    setBusy("load-candidates");
+    try {
+      const response = await productWriteJson<ConsolidationCandidateListResponse>(
+        "/memory/consolidation-candidates?review_status=pending&limit=50",
+        token,
+      );
+      setConsolidationCandidates(response.candidates || []);
+      setConsolidationPreview(null);
+    } catch (error) {
+      announce(`Candidates could not be loaded: ${(error as Error).message}`, "error");
+    } finally {
+      setBusy(null);
+    }
+  }, [announce, productWriteJson, requireWriteAccess]);
+
+  const previewConsolidationReview = useCallback(
+    async (candidateId: string, action: "approve" | "reject", reason: string) => {
+      const token = requireWriteAccess();
+      if (!token) return;
+      if (!reason.trim()) {
+        announce("A review reason is required.", "error");
+        return;
+      }
+      setBusy("candidate-preview");
+      try {
+        const preview = await productWriteJson<ConsolidationReviewPreview>(
+          `/memory/consolidation-candidates/${encodeURIComponent(candidateId)}/review-preview`,
+          token,
+          {
+            method: "POST",
+            body: JSON.stringify({ action, reason: reason.trim() }),
+          },
+        );
+        setConsolidationPreview(preview);
+        announce("Candidate review preview is bound and ready for execution.");
+      } catch (error) {
+        setConsolidationPreview(null);
+        announce(`Candidate review failed: ${(error as Error).message}`, "error");
+      } finally {
+        setBusy(null);
+      }
+    },
+    [announce, productWriteJson, requireWriteAccess],
+  );
+
   const previewRewind = useCallback(async () => {
     const token = requireWriteAccess();
     if (!token) return;
@@ -1270,6 +1329,45 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     waitForOperation,
   ]);
 
+  const executeConsolidationReview = useCallback(async () => {
+    const token = requireWriteAccess();
+    if (!token || !consolidationPreview) return;
+    setBusy("candidate-execute");
+    try {
+      const accepted = await productWriteJson<RewindAccepted>(
+        "/memory/operations",
+        token,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": crypto.randomUUID() },
+          body: JSON.stringify({
+            preview_id: consolidationPreview.id,
+            fingerprint: consolidationPreview.fingerprint,
+          }),
+        },
+      );
+      setConsolidationPreview(null);
+      announce("Candidate review queued. The exact fingerprints are being revalidated.");
+      const operation = await waitForOperation(accepted.operation_id);
+      if (operation.status !== "completed") {
+        throw new Error(operation.failure_detail || operation.status);
+      }
+      await loadConsolidationCandidates();
+      announce("Candidate review completed and remains available in the audit trail.");
+    } catch (error) {
+      announce(`Candidate review execution failed: ${(error as Error).message}`, "error");
+    } finally {
+      setBusy(null);
+    }
+  }, [
+    announce,
+    consolidationPreview,
+    loadConsolidationCandidates,
+    productWriteJson,
+    requireWriteAccess,
+    waitForOperation,
+  ]);
+
   const selectHistorical = useCallback(
     async (asOf?: string | null) => {
       try {
@@ -1316,6 +1414,8 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     rewindTimestamp,
     rewindReason,
     rewindPreview,
+    consolidationCandidates,
+    consolidationPreview,
     busy,
     retryInitialLoad,
     signIn,
@@ -1337,6 +1437,9 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     },
     previewRewind,
     executeRewind,
+    loadConsolidationCandidates,
+    previewConsolidationReview,
+    executeConsolidationReview,
     selectHistorical,
   };
 }

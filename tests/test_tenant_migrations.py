@@ -28,10 +28,7 @@ def test_governed_operation_idempotency_is_tenant_scoped_and_restart_safe():
     migration = (ROOT / "migrations" / "0031_tenant_memory_operation_idempotency.sql").read_text()
     source = (ROOT / "src" / "hindsight" / "operations.py").read_text()
 
-    assert (
-        "DROP INDEX IF EXISTS memory_operations@memory_operations_idempotency_idx;"
-        in migration
-    )
+    assert "DROP INDEX IF EXISTS memory_operations@memory_operations_idempotency_idx;" in migration
     assert "CASCADE" not in migration
     assert "CREATE UNIQUE INDEX IF NOT EXISTS memory_operations_tenant_idempotency_idx" in migration
     assert "ON memory_operations (tenant_id, idempotency_key)" in migration
@@ -43,9 +40,7 @@ def test_governed_operation_idempotency_is_tenant_scoped_and_restart_safe():
 
 
 def test_lifecycle_public_identity_baseline_is_additive_and_digest_only():
-    migration = (
-        ROOT / "migrations" / "0031a_lifecycle_public_identity_baseline.sql"
-    ).read_text()
+    migration = (ROOT / "migrations" / "0031a_lifecycle_public_identity_baseline.sql").read_text()
 
     assert migration.count("ADD COLUMN IF NOT EXISTS public_identity_sha256 STRING(64)") == 2
     assert "tenant_lifecycle_operations_public_identity_hash" in migration
@@ -53,10 +48,7 @@ def test_lifecycle_public_identity_baseline_is_additive_and_digest_only():
     assert migration.count("public_identity_sha256 IS NULL") == 2
     assert migration.count("^[0-9a-f]{64}$") == 2
     assert "CREATE OR REPLACE FUNCTION guard_lifecycle_public_identity_baseline" in migration
-    assert (
-        "(NEW).public_identity_sha256 IS DISTINCT FROM (OLD).public_identity_sha256"
-        in migration
-    )
+    assert "(NEW).public_identity_sha256 IS DISTINCT FROM (OLD).public_identity_sha256" in migration
     assert "tenant lifecycle public identity baseline is immutable" in migration
     assert "BEFORE UPDATE ON tenant_lifecycle_operations" in migration
     assert "target_tenant_id" not in migration
@@ -375,3 +367,14 @@ def test_tenant_lifecycle_purge_suppresses_orphan_outbox_events_and_preserves_gu
     assert "CREATE OR REPLACE FUNCTION guard_tenant_purge_identity()" in guards
     assert "purged tenant identities cannot be recreated" in guards
     assert ") || (NEW).id::STRING::BYTES" in guards
+
+
+def test_generated_lessons_are_quarantined_and_database_guarded_until_approval():
+    migration = (ROOT / "migrations/0033_consolidation_candidate_approval.sql").read_text()
+
+    assert "review_status IN ('unavailable', 'pending', 'approved', 'rejected')" in migration
+    assert "SET trust_status = 'review_required'" in migration
+    assert "'consolidation_approval'" in migration
+    assert "guard_generated_procedural_lesson_approval" in migration
+    assert "active generated procedural lesson requires approval provenance" in migration
+    assert "approval.request_payload->>'candidate_memory_id'" in migration
