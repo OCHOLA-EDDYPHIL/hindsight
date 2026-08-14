@@ -642,13 +642,13 @@ def _validated_public_causal_envelope(value: dict[str, Any]) -> dict[str, Any] |
     if exact is None or candidate is None:
         return None
     try:
-        # Imported lazily to keep the durable-run module independent of agent startup.
-        from hindsight.agent import _redacted_causal_envelope
+        # Imported lazily to keep ordinary durable-run reads lightweight.
+        from hindsight.causal_projection import public_causal_envelope
         from hindsight.trace_contract import _valid_controlled_envelope
 
         if not _valid_controlled_envelope(exact):
             return None
-        expected = validated_causal_envelope(_redacted_causal_envelope(exact))
+        expected = validated_causal_envelope(public_causal_envelope(exact))
     except Exception:
         # Persisted traces are untrusted at this public projection boundary.
         return None

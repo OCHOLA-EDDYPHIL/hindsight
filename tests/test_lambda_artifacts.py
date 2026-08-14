@@ -65,6 +65,7 @@ def test_api_artifact_does_not_inherit_agent_or_mcp_dependencies():
 
     assert "agent.py" not in api["modules"]
     assert "agent_decision.py" in api["modules"]
+    assert {"causal_evidence.py", "causal_projection.py"} <= set(api["modules"])
     assert "dashboard.py" not in api["modules"]
     assert "mcp_server.py" not in api["modules"]
     assert not any("langgraph" in dependency for dependency in api["dependencies"])
@@ -94,6 +95,8 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
         "operations.py",
         "prompt_safety.py",
         "consolidation.py",
+        "causal_evidence.py",
+        "causal_projection.py",
         "demo_state.py",
         "embedding_index.py",
         "queueing.py",
