@@ -30,6 +30,8 @@ Semantic beliefs have stable identities and immutable versions. Gemini embedding
 
 Gemini reasoning uses a schema derived from the active safety context. Before a terminal decision, the model may select only a server-allow-listed CloudWatch diagnostic. The tool can make at most three read-only calls within a 15-minute window. A current observation then permits a schema-constrained recommendation or an allow-listed governed-memory remediation. Model work happens outside mutation transactions; durable call budgets, leases, and checkpoints prevent an unconstrained loop.
 
+For the controlled payments replay, the version 3 decision schema carries the versioned `payments_retry_amplification.v1` action contract. Gemini selects exactly one primary action, and the server validates and fingerprints that semantic action independently of recommendation identity and prose. The public trace reports a controlled action change only when both action fingerprints validate and differ, the incident input and normalized observations match, the governed correction is proven, and the invalidated memory is absent from the later read set. Legacy or incomplete action records make the comparison unavailable, and a recommendation is never presented as observed service recovery.
+
 A governed remediation is not executed directly by the model. The selected memory and verbatim quote, current observations, preview effects, and fingerprints are shown to an authenticated operator. Approval binds that exact proposal, and execution proceeds through the normal durable operation path.
 
 ## Durable dispatch and recovery
