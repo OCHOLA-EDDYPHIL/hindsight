@@ -19,9 +19,9 @@ from hindsight.tenant import current_tenant_id, normalize_tenant_id
 RUN_QUEUE_URL_ENV = "HINDSIGHT_RUN_QUEUE_URL"
 INLINE_WORKER_ENV = "HINDSIGHT_INLINE_WORKER"
 INLINE_MAX_ATTEMPTS = 3
+INLINE_MAX_DELIVERIES = INLINE_MAX_ATTEMPTS + 1
 INLINE_RETRY_SECONDS = 0.1
 INLINE_QUEUE_ARN = "local:sqs:hindsight-runs"
-INLINE_DLQ_ARN = "local:sqs:hindsight-run-dlq"
 
 
 class RunQueueUnavailableError(RuntimeError):
@@ -82,7 +82,7 @@ def _run_inline_message(message: dict[str, Any]) -> None:
     from hindsight.worker import handler
 
     message_id = str(uuid4())
-    for receive_count in range(1, INLINE_MAX_ATTEMPTS + 1):
+    for receive_count in range(1, INLINE_MAX_DELIVERIES + 1):
         result = handler(
             _inline_event(
                 message=message,
@@ -95,17 +95,8 @@ def _run_inline_message(message: dict[str, Any]) -> None:
         failed = {str(item.get("itemIdentifier")) for item in result.get("batchItemFailures", [])}
         if message_id not in failed:
             return
-        if receive_count < INLINE_MAX_ATTEMPTS:
+        if receive_count < INLINE_MAX_DELIVERIES:
             time.sleep(INLINE_RETRY_SECONDS)
-    handler(
-        _inline_event(
-            message=message,
-            message_id=message_id,
-            receive_count=1,
-            source_arn=os.environ.get("HINDSIGHT_RUN_DLQ_ARN", INLINE_DLQ_ARN),
-        ),
-        SimpleNamespace(aws_request_id=f"inline-dlq:{uuid4()}"),
-    )
 
 
 def _inline_event(

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 from datetime import timedelta
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
+ROOT = Path(__file__).resolve().parents[1]
 LEASE_TTL = timedelta(minutes=5)
 APPROVAL_RECOMMENDATION_ID = "recommendation:test"
 APPROVAL_SELECTION_FINGERPRINT = "selection:test"
@@ -47,6 +52,45 @@ ACTION_APPROVAL_METADATA = {
         },
     }
 }
+
+
+@pytest.fixture
+def agent_writer_database_url() -> str:
+    database_url = os.environ["DATABASE_URL"]
+    login_role = f"hindsight_agent_writer_test_{uuid4().hex}"
+    password = f"AgentWriter-{uuid4().hex}"
+    sslmode = parse_qs(urlsplit(database_url).query).get("sslmode", [None])[0]
+    with psycopg.connect(database_url, autocommit=True) as admin:
+        admin.execute((ROOT / "infra/db/roles.sql").read_text())
+        if sslmode == "disable":
+            admin.execute(
+                sql.SQL("CREATE ROLE {} WITH LOGIN NOBYPASSRLS").format(sql.Identifier(login_role))
+            )
+            restricted_url = make_conninfo(database_url, user=login_role)
+        else:
+            admin.execute(
+                sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD %s NOBYPASSRLS").format(
+                    sql.Identifier(login_role)
+                ),
+                (password,),
+            )
+            restricted_url = make_conninfo(
+                database_url,
+                user=login_role,
+                password=password,
+            )
+        admin.execute(
+            sql.SQL("GRANT hindsight_agent_writer TO {}").format(sql.Identifier(login_role))
+        )
+    with psycopg.connect(restricted_url) as restricted:
+        assert restricted.execute(
+            "SELECT current_user, pg_has_role(current_user, 'hindsight_agent_writer', 'member')"
+        ).fetchone() == (login_role, True)
+    try:
+        yield restricted_url
+    finally:
+        with psycopg.connect(database_url, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(login_role)))
 
 
 def test_delivery_identity_validation_fails_before_database_access():
@@ -488,7 +532,7 @@ def test_terminal_remediation_seals_decision_without_semantic_reflection(termina
 
 
 @requires_db
-def test_exhausted_dlq_finalization_is_atomic_and_idempotent():
+def test_exhausted_source_finalization_is_atomic_and_idempotent():
     from hindsight.runs import claim_run_attempt, create_run, finalize_exhausted_run, get_run
 
     run, _ = create_run(
@@ -529,6 +573,122 @@ def test_exhausted_dlq_finalization_is_atomic_and_idempotent():
             (run["decision_id"],),
         ).fetchone()
     assert decision == ("failed", True)
+
+
+@requires_db
+def test_exact_owner_can_finalize_the_live_final_attempt():
+    from hindsight.runs import claim_run_attempt, create_run, finalize_exhausted_run, get_run
+
+    run, _ = create_run(
+        incident_slug=f"attempt-final-owner-{uuid4().hex}",
+        namespace="attempt-final-owner",
+        user_input="checkout latency",
+    )
+    final = None
+    for attempt_number in range(1, 4):
+        claim = claim_run_attempt(
+            run_id=run["id"],
+            command="start",
+            command_generation=0,
+            lease_ttl=LEASE_TTL,
+            max_attempts=3,
+        )
+        assert claim.outcome == "claimed"
+        if attempt_number < 3:
+            _expire_attempt(run["id"])
+        else:
+            final = claim
+    failed = finalize_exhausted_run(
+        run_id=run["id"],
+        command="start",
+        max_attempts=3,
+        attempt_id=final.attempt_id,
+    )
+    repeated = finalize_exhausted_run(
+        run_id=run["id"],
+        command="start",
+        max_attempts=3,
+        attempt_id=final.attempt_id,
+    )
+
+    assert failed["status"] == "failed"
+    assert repeated["status"] == "failed"
+    persisted = get_run(run_id=run["id"])
+    assert [event["status"] for event in persisted["events"]].count("failed") == 1
+
+
+@requires_db
+def test_agent_writer_redrive_creates_one_fresh_run_for_an_exhausted_source(
+    agent_writer_database_url,
+):
+    from hindsight.quarantine import persist_quarantine_record
+    from hindsight.quarantine_redrive import redrive_quarantined_run
+    from hindsight.runs import claim_run_attempt, create_run, finalize_exhausted_run, get_run
+    from tests.quarantine_fakes import InMemoryQuarantineTable
+
+    run, _ = create_run(
+        incident_slug=f"redrive-source-{uuid4().hex}",
+        namespace="attempt-redrive",
+        user_input="checkout latency",
+    )
+    for _ in range(3):
+        claim = claim_run_attempt(
+            run_id=run["id"],
+            command="start",
+            command_generation=0,
+            lease_ttl=LEASE_TTL,
+            max_attempts=3,
+        )
+        assert claim.outcome == "claimed"
+        _expire_attempt(run["id"])
+    finalized = finalize_exhausted_run(
+        run_id=run["id"],
+        command="start",
+        max_attempts=3,
+    )
+    assert finalized["status"] == "failed"
+
+    table = InMemoryQuarantineTable()
+    record = persist_quarantine_record(
+        table=table,
+        source_arn="arn:aws:sqs:us-east-1:123456789012:hindsight-runs",
+        source_message_id=str(uuid4()),
+        raw_body='{"command":"start"}',
+        reason_code="run_attempts_exhausted",
+        work_kind="run",
+        command="start",
+        receive_count=4,
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        run_id=str(run["id"]),
+        command_generation=0,
+    ).item
+    confirmation = f"redrive:{record['quarantine_id']}:{record['raw_body_sha256']}"
+    arguments = {
+        "table": table,
+        "quarantine_id": record["quarantine_id"],
+        "raw_body_sha256": record["raw_body_sha256"],
+        "confirmation": confirmation,
+        "repository_owner": "owner",
+        "actor": "owner",
+        "triggering_actor": "owner",
+        "db_url": agent_writer_database_url,
+    }
+
+    first = redrive_quarantined_run(**arguments)
+    repeated = redrive_quarantined_run(**arguments)
+
+    assert first["created"] is True
+    assert repeated == {**first, "created": False}
+    assert first["run_id"] != str(run["id"])
+    redriven = get_run(run_id=first["run_id"])
+    assert redriven["status"] == "queued"
+    assert redriven["user_input"] == finalized["user_input"]
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        effect_count = conn.execute(
+            "SELECT count(*) FROM agent_runs WHERE idempotency_key = %s",
+            (f"quarantine-redrive:{first['redrive_effect_id']}",),
+        ).fetchone()[0]
+    assert effect_count == 1
 
 
 @requires_db

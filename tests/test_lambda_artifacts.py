@@ -94,6 +94,7 @@ def test_worker_artifact_does_not_include_frontend_or_api_framework():
     assert {
         "operations.py",
         "prompt_safety.py",
+        "quarantine.py",
         "consolidation.py",
         "causal_evidence.py",
         "causal_projection.py",

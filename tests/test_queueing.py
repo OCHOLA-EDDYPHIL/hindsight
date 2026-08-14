@@ -86,3 +86,42 @@ def test_queue_tenant_follows_bound_context_and_accepts_trusted_internal_message
                 {"run_id": "wrong", "tenant_id": acceptance},
                 client=client,
             )
+
+
+def test_inline_queue_keeps_the_fourth_source_delivery_for_hard_failure_terminalization(
+    monkeypatch,
+):
+    import hindsight.queueing as queueing
+    import hindsight.worker as worker
+
+    calls = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.target = target
+            self.args = args
+            self.name = name
+            assert daemon is True
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.delenv(queueing.RUN_QUEUE_URL_ENV, raising=False)
+    monkeypatch.setenv(queueing.INLINE_WORKER_ENV, "1")
+    monkeypatch.setattr(queueing.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(queueing, "INLINE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(
+        worker,
+        "handler",
+        lambda event, _context: (
+            calls.append(event)
+            or {"batchItemFailures": [{"itemIdentifier": event["Records"][0]["messageId"]}]}
+        ),
+    )
+
+    queueing.enqueue_run({"command": "start", "run_id": "run-hard-failure"})
+
+    assert [
+        int(event["Records"][0]["attributes"]["ApproximateReceiveCount"]) for event in calls
+    ] == [1, 2, 3, 4]
+    assert {event["Records"][0]["eventSourceARN"] for event in calls} == {queueing.INLINE_QUEUE_ARN}

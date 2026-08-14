@@ -329,6 +329,60 @@ jobs:
           } >> "$GITHUB_ENV"
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase semantic
 
+  alert_delivery:
+    needs: [authorize, deploy]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
+      ALERT_RECEIVER_QUEUE_NAME: ${{ needs.deploy.outputs.alert_receiver_queue_name }}
+      ALERT_TOPIC_ARN: ${{ needs.deploy.outputs.alert_topic_arn }}
+      BUDGET_ALERT_TOPIC_ARN: ${{ needs.deploy.outputs.budget_alert_topic_arn }}
+      EXACT_RELEASE_PROBE_ALARM_NAME: ${{ needs.deploy.outputs.exact_release_probe_alarm_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Verify exact product revision
+        env:
+          EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-observability-evidence
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Exercise exact-release alert delivery
+        run: >-
+          uv run python scripts/exercise_alert_delivery.py
+          --alarm-name "$EXACT_RELEASE_PROBE_ALARM_NAME"
+          --receiver-queue-name "$ALERT_RECEIVER_QUEUE_NAME"
+          --operational-topic-arn "$ALERT_TOPIC_ARN"
+          --budget-topic-arn "$BUDGET_ALERT_TOPIC_ARN"
+          --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID"
+          --region "$AWS_REGION"
+          --stage "$HINDSIGHT_STAGE"
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --output build/alert-delivery-evidence.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alert-delivery-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
+          path: build/alert-delivery-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
   consolidation_product:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
@@ -405,16 +459,32 @@ jobs:
       id-token: write
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      API_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
       HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS: ${{ needs.deploy.outputs.run_attempt_lease_seconds }}
       HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS: ${{ needs.deploy.outputs.run_queue_visibility_seconds }}
       HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS: ${{ needs.deploy.outputs.run_max_attempts }}
       HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS: ${{ needs.deploy.outputs.run_dispatch_schedule_seconds }}
+      HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL: ${{ needs.deploy.outputs.run_queue_url }}
+      HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN: ${{ needs.deploy.outputs.run_queue_arn }}
+      HINDSIGHT_QUARANTINE_TABLE: ${{ needs.deploy.outputs.quarantine_table }}
+      HINDSIGHT_QUARANTINE_INDEX: ${{ needs.deploy.outputs.quarantine_index }}
+      HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Verify exact product revision and prepare worker evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+          EVIDENCE_DIR="$RUNNER_TEMP/hindsight-worker-evidence"
+          mkdir -p "$EVIDENCE_DIR"
+          {
+            echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$EVIDENCE_DIR"
+            echo "HINDSIGHT_QUARANTINE_EVIDENCE_PATH=$EVIDENCE_DIR/quarantine-evidence.json"
+          } >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -422,16 +492,22 @@ jobs:
       - run: uv sync --frozen
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-worker-acceptance
           aws-region: ${{ env.AWS_REGION }}
       - name: Load worker database setting
         shell: bash
         run: |
-          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          DATABASE_URL="$(aws ssm get-parameter --name "$API_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
           [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
           echo "::add-mask::$DATABASE_URL"
           printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase worker
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hindsight-worker-evidence/quarantine-evidence.json
+          if-no-files-found: error
+          retention-days: 90
 
   browser_product:
     needs: [authorize, acceptance_plan, deploy]
@@ -593,6 +669,7 @@ jobs:
       - exact_main_ci
       - product_preflight
       - deploy
+      - alert_delivery
       - semantic_product
       - consolidation_product
       - worker_product
@@ -612,6 +689,7 @@ jobs:
           EXACT_MAIN_CI_RESULT: ${{ needs.exact_main_ci.result }}
           PREFLIGHT_RESULT: ${{ needs.product_preflight.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          ALERT_DELIVERY_RESULT: ${{ needs.alert_delivery.result }}
           SEMANTIC_RESULT: ${{ needs.semantic_product.result }}
           CONSOLIDATION_RESULT: ${{ needs.consolidation_product.result }}
           WORKER_RESULT: ${{ needs.worker_product.result }}
@@ -625,6 +703,7 @@ jobs:
             "$EXACT_MAIN_CI_RESULT" \
             "$PREFLIGHT_RESULT" \
             "$DEPLOY_RESULT" \
+            "$ALERT_DELIVERY_RESULT" \
             "$SEMANTIC_RESULT" \
             "$CONSOLIDATION_RESULT" \
             "$WORKER_RESULT" \

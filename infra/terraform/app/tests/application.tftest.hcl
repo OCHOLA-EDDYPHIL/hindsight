@@ -59,6 +59,99 @@ run "complete_demo_graph" {
     manage_public_dns   = true
   }
 
+  override_resource {
+    target          = aws_sqs_queue.runs
+    override_during = plan
+    values = {
+      arn = "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-runs"
+      url = "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-runs"
+    }
+  }
+
+  override_resource {
+    target          = aws_sqs_queue.run_dlq
+    override_during = plan
+    values = {
+      arn = "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-run-dlq"
+      url = "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-run-dlq"
+    }
+  }
+
+  override_resource {
+    target          = aws_sqs_queue.scheduler_dlq
+    override_during = plan
+    values = {
+      arn = "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-scheduler-dlq"
+      url = "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-scheduler-dlq"
+    }
+  }
+
+  override_resource {
+    target          = aws_sqs_queue.alert_receiver
+    override_during = plan
+    values = {
+      arn = "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-alert-receiver"
+      url = "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-alert-receiver"
+    }
+  }
+
+  override_resource {
+    target          = aws_kms_key.quarantine
+    override_during = plan
+    values = {
+      arn    = "arn:aws:kms:us-east-1:123456789012:key/quarantine-key"
+      key_id = "quarantine-key"
+    }
+  }
+
+  override_resource {
+    target          = aws_dynamodb_table.quarantine
+    override_during = plan
+    values = {
+      arn = "arn:aws:dynamodb:us-east-1:123456789012:table/hindsight-demo-quarantine"
+    }
+  }
+
+  override_resource {
+    target          = aws_sns_topic.alerts
+    override_during = plan
+    values = {
+      arn = "arn:aws:sns:us-east-1:123456789012:hindsight-demo-alerts"
+    }
+  }
+
+  override_resource {
+    target          = aws_sns_topic.budget_alerts
+    override_during = plan
+    values = {
+      arn = "arn:aws:sns:us-east-1:123456789012:hindsight-demo-budget-alerts"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_event_rule.operation_reaper
+    override_during = plan
+    values = {
+      arn = "arn:aws:events:us-east-1:123456789012:rule/hindsight-demo-operation-reaper"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_event_rule.quarantine_metrics
+    override_during = plan
+    values = {
+      arn = "arn:aws:events:us-east-1:123456789012:rule/hindsight-demo-quarantine-metrics"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_event_rule.run_dispatcher
+    override_during = plan
+    values = {
+      arn = "arn:aws:events:us-east-1:123456789012:rule/hindsight-demo-run-dispatcher"
+    }
+  }
+
   assert {
     condition     = aws_sqs_queue.runs.redrive_policy != null
     error_message = "The run queue must retain a dead-letter policy."
@@ -67,9 +160,13 @@ run "complete_demo_graph" {
   assert {
     condition = (
       length(aws_sns_topic_subscription.alert_email) == 0 &&
-      length(aws_sns_topic_subscription.budget_alert_email) == 0
+      length(aws_sns_topic_subscription.budget_alert_email) == 0 &&
+      aws_sns_topic_subscription.alert_receiver.protocol == "sqs" &&
+      aws_sns_topic_subscription.budget_alert_receiver.protocol == "sqs" &&
+      aws_sns_topic_subscription.alert_receiver.endpoint == aws_sqs_queue.alert_receiver.arn &&
+      aws_sns_topic_subscription.budget_alert_receiver.endpoint == aws_sqs_queue.alert_receiver.arn
     )
-    error_message = "Email notification subscriptions must remain disabled by default."
+    error_message = "Email subscriptions must remain optional while both topics retain the controlled SQS receiver."
   }
 
   assert {
@@ -105,30 +202,152 @@ run "complete_demo_graph" {
   }
 
   assert {
-    condition     = tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == local.run_max_attempts
-    error_message = "The database attempt budget and queue redrive budget must match."
+    condition = (
+      tonumber(aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_MAX_ATTEMPTS) == local.run_max_attempts &&
+      local.run_queue_max_receive_count == local.run_max_attempts + 1 &&
+      tonumber(jsondecode(aws_sqs_queue.runs.redrive_policy).maxReceiveCount) == local.run_queue_max_receive_count &&
+      jsondecode(aws_sqs_queue_redrive_allow_policy.run_dlq.redrive_allow_policy).redrivePermission == "byQueue" &&
+      toset(jsondecode(aws_sqs_queue_redrive_allow_policy.run_dlq.redrive_allow_policy).sourceQueueArns) == toset([aws_sqs_queue.runs.arn])
+    )
+    error_message = "The source queue must retain one terminalization delivery beyond the database attempt budget and be the DLQ's only allowed source."
   }
 
   assert {
     condition = (
       aws_sqs_queue.runs.message_retention_seconds == 1209600 &&
       aws_sqs_queue.run_dlq.message_retention_seconds == 1209600 &&
+      aws_sqs_queue.scheduler_dlq.message_retention_seconds == 1209600 &&
+      aws_sqs_queue.alert_receiver.message_retention_seconds == 1209600 &&
+      aws_sqs_queue.scheduler_dlq.sqs_managed_sse_enabled &&
+      aws_sqs_queue.alert_receiver.sqs_managed_sse_enabled &&
       aws_lambda_event_source_mapping.worker.batch_size == 1 &&
-      aws_lambda_event_source_mapping.worker_dlq.batch_size == 1 &&
       aws_lambda_event_source_mapping.worker.scaling_config[0].maximum_concurrency == 2 &&
-      toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"]) &&
-      toset(aws_lambda_event_source_mapping.worker_dlq.function_response_types) == toset(["ReportBatchItemFailures"])
+      toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"])
     )
-    error_message = "Both queues must retain messages for 14 days and isolate retries, while the source mapping stays within worker concurrency."
+    error_message = "Durable queues must stay encrypted and retained while only the source queue has a bounded worker consumer."
   }
 
   assert {
     condition = (
       aws_cloudwatch_event_rule.run_dispatcher.schedule_expression == "rate(1 minute)" &&
       aws_cloudwatch_event_rule.operation_reaper.schedule_expression == "rate(1 minute)" &&
-      jsondecode(aws_cloudwatch_event_target.run_dispatcher.input).command == "dispatch_run_commands"
+      aws_cloudwatch_event_rule.quarantine_metrics.schedule_expression == "rate(1 minute)" &&
+      jsondecode(aws_cloudwatch_event_target.run_dispatcher.input).command == "dispatch_run_commands" &&
+      jsondecode(aws_cloudwatch_event_target.quarantine_metrics.input).command == "report_quarantine_metrics" &&
+      alltrue([
+        for target in [
+          aws_cloudwatch_event_target.operation_reaper,
+          aws_cloudwatch_event_target.quarantine_metrics,
+          aws_cloudwatch_event_target.run_dispatcher,
+        ] :
+        target.dead_letter_config[0].arn == aws_sqs_queue.scheduler_dlq.arn &&
+        target.retry_policy[0].maximum_event_age_in_seconds == 3600 &&
+        target.retry_policy[0].maximum_retry_attempts == 2
+      ])
     )
-    error_message = "The worker must sweep durable run commands through the run queue."
+    error_message = "Every scheduled worker command must use bounded delivery and the encrypted scheduler fallback."
+  }
+
+  assert {
+    condition = (
+      toset(one(data.aws_iam_policy_document.scheduler_dlq.statement).actions) == toset(["sqs:SendMessage"]) &&
+      toset(one(data.aws_iam_policy_document.scheduler_dlq.statement).resources) == toset([aws_sqs_queue.scheduler_dlq.arn]) &&
+      one(one(data.aws_iam_policy_document.scheduler_dlq.statement).principals).type == "Service" &&
+      toset(one(one(data.aws_iam_policy_document.scheduler_dlq.statement).principals).identifiers) == toset(["events.amazonaws.com"]) &&
+      anytrue([
+        for condition in one(data.aws_iam_policy_document.scheduler_dlq.statement).condition :
+        condition.test == "ArnEquals" && condition.variable == "aws:SourceArn" &&
+        toset(condition.values) == toset([
+          aws_cloudwatch_event_rule.operation_reaper.arn,
+          aws_cloudwatch_event_rule.quarantine_metrics.arn,
+          aws_cloudwatch_event_rule.run_dispatcher.arn,
+        ])
+      ]) &&
+      anytrue([
+        for condition in one(data.aws_iam_policy_document.scheduler_dlq.statement).condition :
+        condition.test == "StringEquals" && condition.variable == "aws:SourceAccount" &&
+        toset(condition.values) == toset([data.aws_caller_identity.current.account_id])
+      ])
+    )
+    error_message = "The scheduler fallback policy must trust only this account's three exact EventBridge rules."
+  }
+
+  assert {
+    condition = (
+      aws_dynamodb_table.quarantine.hash_key == "quarantine_id" &&
+      aws_dynamodb_table.quarantine.point_in_time_recovery[0].enabled &&
+      aws_dynamodb_table.quarantine.server_side_encryption[0].enabled &&
+      aws_dynamodb_table.quarantine.server_side_encryption[0].kms_key_arn == aws_kms_key.quarantine.arn &&
+      aws_kms_key.quarantine.enable_key_rotation &&
+      anytrue([
+        for index in aws_dynamodb_table.quarantine.global_secondary_index :
+        index.name == "quarantine-status-created-at-index" &&
+        index.hash_key == "status" &&
+        index.range_key == "created_at" &&
+        index.projection_type == "ALL"
+      ]) &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_RUN_DLQ_ARN == aws_sqs_queue.run_dlq.arn &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_QUARANTINE_TABLE == aws_dynamodb_table.quarantine.name &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_QUARANTINE_INDEX == "quarantine-status-created-at-index" &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_QUARANTINE_METRIC_NAMESPACE == "Hindsight/Quarantine" &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_QUARANTINE_METRIC_STAGE == var.stage
+    )
+    error_message = "Terminal poison records require the KMS-encrypted PITR ledger, query index, and exact worker contract."
+  }
+
+  assert {
+    condition = (
+      toset(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if contains(statement.actions, "sqs:ReceiveMessage")
+      ]).resources) == toset([aws_sqs_queue.runs.arn]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if statement.sid == "QuarantineLedger"
+        ]).actions) == toset([
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:Query",
+      ]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if statement.sid == "QuarantineLedger"
+        ]).resources) == toset([
+        aws_dynamodb_table.quarantine.arn,
+        "${aws_dynamodb_table.quarantine.arn}/index/quarantine-status-created-at-index",
+      ]) &&
+      length([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if(
+          (statement.sid == "QuarantineLedger" && contains(statement.actions, "dynamodb:UpdateItem")) ||
+          anytrue([for action in statement.actions : startswith(action, "kms:")])
+        )
+      ]) == 0 &&
+      toset(one(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if statement.sid == "QuarantineMetrics"
+      ]).condition).values) == toset(["Hindsight/Quarantine"])
+    )
+    error_message = "The worker must consume only the source queue and retain narrowly scoped ledger, key, and metric access."
+  }
+
+  assert {
+    condition = (
+      toset(one(data.aws_iam_policy_document.alert_receiver.statement).actions) == toset(["sqs:SendMessage"]) &&
+      toset(one(data.aws_iam_policy_document.alert_receiver.statement).resources) == toset([aws_sqs_queue.alert_receiver.arn]) &&
+      toset(one(one(data.aws_iam_policy_document.alert_receiver.statement).principals).identifiers) == toset(["sns.amazonaws.com"]) &&
+      anytrue([
+        for condition in one(data.aws_iam_policy_document.alert_receiver.statement).condition :
+        condition.test == "ArnEquals" && condition.variable == "aws:SourceArn" &&
+        toset(condition.values) == toset([aws_sns_topic.alerts.arn, aws_sns_topic.budget_alerts.arn])
+      ]) &&
+      anytrue([
+        for condition in one(data.aws_iam_policy_document.alert_receiver.statement).condition :
+        condition.test == "StringEquals" && condition.variable == "aws:SourceAccount" &&
+        toset(condition.values) == toset([data.aws_caller_identity.current.account_id])
+      ])
+    )
+    error_message = "The controlled receiver policy must trust only the exact stage topics in this account."
   }
 
   assert {
@@ -315,6 +534,22 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
+      length(aws_cloudwatch_metric_alarm.scheduler_failed_invocations) == 3 &&
+      length(aws_cloudwatch_metric_alarm.quarantine) == 2 &&
+      length(aws_cloudwatch_log_metric_filter.bounded) == 2 &&
+      aws_cloudwatch_metric_alarm.run_queue_age.metric_name == "ApproximateAgeOfOldestMessage" &&
+      aws_cloudwatch_metric_alarm.run_dlq.metric_name == "ApproximateNumberOfMessagesVisible" &&
+      aws_cloudwatch_metric_alarm.run_dlq_age.metric_name == "ApproximateAgeOfOldestMessage" &&
+      aws_cloudwatch_metric_alarm.scheduler_dlq.dimensions.QueueName == aws_sqs_queue.scheduler_dlq.name &&
+      toset(aws_cloudwatch_metric_alarm.exact_release_probe.alarm_actions) == toset(local.operational_alarm_actions) &&
+      toset(aws_cloudwatch_metric_alarm.exact_release_probe.ok_actions) == toset(local.operational_alarm_actions) &&
+      aws_cloudwatch_metric_alarm.exact_release_probe.treat_missing_data == "ignore"
+    )
+    error_message = "Core queue, quarantine, scheduler, API, worker, Lambda, and exact-release alarm surfaces must remain active."
+  }
+
+  assert {
+    condition = (
       aws_iam_role.apigateway_cloudwatch.name == "hindsight-demo-apigateway-cloudwatch" &&
       aws_iam_role_policy_attachment.apigateway_cloudwatch.role == aws_iam_role.apigateway_cloudwatch.name &&
       endswith(aws_iam_role_policy_attachment.apigateway_cloudwatch.policy_arn, "AmazonAPIGatewayPushToCloudWatchLogs")
@@ -349,6 +584,15 @@ run "alert_email_subscribes_operational_and_budget_topics" {
     }
   }
 
+  override_resource {
+    target          = aws_sqs_queue.alert_receiver
+    override_during = plan
+    values = {
+      arn = "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-alert-receiver"
+      url = "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-alert-receiver"
+    }
+  }
+
   assert {
     condition = (
       length(aws_sns_topic_subscription.alert_email) == 1 &&
@@ -359,6 +603,10 @@ run "alert_email_subscribes_operational_and_budget_topics" {
       aws_sns_topic_subscription.budget_alert_email[0].protocol == "email" &&
       aws_sns_topic_subscription.alert_email[0].endpoint == var.alert_email &&
       aws_sns_topic_subscription.budget_alert_email[0].endpoint == var.alert_email &&
+      aws_sns_topic_subscription.alert_receiver.topic_arn == aws_sns_topic.alerts.arn &&
+      aws_sns_topic_subscription.budget_alert_receiver.topic_arn == aws_sns_topic.budget_alerts.arn &&
+      aws_sns_topic_subscription.alert_receiver.endpoint == aws_sqs_queue.alert_receiver.arn &&
+      aws_sns_topic_subscription.budget_alert_receiver.endpoint == aws_sqs_queue.alert_receiver.arn &&
       length(aws_budgets_budget.monthly.notification) == 2 &&
       alltrue([
         for notification in aws_budgets_budget.monthly.notification :
@@ -445,10 +693,12 @@ run "bounded_observability_profile" {
     condition = (
       length(aws_cloudwatch_log_metric_filter.bounded) == 5 &&
       length(aws_cloudwatch_metric_alarm.lambda_errors) +
-      1 +
-      length(aws_cloudwatch_metric_alarm.bounded) == 10
+      length(aws_cloudwatch_metric_alarm.scheduler_failed_invocations) +
+      length(aws_cloudwatch_metric_alarm.quarantine) +
+      length(aws_cloudwatch_metric_alarm.bounded) +
+      5 == 19
     )
-    error_message = "The bounded profile must stop at five custom series and ten alarm metrics."
+    error_message = "The bounded profile must stop at five log-derived series and nineteen required alarm metrics."
   }
 
   assert {
@@ -537,8 +787,8 @@ run "validation_timing_profile" {
       aws_sqs_queue.runs.visibility_timeout_seconds >= aws_lambda_function.worker.timeout * 6 &&
       aws_cloudwatch_event_rule.run_dispatcher.schedule_expression == "rate(1 minute)" &&
       aws_cloudwatch_event_rule.operation_reaper.schedule_expression == "rate(1 minute)" &&
-      toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"]) &&
-      toset(aws_lambda_event_source_mapping.worker_dlq.function_response_types) == toset(["ReportBatchItemFailures"])
+      aws_cloudwatch_event_rule.quarantine_metrics.schedule_expression == "rate(1 minute)" &&
+      toset(aws_lambda_event_source_mapping.worker.function_response_types) == toset(["ReportBatchItemFailures"])
     )
     error_message = "Validation mode must preserve scheduler and queue execution boundaries."
   }
@@ -568,9 +818,9 @@ run "inactive_candidate_plane" {
   assert {
     condition = (
       aws_lambda_event_source_mapping.worker.enabled == false &&
-      aws_lambda_event_source_mapping.worker_dlq.enabled == false &&
       aws_cloudwatch_event_rule.run_dispatcher.state == "DISABLED" &&
-      aws_cloudwatch_event_rule.operation_reaper.state == "DISABLED"
+      aws_cloudwatch_event_rule.operation_reaper.state == "DISABLED" &&
+      aws_cloudwatch_event_rule.quarantine_metrics.state == "DISABLED"
     )
     error_message = "An inactive candidate must not consume queued or scheduled work."
   }

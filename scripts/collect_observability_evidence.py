@@ -16,7 +16,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from exercise_alert_delivery import publish
+from exercise_alert_delivery import exercise
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 ACCOUNT_ID = re.compile(r"[0-9]{12}")
@@ -832,7 +832,7 @@ def build_report(
             "alert": alert,
         },
         "limitations": [
-            "SNS provider acknowledgement does not prove endpoint receipt.",
+            "The controlled SQS receiver proves machine delivery and deletion, not a separate human response.",
             "The bounded acceptance window and configured sampling rate may omit other valid traces.",
             "Realtime evidence is independently traced and is correlated by tenant and run identity.",
         ],
@@ -916,12 +916,20 @@ def main() -> int:
             end=end,
             product_run_id=product_run_id,
         )
-        topic_arn = (
-            f"arn:aws:sns:{args.region}:{args.expected_account_id}:"
-            f"hindsight-{args.stage}-alerts"
+        operational_topic_arn = (
+            f"arn:aws:sns:{args.region}:{args.expected_account_id}:hindsight-{args.stage}-alerts"
         )
-        alert = publish(
-            topic_arn=topic_arn,
+        budget_topic_arn = (
+            f"arn:aws:sns:us-east-1:{args.expected_account_id}:hindsight-{args.stage}-budget-alerts"
+        )
+        alert = exercise(
+            alarm_name=f"hindsight-{args.stage}-exact-release-probe",
+            receiver_queue_name=f"hindsight-{args.stage}-alert-receiver",
+            operational_topic_arn=operational_topic_arn,
+            budget_topic_arn=budget_topic_arn,
+            expected_account_id=args.expected_account_id,
+            region=args.region,
+            stage=args.stage,
             profile=args.profile,
             source_revision=args.source_revision,
             session=session,

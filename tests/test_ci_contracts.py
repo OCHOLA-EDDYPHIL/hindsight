@@ -269,6 +269,7 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
         "plan-bootstrap.yml",
         "provision-lifecycle-fixture.yml",
         "recovery-drill.yml",
+        "redrive-quarantine.yml",
         "tenant-lifecycle.yml",
         "verify-deployed.yml",
     }
@@ -284,6 +285,7 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
         "plan-bootstrap.yml",
         "provision-lifecycle-fixture.yml",
         "recovery-drill.yml",
+        "redrive-quarantine.yml",
         "tenant-lifecycle.yml",
     ):
         assert set(workflows[name]) == {"workflow_dispatch"}

@@ -105,7 +105,7 @@ HOSTED_BROWSER_PRODUCT_SELECTORS = (
 )
 WORKER_PRODUCT_SELECTORS = (
     "tests/test_hosted_acceptance.py::"
-    "test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq",
+    "test_scheduled_dispatch_reclaims_and_source_terminalizes_with_quarantine",
 )
 ROLE_PRODUCT_SELECTORS = (
     "tests/test_hosted_database_roles.py::"
@@ -120,6 +120,10 @@ HOSTED_PHASE_SELECTORS = {
 }
 HOSTED_ACCEPTANCE_MODES = ("full", "browser-only")
 EXACT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SQS_QUEUE_HOST_PATTERN = re.compile(r"sqs\.([a-z0-9-]+)\.amazonaws\.com(\.cn)?")
+SQS_QUEUE_ARN_PATTERN = re.compile(r"arn:(aws|aws-us-gov|aws-cn):sqs:([a-z0-9-]+):([0-9]{12}):(.+)")
+AWS_RESOURCE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{3,255}")
+SQS_QUEUE_NAME_PATTERN = re.compile(r"(?=.{1,80}\Z)[A-Za-z0-9_-]+(?:\.fifo)?")
 
 
 def main() -> None:
@@ -424,6 +428,9 @@ def _run_hosted_product(args: argparse.Namespace) -> None:
             "HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS",
         ):
             _required_positive_int_env(name)
+        _required_matching_sqs_queue_env()
+        _required_aws_resource_name_env("HINDSIGHT_QUARANTINE_TABLE")
+        _required_aws_resource_name_env("HINDSIGHT_QUARANTINE_INDEX")
     elif args.phase == "browser":
         _verify_hosted_endpoints()
         _required_env("HINDSIGHT_OPERATOR_USERNAME")
@@ -684,6 +691,48 @@ def _required_env(name: str) -> str:
     value = (os.environ.get(name) or "").strip()
     if not value:
         raise ValueError(f"{name} is required")
+    return value
+
+
+def _required_matching_sqs_queue_env() -> tuple[str, str]:
+    queue_url = _required_env("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL")
+    queue_arn = _required_env("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN")
+    parts = urlsplit(queue_url)
+    host_match = SQS_QUEUE_HOST_PATTERN.fullmatch(parts.hostname or "")
+    path_parts = parts.path.split("/")
+    if (
+        parts.scheme != "https"
+        or host_match is None
+        or parts.netloc != parts.hostname
+        or parts.query
+        or parts.fragment
+        or len(path_parts) != 3
+        or path_parts[0]
+        or re.fullmatch(r"[0-9]{12}", path_parts[1]) is None
+        or SQS_QUEUE_NAME_PATTERN.fullmatch(path_parts[2]) is None
+    ):
+        raise ValueError("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL is not an exact SQS queue URL")
+    arn_match = SQS_QUEUE_ARN_PATTERN.fullmatch(queue_arn)
+    if arn_match is None or SQS_QUEUE_NAME_PATTERN.fullmatch(arn_match[4]) is None:
+        raise ValueError("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN is not an exact SQS queue ARN")
+    partition, arn_region, arn_account, arn_name = arn_match.groups()
+    url_region, china_endpoint = host_match.groups()
+    expected_partition = (
+        "aws-cn" if china_endpoint else "aws-us-gov" if url_region.startswith("us-gov-") else "aws"
+    )
+    if (url_region, path_parts[1], path_parts[2]) != (
+        arn_region,
+        arn_account,
+        arn_name,
+    ) or partition != expected_partition:
+        raise ValueError("hosted run queue URL and ARN do not identify the same queue")
+    return queue_url, queue_arn
+
+
+def _required_aws_resource_name_env(name: str) -> str:
+    value = _required_env(name)
+    if AWS_RESOURCE_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{name} is not a valid AWS resource name")
     return value
 
 

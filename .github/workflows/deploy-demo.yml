@@ -110,6 +110,33 @@ on:
       run_dispatch_schedule_seconds:
         description: Applied dispatcher cadence
         value: ${{ jobs.apply.outputs.run_dispatch_schedule_seconds }}
+      run_queue_url:
+        description: Exact worker source queue URL
+        value: ${{ jobs.apply.outputs.run_queue_url }}
+      run_queue_arn:
+        description: Exact worker source queue ARN
+        value: ${{ jobs.apply.outputs.run_queue_arn }}
+      run_fallback_queue_arn:
+        description: Exact unconsumed raw fallback queue ARN
+        value: ${{ jobs.apply.outputs.run_fallback_queue_arn }}
+      quarantine_table:
+        description: Terminal poison quarantine table
+        value: ${{ jobs.apply.outputs.quarantine_table }}
+      quarantine_index:
+        description: Terminal poison quarantine status index
+        value: ${{ jobs.apply.outputs.quarantine_index }}
+      alert_receiver_queue_name:
+        description: Controlled durable alert receiver
+        value: ${{ jobs.apply.outputs.alert_receiver_queue_name }}
+      alert_topic_arn:
+        description: Operational alarm topic
+        value: ${{ jobs.apply.outputs.alert_topic_arn }}
+      budget_alert_topic_arn:
+        description: Budget alarm topic
+        value: ${{ jobs.apply.outputs.budget_alert_topic_arn }}
+      exact_release_probe_alarm_name:
+        description: Exact-release delivery probe alarm
+        value: ${{ jobs.apply.outputs.exact_release_probe_alarm_name }}
 
 permissions:
   contents: read
@@ -396,6 +423,15 @@ jobs:
       run_queue_visibility_seconds: ${{ steps.stack_outputs.outputs.run_queue_visibility_seconds }}
       run_max_attempts: ${{ steps.stack_outputs.outputs.run_max_attempts }}
       run_dispatch_schedule_seconds: ${{ steps.stack_outputs.outputs.run_dispatch_schedule_seconds }}
+      run_queue_url: ${{ steps.stack_outputs.outputs.run_queue_url }}
+      run_queue_arn: ${{ steps.stack_outputs.outputs.run_queue_arn }}
+      run_fallback_queue_arn: ${{ steps.stack_outputs.outputs.run_fallback_queue_arn }}
+      quarantine_table: ${{ steps.stack_outputs.outputs.quarantine_table }}
+      quarantine_index: ${{ steps.stack_outputs.outputs.quarantine_index }}
+      alert_receiver_queue_name: ${{ steps.stack_outputs.outputs.alert_receiver_queue_name }}
+      alert_topic_arn: ${{ steps.stack_outputs.outputs.alert_topic_arn }}
+      budget_alert_topic_arn: ${{ steps.stack_outputs.outputs.budget_alert_topic_arn }}
+      exact_release_probe_alarm_name: ${{ steps.stack_outputs.outputs.exact_release_probe_alarm_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -604,6 +640,15 @@ jobs:
           RUN_QUEUE_VISIBILITY_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_queue_visibility_seconds)"
           RUN_MAX_ATTEMPTS="$(terraform -chdir=infra/terraform/app output -raw run_max_attempts)"
           RUN_DISPATCH_SCHEDULE_SECONDS="$(terraform -chdir=infra/terraform/app output -raw run_dispatch_schedule_seconds)"
+          RUN_QUEUE_URL="$(terraform -chdir=infra/terraform/app output -raw run_queue_url)"
+          RUN_QUEUE_ARN="$(terraform -chdir=infra/terraform/app output -raw run_queue_arn)"
+          RUN_FALLBACK_QUEUE_ARN="$(terraform -chdir=infra/terraform/app output -raw run_fallback_queue_arn)"
+          QUARANTINE_TABLE="$(terraform -chdir=infra/terraform/app output -raw quarantine_table)"
+          QUARANTINE_INDEX="$(terraform -chdir=infra/terraform/app output -raw quarantine_index)"
+          ALERT_RECEIVER_QUEUE_NAME="$(terraform -chdir=infra/terraform/app output -raw alert_receiver_queue_name)"
+          ALERT_TOPIC_ARN="$(terraform -chdir=infra/terraform/app output -raw alert_topic_arn)"
+          BUDGET_ALERT_TOPIC_ARN="$(terraform -chdir=infra/terraform/app output -raw budget_alert_topic_arn)"
+          EXACT_RELEASE_PROBE_ALARM_NAME="$(terraform -chdir=infra/terraform/app output -raw exact_release_probe_alarm_name)"
           {
             echo "ui_url=$UI_URL"
             echo "api_url=$API_URL"
@@ -615,7 +660,44 @@ jobs:
             echo "run_queue_visibility_seconds=$RUN_QUEUE_VISIBILITY_SECONDS"
             echo "run_max_attempts=$RUN_MAX_ATTEMPTS"
             echo "run_dispatch_schedule_seconds=$RUN_DISPATCH_SCHEDULE_SECONDS"
+            echo "run_queue_url=$RUN_QUEUE_URL"
+            echo "run_queue_arn=$RUN_QUEUE_ARN"
+            echo "run_fallback_queue_arn=$RUN_FALLBACK_QUEUE_ARN"
+            echo "quarantine_table=$QUARANTINE_TABLE"
+            echo "quarantine_index=$QUARANTINE_INDEX"
+            echo "alert_receiver_queue_name=$ALERT_RECEIVER_QUEUE_NAME"
+            echo "alert_topic_arn=$ALERT_TOPIC_ARN"
+            echo "budget_alert_topic_arn=$BUDGET_ALERT_TOPIC_ARN"
+            echo "exact_release_probe_alarm_name=$EXACT_RELEASE_PROBE_ALARM_NAME"
           } >> "$GITHUB_OUTPUT"
+      - name: Verify raw fallback queue has no Lambda consumer
+        env:
+          RUN_FALLBACK_QUEUE_ARN: ${{ steps.stack_outputs.outputs.run_fallback_queue_arn }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import os
+          import sys
+
+          import boto3
+
+          source_arn = os.environ["RUN_FALLBACK_QUEUE_ARN"]
+          client = boto3.client("lambda", region_name=os.environ["AWS_REGION"])
+          mappings = [
+              mapping
+              for page in client.get_paginator("list_event_source_mappings").paginate(
+                  EventSourceArn=source_arn
+              )
+              for mapping in page.get("EventSourceMappings", [])
+          ]
+          if mappings:
+              print(
+                  f"raw fallback queue has {len(mappings)} Lambda event source mapping(s)",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY
       - name: Verify deployed HTTP health
         shell: bash
         env:

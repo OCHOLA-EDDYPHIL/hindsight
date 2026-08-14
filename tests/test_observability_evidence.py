@@ -101,30 +101,221 @@ def test_capacity_evidence_requires_bound_supplemental_artifacts():
         )
 
 
-def test_alert_exercise_records_only_acknowledgement_and_revision():
+def test_alert_exercise_proves_confirmed_challenge_bound_alarm_and_ok_delivery():
     module = _script("exercise_alert_delivery")
+    account_id = "123456789012"
+    stage = "demo"
+    queue_name = f"hindsight-{stage}-alert-receiver"
+    queue_url = f"https://sqs.us-east-1.amazonaws.com/{account_id}/{queue_name}"
+    queue_arn = f"arn:aws:sqs:us-east-1:{account_id}:{queue_name}"
+    operational_topic = f"arn:aws:sns:us-east-1:{account_id}:hindsight-demo-alerts"
+    budget_topic = f"arn:aws:sns:us-east-1:{account_id}:hindsight-demo-budget-alerts"
+    alarm_name = "hindsight-demo-exact-release-probe"
+    messages = []
+    deleted = []
 
-    class Client:
-        def publish(self, **kwargs):
-            assert kwargs["TopicArn"].endswith(":alerts")
-            assert SOURCE_REVISION in kwargs["Message"]
-            return {"MessageId": "message-1"}
+    class Paginator:
+        def paginate(self, *, TopicArn):
+            yield {
+                "Subscriptions": [
+                    {
+                        "Protocol": "sqs",
+                        "Endpoint": queue_arn,
+                        "SubscriptionArn": f"{TopicArn}:subscription-id",
+                    }
+                ]
+            }
+
+    class SNS:
+        def get_paginator(self, operation):
+            assert operation == "list_subscriptions_by_topic"
+            return Paginator()
+
+        def get_subscription_attributes(self, *, SubscriptionArn):
+            assert SubscriptionArn.endswith(":subscription-id")
+            return {"Attributes": {"PendingConfirmation": "false"}}
+
+    class SQS:
+        def get_queue_url(self, **kwargs):
+            assert kwargs == {
+                "QueueName": queue_name,
+                "QueueOwnerAWSAccountId": account_id,
+            }
+            return {"QueueUrl": queue_url}
+
+        def get_queue_attributes(self, **kwargs):
+            assert kwargs["QueueUrl"] == queue_url
+            return {
+                "Attributes": {
+                    "QueueArn": queue_arn,
+                    "SqsManagedSseEnabled": "true",
+                }
+            }
+
+        def receive_message(self, **kwargs):
+            assert kwargs["MessageSystemAttributeNames"] == ["All"]
+            assert kwargs["VisibilityTimeout"] == 1
+            return {"Messages": [messages.pop(0)]} if messages else {}
+
+        def delete_message(self, **kwargs):
+            deleted.append(kwargs["ReceiptHandle"])
+
+    class CloudWatch:
+        state = "OK"
+
+        def describe_alarms(self, **kwargs):
+            assert kwargs == {"AlarmNames": [alarm_name]}
+            return {
+                "MetricAlarms": [
+                    {
+                        "AlarmName": alarm_name,
+                        "AlarmArn": f"arn:aws:cloudwatch:us-east-1:{account_id}:alarm:{alarm_name}",
+                        "Namespace": "Hindsight/Release",
+                        "MetricName": "ExactReleaseProbe",
+                        "Dimensions": [
+                            {"Name": "Stage", "Value": stage},
+                            {"Name": "ReleaseRevision", "Value": SOURCE_REVISION},
+                        ],
+                        "AlarmActions": [operational_topic],
+                        "OKActions": [operational_topic],
+                        "StateValue": self.state,
+                    }
+                ]
+            }
+
+        def set_alarm_state(self, **kwargs):
+            assert kwargs["AlarmName"] == alarm_name
+            assert SOURCE_REVISION in kwargs["StateReasonData"]
+            self.state = kwargs["StateValue"]
+            notification = {
+                "Type": "Notification",
+                "TopicArn": operational_topic,
+                "MessageId": f"sns-{self.state.lower()}",
+                "Message": json.dumps(
+                    {
+                        "AlarmName": alarm_name,
+                        "NewStateValue": self.state,
+                        "NewStateReason": kwargs["StateReason"],
+                        "StateChangeTime": "2026-08-14T12:00:00.000+0000",
+                    }
+                ),
+            }
+            messages.append(
+                {
+                    "MessageId": f"sqs-{self.state.lower()}",
+                    "ReceiptHandle": f"receipt-{self.state.lower()}",
+                    "Body": json.dumps(notification),
+                }
+            )
+
+    sns = SNS()
+    sqs = SQS()
+    cloudwatch = CloudWatch()
 
     class Session:
-        def client(self, service, *, region_name):
-            assert (service, region_name) == ("sns", "us-east-1")
-            return Client()
+        def client(self, service, *, region_name, config):
+            assert region_name == "us-east-1"
+            assert config is module.CLIENT_CONFIG
+            return {"sns": sns, "sqs": sqs, "cloudwatch": cloudwatch}[service]
 
-    evidence = module.publish(
-        topic_arn="arn:aws:sns:us-east-1:123456789012:alerts",
+    evidence = module.exercise(
+        alarm_name=alarm_name,
+        receiver_queue_name=queue_name,
+        operational_topic_arn=operational_topic,
+        budget_topic_arn=budget_topic,
+        expected_account_id=account_id,
+        region="us-east-1",
+        stage=stage,
         profile="test",
         source_revision=SOURCE_REVISION,
         session=Session(),
+        challenge="b" * 32,
+        timeout_seconds=1,
     )
-    assert evidence["message_id"] == "message-1"
+    assert [transition["state"] for transition in evidence["transitions"]] == [
+        "ALARM",
+        "OK",
+    ]
+    assert all(transition["deleted"] for transition in evidence["transitions"])
+    assert deleted == ["receipt-alarm", "receipt-ok"]
+    assert {row["status"] for row in evidence["receiver"]["subscriptions"]} == {"confirmed"}
     assert evidence["source_revision"] == SOURCE_REVISION
-    assert evidence["account_id"] == "123456789012"
+    assert evidence["challenge"] == "b" * 32
+    assert evidence["account_id"] == account_id
     assert evidence["region"] == "us-east-1"
+
+
+def test_alert_exercise_restores_ok_when_alarm_call_fails_after_acceptance(monkeypatch):
+    module = _script("exercise_alert_delivery")
+    account_id = "123456789012"
+    stage = "demo"
+    alarm_name = f"hindsight-{stage}-exact-release-probe"
+    queue_name = f"hindsight-{stage}-alert-receiver"
+    operational_topic = f"arn:aws:sns:us-east-1:{account_id}:hindsight-{stage}-alerts"
+    budget_topic = f"arn:aws:sns:us-east-1:{account_id}:hindsight-{stage}-budget-alerts"
+    queue_arn = f"arn:aws:sqs:us-east-1:{account_id}:{queue_name}"
+    states = []
+
+    class Session:
+        def client(self, service, *, region_name, config):
+            return object()
+
+    monkeypatch.setattr(
+        module,
+        "_receiver_queue",
+        lambda *args, **kwargs: ("https://sqs.example.invalid/receiver", queue_arn),
+    )
+    monkeypatch.setattr(
+        module,
+        "_confirmed_subscription",
+        lambda *args, topic_arn, **kwargs: {
+            "topic_arn": topic_arn,
+            "subscription_arn": f"{topic_arn}:subscription",
+            "protocol": "sqs",
+            "endpoint": queue_arn,
+            "status": "confirmed",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_release_alarm",
+        lambda *args, **kwargs: {
+            "alarm_name": alarm_name,
+            "alarm_arn": f"arn:aws:cloudwatch:us-east-1:{account_id}:alarm:{alarm_name}",
+            "release_revision": SOURCE_REVISION,
+            "stage": stage,
+            "initial_state": "OK",
+        },
+    )
+
+    def set_state(*args, state, **kwargs):
+        states.append(state)
+        if state == "ALARM":
+            raise RuntimeError("client timed out after CloudWatch accepted ALARM")
+
+    monkeypatch.setattr(module, "_set_alarm_state", set_state)
+    monkeypatch.setattr(
+        module,
+        "_receive_and_delete",
+        lambda *args, **kwargs: pytest.fail("delivery wait must not start after failed ALARM call"),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        module.exercise(
+            alarm_name=alarm_name,
+            receiver_queue_name=queue_name,
+            operational_topic_arn=operational_topic,
+            budget_topic_arn=budget_topic,
+            expected_account_id=account_id,
+            region="us-east-1",
+            stage=stage,
+            profile="test",
+            source_revision=SOURCE_REVISION,
+            session=Session(),
+            challenge="b" * 32,
+            timeout_seconds=1,
+        )
+    assert states == ["ALARM", "OK"]
 
 
 def _acceptance_documents():
@@ -536,11 +727,11 @@ def test_worker_record_keeps_all_correlation_identities(caplog):
     from hindsight.worker import _log_record_result
 
     message = {
-        "tenant_id": "tenant-1",
-        "run_id": "run-1",
-        "dispatch_id": "dispatch-1",
-        "dispatch_attempt_id": "dispatch-attempt-1",
-        "attempt_id": "attempt-1",
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "run_id": "11111111-1111-4111-8111-111111111111",
+        "dispatch_id": "22222222-2222-4222-8222-222222222222",
+        "dispatch_attempt_id": "33333333-3333-4333-8333-333333333333",
+        "attempt_id": "44444444-4444-4444-8444-444444444444",
     }
     context = type("Context", (), {"aws_request_id": "request-1"})()
     with caplog.at_level("INFO", logger="hindsight.worker"):

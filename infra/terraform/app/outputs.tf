@@ -66,6 +66,30 @@ output "run_queue_url" {
   value = aws_sqs_queue.runs.url
 }
 
+output "run_queue_arn" {
+  value = aws_sqs_queue.runs.arn
+}
+
+output "run_fallback_queue_url" {
+  value = aws_sqs_queue.run_dlq.url
+}
+
+output "run_fallback_queue_arn" {
+  value = aws_sqs_queue.run_dlq.arn
+}
+
+output "scheduler_dlq_url" {
+  value = aws_sqs_queue.scheduler_dlq.url
+}
+
+output "quarantine_table" {
+  value = aws_dynamodb_table.quarantine.name
+}
+
+output "quarantine_index" {
+  value = "quarantine-status-created-at-index"
+}
+
 output "worker_timeout_seconds" {
   value = local.worker_timeout_seconds
 }
@@ -120,6 +144,22 @@ output "waf_web_acl_arn" {
 
 output "alert_topic_arn" {
   value = aws_sns_topic.alerts.arn
+}
+
+output "budget_alert_topic_arn" {
+  value = aws_sns_topic.budget_alerts.arn
+}
+
+output "alert_receiver_queue_name" {
+  value = aws_sqs_queue.alert_receiver.name
+}
+
+output "alert_receiver_queue_url" {
+  value = aws_sqs_queue.alert_receiver.url
+}
+
+output "exact_release_probe_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.exact_release_probe.alarm_name
 }
 
 output "bounded_observability_enabled" {

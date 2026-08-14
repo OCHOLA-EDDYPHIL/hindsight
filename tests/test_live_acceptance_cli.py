@@ -351,6 +351,11 @@ def test_hosted_product_binds_server_owned_phase_tenant(
     monkeypatch.setattr(acceptance, "_verify_changefeed", lambda _env: None)
     monkeypatch.setattr(acceptance, "_required_env", lambda _name: "configured")
     monkeypatch.setattr(acceptance, "_required_positive_int_env", lambda _name: 1)
+    monkeypatch.setattr(
+        acceptance,
+        "_required_matching_sqs_queue_env",
+        lambda: ("https://queue.example", "arn:aws:sqs:region:123456789012:queue"),
+    )
     calls = []
     monkeypatch.setattr(
         acceptance,
@@ -366,6 +371,57 @@ def test_hosted_product_binds_server_owned_phase_tenant(
     assert selectors == acceptance.HOSTED_PHASE_SELECTORS[phase]
     assert selected_phase == phase
     assert env["PGOPTIONS"] == f"-c hindsight.tenant_id={expected_tenant}"
+
+
+def test_worker_hosted_contract_separates_numbers_from_exact_aws_identifiers(monkeypatch):
+    database_url = "postgresql://runtime@cluster.example:26257/hindsight?sslmode=verify-full"
+    numeric_names = (
+        "HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS",
+        "HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS",
+        "HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS",
+        "HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS",
+    )
+    for name in numeric_names:
+        monkeypatch.setenv(name, "3")
+    monkeypatch.setenv(
+        "HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL",
+        "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-runs",
+    )
+    monkeypatch.setenv(
+        "HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN",
+        "arn:aws:sqs:us-east-1:123456789012:hindsight-demo-runs",
+    )
+    monkeypatch.setenv("HINDSIGHT_QUARANTINE_TABLE", "hindsight-demo-quarantine")
+    monkeypatch.setenv(
+        "HINDSIGHT_QUARANTINE_INDEX",
+        "quarantine-status-created-at-index",
+    )
+    numeric_calls = []
+    original_positive_int = acceptance._required_positive_int_env
+    monkeypatch.setattr(
+        acceptance,
+        "_required_positive_int_env",
+        lambda name: numeric_calls.append(name) or original_positive_int(name),
+    )
+    monkeypatch.setattr(acceptance, "_run_hosted_pytest", lambda *_args, **_kwargs: None)
+
+    acceptance._run_hosted_product(SimpleNamespace(phase="worker", database_url=database_url))
+
+    assert numeric_calls == list(numeric_names)
+
+
+def test_worker_hosted_contract_rejects_mismatched_queue_url_and_arn(monkeypatch):
+    monkeypatch.setenv(
+        "HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL",
+        "https://sqs.us-east-1.amazonaws.com/123456789012/hindsight-demo-runs",
+    )
+    monkeypatch.setenv(
+        "HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN",
+        "arn:aws:sqs:us-east-1:123456789012:other-queue",
+    )
+
+    with pytest.raises(ValueError, match="do not identify the same queue"):
+        acceptance._required_matching_sqs_queue_env()
 
 
 def test_browser_contract_inventories_have_explicit_local_hosted_parity():
