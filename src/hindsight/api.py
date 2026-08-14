@@ -25,13 +25,14 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from mangum import Mangum
 from psycopg import errors as psycopg_errors
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hindsight.db import connect
+from hindsight.causal_evidence import canonical_json_bytes, canonical_sha256
 from hindsight.consolidation import (
     get_consolidation_candidate,
     list_consolidation_candidates,
@@ -90,6 +91,7 @@ from hindsight.runs import (
 )
 from hindsight.trace_contract import (
     decision_influence,
+    signature_scenario_evidence,
     signature_scenario_trace,
 )
 from hindsight.tracing import configure_tracing_from_env, start_span
@@ -785,6 +787,36 @@ def signature_scenarios_get_by_id(scenario_id: str) -> dict[str, Any]:
     if scenario is None:
         raise HTTPException(status_code=404, detail="signature scenario not found")
     return _jsonable(scenario)
+
+
+@app.get(
+    f"{V2_PREFIX}/signature-scenarios/{{scenario_id}}/evidence",
+    tags=["v2"],
+    dependencies=[Depends(_v2_scope("read"))],
+)
+@app.get(
+    f"{API_PREFIX}/signature-scenarios/{{scenario_id}}/evidence",
+    tags=["memory"],
+)
+def signature_scenarios_evidence_download(scenario_id: str) -> Response:
+    evidence = signature_scenario_evidence(
+        scenario_id=scenario_id,
+        db_url=_api_database_url(),
+    )
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="signature scenario not found")
+    resolved_id = str(evidence["scenario"]["scenario_id"])
+    canonical_evidence = _jsonable(evidence)
+    return Response(
+        content=canonical_json_bytes(canonical_evidence),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="hindsight-causal-evidence-{resolved_id}.json"'
+            ),
+            "X-Hindsight-Evidence-SHA256": canonical_sha256(canonical_evidence),
+        },
+    )
 
 
 @app.post(

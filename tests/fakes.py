@@ -39,30 +39,16 @@ def recommendation_decision(
 
 def controlled_recommendation_decision(
     primary_action: str,
-    recommendation: str,
-    *,
-    diagnosis: str = "Retry amplification is saturating the downstream processor.",
-    citations: list[dict[str, str]] | None = None,
+    rationale: str,
 ) -> str:
-    """Return a strict controlled-replay recommendation."""
+    """Return the exact model-authored controlled terminal selection."""
 
     return json.dumps(
         {
-            "schema_version": 3,
-            "diagnosis": diagnosis,
-            "recalled_memory_citations": citations or [],
-            "next_step_kind": "recommendation",
-            "tool_call": None,
-            "recommendation": recommendation,
-            "remediation_action": None,
-            "operational_action": {
-                "contract": "payments_retry_amplification.v1",
-                "primary_action": primary_action,
-            },
-            "rationale": "The recommendation is bounded and follows the available evidence.",
-            "rollback": "Restore the previous retry policy if the service degrades.",
-            "verification": ["Confirm latency and queue depth return to their expected range."],
-            "safety_constraints": ["Do not mutate infrastructure from this workflow."],
+            "action_id": primary_action,
+            "disposition": "recommend",
+            "parameters": {},
+            "rationale": rationale,
         },
         sort_keys=True,
     )
@@ -284,3 +270,13 @@ class FakeCloudWatchDiagnostics:
         if isinstance(observation, Exception):
             raise observation
         return dict(observation)
+
+    def observe_at_replay_anchor(
+        self,
+        query_key: str,
+        *,
+        budget: Any,
+        replay_anchor: Any,
+    ) -> dict[str, Any]:
+        del replay_anchor
+        return self.observe(query_key, budget=budget)

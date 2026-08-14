@@ -74,6 +74,94 @@ def test_get_run_bounds_retries_and_preserves_non_retryable_errors(monkeypatch):
     assert non_retryable_calls == 1
 
 
+def test_public_run_response_recursively_rejects_unbound_or_private_envelopes():
+    from copy import deepcopy
+
+    from hindsight.causal_evidence import build_causal_envelope, text_sha256
+    from hindsight.runs import _public_run_response
+
+    def envelope(prompt: str) -> dict:
+        return build_causal_envelope(
+            identity={"scenario_id": "scenario-1"},
+            invariant_inputs={},
+            permitted_intervention={},
+            actual_decision_inputs={"ordered_model_requests": [{"prompt": prompt}]},
+            rendered_prompt_sha256=[text_sha256(prompt)],
+            decision_output={},
+        )
+
+    exact = envelope("Exact private provider request without a credential label.")
+    redacted = envelope("Use [redacted-token] for the public provider request.")
+    tampered = deepcopy(redacted)
+    tampered["identity"]["scenario_id"] = "tampered-without-rehashing"
+
+    def action_trace(candidate: dict) -> dict:
+        return {
+            "schema_version": 4,
+            "mode": "recommendation_only",
+            "plan_payload": {"rationale": "Exact private action-trace plan"},
+            "reasoning_steps": [{"prompt": "password=hunter2"}],
+            "causal_envelope": exact,
+            "redacted_causal_envelope": candidate,
+            "recommendation": {
+                "summary": "postgresql://user:hunter2@db.internal/app",
+                "rationale": "Exact private model explanation",
+                "diagnosis": "Exact private diagnosis",
+                "rollback": "Exact private rollback",
+                "verification": ["Exact private verification"],
+                "safety_constraints": ["Exact private safety constraint"],
+            },
+        }
+
+    source = {
+        "action_trace": action_trace(redacted),
+        "events": [
+            {
+                "metadata": {
+                    "action_trace": action_trace(redacted),
+                    "plan_payload": {"rationale": "Exact private plan"},
+                    "reasoning_steps": [{"prompt": "Exact private provider prompt"}],
+                    "credential_samples": (
+                        "ghp_exampleSecret123 xoxb-slackSecret123 glpat-gitlabSecret123 "
+                        "AIzaGoogleSecretToken1234567890 npm_npmSecret123"
+                    ),
+                }
+            },
+            {"metadata": {"action_trace": action_trace(tampered)}},
+            {"metadata": {"action_trace": action_trace(exact)}},
+            {"metadata": {"action_trace": "malformed"}},
+        ],
+    }
+
+    projected = _public_run_response(source)
+    projected_traces = [
+        projected["action_trace"],
+        projected["events"][0]["metadata"]["action_trace"],
+    ]
+    for trace in projected_traces:
+        assert "reasoning_steps" not in trace
+        assert "plan_payload" not in trace
+        assert "redacted_causal_envelope" not in trace
+        assert "causal_envelope" not in trace
+        assert trace["recommendation"]["summary"] == (
+            "postgresql://user:[redacted-secret]@db.internal/app"
+        )
+        assert "rationale" not in trace["recommendation"]
+        assert set(trace["recommendation"]) == {"summary"}
+
+    assert "causal_envelope" not in projected["events"][1]["metadata"]["action_trace"]
+    assert "causal_envelope" not in projected["events"][2]["metadata"]["action_trace"]
+    assert "action_trace" not in projected["events"][3]["metadata"]
+    assert "plan_payload" not in projected["events"][0]["metadata"]
+    assert "reasoning_steps" not in projected["events"][0]["metadata"]
+    assert "Exact private" not in str(projected)
+    for token_prefix in ("xoxb-", "glpat-", "AIza", "npm_"):
+        assert token_prefix not in str(projected)
+    assert "ghp_exampleSecret123" not in str(projected)
+    assert source["action_trace"]["causal_envelope"] == exact
+    assert "reasoning_steps" in source["action_trace"]
+
+
 def test_create_run_retries_a_concurrent_idempotency_race(monkeypatch):
     import hindsight.runs as runs
     from psycopg.errors import SerializationFailure

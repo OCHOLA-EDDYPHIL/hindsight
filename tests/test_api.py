@@ -39,6 +39,8 @@ def test_openapi_exposes_narrow_product_contract():
     assert "/v1/decisions/{decision_id}/influence" in paths
     assert "/v1/signature-scenarios" in paths
     assert "/v1/signature-scenarios/{scenario_id}" in paths
+    assert "/v1/signature-scenarios/{scenario_id}/evidence" in paths
+    assert "/v2/signature-scenarios/{scenario_id}/evidence" in paths
     assert "/v1/namespaces/{namespace}/rewinds/preview" not in paths
     assert "post" in paths["/v2/namespaces/{namespace}/rewinds/preview"]
     assert "/v1/demo/poison-rewind/poison" not in paths
@@ -47,6 +49,38 @@ def test_openapi_exposes_narrow_product_contract():
     assert "get" in paths["/v2/memory/consolidation-candidates/{candidate_id}"]
     assert "post" in paths["/v2/memory/consolidation-candidates/{candidate_id}/review-preview"]
     assert "get" in paths["/v2/me"]
+
+
+def test_causal_evidence_download_is_digest_bound_and_attachment_safe(monkeypatch):
+    import hindsight.api as api
+    from hindsight.causal_evidence import canonical_json_bytes, canonical_sha256
+
+    scenario_id = "49109a44-43e7-40de-b547-b4f9d0a387a2"
+    monkeypatch.setattr(api, "_api_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "signature_scenario_evidence",
+        lambda **_kwargs: {
+            "schema_version": 1,
+            "canonicalization": "hindsight.canonical-json.v1",
+            "scenario": {"scenario_id": scenario_id},
+        },
+    )
+
+    response = TestClient(api.app).get(f"/v1/signature-scenarios/{scenario_id}/evidence")
+
+    assert response.status_code == 200
+    document = {
+        "schema_version": 1,
+        "canonicalization": "hindsight.canonical-json.v1",
+        "scenario": {"scenario_id": scenario_id},
+    }
+    assert response.headers["x-hindsight-evidence-sha256"] == canonical_sha256(document)
+    assert response.headers["content-disposition"] == (
+        f'attachment; filename="hindsight-causal-evidence-{scenario_id}.json"'
+    )
+    assert response.content == canonical_json_bytes(document)
+    assert response.json() == document
 
 
 def test_consolidation_review_preview_binds_authenticated_operator(monkeypatch):

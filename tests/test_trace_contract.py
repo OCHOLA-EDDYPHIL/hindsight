@@ -1,5 +1,6 @@
 """Tests for the public governed-memory identity trace."""
 
+import json
 import os
 from uuid import uuid4
 
@@ -15,12 +16,140 @@ def test_public_redaction_removes_nested_aws_account_identifiers():
     redacted = redact_account_identifiers(
         {
             "account_id": secret,
-            "nested": [{"aws_account_id": secret, "region": "us-east-1"}],
+            "nested": [
+                {
+                    "aws_account_id": secret,
+                    "region": "us-east-1",
+                    "message": f"account {secret} was queried",
+                }
+            ],
         }
     )
 
-    assert redacted == {"nested": [{"region": "us-east-1"}]}
+    assert redacted == {
+        "nested": [
+            {
+                "region": "us-east-1",
+                "message": "account [redacted-account] was queried",
+            }
+        ]
+    }
     assert secret not in str(redacted)
+
+
+def test_public_redaction_removes_secret_keys_and_credential_like_prompt_text():
+    from hindsight.redaction import redact_account_identifiers
+
+    redacted = redact_account_identifiers(
+        {
+            "api_key": "do-not-keep",
+            "nested": {
+                "password": "do-not-keep",
+                "AccessKeyId": "do-not-keep",
+                "SecretAccessKey": "do-not-keep",
+                "GitHubToken": "do-not-keep",
+                "awsAccountId": "123456789012",
+                "max_output_tokens": 1_024,
+                "safe": "visible",
+            },
+            "prompt": (
+                "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature "
+                "x-api-key=opaque-value AKIAABCDEFGHIJKLMNOP "
+                '{"apiKey": "sk-proj-exampleSecret123", "password": "hunter2"} '
+                "postgresql://operator:database-secret@db.internal/hindsight "
+                "ghp_exampleSecret123 sk-proj_anotherSecret123 "
+                "xoxb-slackSecret123 glpat-gitlabSecret123 "
+                "AIzaGoogleSecretToken1234567890 npm_npmSecret123"
+            ),
+        }
+    )
+
+    assert redacted["nested"] == {"max_output_tokens": 1_024, "safe": "visible"}
+    assert "api_key" not in redacted
+    for secret in (
+        "eyJ",
+        "opaque-value",
+        "AKIA",
+        "hunter2",
+        "database-secret",
+        "ghp_",
+        "sk-proj",
+        "xoxb-",
+        "glpat-",
+        "AIza",
+        "npm_",
+    ):
+        assert secret not in redacted["prompt"]
+    assert '"apiKey": "[redacted-secret]"' in redacted["prompt"]
+    assert "postgresql://operator:[redacted-secret]@db.internal" in redacted["prompt"]
+
+
+def test_causal_evidence_document_digest_excludes_download_metadata():
+    from hindsight.causal_evidence import canonical_sha256
+    from hindsight.trace_contract import causal_evidence_document
+
+    scenario = {
+        "scenario_id": "scenario-1",
+        "namespace": "tenant-private-namespace",
+        "rewind_anchor": "2026-08-14T10:00:00Z",
+        "created_at": "2026-08-14T09:00:00Z",
+        "completed_at": None,
+        "stages": {
+            "influenced_decision_id": "decision-before",
+            "corrected_decision_id": "decision-after",
+        },
+        "runs": [],
+        "operation": {
+            "id": "operation-1",
+            "operation_type": "rewind",
+            "status": "completed",
+            "reason": "password=hunter2",
+            "actor": "ghp_exampleSecret123",
+            "invalidated_memory_ids": ["memory-1"],
+            "restored_memory_ids": [],
+        },
+        "operation_events": [
+            {
+                "id": "event-1",
+                "operation_id": "operation-1",
+                "sequence": 1,
+                "status": "completed",
+                "summary": "api_key=opaque-value",
+            }
+        ],
+        "operation_effects": [],
+        "memories": [
+            {
+                "id": "memory-1",
+                "namespace": "tenant-private-namespace",
+                "writer": "postgresql://operator:database-secret@db.internal/app",
+                "version_number": 1,
+            }
+        ],
+        "causal_evidence": {
+            "proof_states": {
+                "repeatable_causal_effect_supported": {
+                    "status": "unavailable",
+                    "reason": "repeated_trials_not_measured",
+                }
+            },
+            "download": {"sha256": "must-not-be-canonicalized"},
+        },
+    }
+
+    document = causal_evidence_document(scenario)
+
+    assert canonical_sha256(document).startswith("sha256:")
+    assert "download" not in str(document)
+    assert document["scenario"]["namespace"] == "[redacted-namespace]"
+    for secret in (
+        "tenant-private-namespace",
+        "hunter2",
+        "ghp_",
+        "opaque-value",
+        "database-secret",
+    ):
+        assert secret not in str(document)
 
 
 def test_signature_trace_pairs_latest_pre_rewind_rejection_with_correction():
@@ -56,8 +185,26 @@ def test_signature_trace_pairs_latest_pre_rewind_rejection_with_correction():
 def test_action_comparison_requires_structured_actions_equivalent_context_and_lineage():
     from copy import deepcopy
 
-    from hindsight.agent_decision import operational_action_fingerprint
-    from hindsight.trace_contract import _action_comparison
+    from hindsight.agent_decision import (
+        PAYMENTS_OPERATIONAL_ACTION_CATALOG_ID,
+        PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+        agent_decision_provider_schema,
+        controlled_action_selection_provider_schema,
+        operational_action_catalog,
+        operational_action_fingerprint,
+    )
+    from hindsight.causal_evidence import (
+        GOVERNED_MEMORY_PROMPT_MARKER,
+        build_causal_envelope,
+        canonical_sha256,
+        text_sha256,
+    )
+    from hindsight.trace_contract import (
+        _action_comparison,
+        _causal_proof_states,
+        _controlled_pair_checks,
+        _request_invariant_from_actual,
+    )
 
     prompt = (
         "Checkout p99 is above 2s and the queue is growing. Inspect current telemetry "
@@ -65,10 +212,20 @@ def test_action_comparison_requires_structured_actions_equivalent_context_and_li
     )
 
     def observation(timestamp: str, *, account_id: str) -> dict:
+        from datetime import datetime, timedelta
+
+        end = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        start = end - timedelta(seconds=900)
+        early = end - timedelta(seconds=120)
+        latest = end - timedelta(seconds=60)
         return {
+            "id": "observation:stable:1",
+            "tool_call_id": "diagnostic:stable:1",
+            "schema_version": 1,
             "status": "available",
             "tool": "aws_cloudwatch_diagnostics",
-            "query_key": "payments.checkout_latency_ms",
+            "query_key": "payments.retry_fanout",
+            "query_fingerprint": f"cloudwatch_query:{'e' * 64}",
             "account_id": account_id,
             "region": "us-east-1",
             "metric": {
@@ -79,32 +236,423 @@ def test_action_comparison_requires_structured_actions_equivalent_context_and_li
                     {"name": "Stage", "value": "demo"},
                 ],
                 "statistic": "Maximum",
+                "unit": "Milliseconds",
                 "period_seconds": 60,
             },
-            "window": {"start": timestamp, "end": timestamp, "seconds": 900},
-            "datapoints": [{"timestamp": timestamp, "value": 2400.0}],
-            "datapoint_count": 1,
+            "window": {
+                "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "seconds": 900,
+            },
+            "datapoints": [
+                {"timestamp": early.strftime("%Y-%m-%dT%H:%M:%SZ"), "value": 2100.0},
+                {"timestamp": latest.strftime("%Y-%m-%dT%H:%M:%SZ"), "value": 2400.0},
+            ],
+            "datapoint_count": 2,
+            "truncated": False,
         }
 
-    def run(decision_id: str, memory_id: str, action: str, timestamp: str) -> dict:
+    def run(
+        decision_id: str,
+        memory_id: str,
+        action: str,
+        timestamp: str,
+        *,
+        report: str = prompt,
+        rationale: str = "Recorded evidence supports this catalog selection.",
+    ) -> dict:
         payload = {
+            "catalog_id": PAYMENTS_OPERATIONAL_ACTION_CATALOG_ID,
             "contract": "payments_retry_amplification.v1",
-            "primary_action": action,
+            "action_id": action,
+            "disposition": "recommend",
+            "parameters": {},
         }
+        catalog = operational_action_catalog("payments_retry_amplification.v1")
+        invariant_observation = observation(timestamp, account_id="redacted")
+        invariant_observation.pop("account_id")
+        ordered_observations = [invariant_observation]
+        memory_payload = {"memory_id": memory_id}
+        diagnostic_schema = agent_decision_provider_schema(
+            recalled_memory_ids={memory_id},
+            allowed_query_keys={"payments.retry_fanout"},
+            diagnostic_calls_used=0,
+            diagnostic_observation_available=False,
+            model_turn=1,
+            operational_action_contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT,
+        )
+        selection_schema = controlled_action_selection_provider_schema(
+            contract=PAYMENTS_OPERATIONAL_ACTION_CONTRACT
+        )
+        prompt_invariant = f"prompt before\n{GOVERNED_MEMORY_PROMPT_MARKER}\nprompt after"
+        diagnostic_request_configuration = {
+            "schema_version": 1,
+            "attempt": 1,
+            "repair_reason": None,
+            "logical_turn": 1,
+            "provider": "provider-1",
+            "model": "model-1",
+            "system": "controlled system",
+            "prompt_invariant": prompt_invariant,
+            "prompt_invariant_sha256": text_sha256(prompt_invariant),
+            "temperature": 0,
+            "max_output_tokens": 1024,
+            "routing_key": "signature:stable:turn:1",
+            "decision_contract": "AgentDecisionV3",
+            "response_schema_version": 3,
+            "response_json_schema": diagnostic_schema,
+        }
+        selection_request_configuration = {
+            **diagnostic_request_configuration,
+            "logical_turn": 2,
+            "routing_key": "signature:stable:turn:2",
+            "decision_contract": "ControlledActionSelectionV1",
+            "response_schema_version": 1,
+            "response_json_schema": selection_schema,
+        }
+        request_configurations = [
+            diagnostic_request_configuration,
+            selection_request_configuration,
+        ]
+        memory_prompt_fragment = f"1. {json.dumps(memory_payload, sort_keys=True)}"
+        memory_intervention = [
+            {
+                "ordinal": 1,
+                "memory": memory_payload,
+                "memory_sha256": canonical_sha256(memory_payload),
+                "prompt_fragment_sha256": text_sha256(memory_prompt_fragment),
+            }
+        ]
+        tool_contract = {
+            "schema_version": 1,
+            "diagnostic_tool": "aws_cloudwatch_diagnostics",
+            "observation_schema_version": 1,
+            "allowed_query_keys": ["payments.retry_fanout"],
+            "max_diagnostic_calls": 3,
+        }
+        operation_effects = [
+            {
+                "sequence": 1,
+                "effect_type": "closed",
+                "source_memory_id": "memory-v2",
+                "result_memory_id": None,
+                "belief_id": "belief-1",
+                "namespace": "namespace-1",
+            },
+            {
+                "sequence": 2,
+                "effect_type": "reasserted",
+                "source_memory_id": "memory-v1",
+                "result_memory_id": "memory-v3",
+                "belief_id": "belief-1",
+                "namespace": "namespace-1",
+            },
+        ]
+        triage = {
+            "incident_id": "incident-1",
+            "namespace": "namespace-1",
+            "service_slug": "payments-api",
+            "severity": "high",
+            "title": "Checkout latency",
+            "summary": report,
+            "prior_chat_messages": 0,
+        }
+        incident = {
+            "incident_id": triage["incident_id"],
+            "namespace": triage["namespace"],
+            "service_slug": triage["service_slug"],
+            "severity": triage["severity"],
+            "title": triage["title"],
+            "normalized_user_incident": report,
+        }
+        fixed_context = {
+            "normalized_user_incident": report,
+            "prompt_templates": {
+                name: {"id": f"template-{name}", "sha256": f"sha256:{'d' * 64}"}
+                for name in ("triage", "decision", "system")
+            },
+            "triage_result": triage,
+            "ordered_tool_calls": [
+                {
+                    "id": "diagnostic:stable:1",
+                    "tool": "aws_cloudwatch_diagnostics",
+                    "query_key": "payments.retry_fanout",
+                    "status": "completed",
+                }
+            ],
+            "ordered_observations": ordered_observations,
+            "ordered_model_request_configuration": [
+                _request_invariant_from_actual(request)
+                for request in request_configurations
+            ],
+            "tool_contract": tool_contract,
+            "embedding_profile": {
+                "profile_id": "profile-1",
+                "provider": "provider-1",
+                "model": "embedding-1",
+                "dimensions": 3,
+                "capability": "semantic",
+                "encoder_revision": "test-v1",
+                "configuration": {},
+                "max_distance": None,
+            },
+            "release_revision": "a" * 40,
+            "action_catalog": operational_action_catalog("payments_retry_amplification.v1"),
+            "tenant_id": "tenant-1",
+            "namespace": "namespace-1",
+            "scenario_id": "scenario-1",
+            "replay_anchor": "2026-08-13T10:00:00Z",
+            "retrieval_policy": "semantic_strict",
+            "retrieval_policy_version": 1,
+        }
+        prompt_input = prompt_invariant.replace(
+            GOVERNED_MEMORY_PROMPT_MARKER,
+            memory_prompt_fragment,
+        )
+        actual_requests = [
+            {**request_configuration, "prompt": prompt_input}
+            for request_configuration in request_configurations
+        ]
+        envelope = build_causal_envelope(
+            identity={
+                "scenario_id": "scenario-1",
+                "namespace": "namespace-1",
+                "replay_anchor": "2026-08-13T10:00:00Z",
+                "scenario_routing_key": "signature:stable",
+                "release_revision": "a" * 40,
+                "run_id": f"run-{decision_id}",
+                "decision_id": decision_id,
+            },
+            invariant_inputs=fixed_context,
+            permitted_intervention={
+                "kind": "governed_memory_version_selection.v1",
+                "ordered_memory_versions": memory_intervention,
+                "selection_fingerprint": f"selection-{memory_id}",
+                "expected_changed_prompt_fragments": [text_sha256(memory_prompt_fragment)],
+                "correction_operation_id": ("operation-1" if memory_id == "memory-v3" else None),
+                "correction_target_timestamp": (
+                    "2026-08-13T10:00:00Z" if memory_id == "memory-v3" else None
+                ),
+                "operation_effects": operation_effects if memory_id == "memory-v3" else [],
+                "invalidated_memory_fingerprints": (
+                    [canonical_sha256("memory-v2")] if memory_id == "memory-v3" else []
+                ),
+                "restored_memory_fingerprints": (
+                    [canonical_sha256("memory-v3")] if memory_id == "memory-v3" else []
+                ),
+            },
+            actual_decision_inputs={
+                "incident": incident,
+                "triage": triage,
+                "retrieval_policy": "semantic_strict",
+                "embedding_profile": fixed_context["embedding_profile"],
+                "ordered_governed_memories": memory_intervention,
+                "ordered_tool_calls": fixed_context["ordered_tool_calls"],
+                "ordered_observations": ordered_observations,
+                "ordered_model_requests": actual_requests,
+                "tool_contract": tool_contract,
+                "action_catalog": catalog,
+            },
+            rendered_prompt_sha256=[text_sha256(prompt_input), text_sha256(prompt_input)],
+            decision_output={
+                "action_id": action,
+                "disposition": "recommend",
+                "parameters": {},
+                "rationale": rationale,
+            },
+        )
+        read_at = "2026-08-13T10:05:00Z" if memory_id == "memory-v3" else "2026-08-13T10:02:00Z"
         return {
             "decision_id": decision_id,
-            "user_input": prompt,
-            "trace": {"reads": [{"memory_id": memory_id}]},
+            "user_input": report,
+            "trace": {
+                "reads": [
+                    {
+                        "memory_id": memory_id,
+                        "read_at": read_at,
+                        "t_valid": (
+                            "2026-08-13T10:04:00Z"
+                            if memory_id == "memory-v3"
+                            else "2026-08-13T10:01:00Z"
+                        ),
+                        "t_invalid": (None if memory_id == "memory-v3" else "2026-08-13T10:04:00Z"),
+                        "memory_lineage_status": "complete",
+                        "incoming_lineage_edge_ids": [f"lineage-{memory_id}"],
+                    }
+                ]
+            },
             "action_trace": {
+                "schema_version": 4,
+                "mode": "recommendation_only",
                 "observations": [observation(timestamp, account_id=f"secret-{decision_id}")],
+                "causal_envelope": envelope,
                 "recommendation": {
+                    "summary": operational_action_catalog(
+                        "payments_retry_amplification.v1"
+                    )["directives"][action],
+                    "rationale": rationale,
                     "operational_action": {
                         **payload,
+                        "primary_action": action,
+                        "directive": operational_action_catalog("payments_retry_amplification.v1")[
+                            "directives"
+                        ][action],
+                        "consistency_status": "consistent",
                         "fingerprint": operational_action_fingerprint(payload),
                     }
                 },
             },
         }
+
+    def validly_mutated(candidate: dict, case: str) -> dict:
+        mutated = deepcopy(candidate)
+        envelope = deepcopy(mutated["action_trace"]["causal_envelope"])
+        invariants = envelope["invariant_inputs"]
+        actual = envelope["actual_decision_inputs"]
+        memory_block = "\n".join(
+            f"{ordinal}. {json.dumps(item['memory'], sort_keys=True)}"
+            for ordinal, item in enumerate(
+                actual["ordered_governed_memories"],
+                start=1,
+            )
+        )
+        if case == "timestamp":
+            value = "2026-08-13T09:59:00Z"
+            invariants["ordered_observations"][0]["datapoints"][0]["timestamp"] = value
+            actual["ordered_observations"][0]["datapoints"][0]["timestamp"] = value
+        elif case == "early_value":
+            invariants["ordered_observations"][0]["datapoints"][0]["value"] = 2_200
+            actual["ordered_observations"][0]["datapoints"][0]["value"] = 2_200
+        elif case == "dimensions":
+            value = "canary"
+            invariants["ordered_observations"][0]["metric"]["dimensions"][1]["value"] = value
+            actual["ordered_observations"][0]["metric"]["dimensions"][1]["value"] = value
+        elif case == "region":
+            invariants["ordered_observations"][0]["region"] = "us-west-2"
+            actual["ordered_observations"][0]["region"] = "us-west-2"
+        elif case == "unit":
+            invariants["ordered_observations"][0]["metric"]["unit"] = "Seconds"
+            actual["ordered_observations"][0]["metric"]["unit"] = "Seconds"
+        elif case == "statistic":
+            invariants["ordered_observations"][0]["metric"]["statistic"] = "Average"
+            actual["ordered_observations"][0]["metric"]["statistic"] = "Average"
+        elif case == "period":
+            invariants["ordered_observations"][0]["metric"]["period_seconds"] = 300
+            actual["ordered_observations"][0]["metric"]["period_seconds"] = 300
+        elif case == "query_fingerprint":
+            value = f"cloudwatch_query:{'7' * 64}"
+            invariants["ordered_observations"][0]["query_fingerprint"] = value
+            actual["ordered_observations"][0]["query_fingerprint"] = value
+        elif case == "truncated":
+            invariants["ordered_observations"][0]["truncated"] = True
+            actual["ordered_observations"][0]["truncated"] = True
+        elif case == "window":
+            value = "2026-08-13T09:48:00Z"
+            invariants["ordered_observations"][0]["window"]["start"] = value
+            actual["ordered_observations"][0]["window"]["start"] = value
+            invariants["ordered_observations"][0]["window"]["seconds"] = 840
+            actual["ordered_observations"][0]["window"]["seconds"] = 840
+        elif case in {"provider", "model"}:
+            value = f"changed-{case}"
+            invariants["ordered_model_request_configuration"][0][case] = value
+            actual["ordered_model_requests"][0][case] = value
+        elif case == "action_schema":
+            value = {"schema": "controlled-v4"}
+            invariants["ordered_model_request_configuration"][0]["response_json_schema"] = value
+            actual["ordered_model_requests"][0]["response_json_schema"] = value
+        elif case == "selection_schema":
+            value = {
+                "type": "object",
+                "required": ["directive"],
+                "properties": {"directive": {"type": "string"}},
+            }
+            invariants["ordered_model_request_configuration"][1]["response_json_schema"] = value
+            actual["ordered_model_requests"][1]["response_json_schema"] = value
+        elif case == "selection_only":
+            invariants["ordered_model_request_configuration"].pop(0)
+            actual["ordered_model_requests"].pop(0)
+            for request in (
+                invariants["ordered_model_request_configuration"][0],
+                actual["ordered_model_requests"][0],
+            ):
+                request["logical_turn"] = 1
+                request["routing_key"] = "signature:stable:turn:1"
+        elif case == "turn_gap":
+            for request in (
+                invariants["ordered_model_request_configuration"][1],
+                actual["ordered_model_requests"][1],
+            ):
+                request["logical_turn"] = 3
+                request["routing_key"] = "signature:stable:turn:3"
+        elif case == "prompt_template":
+            invariants["prompt_templates"]["decision"]["sha256"] = f"sha256:{'9' * 64}"
+        elif case == "prompt_suffix":
+            configuration = invariants["ordered_model_request_configuration"][0]
+            request = actual["ordered_model_requests"][0]
+            changed = f"{configuration['prompt_invariant']}\nnon-memory suffix"
+            configuration["prompt_invariant"] = changed
+            configuration["prompt_invariant_sha256"] = text_sha256(changed)
+            request["prompt_invariant"] = changed
+            request["prompt_invariant_sha256"] = text_sha256(changed)
+            request["prompt"] = changed.replace(
+                GOVERNED_MEMORY_PROMPT_MARKER,
+                memory_block,
+            )
+        elif case == "tenant":
+            invariants["tenant_id"] = "tenant-2"
+        elif case == "policy":
+            invariants["retrieval_policy"] = "semantic_then_keyword"
+            actual["retrieval_policy"] = "semantic_then_keyword"
+        elif case == "embedding":
+            invariants["embedding_profile"]["profile_id"] = "profile-2"
+            actual["embedding_profile"]["profile_id"] = "profile-2"
+        elif case == "query_config":
+            changed_contract = deepcopy(invariants["tool_contract"])
+            changed_contract["allowed_query_keys"] = ["payments.processor_queue_depth"]
+            invariants["tool_contract"] = changed_contract
+            actual["tool_contract"] = changed_contract
+        elif case == "operation_target":
+            envelope["permitted_intervention"]["correction_target_timestamp"] = (
+                "2026-08-13T10:01:00Z"
+            )
+        elif case == "unrelated_memory":
+            unrelated_memory = {"memory_id": "memory-unrelated"}
+            unrelated_fragment = f"2. {json.dumps(unrelated_memory, sort_keys=True)}"
+            unrelated_item = {
+                "ordinal": 2,
+                "memory": unrelated_memory,
+                "memory_sha256": canonical_sha256(unrelated_memory),
+                "prompt_fragment_sha256": text_sha256(unrelated_fragment),
+            }
+            intervention = envelope["permitted_intervention"]
+            intervention["ordered_memory_versions"].append(unrelated_item)
+            intervention["expected_changed_prompt_fragments"].append(
+                unrelated_item["prompt_fragment_sha256"]
+            )
+            intervention["selection_fingerprint"] = "selection-with-unrelated-memory"
+            actual["ordered_governed_memories"].append(unrelated_item)
+            request = actual["ordered_model_requests"][0]
+            request["prompt"] = request["prompt_invariant"].replace(
+                GOVERNED_MEMORY_PROMPT_MARKER,
+                f"{memory_block}\n{unrelated_fragment}",
+            )
+        elif case == "release":
+            envelope["identity"]["release_revision"] = "9" * 40
+            invariants["release_revision"] = "9" * 40
+        else:  # pragma: no cover - test helper exhaustiveness
+            raise AssertionError(f"unknown mutation case: {case}")
+        mutated["action_trace"]["causal_envelope"] = build_causal_envelope(
+            identity=envelope["identity"],
+            invariant_inputs=invariants,
+            permitted_intervention=envelope["permitted_intervention"],
+            actual_decision_inputs=actual,
+            rendered_prompt_sha256=[
+                text_sha256(request["prompt"])
+                for request in actual["ordered_model_requests"]
+            ],
+            decision_output=envelope["decision_output"],
+        )
+        return mutated
 
     seed = {
         "id": "memory-v1",
@@ -131,24 +679,31 @@ def test_action_comparison_requires_structured_actions_equivalent_context_and_li
         "t_invalid": None,
     }
     rejected = run("decision-before", "memory-v2", "scale_workers", "2026-08-13T10:02:00Z")
-    corrected = run(
-        "decision-after",
-        "memory-v3",
-        "throttle_retries",
-        "2026-08-13T10:05:00Z",
-    )
+    corrected = run("decision-after", "memory-v3", "throttle_retries", "2026-08-13T10:02:00Z")
     operation = {
         "id": "operation-1",
         "status": "completed",
+        "target_timestamp": "2026-08-13T10:00:00Z",
         "invalidated_memory_ids": ["memory-v2"],
+        "restored_memory_ids": ["memory-v3"],
     }
     effects = [
         {
+            "sequence": 1,
+            "effect_type": "closed",
+            "source_memory_id": "memory-v2",
+            "result_memory_id": None,
+            "belief_id": "belief-1",
+            "namespace": "namespace-1",
+        },
+        {
+            "sequence": 2,
             "effect_type": "reasserted",
             "source_memory_id": "memory-v1",
             "result_memory_id": "memory-v3",
             "belief_id": "belief-1",
-        }
+            "namespace": "namespace-1",
+        },
     ]
 
     comparison = _action_comparison(
@@ -171,8 +726,70 @@ def test_action_comparison_requires_structured_actions_equivalent_context_and_li
     assert comparison["memory_correction_proven"] is True
     assert comparison["controlled_pair"] is True
 
-    different_prompt = deepcopy(corrected)
-    different_prompt["user_input"] = "A changed report"
+    same_action_with_paraphrased_rationale = run(
+        "decision-after-same-action",
+        "memory-v3",
+        "scale_workers",
+        "2026-08-13T10:02:00Z",
+        rationale="The current telemetry supports the selected catalog action.",
+    )
+    unchanged = _action_comparison(
+        rejected=rejected,
+        corrected=same_action_with_paraphrased_rationale,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert unchanged["status"] == "unchanged"
+    assert unchanged["before"]["fingerprint"] == unchanged["after"]["fingerprint"]
+    proof_states = _causal_proof_states(
+        rejected=rejected,
+        corrected=corrected,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert proof_states == {
+        "memory_correction_proven": {
+            "status": "proven",
+            "reason": "rewind_lineage_and_reads_verified",
+        },
+        "action_delta_proven": {"status": "proven", "reason": "catalog_action_changed"},
+        "controlled_pair_eligible": {
+            "status": "proven",
+            "reason": "fixed_context_and_memory_delta_verified",
+        },
+        "repeatable_causal_effect_supported": {
+            "status": "unavailable",
+            "reason": "repeated_trials_not_measured",
+        },
+        "service_recovery_proven": {
+            "status": "unavailable",
+            "reason": "service_recovery_not_measured",
+        },
+    }
+    assert all(
+        check["status"] == "matched"
+        for check in _controlled_pair_checks(
+            rejected=rejected,
+            corrected=corrected,
+            operation=operation,
+            operation_effects=effects,
+            memory_correction_proven=True,
+        )
+    )
+
+    different_prompt = run(
+        "decision-after-changed",
+        "memory-v3",
+        "throttle_retries",
+        "2026-08-13T10:02:00Z",
+        report="A changed report",
+    )
     not_controlled = _action_comparison(
         rejected=rejected,
         corrected=different_prompt,
@@ -184,6 +801,135 @@ def test_action_comparison_requires_structured_actions_equivalent_context_and_li
     )
     assert not_controlled["status"] == "changed"
     assert not_controlled["controlled_pair"] is False
+
+    changed_early_telemetry = run(
+        "decision-after-telemetry-change",
+        "memory-v3",
+        "throttle_retries",
+        "2026-08-13T10:03:00Z",
+    )
+    telemetry_mismatch = _action_comparison(
+        rejected=rejected,
+        corrected=changed_early_telemetry,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert telemetry_mismatch["context"]["normalized_telemetry_equal"] is True
+    assert telemetry_mismatch["controlled_pair"] is False
+
+    expected_mismatch_reasons = {
+        "timestamp": "invariant_inputs_ordered_observations_mismatch",
+        "early_value": "invariant_inputs_ordered_observations_mismatch",
+        "dimensions": "invariant_inputs_ordered_observations_mismatch",
+        "region": "invariant_inputs_ordered_observations_mismatch",
+        "unit": "invariant_inputs_ordered_observations_mismatch",
+        "statistic": "invariant_inputs_ordered_observations_mismatch",
+        "period": "invariant_inputs_ordered_observations_mismatch",
+        "query_fingerprint": "invariant_inputs_ordered_observations_mismatch",
+        "truncated": "invariant_inputs_ordered_observations_mismatch",
+        "window": "invariant_inputs_ordered_observations_mismatch",
+        "provider": "invariant_inputs_ordered_model_request_configuration_mismatch",
+        "model": "invariant_inputs_ordered_model_request_configuration_mismatch",
+        "prompt_template": "invariant_inputs_prompt_templates_mismatch",
+        "prompt_suffix": "invariant_inputs_ordered_model_request_configuration_mismatch",
+        "tenant": "invariant_inputs_tenant_id_mismatch",
+        "policy": "invariant_inputs_retrieval_policy_mismatch",
+        "embedding": "invariant_inputs_embedding_profile_mismatch",
+        "release": "identity_release_revision_mismatch",
+    }
+    for mismatch_case, expected_reason in expected_mismatch_reasons.items():
+        mismatch_proof = _causal_proof_states(
+            rejected=rejected,
+            corrected=validly_mutated(corrected, mismatch_case),
+            operation=operation,
+            operation_effects=effects,
+            memories=[seed, stale, restored],
+            seed=seed,
+            compromised=stale,
+        )
+        assert mismatch_proof["controlled_pair_eligible"] == {
+            "status": "not_proven",
+            "reason": expected_reason,
+        }
+
+    for invalid_request_case in (
+        "action_schema",
+        "selection_schema",
+        "selection_only",
+        "turn_gap",
+    ):
+        invalid_request_proof = _causal_proof_states(
+            rejected=rejected,
+            corrected=validly_mutated(corrected, invalid_request_case),
+            operation=operation,
+            operation_effects=effects,
+            memories=[seed, stale, restored],
+            seed=seed,
+            compromised=stale,
+        )
+        assert invalid_request_proof["controlled_pair_eligible"] == {
+            "status": "unavailable",
+            "reason": "causal_envelope_incomplete_or_invalid",
+        }
+
+    invalid_query_contract = _causal_proof_states(
+        rejected=rejected,
+        corrected=validly_mutated(corrected, "query_config"),
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert invalid_query_contract["controlled_pair_eligible"] == {
+        "status": "unavailable",
+        "reason": "causal_envelope_incomplete_or_invalid",
+    }
+
+    operation_target_proof = _causal_proof_states(
+        rejected=rejected,
+        corrected=validly_mutated(corrected, "operation_target"),
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert operation_target_proof["controlled_pair_eligible"]["status"] == "not_proven"
+
+    unrelated_memory_proof = _causal_proof_states(
+        rejected=rejected,
+        corrected=validly_mutated(corrected, "unrelated_memory"),
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert unrelated_memory_proof["controlled_pair_eligible"] == {
+        "status": "unavailable",
+        "reason": "causal_envelope_incomplete_or_invalid",
+    }
+
+    missing_lineage = deepcopy(corrected)
+    missing_lineage["trace"]["reads"][0]["incoming_lineage_edge_ids"] = []
+    invalid_at_read = deepcopy(corrected)
+    invalid_at_read["trace"]["reads"][0]["t_invalid"] = "2026-08-13T10:04:30Z"
+    for invalid_lineage in (missing_lineage, invalid_at_read):
+        invalid_proof = _causal_proof_states(
+            rejected=rejected,
+            corrected=invalid_lineage,
+            operation=operation,
+            operation_effects=effects,
+            memories=[seed, stale, restored],
+            seed=seed,
+            compromised=stale,
+        )
+        assert invalid_proof["memory_correction_proven"]["status"] == "not_proven"
+        assert invalid_proof["controlled_pair_eligible"]["status"] == "not_proven"
 
     tampered = deepcopy(corrected)
     tampered["action_trace"]["recommendation"]["operational_action"]["fingerprint"] = (
@@ -200,6 +946,40 @@ def test_action_comparison_requires_structured_actions_equivalent_context_and_li
     )
     assert unavailable["status"] == "unavailable"
     assert unavailable["controlled_pair"] is False
+
+    for field, value in (
+        ("summary", "Scale payment workers."),
+        ("rationale", "Tampered explanatory prose."),
+    ):
+        tampered_prose = deepcopy(corrected)
+        tampered_prose["action_trace"]["recommendation"][field] = value
+        prose_comparison = _action_comparison(
+            rejected=rejected,
+            corrected=tampered_prose,
+            operation=operation,
+            operation_effects=effects,
+            memories=[seed, stale, restored],
+            seed=seed,
+            compromised=stale,
+        )
+        assert prose_comparison["status"] == "unavailable"
+        assert prose_comparison["controlled_pair"] is False
+
+    legacy = deepcopy(corrected)
+    legacy["action_trace"].pop("causal_envelope")
+    legacy_proof = _causal_proof_states(
+        rejected=rejected,
+        corrected=legacy,
+        operation=operation,
+        operation_effects=effects,
+        memories=[seed, stale, restored],
+        seed=seed,
+        compromised=stale,
+    )
+    assert legacy_proof["controlled_pair_eligible"] == {
+        "status": "unavailable",
+        "reason": "causal_envelope_incomplete_or_invalid",
+    }
 
 
 @requires_db
@@ -327,7 +1107,7 @@ def test_explicit_signature_scenario_returns_partial_identity_state():
         record_poison_rewind_anchor,
         reset_poison_rewind_state,
     )
-    from hindsight.trace_contract import signature_scenario_trace
+    from hindsight.trace_contract import signature_scenario_evidence, signature_scenario_trace
 
     fixture_id = uuid4()
     incident = ensure_poison_rewind_incident(
@@ -367,6 +1147,18 @@ def test_explicit_signature_scenario_returns_partial_identity_state():
         "rewind_operation_id": None,
         "corrected_decision_id": None,
     }
+    assert {state["status"] for state in scenario["causal_evidence"]["proof_states"].values()} == {
+        "unavailable"
+    }
+    evidence = signature_scenario_evidence(
+        scenario_id=str(fixture_id),
+        db_url=database_url(),
+    )
+    assert evidence is not None
+    from hindsight.causal_evidence import canonical_sha256
+
+    assert canonical_sha256(evidence) == scenario["causal_evidence"]["download"]["sha256"]
+    assert evidence["scope"] == "recommendation_only"
 
 
 @requires_db

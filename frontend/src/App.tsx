@@ -23,6 +23,12 @@ const OperatorConsole = lazy(() =>
   })),
 );
 
+const CausalEvidencePanel = lazy(() =>
+  import("@/components/causal-evidence-panel").then((module) => ({
+    default: module.CausalEvidencePanel,
+  })),
+);
+
 export default function App() {
   const cockpit = useCockpit();
   const [identityOpen, setIdentityOpen] = useState(false);
@@ -80,6 +86,12 @@ export default function App() {
               activeRun={cockpit.run}
             />
             <OutcomeComparison scenario={cockpit.scenario} activeRun={cockpit.run} />
+            <Suspense fallback={<p className="phase-trace-unavailable">Loading evidence…</p>}>
+              <CausalEvidencePanel
+                scenario={cockpit.scenario}
+                onDownload={cockpit.downloadCausalEvidence}
+              />
+            </Suspense>
             <Timeline snapshot={cockpit.snapshot} onSelect={cockpit.selectHistorical} />
             <div className="evidence-grid">
               <BeliefLedger snapshot={cockpit.snapshot} />

@@ -244,10 +244,11 @@ def test_browser_demo_reset_isolates_sessions_and_incidents():
 def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
     from hindsight.db import database_url
     from hindsight.demo_state import (
-        current_database_timestamp,
         poison_demo_memory,
+        record_poison_rewind_anchor,
         reset_poison_rewind_state,
         seed_good_demo_memory,
+        signature_replay_context,
     )
     from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore, Provenance
@@ -263,7 +264,7 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
         db_url=database_url(),
         embedding_provider=provider,
     )
-    rewind_anchor = current_database_timestamp(db_url=database_url())
+    rewind_anchor = record_poison_rewind_anchor(namespace=namespace, db_url=database_url())
     poison = poison_demo_memory(
         namespace=namespace,
         db_url=database_url(),
@@ -310,12 +311,24 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
         worker_id="test.browser-signature",
         db_url=database_url(),
     )
+    replay_context = signature_replay_context(namespace=namespace, db_url=database_url())
 
     invalidated_ids = {str(value) for value in completed["invalidated_memory_ids"]}
     assert invalidated_ids == {
         str(poison["id"]),
         str(rejected_reflection["id"]),
     }
+    assert replay_context is not None
+    assert replay_context["correction_operation"]["id"] == str(completed["id"])
+    assert replay_context["correction_operation"]["invalidated_memory_ids"] == [
+        str(value) for value in completed["invalidated_memory_ids"]
+    ]
+    assert replay_context["correction_operation"]["restored_memory_ids"] == [
+        str(value) for value in completed["restored_memory_ids"]
+    ]
+    assert [
+        effect["sequence"] for effect in replay_context["correction_operation"]["effects"]
+    ] == list(range(1, len(replay_context["correction_operation"]["effects"]) + 1))
     with MemoryStore(url=database_url()) as store:
         current = store.list_current_semantic(namespace=namespace, limit=100)
         poison_audit = store.audit_memory(

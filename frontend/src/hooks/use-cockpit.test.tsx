@@ -54,6 +54,47 @@ function approvalScenario(withIdentity = true): SignatureScenario {
   };
 }
 
+function evidenceScenario(sha256: string): SignatureScenario {
+  const unavailable = { status: "unavailable" as const, reason: "test fixture" };
+  return {
+    ...approvalScenario(),
+    causal_evidence: {
+      schema_version: 1,
+      canonicalization: "hindsight.canonical-json.v1",
+      scope: "recommendation_only",
+      proof_states: {
+        memory_correction_proven: unavailable,
+        action_delta_proven: unavailable,
+        controlled_pair_eligible: unavailable,
+        repeatable_causal_effect_supported: unavailable,
+        service_recovery_proven: unavailable,
+      },
+      download: {
+        url: "/v1/signature-scenarios/scenario-approval/evidence",
+        protected_url: "/v2/signature-scenarios/scenario-approval/evidence",
+        sha256,
+        media_type: "application/json",
+      },
+    },
+  };
+}
+
+function installEvidenceDownloadRuntime(digestByte: number) {
+  const NativeUrl = URL;
+  class EvidenceUrl extends NativeUrl {}
+  const createObjectURL = vi.fn(() => "blob:causal-evidence");
+  const revokeObjectURL = vi.fn();
+  Object.assign(EvidenceUrl, { createObjectURL, revokeObjectURL });
+  vi.stubGlobal("URL", EvidenceUrl);
+  vi.stubGlobal("crypto", {
+    subtle: {
+      digest: vi.fn(async () => new Uint8Array(32).fill(digestByte).buffer),
+    },
+  });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+  return { click, createObjectURL, revokeObjectURL };
+}
+
 function remediationApprovalScenario(): SignatureScenario {
   const scenario = approvalScenario();
   return {
@@ -1100,5 +1141,148 @@ describe("cockpit historical snapshot selection", () => {
     expect(new URLSearchParams(window.location.search).get("scenario_id")).toBe(
       "scenario-reset",
     );
+  });
+
+  it("downloads public causal evidence only after both digests match", async () => {
+    const sha256 = `sha256:${"ab".repeat(32)}`;
+    const scenario = evidenceScenario(sha256);
+    const runtime = installEvidenceDownloadRuntime(0xab);
+    window.history.replaceState(
+      {},
+      "",
+      "/?scenario_id=scenario-approval&namespace=test%3Ahistory-race",
+    );
+    let evidenceAuthorization: string | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/signature-scenarios/scenario-approval") {
+          return Promise.resolve(jsonResponse(scenario));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/snapshot") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-approval/evidence") {
+          evidenceAuthorization = new Headers(init?.headers).get("authorization");
+          return Promise.resolve(
+            new Response(new Uint8Array([1, 2, 3]), {
+              status: 200,
+              headers: { "x-hindsight-evidence-sha256": sha256 },
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await waitFor(() => expect(result.current.scenario?.causal_evidence).toBeDefined());
+    await act(async () => result.current.downloadCausalEvidence());
+
+    expect(evidenceAuthorization).toBeNull();
+    expect(runtime.createObjectURL).toHaveBeenCalledOnce();
+    expect(runtime.click).toHaveBeenCalledOnce();
+    expect(runtime.revokeObjectURL).toHaveBeenCalledWith("blob:causal-evidence");
+    expect(result.current.notice).toEqual({
+      kind: "status",
+      message: "Verified causal evidence downloaded.",
+    });
+  });
+
+  it("uses the protected evidence endpoint for an authenticated replay", async () => {
+    const sha256 = `sha256:${"cd".repeat(32)}`;
+    const scenario = evidenceScenario(sha256);
+    installEvidenceDownloadRuntime(0xcd);
+    const requestedEvidence: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v2/me") {
+          return Promise.resolve(jsonResponse(effectiveIdentity()));
+        }
+        if (url.pathname === "/v2/signature-scenarios") {
+          return Promise.resolve(jsonResponse(scenario));
+        }
+        if (url.pathname === "/v2/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v2/signature-scenarios/scenario-approval/evidence") {
+          requestedEvidence.push(url.pathname);
+          expect(new Headers(init?.headers).get("authorization")).toBe(
+            "Bearer test-access-token",
+          );
+          return Promise.resolve(
+            new Response(new Uint8Array([4, 5, 6]), {
+              status: 200,
+              headers: { "x-hindsight-evidence-sha256": sha256 },
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit({ authAdapter: signedInAdapter() }));
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await act(async () => result.current.downloadCausalEvidence());
+
+    expect(requestedEvidence).toEqual([
+      "/v2/signature-scenarios/scenario-approval/evidence",
+    ]);
+    expect(result.current.notice?.message).toBe("Verified causal evidence downloaded.");
+  });
+
+  it("fails closed when downloaded causal evidence does not match its receipt", async () => {
+    const receiptDigest = `sha256:${"ef".repeat(32)}`;
+    const scenario = evidenceScenario(receiptDigest);
+    const runtime = installEvidenceDownloadRuntime(0x11);
+    window.history.replaceState(
+      {},
+      "",
+      "/?scenario_id=scenario-approval&namespace=test%3Ahistory-race",
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/signature-scenarios/scenario-approval") {
+          return Promise.resolve(jsonResponse(scenario));
+        }
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/snapshot") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-approval/evidence") {
+          return Promise.resolve(
+            new Response(new Uint8Array([7, 8, 9]), {
+              status: 200,
+              headers: { "x-hindsight-evidence-sha256": receiptDigest },
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+    await waitFor(() => expect(result.current.scenario?.causal_evidence).toBeDefined());
+    await act(async () => result.current.downloadCausalEvidence());
+
+    expect(runtime.createObjectURL).not.toHaveBeenCalled();
+    expect(runtime.click).not.toHaveBeenCalled();
+    expect(result.current.notice).toEqual({
+      kind: "error",
+      message:
+        "Evidence download failed: The downloaded evidence digest did not match the replay receipt.",
+    });
   });
 });

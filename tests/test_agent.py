@@ -132,12 +132,28 @@ def test_diagnostic_action_is_selected_only_by_structured_model_output():
     assert "role" not in provider.requests[0].prompt
 
 
-def test_payments_replay_records_strict_operational_action_without_changing_generic_agent():
-    from hindsight.agent import _generate_agent_decision, _recommendation_trace
+def test_payments_replay_records_strict_operational_action_without_changing_generic_agent(
+    monkeypatch,
+):
+    from copy import deepcopy
+    import json
+    from uuid import UUID
+
+    from hindsight.agent import (
+        PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY,
+        _generate_agent_decision,
+        _recommendation_trace,
+        _scenario_routing_key,
+    )
     from hindsight.agent_decision import recommendation_id
+    from hindsight.causal_evidence import validated_causal_envelope
+    from hindsight.runs import _public_run_response
+    from hindsight.tenant import tenant_scope
+    from hindsight.trace_contract import _public_run_projection, causal_evidence_document
     from tests.fakes import (
         DeterministicReasoningProvider,
         controlled_recommendation_decision,
+        diagnostic_decision,
     )
 
     state = {
@@ -158,42 +174,266 @@ def test_payments_replay_records_strict_operational_action_without_changing_gene
         "diagnostic_call_count": 0,
         "selection_fingerprint": "selection-controlled",
         "reasoning": {"provider": "test", "model": "controlled"},
+        "embedding_profile": {
+            "profile_id": "profile-controlled",
+            "provider": "test",
+            "model": "embedding-controlled",
+            "dimensions": 3,
+            "capability": "semantic",
+            "encoder_revision": "test-v1",
+            "configuration": {},
+            "max_distance": None,
+        },
     }
+    state["triage"] = {
+        "incident_id": state["incident_id"],
+        "namespace": state["namespace"],
+        "service_slug": state["service_slug"],
+        "severity": "high",
+        "title": "Payments checkout latency",
+        "summary": state["user_input"],
+        "prior_chat_messages": 0,
+    }
+    replay = {
+        "scenario_id": "49109a44-43e7-40de-b547-b4f9d0a387a2",
+        "namespace": state["namespace"],
+        "replay_anchor": "2026-08-14T10:00:00+00:00",
+    }
+    replay["scenario_routing_key"] = _scenario_routing_key(
+        state,
+        replay_context=replay,
+    )
+    state["metadata"] = {"retrieval_policy": "semantic_strict", "causal_replay": replay}
+    monkeypatch.setenv("HINDSIGHT_DEPLOYED_REVISION", "a" * 40)
+    diagnostic_payload = json.loads(diagnostic_decision(PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY))
+    diagnostic_payload.update({"schema_version": 3, "operational_action": None})
+    diagnostic_provider = DeterministicReasoningProvider(
+        response_text=json.dumps(diagnostic_payload)
+    )
+    diagnostic_choice, diagnostic_response, diagnostic_turn = _generate_agent_decision(
+        state,
+        provider=diagnostic_provider,
+        allowed_query_keys={PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY},
+    )
+    state.update(
+        {
+            "model_turn_count": diagnostic_turn,
+            "diagnostic_call_count": 1,
+            "tool_calls": [
+                {
+                    "id": "diagnostic-controlled",
+                    "tool": "aws_cloudwatch_diagnostics",
+                    "query_key": PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY,
+                    "status": "completed",
+                }
+            ],
+            "observations": [
+                {
+                    "id": "observation-controlled",
+                    "tool_call_id": "diagnostic-controlled",
+                    "schema_version": 1,
+                    "tool": "aws_cloudwatch_diagnostics",
+                    "query_key": PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY,
+                    "query_fingerprint": f"cloudwatch_query:{'b' * 64}",
+                    "status": "available",
+                    "region": "us-east-1",
+                    "metric": {
+                        "namespace": "Hindsight/ControlledIncidentTelemetry",
+                        "name": "RetryFanout",
+                        "dimensions": [{"name": "Service", "value": "payments-api"}],
+                        "statistic": "Maximum",
+                        "unit": "Count",
+                        "period_seconds": 60,
+                    },
+                    "window": {
+                        "start": "2026-08-14T09:45:00Z",
+                        "end": "2026-08-14T10:00:00Z",
+                        "seconds": 900,
+                    },
+                    "datapoints": [{"timestamp": "2026-08-14T09:59:00Z", "value": 8.0}],
+                    "datapoint_count": 1,
+                    "truncated": False,
+                }
+            ],
+            "reasoning_steps": [
+                {
+                    "turn": diagnostic_turn,
+                    "provider": diagnostic_response.provider,
+                    "model": diagnostic_response.model,
+                    "requests": diagnostic_response.usage["request_contracts"],
+                    "decision": diagnostic_choice.model_dump(mode="json"),
+                }
+            ],
+        }
+    )
     provider = DeterministicReasoningProvider(
         response_text=controlled_recommendation_decision(
             "scale_workers",
-            "Scale payment workers, then inspect queue depth.",
+            "Recorded evidence supports this catalog selection.",
         )
     )
 
-    decision, _, turns = _generate_agent_decision(
+    decision, response, turns = _generate_agent_decision(
         state,
         provider=provider,
-        allowed_query_keys=set(),
+        allowed_query_keys={PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY},
     )
     identity = recommendation_id(
         run_id=state["run_id"],
         decision=decision,
         selection_fingerprint=state["selection_fingerprint"],
     )
-    trace = _recommendation_trace(
-        state=state,
-        decision=decision,
-        recommendation_identity=identity,
-    )
+    with tenant_scope(UUID("11111111-1111-4111-8111-111111111111")):
+        trace = _recommendation_trace(
+            state={
+                **state,
+                "reasoning_steps": [
+                    *state["reasoning_steps"],
+                    {
+                        "turn": turns,
+                        "provider": response.provider,
+                        "model": response.model,
+                        "request": response.usage["request_contract"],
+                        "decision": decision.model_dump(mode="json"),
+                    },
+                ],
+                "observation_fingerprint": "observation-controlled",
+            },
+            decision=decision,
+            recommendation_identity=identity,
+        )
 
-    assert turns == 1
+    assert turns == 2
     assert decision.schema_version == 3
-    assert provider.requests[0].response_json_schema["properties"]["schema_version"][
-        "enum"
-    ] == [3]
-    assert "governed-memory remediation is unavailable" in provider.requests[0].system
-    assert trace["schema_version"] == 3
-    assert trace["recommendation"]["operational_action"]["primary_action"] == (
-        "scale_workers"
-    )
+    assert set(provider.requests[0].response_json_schema["properties"]) == {
+        "action_id",
+        "disposition",
+        "parameters",
+        "rationale",
+    }
+    assert "server renders the operator directive" in provider.requests[0].system.lower()
+    assert trace["schema_version"] == 4
+    assert trace["recommendation"]["operational_action"]["primary_action"] == ("scale_workers")
     assert trace["recommendation"]["operational_action"]["fingerprint"].startswith(
         "operational_action:"
+    )
+    assert trace["recommendation"]["operational_action"]["catalog_id"] == (
+        "payments_retry_amplification.actions.v1"
+    )
+    assert trace["recommendation"]["summary"] == "Scale payment workers."
+    assert "explanation" not in trace["recommendation"]
+    assert trace["causal_envelope"]["identity"]["replay_anchor"] == replay["replay_anchor"]
+    assert set(trace["causal_envelope"]["decision_output"]) == {
+        "action_id",
+        "disposition",
+        "parameters",
+        "rationale",
+    }
+    assert trace["causal_envelope"]["actual_decision_inputs"]["ordered_model_requests"][0][
+        "routing_key"
+    ].startswith(f"{replay['scenario_routing_key']}:turn:")
+
+    def evidence_for(public_run: dict) -> dict:
+        return causal_evidence_document(
+            {
+                "scenario_id": replay["scenario_id"],
+                "namespace": state["namespace"],
+                "rewind_anchor": replay["replay_anchor"],
+                "created_at": None,
+                "completed_at": None,
+                "stages": {
+                    "influenced_decision_id": state["decision_id"],
+                    "corrected_decision_id": state["decision_id"],
+                },
+                "runs": [public_run],
+                "operation": None,
+                "operation_events": [],
+                "operation_effects": [],
+                "memories": [],
+                "causal_evidence": {},
+            }
+        )
+
+    internal_run = {"decision_id": state["decision_id"], "action_trace": trace}
+    expected_public_envelope = trace["redacted_causal_envelope"]
+    public_run = _public_run_response(deepcopy(internal_run))
+    public_scenario_run = _public_run_projection(deepcopy(internal_run))
+    for projected in (public_run, public_scenario_run):
+        assert projected["action_trace"]["causal_envelope"] == expected_public_envelope
+        assert validated_causal_envelope(projected["action_trace"]["causal_envelope"])
+    public_evidence = evidence_for(public_scenario_run)
+    assert (
+        public_evidence["recommendations"]["before"]["causal_envelope"] == expected_public_envelope
+    )
+
+    private_candidate_run = deepcopy(internal_run)
+    private_candidate_run["action_trace"]["redacted_causal_envelope"] = deepcopy(
+        trace["causal_envelope"]
+    )
+    rejected_run = _public_run_response(deepcopy(private_candidate_run))
+    rejected_scenario_run = _public_run_projection(deepcopy(private_candidate_run))
+    for projected in (rejected_run, rejected_scenario_run):
+        assert "causal_envelope" not in projected["action_trace"]
+    rejected_evidence = evidence_for(rejected_scenario_run)
+    assert rejected_evidence["recommendations"]["before"]["causal_envelope"] is None
+
+
+def test_controlled_terminal_readiness_requires_the_pinned_diagnostic_observation():
+    from hindsight.agent import _has_current_diagnostic_observation
+
+    state = {
+        "observations": [
+            {
+                "status": "available",
+                "tool": "aws_cloudwatch_diagnostics",
+                "query_key": "unrelated.metric",
+                "tool_call_id": "diagnostic-1",
+                "datapoint_count": 1,
+            }
+        ],
+        "tool_calls": [
+            {
+                "id": "diagnostic-1",
+                "tool": "aws_cloudwatch_diagnostics",
+                "query_key": "payments.retry_fanout",
+                "status": "completed",
+            }
+        ],
+    }
+
+    assert not _has_current_diagnostic_observation(
+        state,
+        allowed_query_keys={"payments.retry_fanout"},
+    )
+    state["observations"][0]["query_key"] = "payments.retry_fanout"
+    assert _has_current_diagnostic_observation(
+        state,
+        allowed_query_keys={"payments.retry_fanout"},
+    )
+
+
+@pytest.mark.parametrize("invalid_call_id", [None, 7])
+def test_controlled_terminal_readiness_rejects_invalid_tool_call_ids(invalid_call_id):
+    from hindsight.agent import _has_current_diagnostic_observation
+
+    call = {
+        "tool": "aws_cloudwatch_diagnostics",
+        "query_key": "payments.retry_fanout",
+        "status": "completed",
+    }
+    observation = {
+        "status": "available",
+        "tool": "aws_cloudwatch_diagnostics",
+        "query_key": "payments.retry_fanout",
+        "datapoint_count": 1,
+    }
+    if invalid_call_id is not None:
+        call["id"] = invalid_call_id
+        observation["tool_call_id"] = invalid_call_id
+
+    assert not _has_current_diagnostic_observation(
+        {"tool_calls": [call], "observations": [observation]},
+        allowed_query_keys={"payments.retry_fanout"},
     )
 
 
@@ -202,6 +442,7 @@ def test_payments_replay_pins_the_causal_pair_to_one_diagnostic():
 
     from hindsight.agent import (
         PAYMENTS_REPLAY_DIAGNOSTIC_QUERY_KEY,
+        AgentDecisionError,
         _generate_agent_decision,
     )
     from tests.fakes import DeterministicReasoningProvider, diagnostic_decision
@@ -227,7 +468,15 @@ def test_payments_replay_pins_the_causal_pair_to_one_diagnostic():
     payload.update({"schema_version": 3, "operational_action": None})
     provider = DeterministicReasoningProvider(response_text=json.dumps(payload))
 
-    decision, _, turns = _generate_agent_decision(
+    for invalid_queries in (set(), {"unrelated.metric"}):
+        with pytest.raises(AgentDecisionError, match="pinned diagnostic query"):
+            _generate_agent_decision(
+                state,
+                provider=provider,
+                allowed_query_keys=invalid_queries,
+            )
+
+    decision, response, turns = _generate_agent_decision(
         state,
         provider=provider,
         allowed_query_keys={
@@ -280,9 +529,10 @@ def test_provider_may_omit_forbidden_branch_siblings_without_changing_raw_respon
 
     assert decision.next_step_kind == "diagnostic_tool"
     assert turns == 1
-    assert response.usage["response_sha256"] == hashlib.sha256(
-        raw_response.encode("utf-8")
-    ).hexdigest()
+    assert (
+        response.usage["response_sha256"]
+        == hashlib.sha256(raw_response.encode("utf-8")).hexdigest()
+    )
     schema = provider.requests[0].response_json_schema
     assert schema is not None
     assert "recommendation" not in schema["properties"]
@@ -348,7 +598,7 @@ def test_context_invalid_recommendation_repairs_to_required_diagnostic():
         "diagnostic_call_count": 0,
     }
 
-    decision, _, turns = _generate_agent_decision(
+    decision, response, turns = _generate_agent_decision(
         state,
         provider=provider,
         allowed_query_keys={"payments.checkout_latency_ms"},
@@ -357,6 +607,10 @@ def test_context_invalid_recommendation_repairs_to_required_diagnostic():
     assert decision.next_step_kind == "diagnostic_tool"
     assert turns == 2
     assert len(provider.requests) == 2
+    assert [contract["attempt"] for contract in response.usage["request_contracts"]] == [1, 2]
+    assert response.usage["request_contracts"][1]["repair_reason"] == (
+        "current_diagnostic_observation_required"
+    )
     assert (
         "Stable repair reason: current_diagnostic_observation_required."
         in provider.requests[1].prompt
@@ -1726,6 +1980,129 @@ def test_incident_graph_interrupt_resumes_from_cockroachdb_checkpoint():
     assert [row[1] for row in chat_rows] == ["human", "ai"]
     assert "Roll back the deploy candidate" in chat_rows[1][2]
     assert reflected_trust == ("review_required",)
+
+
+@requires_db
+def test_controlled_replay_persists_complete_anchored_causal_envelope(monkeypatch):
+    import json
+
+    from hindsight.agent import IncidentInput, run_incident_agent
+    from hindsight.db import connect, database_url
+    from hindsight.demo_state import (
+        DEMO_INPUT,
+        DEMO_NAMESPACE,
+        DEMO_SERVICE_SLUG,
+        ensure_poison_rewind_incident,
+        record_poison_rewind_anchor,
+        reset_poison_rewind_state,
+        seed_good_demo_memory,
+    )
+    from hindsight.tenant import tenant_scope
+    from hindsight.trace_contract import _causal_envelope
+    from tests.fakes import (
+        DeterministicEmbeddingProvider,
+        FakeCloudWatchDiagnostics,
+        SequencedReasoningProvider,
+        controlled_recommendation_decision,
+        diagnostic_decision,
+    )
+
+    fixture_id = uuid4()
+    embedding = DeterministicEmbeddingProvider()
+    incident = ensure_poison_rewind_incident(
+        fixture_id=fixture_id,
+        db_url=database_url(),
+    )
+    namespace = reset_poison_rewind_state(
+        namespace=DEMO_NAMESPACE,
+        session_id=fixture_id,
+        incident_id=fixture_id,
+        db_url=database_url(),
+    )
+    seed_good_demo_memory(
+        namespace=namespace,
+        db_url=database_url(),
+        embedding_provider=embedding,
+    )
+    anchor = record_poison_rewind_anchor(namespace=namespace, db_url=database_url())
+    with connect(database_url()) as conn:
+        tenant_id = conn.execute(
+            "SELECT tenant_id FROM incidents WHERE id = %s",
+            (fixture_id,),
+        ).fetchone()[0]
+
+    diagnostic_payload = json.loads(diagnostic_decision("payments.retry_fanout"))
+    diagnostic_payload.update({"schema_version": 3, "operational_action": None})
+    reasoning = SequencedReasoningProvider(
+        [
+            json.dumps(diagnostic_payload),
+            controlled_recommendation_decision(
+                "inspect_only",
+                "Recorded evidence supports this catalog selection.",
+            ),
+        ]
+    )
+    diagnostic = FakeCloudWatchDiagnostics(
+        {
+            "payments.retry_fanout": {
+                "schema_version": 1,
+                "tool": "aws_cloudwatch_diagnostics",
+                "query_key": "payments.retry_fanout",
+                "query_fingerprint": f"cloudwatch_query:{'b' * 64}",
+                "status": "available",
+                "region": "us-east-1",
+                "metric": {
+                    "namespace": "Hindsight/ControlledIncidentTelemetry",
+                    "name": "RetryFanout",
+                    "dimensions": [
+                        {"name": "Scenario", "value": "payments-checkout-latency"},
+                        {"name": "Service", "value": "payments-api"},
+                    ],
+                    "statistic": "Maximum",
+                    "unit": "Count",
+                    "period_seconds": 60,
+                },
+                "window": {
+                    "start": "2026-08-14T09:45:00Z",
+                    "end": "2026-08-14T10:00:00Z",
+                    "seconds": 900,
+                },
+                "datapoints": [{"timestamp": "2026-08-14T09:59:00Z", "value": 8.0}],
+                "datapoint_count": 1,
+                "truncated": False,
+            }
+        }
+    )
+    monkeypatch.setenv("HINDSIGHT_DEPLOYED_REVISION", "a" * 40)
+
+    with tenant_scope(tenant_id):
+        result = run_incident_agent(
+            IncidentInput(
+                user_input=DEMO_INPUT,
+                incident_id=incident["slug"],
+                namespace=namespace,
+                service_slug=DEMO_SERVICE_SLUG,
+                title=incident["title"],
+                metadata={"retrieval_policy": "semantic_strict"},
+            ),
+            thread_id=f"controlled-envelope-{fixture_id}",
+            pause_before_act=True,
+            db_url=database_url(),
+            reasoning_provider=reasoning,
+            embedding_provider=embedding,
+            diagnostic_tool=diagnostic,
+        )
+
+    assert result.interrupted
+    envelope = _causal_envelope({"action_trace": result.state["action_trace"]})
+    assert envelope is not None
+    assert envelope["identity"]["replay_anchor"] == anchor.isoformat().replace("+00:00", "Z")
+    assert envelope["invariant_inputs"]["ordered_observations"][0]["datapoints"] == [
+        {"timestamp": "2026-08-14T09:59:00Z", "value": 8.0}
+    ]
+    assert envelope["invariant_inputs"]["tenant_id"] == str(tenant_id)
+    assert envelope["rendered_prompt_sha256"][0] != envelope["rendered_prompt_sha256"][1]
+    assert diagnostic.calls == ["payments.retry_fanout"]
 
 
 @requires_db

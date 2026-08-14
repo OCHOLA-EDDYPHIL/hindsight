@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   ApiError,
+  productApiUrl,
+  publicApiUrl,
   publicSnapshotUrl,
   requestProductJson,
   requestPublicJson,
@@ -1384,6 +1386,49 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     [announce, loadSnapshot, refreshScenario, updateReplayUrl],
   );
 
+  const downloadCausalEvidence = useCallback(async () => {
+    const current = scenario;
+    const download = current?.causal_evidence?.download;
+    if (!current || !download) {
+      announce("Causal evidence is unavailable for this replay.", "error");
+      return;
+    }
+    try {
+      const path = `/signature-scenarios/${encodeURIComponent(current.scenario_id)}/evidence`;
+      const headers = new Headers({ accept: "application/json" });
+      let url = publicApiUrl(config, path);
+      if (authStatusRef.current === "authenticated") {
+        const token = authAdapter?.accessToken() || null;
+        if (!token) throw new Error("The authenticated evidence credential is unavailable.");
+        headers.set("authorization", `Bearer ${token}`);
+        url = productApiUrl(config, path);
+      }
+      const response = await fetch(url, { credentials: "omit", headers });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      const bytes = await response.arrayBuffer();
+      const digestBytes = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+      const observedDigest = `sha256:${Array.from(new Uint8Array(digestBytes))
+        .map((value) => value.toString(16).padStart(2, "0"))
+        .join("")}`;
+      const headerDigest = response.headers.get("x-hindsight-evidence-sha256");
+      if (observedDigest !== download.sha256 || headerDigest !== download.sha256) {
+        throw new Error("The downloaded evidence digest did not match the replay receipt.");
+      }
+      const objectUrl = URL.createObjectURL(
+        new Blob([bytes], { type: download.media_type }),
+      );
+      const anchor = document.createElement("a");
+      const safeId = String(current.scenario_id).replace(/[^A-Za-z0-9._-]/g, "_");
+      anchor.href = objectUrl;
+      anchor.download = `hindsight-causal-evidence-${safeId}.json`;
+      anchor.click();
+      URL.revokeObjectURL(objectUrl);
+      announce("Verified causal evidence downloaded.");
+    } catch (error) {
+      announce(`Evidence download failed: ${(error as Error).message}`, "error");
+    }
+  }, [announce, authAdapter, config, scenario]);
+
   const canWrite =
     authStatus === "authenticated" &&
     identity?.effective_role === "operator" &&
@@ -1440,6 +1485,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     loadConsolidationCandidates,
     previewConsolidationReview,
     executeConsolidationReview,
+    downloadCausalEvidence,
     selectHistorical,
   };
 }

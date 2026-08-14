@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -107,6 +107,81 @@ def record_poison_rewind_anchor(
     if row is None:
         raise LookupError("active demo session not found")
     return row[0]
+
+
+def signature_replay_context(
+    *,
+    namespace: str,
+    db_url: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the server-owned identity and anchor for one controlled replay."""
+
+    with connect(
+        db_url or database_url(),
+        application_name="hindsight-signature-replay-context",
+    ) as conn:
+        row = conn.execute(
+            """
+                SELECT id, namespace, rewind_anchor
+                FROM demo_sessions
+                WHERE namespace = %s
+                  AND demo_kind IN ('compromised_guidance_rewind', 'poison_rewind')
+                ORDER BY created_at DESC
+                LIMIT 1
+            """,
+            (namespace,),
+        ).fetchone()
+        operation = conn.execute(
+            """
+                SELECT id, status, target_timestamp, invalidated_memory_ids,
+                       restored_memory_ids
+                FROM memory_operations
+                WHERE namespace = %s AND operation_type = 'rewind'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """,
+            (namespace,),
+        ).fetchone()
+        effects = (
+            conn.execute(
+                """
+                    SELECT sequence, effect_type, source_memory_id,
+                           result_memory_id, belief_id, namespace
+                    FROM memory_operation_effects
+                    WHERE operation_id = %s
+                    ORDER BY sequence
+                """,
+                (operation[0],),
+            ).fetchall()
+            if operation is not None and operation[1] == "completed"
+            else []
+        )
+    if row is None or row[2] is None:
+        return None
+    context = {
+        "scenario_id": str(row[0]),
+        "namespace": str(row[1]),
+        "replay_anchor": row[2].astimezone(UTC).isoformat().replace("+00:00", "Z"),
+    }
+    if operation is not None and operation[1] == "completed":
+        context["correction_operation"] = {
+            "id": str(operation[0]),
+            "target_timestamp": operation[2].astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            "invalidated_memory_ids": [str(value) for value in operation[3] or []],
+            "restored_memory_ids": [str(value) for value in operation[4] or []],
+            "effects": [
+                {
+                    "sequence": effect[0],
+                    "effect_type": effect[1],
+                    "source_memory_id": (str(effect[2]) if effect[2] is not None else None),
+                    "result_memory_id": (str(effect[3]) if effect[3] is not None else None),
+                    "belief_id": str(effect[4]) if effect[4] is not None else None,
+                    "namespace": effect[5],
+                }
+                for effect in effects
+            ],
+        }
+    return context
 
 
 def seed_good_demo_memory(
