@@ -14,6 +14,16 @@ The deployed read-only demo is available at <https://hindsight.strathmoreedu.qzz
 
 See [Architecture](docs/architecture.md), [API and security](docs/api-security.md), and [Operations](docs/operations.md) for the boundaries behind these capabilities.
 
+## Public walkthrough
+
+The public cockpit opens to a credential-free, persisted payments replay. Follow the cited stale memory into the rejected `scale_workers` recommendation, the governed rewind that preserves the historical version, and the approved `throttle_retries` recommendation produced from the same incident input and normalized CloudWatch observations.
+
+Hindsight labels the result as a recorded action change only when the structured actions validate and differ, the controlled inputs match, the correction is proven, and the invalidated memory is absent from the later run. Otherwise it shows only the narrower supported result. Operator mutations require the protected Cognito operator role.
+
+- [Open the cockpit](https://hindsight.strathmoreedu.qzz.io)
+- [Check readiness and deployed revision](https://hindsight.strathmoreedu.qzz.io/v1/health/ready)
+- [Inspect the persisted scenario evidence](https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios)
+
 ## Run locally
 
 Prerequisites: Git, Docker with Compose, Python 3.12, [uv](https://docs.astral.sh/uv/), Node.js 22 with npm, and a Gemini API key supplied through the local process environment.

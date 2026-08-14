@@ -56,6 +56,7 @@ Readiness and public evidence do not require credentials:
 
 ```bash
 curl --fail https://hindsight.strathmoreedu.qzz.io/v1/health/ready
+curl --fail https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios
 curl --fail https://hindsight.strathmoreedu.qzz.io/v1/incidents
 ```
 
