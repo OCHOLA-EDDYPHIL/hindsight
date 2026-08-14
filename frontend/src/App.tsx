@@ -101,6 +101,8 @@ export default function App() {
             rewindTimestamp={cockpit.rewindTimestamp}
             rewindReason={cockpit.rewindReason}
             rewindPreview={cockpit.rewindPreview}
+            consolidationCandidates={cockpit.consolidationCandidates}
+            consolidationPreview={cockpit.consolidationPreview}
             onIncident={cockpit.selectIncident}
             onIncidentInput={cockpit.setIncidentInput}
             onReset={cockpit.resetDemo}
@@ -111,6 +113,9 @@ export default function App() {
             onRewindReason={cockpit.setRewindReason}
             onPreview={cockpit.previewRewind}
             onExecute={cockpit.executeRewind}
+            onLoadCandidates={cockpit.loadConsolidationCandidates}
+            onPreviewCandidateReview={cockpit.previewConsolidationReview}
+            onExecuteCandidateReview={cockpit.executeConsolidationReview}
             onSignOut={cockpit.signOut}
           />
         ) : null}

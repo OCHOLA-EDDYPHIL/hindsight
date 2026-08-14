@@ -303,4 +303,76 @@ describe("operator console", () => {
     fireEvent.click(approve);
     expect(props.onDecision).toHaveBeenCalledWith(true);
   });
+
+  it("requires a bound preview before executing a generated lesson review", () => {
+    const onPreviewCandidateReview = vi.fn();
+    const onExecuteCandidateReview = vi.fn();
+    const candidateFingerprint = "a".repeat(64);
+    const evidenceFingerprint = "b".repeat(64);
+    const { rerender } = render(
+      <OperatorConsole
+        {...props}
+        consolidationCandidates={[
+          {
+            candidate_id: "candidate-1",
+            candidate_memory_id: "memory-1",
+            incident_id: "incident-1",
+            incident_slug: "retry-storm",
+            incident_title: "Retry storm",
+            namespace: "demo:review",
+            content: "Throttle retries after checking downstream health.",
+            content_schema: "procedural_lesson.v1",
+            structured_payload: {},
+            trust_status: "review_required",
+            review_status: "pending",
+            candidate_fingerprint: candidateFingerprint,
+            evidence_fingerprint: evidenceFingerprint,
+            evidence: [],
+            created_at: "2026-08-14T00:00:00Z",
+            updated_at: "2026-08-14T00:00:00Z",
+          },
+        ]}
+        onPreviewCandidateReview={onPreviewCandidateReview}
+        onExecuteCandidateReview={onExecuteCandidateReview}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Execute bound review" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Preview approval" }));
+    expect(onPreviewCandidateReview).toHaveBeenCalledWith(
+      "candidate-1",
+      "approve",
+      expect.any(String),
+    );
+
+    rerender(
+      <OperatorConsole
+        {...props}
+        consolidationCandidates={[]}
+        consolidationPreview={{
+          id: "preview-1",
+          operation_type: "consolidation_approval",
+          fingerprint: "c".repeat(64),
+          expires_at: "2026-08-14T01:00:00Z",
+          request_payload: {
+            candidate_id: "candidate-1",
+            candidate_memory_id: "memory-1",
+            candidate_fingerprint: candidateFingerprint,
+            evidence_fingerprint: evidenceFingerprint,
+            namespace: "demo:review",
+            action: "approve",
+            reason: "Reviewed evidence",
+          },
+          effect_payload: {
+            candidate_memory_id: "memory-1",
+            review_action: "approve",
+            namespace: "demo:review",
+          },
+        }}
+        onExecuteCandidateReview={onExecuteCandidateReview}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Execute bound review" }));
+    expect(onExecuteCandidateReview).toHaveBeenCalledTimes(1);
+  });
 });

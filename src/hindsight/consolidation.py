@@ -11,11 +11,12 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from hindsight.db import connect, database_url
 from hindsight.embedding_index import lock_embedding_index_write_fence
 from hindsight.embeddings import EmbeddingProvider, embedding_provider_from_env
-from hindsight.memory import APPROVED_POSITIVE_GUIDANCE, MemoryStore, Provenance
+from hindsight.memory import MemoryGovernance, MemoryStore, Provenance
 from hindsight.reasoning import ReasoningProvider, ReasoningRequest, reasoning_provider_from_env
 from hindsight.runtime import runtime_settings
 from hindsight.security import safe_error_detail
@@ -25,8 +26,14 @@ LESSON_SCHEMA = "procedural_lesson.v1"
 TERMINAL_JOB_STATUSES = {"completed", "not_eligible", "failed"}
 MAX_CONSOLIDATION_ATTEMPTS = 3
 ELIGIBLE_SOURCE_RELATIONSHIPS = {"summary", "resolution", "root_cause"}
-ELIGIBLE_SOURCE_LINEAGE_STATUSES = {"complete", "legacy_unverified"}
+ELIGIBLE_SOURCE_LINEAGE_STATUSES = {"complete"}
 SOURCE_EVIDENCE_CHANGED_REASON = "source evidence changed during synthesis"
+REVIEW_REQUIRED_CANDIDATE = MemoryGovernance(
+    operator_disposition="unreviewed",
+    safety_status="safe",
+    contradiction_status="supported",
+    usage_instruction="audit_only",
+)
 LESSON_RESPONSE_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -68,6 +75,40 @@ LESSON_RESPONSE_JSON_SCHEMA = {
         },
     },
     "required": ["schema_version", "title", "claims"],
+    "additionalProperties": False,
+}
+
+LESSON_VALIDATION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "claims": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim_index": {"type": "integer", "minimum": 0},
+                    "entailed": {"type": "boolean"},
+                    "safe": {"type": "boolean"},
+                    "reason_code": {
+                        "type": "string",
+                        "enum": [
+                            "supported",
+                            "not_entailed",
+                            "unsafe_action",
+                            "ambiguous",
+                        ],
+                    },
+                },
+                "required": ["claim_index", "entailed", "safe", "reason_code"],
+                "additionalProperties": False,
+            },
+        },
+        "overall_entailed": {"type": "boolean"},
+        "overall_safe": {"type": "boolean"},
+    },
+    "required": ["schema_version", "claims", "overall_entailed", "overall_safe"],
     "additionalProperties": False,
 }
 
@@ -166,6 +207,144 @@ def enqueue_consolidation_job(
                     (incident_id, source_event_id),
                 )
                 return dict(cur.fetchone())
+
+
+def list_consolidation_candidates(
+    *,
+    review_status: str | None = None,
+    limit: int = 50,
+    db_url: str | None = None,
+) -> list[dict[str, Any]]:
+    """List generated lesson candidates for an authenticated operator."""
+
+    if review_status is not None and review_status not in {"pending", "approved", "rejected"}:
+        raise ValueError("unsupported consolidation candidate review status")
+    if limit < 1 or limit > 200:
+        raise ValueError("limit must be between 1 and 200")
+    with connect(db_url, application_name="hindsight-api") as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                    SELECT job.id AS candidate_id, job.incident_id, job.review_status,
+                           job.candidate_fingerprint, job.evidence_fingerprint,
+                           job.evidence_manifest, job.source_event_id,
+                           job.reviewed_by, job.review_reason, job.reviewed_at,
+                           job.review_operation_id, job.approved_memory_id,
+                           job.created_at, job.updated_at,
+                           memory.id AS candidate_memory_id, memory.namespace,
+                           memory.content, memory.content_schema,
+                           memory.structured_payload, memory.trust_status,
+                           incident.slug AS incident_slug, incident.title AS incident_title
+                    FROM consolidation_jobs AS job
+                    JOIN semantic_memories AS memory ON memory.id = job.lesson_memory_id
+                    JOIN incidents AS incident ON incident.id = job.incident_id
+                    WHERE job.review_status IN ('pending', 'approved', 'rejected')
+                        AND (%s IS NULL OR job.review_status = %s)
+                    ORDER BY job.updated_at DESC, job.id
+                    LIMIT %s
+                """,
+                (review_status, review_status, limit),
+            )
+            candidates = [dict(row) for row in cur.fetchall()]
+            for candidate in candidates:
+                candidate["evidence"] = _candidate_evidence(cur, candidate)
+            return candidates
+
+
+def get_consolidation_candidate(
+    *, candidate_id: str, db_url: str | None = None
+) -> dict[str, Any] | None:
+    """Return one candidate with digest-bound generation and validation receipts."""
+
+    with connect(db_url, application_name="hindsight-api") as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                    SELECT job.*, memory.namespace, memory.content,
+                           memory.content_schema, memory.structured_payload,
+                           memory.metadata, memory.trust_status, memory.t_invalid,
+                           incident.slug AS incident_slug, incident.title AS incident_title
+                    FROM consolidation_jobs AS job
+                    JOIN semantic_memories AS memory ON memory.id = job.lesson_memory_id
+                    JOIN incidents AS incident ON incident.id = job.incident_id
+                    WHERE job.id = %s
+                """,
+                (candidate_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            candidate = dict(row)
+            candidate["candidate_id"] = str(candidate["id"])
+            candidate["candidate_memory_id"] = str(candidate["lesson_memory_id"])
+            candidate["evidence"] = _candidate_evidence(cur, candidate)
+            return candidate
+
+
+def _candidate_evidence(cur: Any, candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    manifest = dict(candidate.get("evidence_manifest") or {})
+    results: list[dict[str, Any]] = []
+    for item in manifest.get("items") or []:
+        expected = dict(item)
+        evidence_id = str(expected.get("evidence_id") or "")
+        if evidence_id.startswith("memory:"):
+            cur.execute(
+                """
+                    SELECT memory.content, memory.namespace, memory.trust_status,
+                           memory.lineage_status, memory.t_invalid,
+                           link.relationship
+                    FROM semantic_memories AS memory
+                    LEFT JOIN incident_semantic_memories AS link
+                        ON link.memory_id = memory.id AND link.incident_id = %s
+                    WHERE memory.id = %s
+                """,
+                (candidate["incident_id"], expected.get("memory_id")),
+            )
+            row = cur.fetchone()
+            content = str(row["content"]) if row is not None else None
+            current_sha = (
+                hashlib.sha256(content.encode("utf-8")).hexdigest() if content is not None else None
+            )
+            results.append(
+                {
+                    **expected,
+                    "content": content,
+                    "current_sha256": current_sha,
+                    "matches_manifest": current_sha == expected.get("sha256"),
+                    "trust_status": row["trust_status"] if row is not None else "missing",
+                    "lineage_status": row["lineage_status"] if row is not None else "missing",
+                    "current": bool(row is not None and row["t_invalid"] is None),
+                    "current_relationship": row["relationship"] if row is not None else None,
+                }
+            )
+            continue
+        cur.execute(
+            """
+                SELECT structured_payload, event_type, event_schema
+                FROM incident_events
+                WHERE id = %s AND incident_id = %s
+            """,
+            (expected.get("event_id"), candidate["incident_id"]),
+        )
+        row = cur.fetchone()
+        content = (
+            json.dumps(dict(row["structured_payload"]), sort_keys=True) if row is not None else None
+        )
+        current_sha = (
+            hashlib.sha256(content.encode("utf-8")).hexdigest() if content is not None else None
+        )
+        results.append(
+            {
+                **expected,
+                "content": content,
+                "current_sha256": current_sha,
+                "matches_manifest": current_sha == expected.get("sha256"),
+                "event_type": row["event_type"] if row is not None else "missing",
+                "event_schema": row["event_schema"] if row is not None else "missing",
+                "current": row is not None,
+            }
+        )
+    return results
 
 
 def consolidate_resolved_incident(
@@ -320,9 +499,41 @@ def process_consolidation_job(
                     raise ConsolidationLeaseLostError(
                         f"consolidation lease is no longer current: {job_id}"
                     )
-        lesson = _generate_lesson(provider=provider, context=context, evidence=evidence)
+        lesson, generation_receipt = _generate_lesson_with_receipt(
+            provider=provider,
+            context=context,
+            evidence=evidence,
+        )
         _validate_lesson(lesson=lesson, evidence=evidence)
         content = _render_lesson(lesson)
+        evidence_manifest = _evidence_manifest(context=context, evidence=evidence)
+        evidence_fingerprint = evidence_digest(evidence_manifest)
+        candidate_fingerprint = evidence_digest(
+            {
+                "content_schema": LESSON_SCHEMA,
+                "content": content,
+                "structured_payload": lesson,
+            }
+        )
+        validation_receipt = _validate_lesson_semantics(
+            provider=provider,
+            context=context,
+            lesson=lesson,
+            evidence=evidence,
+        )
+        if validation_receipt["status"] != "passed":
+            return _fail_candidate_validation(
+                job_id=job_id,
+                lease_owner=lease_owner,
+                lesson=lesson,
+                content=content,
+                candidate_fingerprint=candidate_fingerprint,
+                evidence_manifest=evidence_manifest,
+                evidence_fingerprint=evidence_fingerprint,
+                generation_receipt=generation_receipt,
+                validation_receipt=validation_receipt,
+                db_url=resolved_url,
+            )
         prepared_embedding = embeddings.embed_document(content)
         parent_ids = sorted(
             {
@@ -374,15 +585,19 @@ def process_consolidation_job(
                     provenance=Provenance(
                         writer=CONSOLIDATION_WRITER,
                         source_ref=f"incident_event:{context['resolution_event']['id']}",
-                        justification="Publish evidence-verified procedural lesson",
+                        justification="Record an evidence-validated procedural lesson candidate",
                     ),
                     metadata={
                         "role": "consolidated-lesson",
+                        "candidate_fingerprint": candidate_fingerprint,
+                        "evidence_fingerprint": evidence_fingerprint,
+                        "consolidation_job_id": job_id,
                         "source_incident_id": str(context["incident"]["id"]),
                         "source_incident_slug": context["incident"]["slug"],
                         "source_memory_ids": [str(row["id"]) for row in source_memories],
                     },
-                    governance=APPROVED_POSITIVE_GUIDANCE,
+                    governance=REVIEW_REQUIRED_CANDIDATE,
+                    trust_status="review_required",
                     content_schema=LESSON_SCHEMA,
                     structured_payload=lesson,
                     producer_decision_id=decision_id,
@@ -413,13 +628,18 @@ def process_consolidation_job(
                     job_id=job_id,
                     lease_owner=lease_owner,
                     memory=memory,
+                    candidate_fingerprint=candidate_fingerprint,
+                    evidence_manifest=evidence_manifest,
+                    evidence_fingerprint=evidence_fingerprint,
+                    generation_receipt=generation_receipt,
+                    validation_receipt=validation_receipt,
                 )
         return ConsolidationResult(
             context["incident"],
             context["namespace"],
             memory,
             True,
-            None,
+            "candidate requires operator review",
             [str(row["id"]) for row in source_memories],
             job_id,
         )
@@ -574,7 +794,10 @@ def _load_context(
                 or event["event_type"] != "incident_resolved"
                 or event["event_schema"] != "incident_resolution.v1"
             ):
-                return {"incident": dict(incident), "reason": "structured resolution evidence missing"}
+                return {
+                    "incident": dict(incident),
+                    "reason": "structured resolution evidence missing",
+                }
             cur.execute(
                 """
                     SELECT memory.*, link.relationship AS incident_relationship
@@ -582,7 +805,7 @@ def _load_context(
                     JOIN semantic_memories AS memory ON memory.id = link.memory_id
                     WHERE link.incident_id = %s
                         AND link.relationship IN ('summary', 'resolution', 'root_cause')
-                        AND memory.lineage_status IN ('complete', 'legacy_unverified')
+                        AND memory.lineage_status = 'complete'
                         AND memory.trust_status = 'active'
                         AND memory.t_invalid IS NULL
                     ORDER BY memory.written_at, memory.id
@@ -590,9 +813,7 @@ def _load_context(
                 (incident["id"],),
             )
             memories = [dict(row) for row in cur.fetchall()]
-            target_namespace = namespace or (
-                str(memories[0]["namespace"]) if memories else None
-            )
+            target_namespace = namespace or (str(memories[0]["namespace"]) if memories else None)
             if not memories:
                 return {
                     "incident": dict(incident),
@@ -841,7 +1062,7 @@ def _decision_has_ineligible_source_read(
                         OR memory.id IS NULL
                         OR memory.t_invalid IS NOT NULL
                         OR memory.trust_status != 'active'
-                        OR memory.lineage_status NOT IN ('complete', 'legacy_unverified')
+                        OR memory.lineage_status != 'complete'
                         OR link.memory_id IS NULL
                         OR link.relationship NOT IN ('summary', 'resolution', 'root_cause')
                     )
@@ -863,46 +1084,199 @@ def _evidence_catalog(context: dict[str, Any]) -> dict[str, str]:
     return catalog
 
 
+def _evidence_manifest(*, context: dict[str, Any], evidence: dict[str, str]) -> dict[str, Any]:
+    memory_details = {
+        f"memory:{memory['id']}": {
+            "memory_id": str(memory["id"]),
+            "namespace": str(memory["namespace"]),
+            "relationship": str(memory["incident_relationship"]),
+        }
+        for memory in context["source_memories"]
+    }
+    event_id = str(context["resolution_event"]["id"])
+    return {
+        "schema_version": 1,
+        "incident_id": str(context["incident"]["id"]),
+        "source_event_id": str(context["resolution_event"]["id"]),
+        "items": [
+            {
+                "evidence_id": evidence_id,
+                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                **(
+                    memory_details[evidence_id]
+                    if evidence_id in memory_details
+                    else {
+                        "event_id": event_id,
+                        "namespace": None,
+                        "relationship": "resolution_event",
+                    }
+                ),
+            }
+            for evidence_id, value in sorted(evidence.items())
+        ],
+    }
+
+
 def _generate_lesson(
     *, provider: ReasoningProvider, context: dict[str, Any], evidence: dict[str, str]
 ) -> dict[str, Any]:
+    """Compatibility helper returning only the generated lesson payload."""
+
+    lesson, _receipt = _generate_lesson_with_receipt(
+        provider=provider,
+        context=context,
+        evidence=evidence,
+    )
+    return lesson
+
+
+def _generate_lesson_with_receipt(
+    *, provider: ReasoningProvider, context: dict[str, Any], evidence: dict[str, str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    system = (
+        "Return only JSON for procedural_lesson.v1. Every claim must have one or more "
+        "citations. Each citation requires evidence_id and an exact verbatim quote from "
+        "that evidence. Do not infer facts that are not quoted."
+    )
+    prompt = json.dumps(
+        {
+            "incident": _jsonable(context["incident"]),
+            "service": _jsonable(context["service"]),
+            "evidence": evidence,
+            "required_shape": {
+                "schema_version": 1,
+                "title": "string",
+                "claims": [
+                    {
+                        "kind": "situation|diagnostic_check|safe_action|avoidance",
+                        "text": "string",
+                        "citations": [
+                            {"evidence_id": "memory:uuid or event:uuid", "quote": "exact"}
+                        ],
+                    }
+                ],
+            },
+        },
+        sort_keys=True,
+        default=str,
+    )
     response = provider.generate(
         ReasoningRequest(
-            system=(
-                "Return only JSON for procedural_lesson.v1. Every claim must have one or more "
-                "citations. Each citation requires evidence_id and an exact verbatim quote from "
-                "that evidence. Do not infer facts that are not quoted."
-            ),
-            prompt=json.dumps(
-                {
-                    "incident": _jsonable(context["incident"]),
-                    "service": _jsonable(context["service"]),
-                    "evidence": evidence,
-                    "required_shape": {
-                        "schema_version": 1,
-                        "title": "string",
-                        "claims": [
-                            {
-                                "kind": "situation|diagnostic_check|safe_action|avoidance",
-                                "text": "string",
-                                "citations": [
-                                    {"evidence_id": "memory:uuid or event:uuid", "quote": "exact"}
-                                ],
-                            }
-                        ],
-                    },
-                },
-                sort_keys=True,
-                default=str,
-            ),
+            system=system,
+            prompt=prompt,
             temperature=0.0,
             max_output_tokens=2048,
-            routing_key=f"consolidation:{context['incident']['id']}",
+            routing_key=f"consolidation:{context['incident']['id']}:generate",
             response_json_schema=LESSON_RESPONSE_JSON_SCHEMA,
             thinking_budget=0,
         )
     )
-    return _parse_lesson_response(response.text)
+    return _parse_lesson_response(response.text), _reasoning_receipt(
+        response=response,
+        system=system,
+        prompt=prompt,
+        response_schema=LESSON_RESPONSE_JSON_SCHEMA,
+        purpose="generation",
+    )
+
+
+def _validate_lesson_semantics(
+    *,
+    provider: ReasoningProvider,
+    context: dict[str, Any],
+    lesson: dict[str, Any],
+    evidence: dict[str, str],
+) -> dict[str, Any]:
+    """Require a separate claim-level entailment and operational-safety judgment."""
+
+    system = (
+        "Act as a strict evidence and operational-safety validator. A claim is entailed only "
+        "when its meaning follows from the cited evidence, not merely because an unrelated "
+        "quote appears in that evidence. Mark destructive or unbounded operational actions "
+        "unsafe. Return only the requested JSON."
+    )
+    prompt = json.dumps(
+        {
+            "validation_kind": "procedural_lesson_entailment.v1",
+            "incident_id": str(context["incident"]["id"]),
+            "lesson": lesson,
+            "evidence": evidence,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    response = provider.generate(
+        ReasoningRequest(
+            system=system,
+            prompt=prompt,
+            temperature=0.0,
+            max_output_tokens=1024,
+            routing_key=f"consolidation:{context['incident']['id']}:validate",
+            response_json_schema=LESSON_VALIDATION_JSON_SCHEMA,
+            thinking_budget=0,
+        )
+    )
+    receipt = _reasoning_receipt(
+        response=response,
+        system=system,
+        prompt=prompt,
+        response_schema=LESSON_VALIDATION_JSON_SCHEMA,
+        purpose="validation",
+    )
+    try:
+        result = _parse_lesson_response(response.text)
+    except LessonValidationError as exc:
+        return {
+            **receipt,
+            "status": "failed",
+            "reason_code": "invalid_validator_response",
+            "detail": str(exc),
+        }
+    claims = result.get("claims")
+    expected_indexes = list(range(len(lesson["claims"])))
+    if (
+        result.get("schema_version") != 1
+        or not isinstance(claims, list)
+        or [item.get("claim_index") for item in claims if isinstance(item, dict)]
+        != expected_indexes
+        or result.get("overall_entailed") is not True
+        or result.get("overall_safe") is not True
+        or any(
+            not isinstance(item, dict)
+            or item.get("entailed") is not True
+            or item.get("safe") is not True
+            or item.get("reason_code") != "supported"
+            for item in claims or []
+        )
+    ):
+        return {
+            **receipt,
+            "result": result,
+            "status": "failed",
+            "reason_code": "semantic_entailment_or_safety_not_proven",
+        }
+    return {**receipt, "result": result, "status": "passed", "reason_code": "supported"}
+
+
+def _reasoning_receipt(
+    *,
+    response: Any,
+    system: str,
+    prompt: str,
+    response_schema: dict[str, Any],
+    purpose: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "purpose": purpose,
+        "provider": str(response.provider),
+        "model": str(response.model),
+        "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "response_schema_sha256": evidence_digest(response_schema),
+        "response_sha256": hashlib.sha256(response.text.encode("utf-8")).hexdigest(),
+        "usage": _jsonable(dict(response.usage)),
+    }
 
 
 def _parse_lesson_response(text: str) -> dict[str, Any]:
@@ -949,7 +1323,11 @@ def _validate_lesson(*, lesson: dict[str, Any], evidence: dict[str, str]) -> Non
             quote = citation.get("quote")
             if evidence_id not in evidence:
                 raise LessonValidationError(f"claim {index} cites ineligible evidence")
-            if not isinstance(quote, str) or not quote.strip() or quote not in evidence[evidence_id]:
+            if (
+                not isinstance(quote, str)
+                or not quote.strip()
+                or quote not in evidence[evidence_id]
+            ):
                 raise LessonValidationError(f"claim {index} quote is not exact evidence")
 
 
@@ -965,9 +1343,7 @@ def _render_lesson(lesson: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _existing_lesson(
-    conn: Any, *, incident_id: UUID, namespace: str
-) -> dict[str, Any] | None:
+def _existing_lesson(conn: Any, *, incident_id: UUID, namespace: str) -> dict[str, Any] | None:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
@@ -986,11 +1362,32 @@ def _existing_lesson(
         return dict(row) if row else None
 
 
-def _complete_job(conn: Any, *, job_id: str, lease_owner: str, memory: dict[str, Any]) -> None:
+def _complete_job(
+    conn: Any,
+    *,
+    job_id: str,
+    lease_owner: str,
+    memory: dict[str, Any],
+    candidate_fingerprint: str | None = None,
+    evidence_manifest: dict[str, Any] | None = None,
+    evidence_fingerprint: str | None = None,
+    generation_receipt: dict[str, Any] | None = None,
+    validation_receipt: dict[str, Any] | None = None,
+) -> None:
     row = conn.execute(
         """
             UPDATE consolidation_jobs
             SET status = 'completed', lesson_belief_id = %s, lesson_memory_id = %s,
+                candidate_payload = COALESCE(%s, candidate_payload),
+                candidate_content = COALESCE(%s, candidate_content),
+                candidate_fingerprint = COALESCE(%s, candidate_fingerprint),
+                evidence_manifest = COALESCE(%s, evidence_manifest),
+                evidence_fingerprint = COALESCE(%s, evidence_fingerprint),
+                generation_receipt = COALESCE(%s, generation_receipt),
+                validation_receipt = COALESCE(%s, validation_receipt),
+                review_status = CASE
+                    WHEN %s::STRING IS NULL THEN review_status ELSE 'pending'
+                END,
                 reason = NULL, error_code = NULL, error_detail = NULL,
                 completed_at = now(), updated_at = now(), lease_owner = NULL,
                 lease_expires_at = NULL
@@ -1001,6 +1398,14 @@ def _complete_job(conn: Any, *, job_id: str, lease_owner: str, memory: dict[str,
         (
             memory["belief_id"],
             memory["id"],
+            Jsonb(dict(memory["structured_payload"])) if candidate_fingerprint else None,
+            str(memory["content"]) if candidate_fingerprint else None,
+            candidate_fingerprint,
+            Jsonb(evidence_manifest) if evidence_manifest is not None else None,
+            evidence_fingerprint,
+            Jsonb(generation_receipt) if generation_receipt is not None else None,
+            Jsonb(validation_receipt) if validation_receipt is not None else None,
+            candidate_fingerprint,
             job_id,
             lease_owner,
         ),
@@ -1117,6 +1522,64 @@ def _fail_job_and_decision(
                     RETURNING id
                 """,
                 (reason[:1000], job_id, lease_owner),
+            ).fetchone()
+            if row is None:
+                raise ConsolidationLeaseLostError(
+                    f"consolidation lease is no longer current: {job_id}"
+                )
+    return _result_for_job(job=_get_job(job_id=job_id, db_url=db_url), db_url=db_url)
+
+
+def _fail_candidate_validation(
+    *,
+    job_id: str,
+    lease_owner: str,
+    lesson: dict[str, Any],
+    content: str,
+    candidate_fingerprint: str,
+    evidence_manifest: dict[str, Any],
+    evidence_fingerprint: str,
+    generation_receipt: dict[str, Any],
+    validation_receipt: dict[str, Any],
+    db_url: str,
+) -> ConsolidationResult:
+    """Retain digest-bound audit material while keeping an invalid candidate inactive."""
+
+    reason = "invalid_lesson:semantic entailment or operational safety was not proven"
+    with connect(db_url, application_name="hindsight-consolidation") as conn:
+        with conn.transaction():
+            job = _lock_current_lease(
+                conn,
+                job_id=job_id,
+                lease_owner=lease_owner,
+            )
+            _fail_open_decision(conn, decision_id=job.get("decision_id"))
+            row = conn.execute(
+                """
+                    UPDATE consolidation_jobs
+                    SET status = 'failed', reason = %s,
+                        candidate_payload = %s, candidate_content = %s,
+                        candidate_fingerprint = %s,
+                        evidence_manifest = %s, evidence_fingerprint = %s,
+                        generation_receipt = %s, validation_receipt = %s,
+                        review_status = 'unavailable', completed_at = now(),
+                        updated_at = now(), lease_owner = NULL, lease_expires_at = NULL
+                    WHERE id = %s AND status = 'leased' AND lease_owner = %s
+                        AND lease_expires_at > now()
+                    RETURNING id
+                """,
+                (
+                    reason,
+                    Jsonb(lesson),
+                    content,
+                    candidate_fingerprint,
+                    Jsonb(evidence_manifest),
+                    evidence_fingerprint,
+                    Jsonb(generation_receipt),
+                    Jsonb(validation_receipt),
+                    job_id,
+                    lease_owner,
+                ),
             ).fetchone()
             if row is None:
                 raise ConsolidationLeaseLostError(

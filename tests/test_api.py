@@ -43,7 +43,48 @@ def test_openapi_exposes_narrow_product_contract():
     assert "post" in paths["/v2/namespaces/{namespace}/rewinds/preview"]
     assert "/v1/demo/poison-rewind/poison" not in paths
     assert "post" in paths["/v2/demo/poison-rewind/poison"]
+    assert "get" in paths["/v2/memory/consolidation-candidates"]
+    assert "get" in paths["/v2/memory/consolidation-candidates/{candidate_id}"]
+    assert "post" in paths["/v2/memory/consolidation-candidates/{candidate_id}/review-preview"]
     assert "get" in paths["/v2/me"]
+
+
+def test_consolidation_review_preview_binds_authenticated_operator(monkeypatch):
+    import hindsight.api as api
+
+    captured = []
+    identity = _product_identity()
+    monkeypatch.setattr(api, "_v2_identity", lambda _request: identity)
+    monkeypatch.setattr(api, "runtime_database_url", lambda: "postgresql://resolved/database")
+    monkeypatch.setattr(
+        api,
+        "preview_consolidation_review",
+        lambda **kwargs: (
+            captured.append(kwargs)
+            or {
+                "id": "preview-1",
+                "operation_type": "consolidation_approval",
+                "fingerprint": "a" * 64,
+            }
+        ),
+    )
+
+    response = TestClient(api.app).post(
+        "/v2/memory/consolidation-candidates/candidate-1/review-preview",
+        json={"action": "approve", "reason": "Evidence reviewed"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["operation_type"] == "consolidation_approval"
+    assert captured == [
+        {
+            "candidate_id": "candidate-1",
+            "action": "approve",
+            "actor": identity.actor,
+            "reason": "Evidence reviewed",
+            "db_url": "postgresql://resolved/database",
+        }
+    ]
 
 
 def test_public_surface_has_no_mutation_or_operator_session():

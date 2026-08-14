@@ -1205,6 +1205,77 @@ textarea:focus-visible {
   font: 500 0.58rem/1 var(--font-mono);
 }
 
+.consolidation-review-console {
+  display: grid;
+  gap: 0.75rem;
+  border-top: 1px solid var(--color-line);
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+}
+
+.consolidation-review-console > header,
+.consolidation-candidates > li,
+.candidate-review-actions,
+.candidate-review-preview {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.consolidation-review-console > header {
+  justify-content: space-between;
+}
+
+.consolidation-candidates {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.consolidation-candidates > li {
+  justify-content: space-between;
+  border: 1px solid var(--color-line);
+  padding: 0.7rem;
+}
+
+.consolidation-candidates > li > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 0.25rem;
+}
+
+.candidate-evidence {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.candidate-evidence > li {
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.25fr) minmax(12rem, 1fr) auto;
+  gap: 0.5rem;
+  border-top: 1px solid var(--color-line);
+  padding-top: 0.35rem;
+}
+
+.consolidation-candidates span,
+.consolidation-candidates small,
+.candidate-review-preview small {
+  color: var(--color-faint);
+  font: 500 0.6rem/1.45 var(--font-mono);
+}
+
+.candidate-review-preview {
+  justify-content: space-between;
+  border-left: 2px solid var(--color-warning);
+  background: rgb(226 184 107 / 0.04);
+  padding: 0.65rem 0.75rem;
+}
+
 .rewind-console {
   display: grid;
   grid-template-columns: minmax(12rem, 0.6fr) minmax(12rem, 0.7fr) minmax(16rem, 1fr) auto;
@@ -1563,6 +1634,20 @@ textarea:focus-visible {
   }
 
   .approval-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .consolidation-candidates > li,
+  .candidate-review-preview {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .candidate-review-actions {
+    flex-wrap: wrap;
+  }
+
+  .candidate-evidence > li {
     grid-template-columns: minmax(0, 1fr);
   }
 

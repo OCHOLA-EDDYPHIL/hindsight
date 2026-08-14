@@ -151,10 +151,65 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
     assert lesson[3] == "procedural_lesson.v1"
     claims = dict(lesson[4])["claims"]
     assert claims and all(claim["citations"] for claim in claims)
-    assert lesson[5] == "active"
+    assert lesson[5] == "review_required"
     assert lesson[6] is None
     assert source_read == 1
     assert lesson_link == ("lesson",)
+
+    excluded_decision = f"live-managed-candidate-exclusion:{token}"
+    with MemoryStore(url=settings.database_url, embedding_provider=embeddings) as store:
+        excluded = store.retrieve_semantic(
+            namespace=namespace,
+            query=(
+                "What reusable response should we take when a remote payment processor "
+                "stalls and repeated attempts multiply the queue?"
+            ),
+            decision_id=excluded_decision,
+            reader="live.hosted_acceptance",
+            purpose="Verify the generated candidate is excluded before operator review",
+            policy="semantic_strict",
+            limit=5,
+        )
+        store.seal_decision(decision_id=excluded_decision)
+    assert str(job[4]) not in {str(hit["id"]) for hit in excluded.hits}
+
+    preview = _post_json(
+        f"{api_url}/v2/memory/consolidation-candidates/{job[0]}/review-preview",
+        token=operator_token,
+        payload={
+            "action": "approve",
+            "reason": "Citations, entailment, and operational safety reviewed",
+        },
+    )
+    accepted = _post_json(
+        f"{api_url}/v2/memory/operations",
+        token=operator_token,
+        payload={"preview_id": preview["id"], "fingerprint": preview["fingerprint"]},
+        extra_headers={"Idempotency-Key": uuid4().hex},
+    )
+    operation_deadline = time.monotonic() + 300
+    operation_status = None
+    approved_memory_id = None
+    while time.monotonic() < operation_deadline:
+        with connect(
+            settings.database_url,
+            application_name="hindsight-hosted-acceptance",
+        ) as conn:
+            operation_status = conn.execute(
+                "SELECT status FROM memory_operations WHERE id = %s",
+                (accepted["operation_id"],),
+            ).fetchone()[0]
+            approved_memory_id = conn.execute(
+                "SELECT approved_memory_id FROM consolidation_jobs WHERE id = %s",
+                (job[0],),
+            ).fetchone()[0]
+        if operation_status == "completed":
+            break
+        if operation_status in {"conflict", "failed"}:
+            pytest.fail(f"candidate approval ended in {operation_status}")
+        time.sleep(2)
+    assert operation_status == "completed"
+    assert approved_memory_id is not None
 
     retrieval_decision = f"live-managed-lesson-retrieval:{token}"
     with MemoryStore(url=settings.database_url, embedding_provider=embeddings) as store:
@@ -166,13 +221,13 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
             ),
             decision_id=retrieval_decision,
             reader="live.hosted_acceptance",
-            purpose="Verify the asynchronously published lesson is usable by semantic recall",
+            purpose="Verify the operator-approved successor is usable by semantic recall",
             policy="semantic_strict",
             limit=5,
         )
         store.seal_decision(decision_id=retrieval_decision)
     assert retrieval.selected_strategy == "semantic_vector"
-    assert str(job[4]) in {str(hit["id"]) for hit in retrieval.hits}
+    assert str(approved_memory_id) in {str(hit["id"]) for hit in retrieval.hits}
 
 
 @requires_hosted_acceptance
@@ -188,12 +243,8 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
 
     database_url = runtime_database_url()
     token = _acceptance_token("worker")
-    lease_seconds = _positive_int_env(
-        "HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS"
-    )
-    visibility_seconds = _positive_int_env(
-        "HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS"
-    )
+    lease_seconds = _positive_int_env("HINDSIGHT_ACCEPTANCE_RUN_ATTEMPT_LEASE_SECONDS")
+    visibility_seconds = _positive_int_env("HINDSIGHT_ACCEPTANCE_QUEUE_VISIBILITY_SECONDS")
     max_attempts = _positive_int_env("HINDSIGHT_ACCEPTANCE_RUN_MAX_ATTEMPTS")
     scheduler_seconds = _positive_int_env("HINDSIGHT_ACCEPTANCE_SCHEDULER_SECONDS")
     assert max_attempts == 3
@@ -280,9 +331,7 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
         incident_slug=exhausted_slug,
         namespace=f"hosted-dlq:{token}",
         user_input="Verify exhausted source delivery is finalized from the DLQ",
-        dispatch_available_at=(
-            datetime.now(UTC) + timedelta(seconds=max_attempts * 2 + 5)
-        ),
+        dispatch_available_at=(datetime.now(UTC) + timedelta(seconds=max_attempts * 2 + 5)),
         db_url=database_url,
     )
     for expected_attempt in range(1, max_attempts + 1):
@@ -301,11 +350,7 @@ def test_scheduled_dispatch_reclaims_expired_attempt_and_finalizes_dlq():
         str(exhausted["id"]),
         expected={"failed"},
         database_url=database_url,
-        timeout=(
-            scheduler_seconds * 2
-            + visibility_seconds * (max_attempts + 1)
-            + 120
-        ),
+        timeout=(scheduler_seconds * 2 + visibility_seconds * (max_attempts + 1) + 120),
     )
     assert failed["failure_code"] == "RunAttemptsExhausted"
     assert [event["status"] for event in failed["events"]].count("failed") == 1
@@ -365,9 +410,7 @@ def test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe()
             websocket_url=websocket_url,
         )
         first = await connect(first_url, open_timeout=15, close_timeout=15)
-        await first.send(
-            json.dumps({"type": "subscribe", "namespace": namespace, "run_id": None})
-        )
+        await first.send(json.dumps({"type": "subscribe", "namespace": namespace, "run_id": None}))
         await _wait_for_websocket_delivery(
             first,
             api_url=api_url,
@@ -420,9 +463,7 @@ def test_websocket_requires_resubscribe_after_reconnect_and_honors_unsubscribe()
     asyncio.run(scenario())
 
 
-async def _wait_for_websocket_delivery(
-    socket, *, api_url: str, token: str, namespace: str
-) -> None:
+async def _wait_for_websocket_delivery(socket, *, api_url: str, token: str, namespace: str) -> None:
     for _ in range(20):
         result = await asyncio.to_thread(
             _inject_changefeed_event,
@@ -462,9 +503,7 @@ async def _wait_for_websocket_delivery(
     pytest.fail("WebSocket subscription did not become active")
 
 
-async def _wait_for_websocket_silence(
-    socket, *, api_url: str, token: str, namespace: str
-) -> None:
+async def _wait_for_websocket_silence(socket, *, api_url: str, token: str, namespace: str) -> None:
     for _ in range(20):
         result = await asyncio.to_thread(
             _inject_changefeed_event,
@@ -601,9 +640,7 @@ def _post_changefeed_event(
         return exc.code, json.loads(exc.read())
 
 
-def _changefeed_event_payload(
-    *, namespace: str, event_id: str, hlc: str
-) -> dict[str, object]:
+def _changefeed_event_payload(*, namespace: str, event_id: str, hlc: str) -> dict[str, object]:
     return {
         "payload": [
             {
@@ -621,7 +658,13 @@ def _changefeed_event_payload(
     }
 
 
-def _post_json(url: str, *, token: str, payload: dict[str, object]) -> dict[str, object]:
+def _post_json(
+    url: str,
+    *,
+    token: str,
+    payload: dict[str, object],
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, object]:
     body = json.dumps(payload).encode()
     req = request.Request(
         url,
@@ -630,6 +673,7 @@ def _post_json(url: str, *, token: str, payload: dict[str, object]) -> dict[str,
         headers={
             "authorization": f"Bearer {token}",
             "content-type": "application/json",
+            **(extra_headers or {}),
         },
     )
     try:

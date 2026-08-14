@@ -8,11 +8,13 @@ from uuid import uuid4
 import pytest
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from tests.fakes import DeterministicEmbeddingProvider, FixtureLessonReasoningProvider
-
-requires_db = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set"
+from tests.fakes import (
+    DeterministicEmbeddingProvider,
+    FixtureLessonReasoningProvider,
+    lesson_validation_decision,
 )
+
+requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 
 SERVICE_SLUG = "payments-api"
 ROOT_CAUSE = "Retry fanout amplified downstream payment processor timeouts."
@@ -158,9 +160,7 @@ def resolve_demo_incident(
     from hindsight.runs import resolve_incident
 
     with connect(db_url) as conn:
-        row = conn.execute(
-            "SELECT slug FROM incidents WHERE id = %s", (incident_id,)
-        ).fetchone()
+        row = conn.execute("SELECT slug FROM incidents WHERE id = %s", (incident_id,)).fetchone()
     assert row is not None
     incident = resolve_incident(
         slug=str(row[0]),
@@ -247,7 +247,7 @@ def test_incident_changefeed_handler_consolidates_resolved_after_row(monkeypatch
                     "id": str(incident_id),
                     "slug": "incident-resolved",
                     "status": "resolved",
-                }
+                },
             },
             "source_event_id": "event-1",
         },
@@ -327,13 +327,74 @@ def test_lesson_generation_requests_the_validated_response_schema():
     assert provider.request.thinking_budget == 0
 
 
+def test_semantic_validator_rejects_destructive_claim_with_unrelated_quote():
+    import json
+
+    from hindsight.consolidation import _validate_lesson_semantics
+    from hindsight.reasoning import ReasoningResponse
+
+    class RejectingValidator:
+        provider_name = "test-model"
+        model_name = "strict-validator-v1"
+
+        def generate(self, _request):
+            return ReasoningResponse(
+                text=json.dumps(
+                    {
+                        "schema_version": 1,
+                        "claims": [
+                            {
+                                "claim_index": 0,
+                                "entailed": False,
+                                "safe": False,
+                                "reason_code": "unsafe_action",
+                            }
+                        ],
+                        "overall_entailed": False,
+                        "overall_safe": False,
+                    }
+                ),
+                provider=self.provider_name,
+                model=self.model_name,
+            )
+
+    receipt = _validate_lesson_semantics(
+        provider=RejectingValidator(),
+        context={"incident": {"id": "incident-1"}},
+        lesson={
+            "schema_version": 1,
+            "title": "Unsafe lesson",
+            "claims": [
+                {
+                    "kind": "safe_action",
+                    "text": "Delete the production database",
+                    "citations": [
+                        {"evidence_id": "memory:source", "quote": "Queue depth increased"}
+                    ],
+                }
+            ],
+        },
+        evidence={"memory:source": "Queue depth increased during the incident."},
+    )
+
+    assert receipt["status"] == "failed"
+    assert receipt["reason_code"] == "semantic_entailment_or_safety_not_proven"
+    assert receipt["provider"] == "test-model"
+    assert len(receipt["prompt_sha256"]) == 64
+
+
 @requires_db
-def test_consolidation_writes_idempotent_lesson_with_provenance():
+def test_consolidation_requires_fingerprint_bound_approval_before_retrieval():
     import hindsight.consolidation as consolidation
     from hindsight.db import connect, database_url
     from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
     from hindsight.trace_contract import governed_decision_trace
+    from hindsight.operations import (
+        enqueue_operation,
+        execute_operation,
+        preview_consolidation_review,
+    )
 
     namespace = f"consolidation-test-{uuid4()}"
     incident = open_demo_incident(
@@ -364,11 +425,14 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
     assert first.memory["source_ref"] == f"incident_event:{resolved['resolution_event_id']}"
     assert ROOT_CAUSE in first.memory["content"]
     assert first.memory["content_schema"] == "procedural_lesson.v1"
+    assert first.memory["trust_status"] == "review_required"
+    assert first.memory["metadata"]["operator_disposition"] == "unreviewed"
+    assert first.memory["metadata"]["usage_instruction"] == "audit_only"
     assert second.created is False
     assert second.reason == "lesson already exists"
     assert second.memory is not None
     assert second.memory["id"] == first.memory["id"]
-    decision_id = str(uuid4())
+    excluded_decision_id = str(uuid4())
     with MemoryStore(
         url=database_url(),
         embedding_provider=DeterministicEmbeddingProvider(),
@@ -376,32 +440,189 @@ def test_consolidation_writes_idempotent_lesson_with_provenance():
         retrieval = store.retrieve_semantic(
             namespace=namespace,
             query=first.memory["content"],
-            decision_id=decision_id,
+            decision_id=excluded_decision_id,
             reader="consolidation.regression",
-            purpose="prove a consolidated lesson reaches strict retrieval",
+            purpose="prove an unreviewed lesson is excluded from strict retrieval",
             limit=5,
         )
-    assert retrieval.status == "succeeded"
-    assert str(first.memory["id"]) in {str(hit["id"]) for hit in retrieval.hits}
+    assert str(first.memory["id"]) not in {str(hit["id"]) for hit in retrieval.hits}
+
+    preview = preview_consolidation_review(
+        candidate_id=str(first.job_id),
+        action="approve",
+        actor="operator:test",
+        reason="Evidence and operational safety reviewed",
+        db_url=database_url(),
+    )
+    operation, created = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=str(preview["fingerprint"]),
+        idempotency_key=str(uuid4()),
+        actor="operator:test",
+        db_url=database_url(),
+    )
+    assert created is True
+    completed = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=DeterministicEmbeddingProvider(),
+        worker_id="consolidation-approval-test",
+        db_url=database_url(),
+    )
+    assert completed["status"] == "completed"
+
+    decision_id = str(uuid4())
+    with MemoryStore(
+        url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ) as store:
+        approved_retrieval = store.retrieve_semantic(
+            namespace=namespace,
+            query=first.memory["content"],
+            decision_id=decision_id,
+            reader="consolidation.regression",
+            purpose="prove only the approved successor reaches strict retrieval",
+            limit=5,
+        )
+    assert approved_retrieval.status == "succeeded"
+    approved_ids = {str(hit["id"]) for hit in approved_retrieval.hits}
+    assert str(first.memory["id"]) not in approved_ids
     trace = governed_decision_trace(decision_id=decision_id, db_url=database_url())
     assert trace is not None
-    assert str(first.memory["id"]) in {
-        str(read["memory_id"]) for read in trace["reads"]
-    }
+    traced_ids = {str(read["memory_id"]) for read in trace["reads"]}
+    assert approved_ids.intersection(traced_ids)
     with connect() as conn:
-        conn.execute(
+        job = conn.execute(
             """
-                UPDATE semantic_memories
-                SET trust_status = 'review_required'
-                WHERE id = %s
+                SELECT review_status, review_operation_id, approved_memory_id,
+                       generation_receipt, validation_receipt
+                FROM consolidation_jobs WHERE id = %s
             """,
-            (first.memory["id"],),
+            (first.job_id,),
+        ).fetchone()
+        assert job[0] == "approved"
+        assert str(job[1]) == str(operation["id"])
+        assert str(job[2]) in approved_ids
+        assert job[3]["provider"] == "test_fixture_lesson"
+        assert job[4]["status"] == "passed"
+        assert (
+            consolidation._existing_lesson(  # noqa: SLF001 - idempotency regression
+                conn,
+                incident_id=resolved["id"],
+                namespace=namespace,
+            )
+            is None
         )
-        assert consolidation._existing_lesson(  # noqa: SLF001 - idempotency regression
-            conn,
-            incident_id=resolved["id"],
+
+
+@requires_db
+def test_consolidation_rejection_is_operation_bound_and_preserves_audit_candidate():
+    import psycopg
+
+    from hindsight.consolidation import consolidate_resolved_incident
+    from hindsight.db import connect, database_url
+    from hindsight.memory import MemoryStore
+    from hindsight.operations import (
+        enqueue_operation,
+        execute_operation,
+        preview_consolidation_review,
+    )
+    from tests.fakes import DeterministicEmbeddingProvider
+
+    namespace = f"consolidation-rejection-{uuid4()}"
+    incident = open_demo_incident(
+        label="rejected-candidate",
+        namespace=namespace,
+        summary="retry fanout raised checkout latency",
+        db_url=database_url(),
+    )
+    resolved = resolve_demo_incident(
+        incident_id=str(incident["id"]),
+        reflected_memory_id=None,
+        db_url=database_url(),
+    )
+    candidate = consolidate_resolved_incident(
+        incident_id=str(resolved["id"]),
+        db_url=database_url(),
+    )
+    assert candidate.memory is not None
+
+    preview = preview_consolidation_review(
+        candidate_id=str(candidate.job_id),
+        action="reject",
+        actor="operator:reject-test",
+        reason="The proposed action is too broad",
+        db_url=database_url(),
+    )
+    operation, created = enqueue_operation(
+        preview_id=str(preview["id"]),
+        fingerprint=str(preview["fingerprint"]),
+        idempotency_key=str(uuid4()),
+        actor="operator:reject-test",
+        db_url=database_url(),
+    )
+    assert created is True
+
+    with connect() as conn:
+        with pytest.raises(
+            psycopg.errors.RaiseException,
+            match="terminal consolidation review approval is invalid",
+        ):
+            with conn.transaction():
+                conn.execute(
+                    """
+                        UPDATE consolidation_jobs
+                        SET review_status = 'rejected', reviewed_by = %s,
+                            review_reason = %s, reviewed_at = now(),
+                            review_operation_id = %s
+                        WHERE id = %s
+                    """,
+                    (
+                        "operator:reject-test",
+                        "The proposed action is too broad",
+                        operation["id"],
+                        candidate.job_id,
+                    ),
+                )
+
+    completed = execute_operation(
+        operation_id=str(operation["id"]),
+        embedding_provider=DeterministicEmbeddingProvider(),
+        worker_id="consolidation-rejection-test",
+        db_url=database_url(),
+    )
+    assert completed["status"] == "completed"
+
+    with connect() as conn:
+        review = conn.execute(
+            """
+                SELECT review_status, approved_memory_id
+                FROM consolidation_jobs WHERE id = %s
+            """,
+            (candidate.job_id,),
+        ).fetchone()
+        memory = conn.execute(
+            """
+                SELECT trust_status, t_invalid
+                FROM semantic_memories WHERE id = %s
+            """,
+            (candidate.memory["id"],),
+        ).fetchone()
+    assert review == ("rejected", None)
+    assert memory == ("review_required", None)
+
+    with MemoryStore(
+        url=database_url(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+    ) as store:
+        retrieval = store.retrieve_semantic(
             namespace=namespace,
-        ) is None
+            query=candidate.memory["content"],
+            decision_id=str(uuid4()),
+            reader="consolidation.rejection-regression",
+            purpose="prove a rejected candidate remains excluded",
+            limit=5,
+        )
+    assert str(candidate.memory["id"]) not in {str(hit["id"]) for hit in retrieval.hits}
 
 
 @requires_db
@@ -600,10 +821,14 @@ def test_consolidation_excludes_quarantined_rows_from_mixed_source_evidence():
 
         def generate(self, request):
             prompt = json.loads(request.prompt)
+            if prompt.get("validation_kind") == "procedural_lesson_entailment.v1":
+                return ReasoningResponse(
+                    text=lesson_validation_decision(prompt["lesson"]),
+                    provider=self.provider_name,
+                    model=self.model_name,
+                )
             self.evidence_ids = set(prompt["evidence"])
-            evidence_id = next(
-                key for key in prompt["evidence"] if key.startswith("memory:")
-            )
+            evidence_id = next(key for key in prompt["evidence"] if key.startswith("memory:"))
             return ReasoningResponse(
                 text=json.dumps(
                     {
@@ -717,9 +942,13 @@ def test_governance_change_during_synthesis_prevents_lesson_publication():
 
         def generate(self, request):
             prompt = json.loads(request.prompt)
-            evidence_id = next(
-                key for key in prompt["evidence"] if key.startswith("memory:")
-            )
+            if prompt.get("validation_kind") == "procedural_lesson_entailment.v1":
+                return ReasoningResponse(
+                    text=lesson_validation_decision(prompt["lesson"]),
+                    provider=self.provider_name,
+                    model=self.model_name,
+                )
+            evidence_id = next(key for key in prompt["evidence"] if key.startswith("memory:"))
             memory_id = evidence_id.removeprefix("memory:")
             with connect() as conn:
                 conn.execute(
@@ -815,6 +1044,12 @@ def test_transient_consolidation_failure_reuses_open_decision_and_recovers():
             if self.calls == 1:
                 raise RuntimeError("transient model outage")
             prompt = json.loads(request.prompt)
+            if prompt.get("validation_kind") == "procedural_lesson_entailment.v1":
+                return ReasoningResponse(
+                    text=lesson_validation_decision(prompt["lesson"]),
+                    provider=self.provider_name,
+                    model=self.model_name,
+                )
             evidence_id, quote = next(iter(prompt["evidence"].items()))
             return ReasoningResponse(
                 text=json.dumps(
@@ -825,9 +1060,7 @@ def test_transient_consolidation_failure_reuses_open_decision_and_recovers():
                             {
                                 "kind": "situation",
                                 "text": "Use verified incident evidence",
-                                "citations": [
-                                    {"evidence_id": evidence_id, "quote": quote}
-                                ],
+                                "citations": [{"evidence_id": evidence_id, "quote": quote}],
                             }
                         ],
                     }
@@ -1209,6 +1442,13 @@ def test_expired_attempt_cannot_publish_or_transition_after_overlapping_claim():
             self.lease_owners = []
 
         def generate(self, request):
+            prompt = json.loads(request.prompt)
+            if prompt.get("validation_kind") == "procedural_lesson_entailment.v1":
+                return ReasoningResponse(
+                    text=lesson_validation_decision(prompt["lesson"]),
+                    provider=self.provider_name,
+                    model=self.model_name,
+                )
             with connect() as conn:
                 first_owner = conn.execute(
                     """
@@ -1224,7 +1464,6 @@ def test_expired_attempt_cannot_publish_or_transition_after_overlapping_claim():
                 db_url=database_url(),
             )
             self.lease_owners = [first_owner, replacement["lease_owner"]]
-            prompt = json.loads(request.prompt)
             evidence_id, quote = next(iter(prompt["evidence"].items()))
             return ReasoningResponse(
                 text=json.dumps(

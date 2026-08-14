@@ -3,7 +3,15 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { formatTime } from "@/lib/format";
-import type { Incident, RewindPreview, Run, SignatureScenario, Snapshot } from "@/types";
+import type {
+  ConsolidationCandidate,
+  ConsolidationReviewPreview,
+  Incident,
+  RewindPreview,
+  Run,
+  SignatureScenario,
+  Snapshot,
+} from "@/types";
 
 const phases = [
   { key: "triage", label: "triage" },
@@ -113,6 +121,8 @@ export function OperatorConsole({
   rewindTimestamp,
   rewindReason,
   rewindPreview,
+  consolidationCandidates = [],
+  consolidationPreview = null,
   onIncident,
   onIncidentInput,
   onReset,
@@ -123,6 +133,9 @@ export function OperatorConsole({
   onRewindReason,
   onPreview,
   onExecute,
+  onLoadCandidates = () => undefined,
+  onPreviewCandidateReview = () => undefined,
+  onExecuteCandidateReview = () => undefined,
   onSignOut,
 }: {
   incidents: Incident[];
@@ -136,6 +149,8 @@ export function OperatorConsole({
   rewindTimestamp: string;
   rewindReason: string;
   rewindPreview: RewindPreview | null;
+  consolidationCandidates?: ConsolidationCandidate[];
+  consolidationPreview?: ConsolidationReviewPreview | null;
   onIncident: (slug: string) => void;
   onIncidentInput: (value: string) => void;
   onReset: () => void;
@@ -146,9 +161,19 @@ export function OperatorConsole({
   onRewindReason: (value: string) => void;
   onPreview: () => void;
   onExecute: () => void;
+  onLoadCandidates?: () => void;
+  onPreviewCandidateReview?: (
+    candidateId: string,
+    action: "approve" | "reject",
+    reason: string,
+  ) => void;
+  onExecuteCandidateReview?: () => void;
   onSignOut: () => void;
 }) {
   const [walkthroughOpen, setWalkthroughOpen] = useState(false);
+  const [candidateReason, setCandidateReason] = useState(
+    "Reviewed against the cited incident evidence and operational safety constraints",
+  );
   const eventTraceAvailable = Array.isArray(run?.events);
   const eventPhases = new Set((run?.events || []).map((event) => event.phase));
   const currentPhase = run?.events?.at(-1)?.phase;
@@ -389,6 +414,113 @@ export function OperatorConsole({
         >
           {remediation ? "Approve retraction" : "Approve recommendation"}
         </Button>
+      </div>
+
+      <div className="consolidation-review-console">
+        <header>
+          <div>
+            <p className="section-kicker">Generated guidance</p>
+            <h3>Lesson candidates</h3>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="compact"
+            disabled={busy === "load-candidates"}
+            onClick={onLoadCandidates}
+          >
+            {busy === "load-candidates" ? "Loading" : "Load pending"}
+          </Button>
+        </header>
+        <div className="field">
+          <label htmlFor="candidateReviewReason">Review reason</label>
+          <input
+            id="candidateReviewReason"
+            value={candidateReason}
+            onChange={(event) => setCandidateReason(event.target.value)}
+          />
+        </div>
+        {consolidationCandidates.length ? (
+          <ul className="consolidation-candidates" aria-label="Pending lesson candidates">
+            {consolidationCandidates.map((candidate) => (
+              <li key={candidate.candidate_id}>
+                <div>
+                  <strong>{candidate.incident_title}</strong>
+                  <span>{candidate.content}</span>
+                  <small>
+                    Candidate {candidate.candidate_fingerprint.slice(0, 12)} · evidence{" "}
+                    {candidate.evidence_fingerprint.slice(0, 12)}
+                  </small>
+                  <ul className="candidate-evidence" aria-label="Candidate evidence">
+                    {candidate.evidence.map((item) => (
+                      <li key={item.evidence_id}>
+                        <span>{item.relationship}</span>
+                        <span>{item.content || "Evidence unavailable"}</span>
+                        <small>
+                          {item.matches_manifest && item.current
+                            ? `Verified ${item.sha256.slice(0, 12)}`
+                            : "Evidence changed or unavailable"}
+                        </small>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="candidate-review-actions">
+                  <Button
+                    type="button"
+                    variant="danger"
+                    size="compact"
+                    disabled={busy === "candidate-preview"}
+                    onClick={() =>
+                      onPreviewCandidateReview(candidate.candidate_id, "reject", candidateReason)
+                    }
+                  >
+                    Preview rejection
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="compact"
+                    disabled={busy === "candidate-preview"}
+                    onClick={() =>
+                      onPreviewCandidateReview(candidate.candidate_id, "approve", candidateReason)
+                    }
+                  >
+                    Preview approval
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="phase-trace-unavailable">
+            Load the queue to inspect pending candidates. Generated lessons are not recalled before
+            approval.
+          </p>
+        )}
+        {consolidationPreview ? (
+          <div className="candidate-review-preview" role="status" aria-live="polite">
+            <span>
+              {consolidationPreview.request_payload.action === "approve"
+                ? "Approval will create a new active successor."
+                : "Rejection will retain the candidate as audit-only history."}
+            </span>
+            <small>
+              Preview {consolidationPreview.fingerprint.slice(0, 12)} expires{" "}
+              {formatTime(consolidationPreview.expires_at)}.
+            </small>
+            <Button
+              type="button"
+              variant={
+                consolidationPreview.request_payload.action === "approve" ? "primary" : "danger"
+              }
+              disabled={busy === "candidate-execute"}
+              onClick={onExecuteCandidateReview}
+            >
+              {busy === "candidate-execute" ? "Executing" : "Execute bound review"}
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       <div className="rewind-console">
