@@ -1,5 +1,5 @@
 import { GithubLogo, ShieldCheck } from "@phosphor-icons/react";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 
 import {
   BeliefLedger,
@@ -15,8 +15,13 @@ import {
   Timeline,
 } from "@/components/cockpit";
 import { IdentityAccess } from "@/components/identity-access";
-import { OperatorConsole } from "@/components/operator-console";
 import { useCockpit } from "@/hooks/use-cockpit";
+
+const OperatorConsole = lazy(() =>
+  import("@/components/operator-console").then((module) => ({
+    default: module.OperatorConsole,
+  })),
+);
 
 export default function App() {
   const cockpit = useCockpit();
@@ -89,35 +94,37 @@ export default function App() {
         ) : null}
 
         {cockpit.canWrite && showReplay ? (
-          <OperatorConsole
-            incidents={cockpit.incidents}
-            incident={cockpit.incident}
-            run={cockpit.run}
-            incidentInput={cockpit.incidentInput}
-            busy={cockpit.busy}
-            rewindAnchor={cockpit.rewindAnchor}
-            scenario={cockpit.scenario}
-            snapshot={cockpit.snapshot}
-            rewindTimestamp={cockpit.rewindTimestamp}
-            rewindReason={cockpit.rewindReason}
-            rewindPreview={cockpit.rewindPreview}
-            consolidationCandidates={cockpit.consolidationCandidates}
-            consolidationPreview={cockpit.consolidationPreview}
-            onIncident={cockpit.selectIncident}
-            onIncidentInput={cockpit.setIncidentInput}
-            onReset={cockpit.resetDemo}
-            onPoison={cockpit.poisonDemo}
-            onRun={cockpit.startRun}
-            onDecision={cockpit.decideRun}
-            onRewindTimestamp={cockpit.setRewindTimestamp}
-            onRewindReason={cockpit.setRewindReason}
-            onPreview={cockpit.previewRewind}
-            onExecute={cockpit.executeRewind}
-            onLoadCandidates={cockpit.loadConsolidationCandidates}
-            onPreviewCandidateReview={cockpit.previewConsolidationReview}
-            onExecuteCandidateReview={cockpit.executeConsolidationReview}
-            onSignOut={cockpit.signOut}
-          />
+          <Suspense fallback={<p className="phase-trace-unavailable">Loading controls…</p>}>
+            <OperatorConsole
+              incidents={cockpit.incidents}
+              incident={cockpit.incident}
+              run={cockpit.run}
+              incidentInput={cockpit.incidentInput}
+              busy={cockpit.busy}
+              rewindAnchor={cockpit.rewindAnchor}
+              scenario={cockpit.scenario}
+              snapshot={cockpit.snapshot}
+              rewindTimestamp={cockpit.rewindTimestamp}
+              rewindReason={cockpit.rewindReason}
+              rewindPreview={cockpit.rewindPreview}
+              consolidationCandidates={cockpit.consolidationCandidates}
+              consolidationPreview={cockpit.consolidationPreview}
+              onIncident={cockpit.selectIncident}
+              onIncidentInput={cockpit.setIncidentInput}
+              onReset={cockpit.resetDemo}
+              onPoison={cockpit.poisonDemo}
+              onRun={cockpit.startRun}
+              onDecision={cockpit.decideRun}
+              onRewindTimestamp={cockpit.setRewindTimestamp}
+              onRewindReason={cockpit.setRewindReason}
+              onPreview={cockpit.previewRewind}
+              onExecute={cockpit.executeRewind}
+              onLoadCandidates={cockpit.loadConsolidationCandidates}
+              onPreviewCandidateReview={cockpit.previewConsolidationReview}
+              onExecuteCandidateReview={cockpit.executeConsolidationReview}
+              onSignOut={cockpit.signOut}
+            />
+          </Suspense>
         ) : null}
 
         <div

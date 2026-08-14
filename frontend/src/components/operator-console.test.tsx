@@ -304,7 +304,7 @@ describe("operator console", () => {
     expect(props.onDecision).toHaveBeenCalledWith(true);
   });
 
-  it("requires a bound preview before executing a generated lesson review", () => {
+  it("requires a bound preview before executing a generated lesson review", async () => {
     const onPreviewCandidateReview = vi.fn();
     const onExecuteCandidateReview = vi.fn();
     const candidateFingerprint = "a".repeat(64);
@@ -338,7 +338,7 @@ describe("operator console", () => {
     );
 
     expect(screen.queryByRole("button", { name: "Execute bound review" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Preview approval" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Preview approval" }));
     expect(onPreviewCandidateReview).toHaveBeenCalledWith(
       "candidate-1",
       "approve",
@@ -372,7 +372,7 @@ describe("operator console", () => {
         onExecuteCandidateReview={onExecuteCandidateReview}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Execute bound review" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Execute bound review" }));
     expect(onExecuteCandidateReview).toHaveBeenCalledTimes(1);
   });
 });
