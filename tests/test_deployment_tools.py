@@ -333,6 +333,7 @@ def test_live_acceptance_reauthorizes_every_rerunnable_job_before_work():
     workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
     jobs = workflow["jobs"]
     post_deploy = {
+        "controlled_telemetry",
         "dvi_qualification",
         "semantic_product",
         "alert_delivery",
@@ -399,6 +400,9 @@ def test_deploy_plan_and_apply_reauthorize_the_exact_caller_before_work():
 
 def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
+    telemetry_job = workflow.split("  controlled_telemetry:\n", 1)[1].split(
+        "  dvi_qualification:\n", 1
+    )[0]
     browser_job = workflow.split("  browser_product:\n", 1)[1].split(
         "  infrastructure_audit:\n", 1
     )[0]
@@ -423,9 +427,10 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     assert 'echo "::add-mask::$value"' in browser_job
     assert "HINDSIGHT_CHANGEFEED_AUTH_TOKEN" in browser_job
     assert "HINDSIGHT_SELENIUM_REMOTE_URL: http://127.0.0.1:4444" in browser_job
-    assert "scripts/publish_controlled_incident_telemetry.py" in browser_job
-    assert "--confirm-controlled-fixture" in browser_job
-    assert "--visibility-timeout-seconds 120" in browser_job
+    assert "scripts/publish_controlled_incident_telemetry.py" in telemetry_job
+    assert "--confirm-controlled-fixture" in telemetry_job
+    assert "--visibility-timeout-seconds 120" in telemetry_job
+    assert "scripts/publish_controlled_incident_telemetry.py" not in browser_job
     assert "selenium/standalone-firefox@sha256:" in browser_job
     assert "--shm-size=2g" in browser_job
     assert 'docker ps -aq --filter "name=^/${container_name}$"' in browser_job
@@ -439,6 +444,61 @@ def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle()
     ):
         assert f"{name}: ${{{{ env." not in roles_job
         assert f"{name}: ${{{{ vars.{name} || '{default}' }}}}" in roles_job
+
+
+def test_controlled_telemetry_is_a_shared_exact_release_prerequisite():
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
+    jobs = workflow["jobs"]
+    telemetry = jobs["controlled_telemetry"]
+    rendered = json.dumps(telemetry)
+
+    assert telemetry["needs"] == [
+        "authorize",
+        "acceptance_plan",
+        "deploy",
+        "dvi_qualification",
+        "alert_delivery",
+        "semantic_product",
+        "consolidation_product",
+        "database_roles",
+    ]
+    assert telemetry["permissions"] == {"contents": "read", "id-token": "write"}
+    assert "reuse_candidate" in telemetry["if"]
+    assert "needs.deploy.result == 'success'" in telemetry["if"]
+    assert "needs.deploy.result == 'skipped'" in telemetry["if"]
+    for prerequisite in (
+        "dvi_qualification",
+        "alert_delivery",
+        "semantic_product",
+        "consolidation_product",
+        "database_roles",
+    ):
+        assert f"needs.{prerequisite}.result == 'success'" in telemetry["if"]
+        assert f"needs.{prerequisite}.result == 'skipped'" in telemetry["if"]
+    assert "${{ needs.authorize.outputs.product_sha }}" in rendered
+    assert "scripts/verify_release_context.py" in rendered
+    assert "--deployed-url" in rendered
+    assert "${{ vars.AWS_DEPLOY_ROLE_ARN }}" in rendered
+    assert "scripts/publish_controlled_incident_telemetry.py" in rendered
+    for argument in (
+        "--checkout-latency-ms 842.5",
+        "--retry-fanout 8",
+        "--processor-queue-depth 217",
+        "--visibility-timeout-seconds 120",
+        "--confirm-controlled-fixture",
+    ):
+        assert argument in rendered
+
+    assert "controlled_telemetry" in jobs["worker_product"]["needs"]
+    assert "controlled_telemetry" in jobs["browser_product"]["needs"]
+    assert "needs.controlled_telemetry.result == 'success'" in jobs["browser_product"]["if"]
+    assert "publish_controlled_incident_telemetry.py" not in json.dumps(
+        jobs["worker_product"]
+    )
+    assert "PutMetricData" not in json.dumps(jobs["worker_product"])
+    assert "publish_controlled_incident_telemetry.py" not in json.dumps(
+        jobs["browser_product"]
+    )
 
 
 def test_live_acceptance_exercises_alert_delivery_in_parallel_after_deploy():
@@ -642,6 +702,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "acceptance_plan",
         "product_preflight",
         "deploy",
+        "controlled_telemetry",
         "dvi_qualification",
         "alert_delivery",
         "semantic_product",
@@ -678,14 +739,29 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "dvi_qualification",
         "semantic_product",
         "consolidation_product",
-        "worker_product",
         "database_roles",
     ):
         assert parsed["jobs"][job_name]["needs"] == ["authorize", "deploy"]
+    assert parsed["jobs"]["controlled_telemetry"]["needs"] == [
+        "authorize",
+        "acceptance_plan",
+        "deploy",
+        "dvi_qualification",
+        "alert_delivery",
+        "semantic_product",
+        "consolidation_product",
+        "database_roles",
+    ]
+    assert parsed["jobs"]["worker_product"]["needs"] == [
+        "authorize",
+        "deploy",
+        "controlled_telemetry",
+    ]
     assert parsed["jobs"]["browser_product"]["needs"] == [
         "authorize",
         "acceptance_plan",
         "deploy",
+        "controlled_telemetry",
     ]
     assert parsed["jobs"]["redrive_product"]["needs"] == [
         "authorize",
@@ -708,6 +784,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "exact_main_ci",
         "product_preflight",
         "deploy",
+        "controlled_telemetry",
         "dvi_qualification",
         "alert_delivery",
         "semantic_product",
@@ -750,7 +827,11 @@ def test_live_acceptance_modes_preserve_full_gate_and_isolate_browser_diagnostic
         "database_roles",
     ):
         assert jobs[job_name]["if"] == ("needs.authorize.outputs.acceptance_mode == 'full'")
-    assert jobs["worker_product"]["needs"] == ["authorize", "deploy"]
+    assert jobs["worker_product"]["needs"] == [
+        "authorize",
+        "deploy",
+        "controlled_telemetry",
+    ]
     assert "acceptance_mode == 'full'" in jobs["redrive_cleanup"]["if"]
     assert "reuse_candidate" in jobs["browser_product"]["if"]
     assert jobs["product_acceptance_complete"]["if"] == (
@@ -990,6 +1071,7 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
         "EXACT_MAIN_CI_RESULT",
         "PREFLIGHT_RESULT",
         "DEPLOY_RESULT",
+        "CONTROLLED_TELEMETRY_RESULT",
         "DVI_RESULT",
         "ALERT_DELIVERY_RESULT",
         "SEMANTIC_RESULT",
@@ -1016,6 +1098,7 @@ def test_product_completion_requires_every_product_job(tmp_path, failed_result):
         "EXACT_MAIN_CI_RESULT": "success",
         "PREFLIGHT_RESULT": "success",
         "DEPLOY_RESULT": "success",
+        "CONTROLLED_TELEMETRY_RESULT": "success",
         "DVI_RESULT": "success",
         "ALERT_DELIVERY_RESULT": "success",
         "SEMANTIC_RESULT": "success",

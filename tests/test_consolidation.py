@@ -488,12 +488,30 @@ def test_consolidation_requires_fingerprint_bound_approval_before_retrieval(monk
         db_url=database_url(),
     )
     assert created is True
-    completed = execute_operation(
-        operation_id=str(operation["id"]),
-        embedding_provider=DeterministicEmbeddingProvider(),
-        worker_id="consolidation-approval-test",
-        db_url=database_url(),
-    )
+    with connect(database_url()) as restricted_conn:
+        restricted_conn.execute("SET ROLE hindsight_memory_worker")
+        restricted_conn.commit()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            restricted_conn.execute(
+                "UPDATE incident_events SET summary = summary WHERE id = %s",
+                (resolved["resolution_event_id"],),
+            )
+        restricted_conn.rollback()
+        with monkeypatch.context() as execution_patch:
+            execution_patch.setattr(
+                operations,
+                "connect",
+                lambda *_args, **_kwargs: nullcontext(restricted_conn),
+            )
+            completed = execute_operation(
+                operation_id=str(operation["id"]),
+                embedding_provider=DeterministicEmbeddingProvider(),
+                worker_id="consolidation-approval-test",
+                db_url=database_url(),
+            )
+        restricted_conn.commit()
+        restricted_conn.execute("RESET ROLE")
+        restricted_conn.commit()
     assert completed["status"] == "completed"
 
     decision_id = str(uuid4())

@@ -308,6 +308,85 @@ jobs:
       source_sha: ${{ needs.authorize.outputs.product_sha }}
       deployment_environment: ${{ needs.authorize.outputs.deployment_environment }}
 
+  controlled_telemetry:
+    needs:
+      - authorize
+      - acceptance_plan
+      - deploy
+      - dvi_qualification
+      - alert_delivery
+      - semantic_product
+      - consolidation_product
+      - database_roles
+    if: >-
+      always() &&
+      needs.authorize.result == 'success' &&
+      needs.acceptance_plan.result == 'success' &&
+      ((needs.authorize.outputs.acceptance_mode == 'full' &&
+        needs.acceptance_plan.outputs.reuse_candidate == 'false' &&
+        needs.deploy.result == 'success' &&
+        needs.dvi_qualification.result == 'success' &&
+        needs.alert_delivery.result == 'success' &&
+        needs.semantic_product.result == 'success' &&
+        needs.consolidation_product.result == 'success' &&
+        needs.database_roles.result == 'success') ||
+       (needs.authorize.outputs.acceptance_mode == 'browser-only' &&
+        needs.dvi_qualification.result == 'skipped' &&
+        needs.alert_delivery.result == 'skipped' &&
+        needs.semantic_product.result == 'skipped' &&
+        needs.consolidation_product.result == 'skipped' &&
+        needs.database_roles.result == 'skipped' &&
+        ((needs.acceptance_plan.outputs.reuse_candidate == 'true' &&
+          needs.deploy.result == 'skipped') ||
+         (needs.acceptance_plan.outputs.reuse_candidate == 'false' &&
+          needs.deploy.result == 'success'))))
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      HINDSIGHT_STAGE: ${{ vars.HINDSIGHT_STAGE || 'demo' }}
+      HOSTED_API_URL: ${{ needs.acceptance_plan.outputs.reuse_candidate == 'true' && needs.acceptance_plan.outputs.candidate_api_url || needs.deploy.outputs.api_url }}
+      HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "$HOSTED_API_URL"
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          unset-current-credentials: true
+      - name: Publish and verify controlled incident telemetry
+        run: >-
+          uv run python scripts/publish_controlled_incident_telemetry.py
+          --stage "$HINDSIGHT_STAGE"
+          --region "$AWS_REGION"
+          --checkout-latency-ms 842.5
+          --retry-fanout 8
+          --processor-queue-depth 217
+          --visibility-timeout-seconds 120
+          --confirm-controlled-fixture
+
   dvi_qualification:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
@@ -580,7 +659,7 @@ jobs:
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase consolidation
 
   worker_product:
-    needs: [authorize, deploy]
+    needs: [authorize, deploy, controlled_telemetry]
     if: needs.authorize.outputs.acceptance_mode == 'full'
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     environment: ${{ needs.authorize.outputs.deployment_environment }}
@@ -838,11 +917,12 @@ jobs:
           retention-days: 90
 
   browser_product:
-    needs: [authorize, acceptance_plan, deploy]
+    needs: [authorize, acceptance_plan, deploy, controlled_telemetry]
     if: >-
       always() &&
       needs.authorize.result == 'success' &&
       needs.acceptance_plan.result == 'success' &&
+      needs.controlled_telemetry.result == 'success' &&
       ((needs.acceptance_plan.outputs.reuse_candidate == 'true' &&
         needs.deploy.result == 'skipped') ||
        (needs.acceptance_plan.outputs.reuse_candidate == 'false' &&
@@ -920,16 +1000,6 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/hindsight-browser-evidence"
           echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$RUNNER_TEMP/hindsight-browser-evidence" >> "$GITHUB_ENV"
-      - name: Publish and verify controlled incident telemetry
-        run: >-
-          uv run python scripts/publish_controlled_incident_telemetry.py
-          --stage "$HINDSIGHT_STAGE"
-          --region "$AWS_REGION"
-          --checkout-latency-ms 842.5
-          --retry-fanout 8
-          --processor-queue-depth 217
-          --visibility-timeout-seconds 120
-          --confirm-controlled-fixture
       - name: Start isolated Firefox service
         shell: bash
         run: |
@@ -1186,6 +1256,7 @@ jobs:
       - exact_main_ci
       - product_preflight
       - deploy
+      - controlled_telemetry
       - dvi_qualification
       - alert_delivery
       - semantic_product
@@ -1222,6 +1293,7 @@ jobs:
           EXACT_MAIN_CI_RESULT: ${{ needs.exact_main_ci.result }}
           PREFLIGHT_RESULT: ${{ needs.product_preflight.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          CONTROLLED_TELEMETRY_RESULT: ${{ needs.controlled_telemetry.result }}
           DVI_RESULT: ${{ needs.dvi_qualification.result }}
           ALERT_DELIVERY_RESULT: ${{ needs.alert_delivery.result }}
           SEMANTIC_RESULT: ${{ needs.semantic_product.result }}
@@ -1240,6 +1312,7 @@ jobs:
             "$EXACT_MAIN_CI_RESULT" \
             "$PREFLIGHT_RESULT" \
             "$DEPLOY_RESULT" \
+            "$CONTROLLED_TELEMETRY_RESULT" \
             "$DVI_RESULT" \
             "$ALERT_DELIVERY_RESULT" \
             "$SEMANTIC_RESULT" \
