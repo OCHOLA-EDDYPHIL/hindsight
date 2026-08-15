@@ -43,6 +43,116 @@ ALLOWED_CLOUDFLARE_REFRESH_DRIFT = {
         "type": "cloudflare_dns_record",
     }
 }
+GITHUB_DEPLOY_ROLE_REFRESH_DRIFT = {
+    "address": "aws_iam_role.github_deploy",
+    "mode": "managed",
+    "name": "github_deploy",
+    "provider_name": AWS_PROVIDER,
+    "type": "aws_iam_role",
+}
+GITHUB_DEPLOY_ROLE_POLICY = {
+    "address": "aws_iam_role_policy.github_deploy",
+    "mode": "managed",
+    "name": "github_deploy",
+    "provider_name": AWS_PROVIDER,
+    "type": "aws_iam_role_policy",
+}
+GITHUB_DEPLOY_INLINE_POLICY_NAME = "terraform-96877ae1e0309d9aea1db9eeb4"
+GITHUB_DEPLOY_ROLE_IDENTITY = {
+    "account_id": EXPECTED_AWS_ACCOUNT_ID,
+    "name": "hindsight-github-deploy",
+}
+GITHUB_DEPLOY_ROLE_VALUE_IDENTITY = {
+    "arn": (
+        f"arn:aws:iam::{EXPECTED_AWS_ACCOUNT_ID}:role/hindsight-github-deploy"
+    ),
+    "id": "hindsight-github-deploy",
+    "name": "hindsight-github-deploy",
+}
+GITHUB_DEPLOY_ROLE_VALUE_FIELDS = frozenset(
+    {
+        "arn",
+        "assume_role_policy",
+        "create_date",
+        "description",
+        "force_detach_policies",
+        "id",
+        "inline_policy",
+        "managed_policy_arns",
+        "max_session_duration",
+        "name",
+        "name_prefix",
+        "path",
+        "permissions_boundary",
+        "tags",
+        "tags_all",
+        "unique_id",
+    }
+)
+GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES = {
+    "inline_policy": [{}],
+    "managed_policy_arns": [False],
+    "tags": {},
+    "tags_all": {},
+}
+LIFECYCLE_EXPORT_BUCKET_ARNS = frozenset(
+    {
+        (
+            "arn:aws:s3:::"
+            f"hindsight-demo-lifecycle-exports-{EXPECTED_AWS_ACCOUNT_ID}"
+        ),
+        (
+            "arn:aws:s3:::"
+            f"hindsight-demo-lifecycle-exports-{EXPECTED_AWS_ACCOUNT_ID}/*"
+        ),
+    }
+)
+LIFECYCLE_RECOVERY_BUCKET_ARNS = frozenset(
+    {
+        f"arn:aws:s3:::hindsight-demo-recovery-{EXPECTED_AWS_ACCOUNT_ID}",
+        f"arn:aws:s3:::hindsight-demo-recovery-{EXPECTED_AWS_ACCOUNT_ID}/*",
+    }
+)
+LIFECYCLE_ARCHIVE_DENIED_ACTIONS = frozenset(
+    {
+        "s3:BypassGovernanceRetention",
+        "s3:DeleteBucket",
+        "s3:DeleteBucketPolicy",
+        "s3:DeleteObject",
+        "s3:DeleteObjectTagging",
+        "s3:DeleteObjectVersion",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutBucketOwnershipControls",
+        "s3:PutBucketPolicy",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutLifecycleConfiguration",
+        "s3:PutObject",
+        "s3:PutObjectLegalHold",
+        "s3:PutObjectRetention",
+        "s3:PutObjectTagging",
+        "s3:PutReplicationConfiguration",
+    }
+)
+GITHUB_DEPLOY_POLICY_STATEMENT_SIDS = frozenset(
+    {
+        "ApplicationIam",
+        "ApplicationLifecycle",
+        "CertificateReadiness",
+        "ChangefeedConfigurationRead",
+        "CognitoUserPoolCreate",
+        "ControlledIncidentTelemetryRead",
+        "ControlledIncidentTelemetryWrite",
+        "EvidenceArchiveMutationDenied",
+        "LambdaVersionRefresh",
+        "LifecycleArchiveMutationDenied",
+        "ParameterReadiness",
+        "TerraformStateBucketMetadata",
+        "TerraformStateList",
+        "TerraformStateObject",
+    }
+)
 ALLOWED_NULL_SENSITIVE_RESOURCE_ATTRIBUTES = {
     "aws_acm_certificate.demo": {
         "attribute": "private_key",
@@ -709,6 +819,384 @@ def _validate_cloudflare_refresh_drift(
     return sorted(observed)
 
 
+def _canonical_refresh_json(value: Any) -> str:
+    try:
+        return json.dumps(
+            value, allow_nan=False, separators=(",", ":"), sort_keys=True
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "GitHub deploy role refresh drift contains invalid JSON values"
+        ) from None
+
+
+def _load_inline_policy_document(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str):
+        raise ValueError("GitHub deploy role refresh drift policy is malformed")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        document: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in document:
+                raise ValueError
+            document[key] = child
+        return document
+
+    def reject_non_json_constant(_: str) -> None:
+        raise ValueError
+
+    try:
+        document = json.loads(
+            value,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_non_json_constant,
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "GitHub deploy role refresh drift policy is malformed"
+        ) from None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"Statement", "Version"}
+        or document.get("Version") != "2012-10-17"
+        or not isinstance(document.get("Statement"), list)
+        or len(document["Statement"]) != 14
+        or not all(isinstance(statement, dict) for statement in document["Statement"])
+    ):
+        raise ValueError("GitHub deploy role refresh drift policy is malformed")
+    statement_sids = [statement.get("Sid") for statement in document["Statement"]]
+    if (
+        not all(isinstance(sid, str) and sid for sid in statement_sids)
+        or len(statement_sids) != len(set(statement_sids))
+        or frozenset(statement_sids) != GITHUB_DEPLOY_POLICY_STATEMENT_SIDS
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift statement identities are invalid"
+        )
+    return document
+
+
+def _inline_policy_snapshot(
+    role_values: dict[str, Any],
+) -> tuple[str, dict[str, Any], int]:
+    inline_policies = role_values.get("inline_policy")
+    if (
+        not isinstance(inline_policies, list)
+        or len(inline_policies) != 1
+        or not isinstance(inline_policies[0], dict)
+        or set(inline_policies[0]) != {"name", "policy"}
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift must contain one exact inline policy"
+        )
+    policy_name = inline_policies[0].get("name")
+    if policy_name != GITHUB_DEPLOY_INLINE_POLICY_NAME:
+        raise ValueError(
+            "GitHub deploy role refresh drift inline policy identity is invalid"
+        )
+    policy = _load_inline_policy_document(inline_policies[0].get("policy"))
+    target_indexes = [
+        index
+        for index, statement in enumerate(policy["Statement"])
+        if statement.get("Sid") == "LifecycleArchiveMutationDenied"
+    ]
+    if len(target_indexes) != 1:
+        raise ValueError(
+            "GitHub deploy role refresh drift target statement is not unique"
+        )
+    return policy_name, policy, target_indexes[0]
+
+
+def _validate_lifecycle_statement(
+    statement: dict[str, Any], *, expected_resources: frozenset[str]
+) -> None:
+    actions = statement.get("Action")
+    resources = statement.get("Resource")
+    if (
+        set(statement) != {"Action", "Effect", "Resource", "Sid"}
+        or statement.get("Sid") != "LifecycleArchiveMutationDenied"
+        or statement.get("Effect") != "Deny"
+        or not isinstance(actions, list)
+        or not all(isinstance(action, str) and action for action in actions)
+        or len(actions) != len(set(actions))
+        or frozenset(actions) != LIFECYCLE_ARCHIVE_DENIED_ACTIONS
+        or not isinstance(resources, list)
+        or not all(isinstance(resource, str) for resource in resources)
+        or len(resources) != len(set(resources))
+        or frozenset(resources) != expected_resources
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift target statement is invalid"
+        )
+
+
+def _policy_without_transition_resources(
+    policy: dict[str, Any], target_index: int
+) -> dict[str, Any]:
+    statements = list(policy["Statement"])
+    target = dict(statements[target_index])
+    target["Resource"] = "<lifecycle-archive-transition>"
+    statements[target_index] = target
+    return {"Statement": statements, "Version": policy["Version"]}
+
+
+def _validate_inline_policy_transition(
+    before: dict[str, Any], after: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    before_name, before_policy, before_target = _inline_policy_snapshot(before)
+    after_name, after_policy, after_target = _inline_policy_snapshot(after)
+    if before_name != after_name or before_target != after_target:
+        raise ValueError(
+            "GitHub deploy role refresh drift inline policy identity changed"
+        )
+    _validate_lifecycle_statement(
+        before_policy["Statement"][before_target],
+        expected_resources=LIFECYCLE_EXPORT_BUCKET_ARNS,
+    )
+    _validate_lifecycle_statement(
+        after_policy["Statement"][after_target],
+        expected_resources=(
+            LIFECYCLE_EXPORT_BUCKET_ARNS | LIFECYCLE_RECOVERY_BUCKET_ARNS
+        ),
+    )
+    if _canonical_refresh_json(
+        _policy_without_transition_resources(before_policy, before_target)
+    ) != _canonical_refresh_json(
+        _policy_without_transition_resources(after_policy, after_target)
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift changed other policy content"
+        )
+    return after_name, after_policy
+
+
+def _validate_role_values_identity(values: dict[str, Any]) -> None:
+    if set(values) != GITHUB_DEPLOY_ROLE_VALUE_FIELDS or any(
+        values.get(field) != expected
+        for field, expected in GITHUB_DEPLOY_ROLE_VALUE_IDENTITY.items()
+    ):
+        raise ValueError("GitHub deploy role refresh drift value identity is invalid")
+
+
+def _validate_role_refresh_entry(
+    entry: Any,
+    *,
+    actions: list[str],
+    desired_change: bool,
+) -> dict[str, Any]:
+    if not isinstance(entry, dict) or set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    }:
+        raise ValueError("GitHub deploy role refresh drift identity is invalid")
+    if any(
+        entry.get(field) != expected
+        for field, expected in GITHUB_DEPLOY_ROLE_REFRESH_DRIFT.items()
+    ):
+        raise ValueError("GitHub deploy role refresh drift identity is invalid")
+
+    change = entry.get("change")
+    expected_change_fields = {
+        "actions",
+        "after",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_sensitive",
+    }
+    if desired_change:
+        expected_change_fields.update({"after_identity", "before_identity"})
+    if not isinstance(change, dict) or set(change) != expected_change_fields:
+        raise ValueError(
+            "GitHub deploy role refresh drift contains unexpected metadata"
+        )
+    if _actions(change, subject="GitHub deploy role refresh drift") != actions:
+        raise ValueError("GitHub deploy role refresh drift actions are invalid")
+    if change.get("after_unknown") != {}:
+        raise ValueError(
+            "GitHub deploy role refresh drift contains unknown values"
+        )
+    if desired_change and (
+        change.get("before_identity") != GITHUB_DEPLOY_ROLE_IDENTITY
+        or change.get("after_identity") != GITHUB_DEPLOY_ROLE_IDENTITY
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift change identity is invalid"
+        )
+    before = change.get("before")
+    after = change.get("after")
+    before_sensitive = change.get("before_sensitive")
+    after_sensitive = change.get("after_sensitive")
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or not isinstance(before_sensitive, dict)
+        or not isinstance(after_sensitive, dict)
+        or before_sensitive != GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
+        or after_sensitive != GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
+    ):
+        raise ValueError("GitHub deploy role refresh drift snapshot is malformed")
+    _validate_role_values_identity(before)
+    _validate_role_values_identity(after)
+    return change
+
+
+def _validate_github_deploy_role_policy_change(
+    resource_changes: list[Any],
+    resource_drift: list[Any],
+    *,
+    policy_name: str,
+    refreshed_policy: dict[str, Any],
+) -> None:
+    address = GITHUB_DEPLOY_ROLE_POLICY["address"]
+    if any(
+        isinstance(entry, dict) and entry.get("address") == address
+        for entry in resource_drift
+    ):
+        raise ValueError("GitHub deploy inline policy drift is forbidden")
+    matching_changes = [
+        entry
+        for entry in resource_changes
+        if isinstance(entry, dict) and entry.get("address") == address
+    ]
+    if len(matching_changes) != 1:
+        raise ValueError(
+            "GitHub deploy role refresh drift is not bound to one inline policy"
+        )
+    entry = matching_changes[0]
+    if set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    } or any(
+        entry.get(field) != expected
+        for field, expected in GITHUB_DEPLOY_ROLE_POLICY.items()
+    ):
+        raise ValueError("GitHub deploy inline policy identity is invalid")
+
+    change = entry.get("change")
+    if not isinstance(change, dict) or set(change) != {
+        "actions",
+        "after",
+        "after_identity",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_identity",
+        "before_sensitive",
+    }:
+        raise ValueError("GitHub deploy inline policy contains unexpected metadata")
+    if (
+        _actions(change, subject="GitHub deploy inline policy") != ["no-op"]
+        or change.get("after_unknown") != {}
+        or change.get("before_sensitive") != {}
+        or change.get("after_sensitive") != {}
+    ):
+        raise ValueError("GitHub deploy inline policy no-op is invalid")
+    expected_identity = {
+        "account_id": EXPECTED_AWS_ACCOUNT_ID,
+        "name": policy_name,
+        "role": GITHUB_DEPLOY_ROLE_VALUE_IDENTITY["name"],
+    }
+    if (
+        change.get("before_identity") != expected_identity
+        or change.get("after_identity") != expected_identity
+    ):
+        raise ValueError("GitHub deploy inline policy change identity is invalid")
+
+    before = change.get("before")
+    after = change.get("after")
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or set(before) != {"id", "name", "name_prefix", "policy", "role"}
+        or _canonical_refresh_json(before) != _canonical_refresh_json(after)
+        or before.get("id")
+        != f"{GITHUB_DEPLOY_ROLE_VALUE_IDENTITY['name']}:{policy_name}"
+        or before.get("name") != policy_name
+        or before.get("name_prefix") != "terraform-"
+        or before.get("role") != GITHUB_DEPLOY_ROLE_VALUE_IDENTITY["name"]
+    ):
+        raise ValueError("GitHub deploy inline policy no-op is invalid")
+    policy = _load_inline_policy_document(before.get("policy"))
+    if _canonical_refresh_json(policy) != _canonical_refresh_json(refreshed_policy):
+        raise ValueError(
+            "GitHub deploy role refresh drift does not match its inline policy"
+        )
+
+
+def _validate_github_deploy_role_refresh_drift(
+    resource_changes: list[Any],
+    resource_drift: list[Any],
+) -> list[str]:
+    address = GITHUB_DEPLOY_ROLE_REFRESH_DRIFT["address"]
+    drift_entries = [
+        entry
+        for entry in resource_drift
+        if isinstance(entry, dict) and entry.get("address") == address
+    ]
+    if not drift_entries:
+        return []
+    if len(drift_entries) != 1:
+        raise ValueError(
+            "GitHub deploy role refresh drift is not uniquely represented"
+        )
+    matching_changes = [
+        entry
+        for entry in resource_changes
+        if isinstance(entry, dict) and entry.get("address") == address
+    ]
+    if len(matching_changes) != 1:
+        raise ValueError(
+            "GitHub deploy role refresh drift is not uniquely reconciled"
+        )
+
+    drift_change = _validate_role_refresh_entry(
+        drift_entries[0], actions=["update"], desired_change=False
+    )
+    desired_change = _validate_role_refresh_entry(
+        matching_changes[0], actions=["no-op"], desired_change=True
+    )
+    drift_before = drift_change["before"]
+    refreshed = drift_change["after"]
+    desired_before = desired_change["before"]
+    desired_after = desired_change["after"]
+    if set(drift_before) != set(refreshed) or _canonical_refresh_json(
+        {key: value for key, value in drift_before.items() if key != "inline_policy"}
+    ) != _canonical_refresh_json(
+        {key: value for key, value in refreshed.items() if key != "inline_policy"}
+    ):
+        raise ValueError("GitHub deploy role refresh drift changed other role values")
+    policy_name, refreshed_policy = _validate_inline_policy_transition(
+        drift_before, refreshed
+    )
+    if (
+        _canonical_refresh_json(refreshed)
+        != _canonical_refresh_json(desired_before)
+        or _canonical_refresh_json(desired_before)
+        != _canonical_refresh_json(desired_after)
+        or drift_change["after_sensitive"]
+        != desired_change["before_sensitive"]
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift is not a matching desired no-op"
+        )
+    _validate_github_deploy_role_policy_change(
+        resource_changes,
+        resource_drift,
+        policy_name=policy_name,
+        refreshed_policy=refreshed_policy,
+    )
+    return [address]
+
+
 def _output_actions(entries: Any) -> list[dict[str, Any]]:
     if not isinstance(entries, dict):
         raise ValueError("Terraform plan output_changes must be a complete object")
@@ -915,8 +1403,15 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     checks = _check_summaries(plan["checks"])
     changes = _resource_actions(plan["resource_changes"], kind="resource_changes")
     drift = _resource_actions(plan.get("resource_drift", []), kind="resource_drift")
-    reconciled_refresh_drift = _validate_cloudflare_refresh_drift(
-        plan["resource_changes"], plan.get("resource_drift", [])
+    reconciled_refresh_drift = sorted(
+        [
+            *_validate_cloudflare_refresh_drift(
+                plan["resource_changes"], plan.get("resource_drift", [])
+            ),
+            *_validate_github_deploy_role_refresh_drift(
+                plan["resource_changes"], plan.get("resource_drift", [])
+            ),
+        ]
     )
     outputs = _output_actions(plan["output_changes"])
     unapproved_drift = sorted(
@@ -926,7 +1421,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     )
     if unapproved_drift:
         raise ValueError(
-            "non-Cloudflare resource drift is forbidden: "
+            "unapproved resource drift is forbidden: "
             + ", ".join(unapproved_drift)
         )
     _validate_desired_state_mutations(changes, outputs)
