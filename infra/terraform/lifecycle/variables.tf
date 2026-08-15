@@ -78,6 +78,17 @@ variable "bootstrap_hmac_key_arn" {
   }
 }
 
+variable "bootstrap_apply_external_id" {
+  description = "Shared external ID required for the bootstrap plan role to assume the bootstrap apply role."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.bootstrap_apply_external_id))
+    error_message = "bootstrap_apply_external_id must contain exactly 64 lowercase hexadecimal characters."
+  }
+}
+
 variable "github_subjects" {
   description = "Allowed GitHub OIDC subjects for privileged lifecycle operations."
   type        = list(string)

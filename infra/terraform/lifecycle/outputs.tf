@@ -6,6 +6,10 @@ output "github_bootstrap_plan_role_arn" {
   value = aws_iam_role.github_bootstrap_plan.arn
 }
 
+output "github_bootstrap_apply_role_arn" {
+  value = aws_iam_role.github_bootstrap_apply.arn
+}
+
 output "lifecycle_database_url_parameter_name" {
   value = var.lifecycle_database_url_parameter_name
 }

@@ -13,6 +13,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = "hindsight.bootstrap_plan.v1"
+RECEIPT_SCHEMA_VERSION = "hindsight.bootstrap_apply_receipt.v1"
 TERRAFORM_VERSION = "1.13.5"
 EXPECTED_REPOSITORY = "OCHOLA-EDDYPHIL/hindsight"
 EXPECTED_WORKFLOW = ".github/workflows/plan-bootstrap.yml"
@@ -85,6 +86,43 @@ EXPECTED_ARTIFACT_NAMES = {
     "state_before": "bootstrap-state-before.json",
     "state_after": "bootstrap-state-after.json",
 }
+EXPECTED_RECEIPT_NAMES = {
+    "manifest": EXPECTED_ARTIFACT_NAMES["manifest"],
+    "actions": EXPECTED_ARTIFACT_NAMES["actions"],
+    "state_before_apply": "bootstrap-state-before-apply.json",
+    "state_after_apply": "bootstrap-state-after-apply.json",
+    "state_after_postcheck": "bootstrap-state-after-postcheck.json",
+    "receipt": "bootstrap-apply-receipt.json",
+}
+EXPECTED_PREAPPLY_NAMES = {
+    "manifest": EXPECTED_ARTIFACT_NAMES["manifest"],
+    "actions": EXPECTED_ARTIFACT_NAMES["actions"],
+    "plan": EXPECTED_ARTIFACT_NAMES["plan"],
+    "plan_json": EXPECTED_ARTIFACT_NAMES["plan_json"],
+    "lock": EXPECTED_ARTIFACT_NAMES["lock"],
+    "state_before_plan": EXPECTED_ARTIFACT_NAMES["state_before"],
+    "state_after_plan": EXPECTED_ARTIFACT_NAMES["state_after"],
+    "state_before_apply": EXPECTED_RECEIPT_NAMES["state_before_apply"],
+}
+MUTATING_ACTIONS = frozenset({"create", "update", "delete", "forget"})
+ALLOWED_RESOURCE_MUTATIONS = frozenset(
+    {
+        ("aws_iam_policy.github_deploy_encryption", ("create",)),
+        ("aws_iam_policy.github_deploy_observability", ("update",)),
+        ("aws_iam_role.github_quarantine_redrive", ("create",)),
+        ("aws_iam_role.github_worker_acceptance", ("create",)),
+        ("aws_iam_role_policy.github_observability_evidence", ("update",)),
+        ("aws_iam_role_policy.github_quarantine_redrive", ("create",)),
+        ("aws_iam_role_policy.github_worker_acceptance", ("create",)),
+        ("aws_iam_role_policy_attachment.github_deploy_encryption", ("create",)),
+    }
+)
+ALLOWED_OUTPUT_MUTATIONS = frozenset(
+    {
+        ("github_quarantine_redrive_role_arn", ("create",)),
+        ("github_worker_acceptance_role_arn", ("create",)),
+    }
+)
 
 
 def _write_json(path: Path, document: dict[str, Any]) -> None:
@@ -693,6 +731,31 @@ def _action_counts(entries: list[dict[str, Any]]) -> dict[str, int]:
     return {action: counts[action] for action in sorted(counts)}
 
 
+def _validate_desired_state_mutations(
+    resource_changes: list[dict[str, Any]],
+    output_changes: list[dict[str, Any]],
+) -> None:
+    for entry in resource_changes:
+        actions = tuple(entry["actions"])
+        if not MUTATING_ACTIONS.isdisjoint(actions) and (
+            entry["address"], actions
+        ) not in ALLOWED_RESOURCE_MUTATIONS:
+            raise ValueError(
+                "unapproved desired-state resource mutation: "
+                f"{entry['address']} ({', '.join(actions)})"
+            )
+
+    for entry in output_changes:
+        actions = tuple(entry["actions"])
+        if not MUTATING_ACTIONS.isdisjoint(actions) and (
+            entry["name"], actions
+        ) not in ALLOWED_OUTPUT_MUTATIONS:
+            raise ValueError(
+                "unapproved desired-state output mutation: "
+                f"{entry['name']} ({', '.join(actions)})"
+            )
+
+
 def _check_identity(address: Any, *, subject: str, require_kind: bool) -> dict[str, str]:
     if not isinstance(address, dict):
         raise ValueError(f"{subject} is missing its address object")
@@ -856,6 +919,17 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         plan["resource_changes"], plan.get("resource_drift", [])
     )
     outputs = _output_actions(plan["output_changes"])
+    unapproved_drift = sorted(
+        entry["address"]
+        for entry in drift
+        if entry["address"] not in reconciled_refresh_drift
+    )
+    if unapproved_drift:
+        raise ValueError(
+            "non-Cloudflare resource drift is forbidden: "
+            + ", ".join(unapproved_drift)
+        )
+    _validate_desired_state_mutations(changes, outputs)
     all_entries = [*changes, *drift, *outputs]
     observed_data_removals = sorted(
         entry["address"]
@@ -896,6 +970,439 @@ def _load_provenance(path: Path) -> dict[str, Any]:
     if set(provenance) != {"lineage", "serial", "terraform_version"}:
         raise ValueError(f"{path.name} contains fields beyond state provenance")
     return state_provenance(provenance)
+
+
+def _require_exact_fields(
+    document: dict[str, Any], expected: set[str], *, subject: str
+) -> None:
+    if set(document) != expected:
+        raise ValueError(f"{subject} has an unexpected structure")
+
+
+def _validate_digest_map(digests: Any, *, expected_names: set[str]) -> dict[str, str]:
+    if not isinstance(digests, dict) or set(digests) != expected_names:
+        raise ValueError("bootstrap plan manifest artifact set is incomplete")
+    for name, digest in digests.items():
+        if not isinstance(name, str) or not isinstance(digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", digest
+        ) is None:
+            raise ValueError("bootstrap plan manifest contains an invalid artifact digest")
+    return digests
+
+
+def _validated_receipt_actions(
+    actions: dict[str, Any], manifest_plan: Any
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    expected_fields = {
+        "action_counts",
+        "applyable",
+        "checks",
+        "complete",
+        "observed_allowed_removals",
+        "null_sensitive_placeholders",
+        "reconciled_refresh_drift",
+        "output_changes",
+        "plan_format_version",
+        "resource_changes",
+        "resource_drift",
+        "schema_version",
+        "terraform_version",
+        "totals",
+    }
+    _require_exact_fields(actions, expected_fields, subject="bootstrap plan actions")
+    if (
+        actions.get("schema_version") != SCHEMA_VERSION
+        or actions.get("terraform_version") != TERRAFORM_VERSION
+        or actions.get("complete") is not True
+        or not isinstance(actions.get("applyable"), bool)
+    ):
+        raise ValueError("bootstrap plan actions metadata is invalid")
+
+    collections: dict[str, list[dict[str, Any]]] = {}
+    for name in ("resource_changes", "resource_drift", "output_changes"):
+        entries = actions.get(name)
+        if not isinstance(entries, list) or not all(
+            isinstance(entry, dict) for entry in entries
+        ):
+            raise ValueError(f"bootstrap plan actions {name} is incomplete")
+        for entry in entries:
+            sequence = entry.get("actions")
+            if (
+                not isinstance(sequence, list)
+                or not all(isinstance(action, str) for action in sequence)
+                or tuple(sequence) not in VALID_ACTION_SEQUENCES
+            ):
+                raise ValueError(f"bootstrap plan actions {name} contains invalid actions")
+        collections[name] = entries
+
+    observed_counts = _action_counts(
+        [
+            *collections["resource_changes"],
+            *collections["resource_drift"],
+            *collections["output_changes"],
+        ]
+    )
+    if actions.get("action_counts") != observed_counts:
+        raise ValueError("bootstrap plan action counts are inconsistent")
+
+    totals = actions.get("totals")
+    expected_totals = {
+        "checks": len(actions["checks"]) if isinstance(actions.get("checks"), list) else -1,
+        "output_changes": len(collections["output_changes"]),
+        "resource_changes": len(collections["resource_changes"]),
+        "resource_drift": len(collections["resource_drift"]),
+    }
+    if totals != expected_totals:
+        raise ValueError("bootstrap plan action totals are inconsistent")
+
+    expected_manifest_plan = {
+        "action_counts": observed_counts,
+        "applyable": actions["applyable"],
+        "complete": True,
+        "format_version": actions["plan_format_version"],
+        "null_sensitive_placeholders": actions["null_sensitive_placeholders"],
+        "reconciled_refresh_drift": actions["reconciled_refresh_drift"],
+        "terraform_version": TERRAFORM_VERSION,
+        "totals": expected_totals,
+    }
+    if manifest_plan != expected_manifest_plan:
+        raise ValueError("bootstrap plan manifest does not match its actions")
+
+    mutation_counter = Counter(
+        action
+        for entry in (
+            *collections["resource_changes"],
+            *collections["output_changes"],
+        )
+        for action in entry["actions"]
+        if action in MUTATING_ACTIONS
+    )
+    mutation_counts = {
+        action: mutation_counter[action] for action in sorted(mutation_counter)
+    }
+    if actions["applyable"] is not bool(mutation_counts):
+        raise ValueError(
+            "bootstrap plan applyable status is inconsistent with desired-state mutations"
+        )
+    return observed_counts, mutation_counts, expected_totals
+
+
+def _detailed_exit_code(value: str, *, subject: str) -> int:
+    if value not in {"0", "2"}:
+        raise ValueError(f"{subject} must be an exact Terraform detailed exit code")
+    return int(value)
+
+
+def validate_preapply(
+    *,
+    manifest_file: Path,
+    actions_file: Path,
+    plan_file: Path,
+    plan_json_file: Path,
+    lock_file: Path,
+    state_before_plan_file: Path,
+    state_after_plan_file: Path,
+    state_before_apply_file: Path,
+    plan_exit_code: str,
+) -> None:
+    """Revalidate the exact saved plan and state immediately before apply."""
+
+    paths = {
+        "manifest": manifest_file,
+        "actions": actions_file,
+        "plan": plan_file,
+        "plan_json": plan_json_file,
+        "lock": lock_file,
+        "state_before_plan": state_before_plan_file,
+        "state_after_plan": state_after_plan_file,
+        "state_before_apply": state_before_apply_file,
+    }
+    for kind, path in paths.items():
+        if path.name != EXPECTED_PREAPPLY_NAMES[kind]:
+            raise ValueError(f"unexpected {kind} artifact name: {path.name}")
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError(f"{path.name} is missing or empty")
+
+    manifest = _load_json(manifest_file)
+    _require_exact_fields(
+        manifest,
+        {
+            "artifacts",
+            "aws",
+            "environment",
+            "plan",
+            "repository",
+            "run_attempt",
+            "run_id",
+            "schema_version",
+            "source_revision",
+            "state_provenance",
+            "workflow_ref",
+        },
+        subject="bootstrap plan manifest",
+    )
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("bootstrap plan manifest schema is invalid")
+
+    artifact_paths = (
+        plan_file,
+        plan_json_file,
+        actions_file,
+        lock_file,
+        state_before_plan_file,
+        state_after_plan_file,
+    )
+    expected_artifact_names = set(EXPECTED_ARTIFACT_NAMES.values()) - {
+        EXPECTED_ARTIFACT_NAMES["manifest"]
+    }
+    manifest_artifacts = _validate_digest_map(
+        manifest.get("artifacts"), expected_names=expected_artifact_names
+    )
+    current_artifacts = {path.name: _sha256(path) for path in artifact_paths}
+    if manifest_artifacts != current_artifacts:
+        raise ValueError("saved bootstrap plan artifacts no longer match their manifest")
+
+    actions = _load_json(actions_file)
+    _, mutation_counts, _ = _validated_receipt_actions(
+        actions, manifest.get("plan")
+    )
+    plan_code = _detailed_exit_code(plan_exit_code, subject="initial plan exit code")
+    expected_plan_code = 2 if mutation_counts else 0
+    if plan_code != expected_plan_code:
+        raise ValueError(
+            "initial plan exit code is inconsistent with applyable desired-state mutations"
+        )
+
+    manifest_state = manifest.get("state_provenance")
+    if not isinstance(manifest_state, dict) or set(manifest_state) != {
+        "before",
+        "after",
+    }:
+        raise ValueError("bootstrap plan manifest state provenance is incomplete")
+    if not all(
+        isinstance(manifest_state[name], dict)
+        and set(manifest_state[name]) == {"lineage", "serial", "terraform_version"}
+        for name in ("before", "after")
+    ):
+        raise ValueError("bootstrap plan manifest state provenance is incomplete")
+    plan_before = state_provenance(manifest_state["before"])
+    plan_after = state_provenance(manifest_state["after"])
+    if plan_before != plan_after:
+        raise ValueError("bootstrap plan manifest state provenance changed during planning")
+    if (
+        _load_provenance(state_before_plan_file) != plan_before
+        or _load_provenance(state_after_plan_file) != plan_after
+    ):
+        raise ValueError("bootstrap plan provenance files do not match their manifest")
+    if _load_provenance(state_before_apply_file) != plan_after:
+        raise ValueError("state before apply does not match the saved plan provenance")
+
+
+def build_receipt(
+    *,
+    manifest_file: Path,
+    actions_file: Path,
+    state_before_apply_file: Path,
+    state_after_apply_file: Path,
+    state_after_postcheck_file: Path,
+    receipt_file: Path,
+    source_revision: str,
+    repository: str,
+    workflow_ref: str,
+    aws_account_id: str,
+    environment: str,
+    plan_role_arn: str,
+    apply_role_arn: str,
+    run_id: str,
+    run_attempt: str,
+    plan_exit_code: str,
+    postcheck_exit_code: str,
+) -> dict[str, Any]:
+    """Bind a plan and state transitions into a provenance-only apply receipt."""
+
+    paths = {
+        "manifest": manifest_file,
+        "actions": actions_file,
+        "state_before_apply": state_before_apply_file,
+        "state_after_apply": state_after_apply_file,
+        "state_after_postcheck": state_after_postcheck_file,
+        "receipt": receipt_file,
+    }
+    for kind, path in paths.items():
+        if path.name != EXPECTED_RECEIPT_NAMES[kind]:
+            raise ValueError(f"unexpected {kind} artifact name: {path.name}")
+    for kind in (
+        "manifest",
+        "actions",
+        "state_before_apply",
+        "state_after_apply",
+        "state_after_postcheck",
+    ):
+        path = paths[kind]
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError(f"{path.name} is missing or empty")
+
+    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        raise ValueError("source revision must be a full lowercase Git SHA")
+    if repository != EXPECTED_REPOSITORY:
+        raise ValueError("bootstrap apply repository identity is not authorized")
+    expected_workflow_ref = f"{EXPECTED_REPOSITORY}/{EXPECTED_WORKFLOW}@refs/heads/main"
+    if workflow_ref != expected_workflow_ref:
+        raise ValueError("bootstrap apply workflow identity is not authorized")
+    if aws_account_id != EXPECTED_AWS_ACCOUNT_ID:
+        raise ValueError("bootstrap apply AWS account identity is not authorized")
+    if environment != "demo":
+        raise ValueError("bootstrap apply must use the demo environment")
+    expected_plan_role = (
+        f"arn:aws:iam::{aws_account_id}:role/hindsight-github-bootstrap-plan"
+    )
+    expected_apply_role = (
+        f"arn:aws:iam::{aws_account_id}:role/hindsight-github-bootstrap-apply"
+    )
+    if plan_role_arn != expected_plan_role:
+        raise ValueError("bootstrap plan role identity is not authorized")
+    if apply_role_arn != expected_apply_role:
+        raise ValueError("bootstrap apply role identity is not authorized")
+    if re.fullmatch(r"[1-9][0-9]*", run_id) is None or re.fullmatch(
+        r"[1-9][0-9]*", run_attempt
+    ) is None:
+        raise ValueError("workflow run identity must use positive decimal values")
+
+    plan_code = _detailed_exit_code(plan_exit_code, subject="initial plan exit code")
+    if postcheck_exit_code != "0":
+        raise ValueError("post-apply check must report detailed exit code 0")
+
+    manifest = _load_json(manifest_file)
+    _require_exact_fields(
+        manifest,
+        {
+            "artifacts",
+            "aws",
+            "environment",
+            "plan",
+            "repository",
+            "run_attempt",
+            "run_id",
+            "schema_version",
+            "source_revision",
+            "state_provenance",
+            "workflow_ref",
+        },
+        subject="bootstrap plan manifest",
+    )
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("source_revision") != source_revision
+        or manifest.get("repository") != repository
+        or manifest.get("workflow_ref") != workflow_ref
+        or isinstance(manifest.get("run_id"), bool)
+        or not isinstance(manifest.get("run_id"), int)
+        or manifest.get("run_id") != int(run_id)
+        or isinstance(manifest.get("run_attempt"), bool)
+        or not isinstance(manifest.get("run_attempt"), int)
+        or manifest.get("run_attempt") != int(run_attempt)
+        or manifest.get("environment") != environment
+    ):
+        raise ValueError("bootstrap plan manifest execution identity does not match")
+    if manifest.get("aws") != {
+        "account_id": aws_account_id,
+        "region": "us-east-1",
+        "role_arn": plan_role_arn,
+    }:
+        raise ValueError("bootstrap plan manifest AWS identity does not match")
+
+    expected_manifest_artifacts = set(EXPECTED_ARTIFACT_NAMES.values()) - {
+        EXPECTED_ARTIFACT_NAMES["manifest"]
+    }
+    manifest_artifacts = _validate_digest_map(
+        manifest.get("artifacts"), expected_names=expected_manifest_artifacts
+    )
+    actions_digest = _sha256(actions_file)
+    if manifest_artifacts[actions_file.name] != actions_digest:
+        raise ValueError("bootstrap plan actions digest does not match its manifest")
+
+    actions = _load_json(actions_file)
+    action_counts, mutation_counts, totals = _validated_receipt_actions(
+        actions, manifest.get("plan")
+    )
+    expected_plan_code = 2 if mutation_counts else 0
+    if plan_code != expected_plan_code:
+        raise ValueError(
+            "initial plan exit code is inconsistent with applyable desired-state mutations"
+        )
+
+    manifest_state = manifest.get("state_provenance")
+    if not isinstance(manifest_state, dict) or set(manifest_state) != {
+        "before",
+        "after",
+    }:
+        raise ValueError("bootstrap plan manifest state provenance is incomplete")
+    if not all(
+        isinstance(manifest_state[name], dict)
+        and set(manifest_state[name]) == {"lineage", "serial", "terraform_version"}
+        for name in ("before", "after")
+    ):
+        raise ValueError("bootstrap plan manifest state provenance is incomplete")
+    plan_before = state_provenance(manifest_state["before"])
+    plan_after = state_provenance(manifest_state["after"])
+    if plan_before != plan_after:
+        raise ValueError("bootstrap plan manifest state provenance changed during planning")
+
+    state_before_apply = _load_provenance(state_before_apply_file)
+    state_after_apply = _load_provenance(state_after_apply_file)
+    state_after_postcheck = _load_provenance(state_after_postcheck_file)
+    if state_before_apply != plan_after:
+        raise ValueError("state before apply does not match the saved plan provenance")
+    if (
+        state_after_apply["lineage"] != state_before_apply["lineage"]
+        or state_after_apply["terraform_version"]
+        != state_before_apply["terraform_version"]
+    ):
+        raise ValueError("state lineage or Terraform version changed during apply")
+    if plan_code == 2:
+        if state_after_apply["serial"] <= state_before_apply["serial"]:
+            raise ValueError("applied state serial did not increase")
+    elif state_after_apply["serial"] != state_before_apply["serial"]:
+        raise ValueError("no-op plan changed the state serial")
+    if state_after_postcheck != state_after_apply:
+        raise ValueError("state changed during the post-apply check")
+
+    receipt = {
+        "artifacts": {
+            actions_file.name: actions_digest,
+            manifest_file.name: _sha256(manifest_file),
+        },
+        "aws": {
+            "account_id": aws_account_id,
+            "apply_role_arn": apply_role_arn,
+            "plan_role_arn": plan_role_arn,
+            "region": "us-east-1",
+        },
+        "environment": environment,
+        "plan": {
+            "action_counts": action_counts,
+            "applied": plan_code == 2,
+            "applyable": actions["applyable"],
+            "detailed_exit_code": plan_code,
+            "mutation_action_counts": mutation_counts,
+            "totals": totals,
+        },
+        "postcheck": {"detailed_exit_code": 0, "succeeded": True},
+        "repository": repository,
+        "run_attempt": int(run_attempt),
+        "run_id": int(run_id),
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "source_revision": source_revision,
+        "state_provenance": {
+            "after_apply": state_after_apply,
+            "after_postcheck": state_after_postcheck,
+            "before_apply": state_before_apply,
+            "plan": plan_after,
+        },
+        "workflow_ref": workflow_ref,
+    }
+    _write_json(receipt_file, receipt)
+    return receipt
 
 
 def build_manifest(
@@ -1021,6 +1528,36 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--role-arn", required=True)
     plan.add_argument("--run-id", required=True)
     plan.add_argument("--run-attempt", required=True)
+
+    preapply = commands.add_parser("preapply")
+    preapply.add_argument("--manifest", required=True, type=Path)
+    preapply.add_argument("--actions", required=True, type=Path)
+    preapply.add_argument("--plan-file", required=True, type=Path)
+    preapply.add_argument("--plan-json", required=True, type=Path)
+    preapply.add_argument("--lock-file", required=True, type=Path)
+    preapply.add_argument("--state-before-plan", required=True, type=Path)
+    preapply.add_argument("--state-after-plan", required=True, type=Path)
+    preapply.add_argument("--state-before-apply", required=True, type=Path)
+    preapply.add_argument("--plan-exit-code", required=True)
+
+    receipt = commands.add_parser("receipt")
+    receipt.add_argument("--manifest", required=True, type=Path)
+    receipt.add_argument("--actions", required=True, type=Path)
+    receipt.add_argument("--state-before-apply", required=True, type=Path)
+    receipt.add_argument("--state-after-apply", required=True, type=Path)
+    receipt.add_argument("--state-after-postcheck", required=True, type=Path)
+    receipt.add_argument("--output", required=True, type=Path)
+    receipt.add_argument("--source-revision", required=True)
+    receipt.add_argument("--repository", required=True)
+    receipt.add_argument("--workflow-ref", required=True)
+    receipt.add_argument("--aws-account-id", required=True)
+    receipt.add_argument("--environment", required=True)
+    receipt.add_argument("--plan-role-arn", required=True)
+    receipt.add_argument("--apply-role-arn", required=True)
+    receipt.add_argument("--run-id", required=True)
+    receipt.add_argument("--run-attempt", required=True)
+    receipt.add_argument("--plan-exit-code", required=True)
+    receipt.add_argument("--postcheck-exit-code", required=True)
     return parser
 
 
@@ -1032,6 +1569,40 @@ def main() -> int:
             if not isinstance(state, dict):
                 raise ValueError("Terraform state must contain one JSON object")
             _write_json(args.output, state_provenance(state))
+            return 0
+        if args.command == "preapply":
+            validate_preapply(
+                manifest_file=args.manifest,
+                actions_file=args.actions,
+                plan_file=args.plan_file,
+                plan_json_file=args.plan_json,
+                lock_file=args.lock_file,
+                state_before_plan_file=args.state_before_plan,
+                state_after_plan_file=args.state_after_plan,
+                state_before_apply_file=args.state_before_apply,
+                plan_exit_code=args.plan_exit_code,
+            )
+            return 0
+        if args.command == "receipt":
+            build_receipt(
+                manifest_file=args.manifest,
+                actions_file=args.actions,
+                state_before_apply_file=args.state_before_apply,
+                state_after_apply_file=args.state_after_apply,
+                state_after_postcheck_file=args.state_after_postcheck,
+                receipt_file=args.output,
+                source_revision=args.source_revision,
+                repository=args.repository,
+                workflow_ref=args.workflow_ref,
+                aws_account_id=args.aws_account_id,
+                environment=args.environment,
+                plan_role_arn=args.plan_role_arn,
+                apply_role_arn=args.apply_role_arn,
+                run_id=args.run_id,
+                run_attempt=args.run_attempt,
+                plan_exit_code=args.plan_exit_code,
+                postcheck_exit_code=args.postcheck_exit_code,
+            )
             return 0
         build_manifest(
             plan_json=args.input,

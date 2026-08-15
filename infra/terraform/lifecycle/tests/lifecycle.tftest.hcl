@@ -36,6 +36,7 @@ run "isolated_lifecycle" {
     bootstrap_state_bucket_name = "home-in-cloud-terraform-state-123456789012-us-east-1"
     bootstrap_certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
     bootstrap_hmac_key_arn      = "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000"
+    bootstrap_apply_external_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   }
 
   assert {
@@ -78,6 +79,34 @@ run "isolated_lifecycle" {
       ]) == 1
     )
     error_message = "Bootstrap planning must use the exact repository, protected environment, audience, and account OIDC trust."
+  }
+
+  assert {
+    condition = (
+      aws_iam_role.github_bootstrap_apply.name == "hindsight-github-bootstrap-apply" &&
+      aws_iam_role.github_bootstrap_apply.assume_role_policy == data.aws_iam_policy_document.github_bootstrap_apply_assume.json &&
+      length([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply_assume.statement : statement
+        if toset(statement.actions) == toset(["sts:AssumeRole"]) &&
+        statement.effect == null &&
+        statement.not_actions == null &&
+        statement.resources == null &&
+        statement.not_resources == null &&
+        length(statement.principals) == 1 &&
+        length(statement.not_principals) == 0 &&
+        one(statement.principals).type == "AWS" &&
+        toset(one(statement.principals).identifiers) == toset([
+          "arn:aws:iam::123456789012:role/hindsight-github-bootstrap-plan",
+        ]) &&
+        length(statement.condition) == 1 &&
+        one(statement.condition).test == "StringEquals" &&
+        one(statement.condition).variable == "sts:ExternalId" &&
+        toset(one(statement.condition).values) == toset([
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ])
+      ]) == 1
+    )
+    error_message = "Bootstrap apply trust must allow only the bootstrap plan role with the exact external ID."
   }
 
   assert {
@@ -151,6 +180,8 @@ run "isolated_lifecycle" {
             "arn:aws:iam::123456789012:role/hindsight-github-deploy",
             "arn:aws:iam::123456789012:role/hindsight-github-evidence",
             "arn:aws:iam::123456789012:role/hindsight-github-observability-evidence",
+            "arn:aws:iam::123456789012:role/hindsight-github-quarantine-redrive",
+            "arn:aws:iam::123456789012:role/hindsight-github-worker-acceptance",
           ])
         }
         BootstrapManagedPolicyRead = {
@@ -160,6 +191,7 @@ run "isolated_lifecycle" {
             "iam:ListPolicyTags",
           ])
           resources = toset([
+            "arn:aws:iam::123456789012:policy/hindsight-github-deploy-encryption",
             "arn:aws:iam::123456789012:policy/hindsight-github-deploy-observability",
           ])
         }
@@ -227,6 +259,161 @@ run "isolated_lifecycle" {
       ]) == 0
     )
     error_message = "Bootstrap state listing must be limited to the exact state key and Terraform's default-workspace enumeration prefix."
+  }
+
+  assert {
+    condition = (
+      aws_iam_role_policy.github_bootstrap_plan.policy == data.aws_iam_policy_document.github_bootstrap_plan.json &&
+      aws_iam_role_policy.github_bootstrap_apply_transition.name == "hindsight-github-bootstrap-apply-transition" &&
+      aws_iam_role_policy.github_bootstrap_apply_transition.policy == data.aws_iam_policy_document.github_bootstrap_apply_transition.json &&
+      length(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement) == 1 &&
+      one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).sid == "BootstrapApplyTransition" &&
+      toset(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).actions) == toset(["sts:AssumeRole"]) &&
+      toset(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).resources) == toset([
+        "arn:aws:iam::123456789012:role/hindsight-github-bootstrap-apply",
+      ]) &&
+      one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).effect == null &&
+      one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).not_actions == null &&
+      one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).not_resources == null &&
+      length(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).principals) == 0 &&
+      length(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).not_principals) == 0 &&
+      length(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).condition) == 1 &&
+      one(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).condition).test == "StringEquals" &&
+      one(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).condition).variable == "sts:ExternalId" &&
+      toset(one(one(data.aws_iam_policy_document.github_bootstrap_apply_transition.statement).condition).values) == toset([
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      ])
+    )
+    error_message = "Bootstrap planning must keep reads separate from the exact external-ID-gated apply transition."
+  }
+
+  assert {
+    condition = (
+      aws_iam_role_policy.github_bootstrap_apply.policy == data.aws_iam_policy_document.github_bootstrap_apply.json &&
+      toset(data.aws_iam_policy_document.github_bootstrap_apply.source_policy_documents) == toset([
+        data.aws_iam_policy_document.github_bootstrap_plan.json,
+      ]) &&
+      {
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement :
+        statement.sid => {
+          actions   = toset(statement.actions)
+          resources = toset(statement.resources)
+        }
+        } == {
+        BootstrapStateWrite = {
+          actions = toset(["s3:PutObject"])
+          resources = toset([
+            "arn:aws:s3:::home-in-cloud-terraform-state-123456789012-us-east-1/hindsight/bootstrap/terraform.tfstate",
+          ])
+        }
+        BootstrapRoleCreate = {
+          actions = toset([
+            "iam:CreateRole",
+            "iam:TagRole",
+          ])
+          resources = toset([
+            "arn:aws:iam::123456789012:role/hindsight-github-quarantine-redrive",
+            "arn:aws:iam::123456789012:role/hindsight-github-worker-acceptance",
+          ])
+        }
+        BootstrapInlinePolicyUpdate = {
+          actions = toset(["iam:PutRolePolicy"])
+          resources = toset([
+            "arn:aws:iam::123456789012:role/hindsight-github-observability-evidence",
+            "arn:aws:iam::123456789012:role/hindsight-github-quarantine-redrive",
+            "arn:aws:iam::123456789012:role/hindsight-github-worker-acceptance",
+          ])
+        }
+        BootstrapManagedPolicyCreate = {
+          actions = toset([
+            "iam:CreatePolicy",
+            "iam:TagPolicy",
+          ])
+          resources = toset([
+            "arn:aws:iam::123456789012:policy/hindsight-github-deploy-encryption",
+          ])
+        }
+        BootstrapManagedPolicyVersionUpdate = {
+          actions = toset([
+            "iam:CreatePolicyVersion",
+            "iam:DeletePolicyVersion",
+            "iam:ListPolicyVersions",
+          ])
+          resources = toset([
+            "arn:aws:iam::123456789012:policy/hindsight-github-deploy-encryption",
+            "arn:aws:iam::123456789012:policy/hindsight-github-deploy-observability",
+          ])
+        }
+        BootstrapManagedPolicyAttach = {
+          actions = toset(["iam:AttachRolePolicy"])
+          resources = toset([
+            "arn:aws:iam::123456789012:role/hindsight-github-deploy",
+          ])
+        }
+      } &&
+      alltrue([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement :
+        statement.effect == null &&
+        statement.not_actions == null &&
+        statement.not_resources == null &&
+        length(statement.principals) == 0 &&
+        length(statement.not_principals) == 0
+      ]) &&
+      length([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement
+        if statement.sid != "BootstrapManagedPolicyAttach" && length(statement.condition) > 0
+      ]) == 0 &&
+      length(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement
+        if statement.sid == "BootstrapManagedPolicyAttach"
+      ]).condition) == 1 &&
+      one(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement
+        if statement.sid == "BootstrapManagedPolicyAttach"
+      ]).condition).test == "StringEquals" &&
+      one(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement
+        if statement.sid == "BootstrapManagedPolicyAttach"
+      ]).condition).variable == "iam:PolicyARN" &&
+      toset(one(one([
+        for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement
+        if statement.sid == "BootstrapManagedPolicyAttach"
+        ]).condition).values) == toset([
+        "arn:aws:iam::123456789012:policy/hindsight-github-deploy-encryption",
+      ])
+    )
+    error_message = "Bootstrap apply must inherit planning reads and add only the exact state and IAM mutations required by the reviewed exact-main plan."
+  }
+
+  assert {
+    condition = (
+      length(setintersection(
+        toset(flatten([
+          for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement.resources
+        ])),
+        toset([
+          "arn:aws:iam::123456789012:role/hindsight-github-bootstrap-apply",
+          "arn:aws:iam::123456789012:role/hindsight-github-bootstrap-plan",
+        ])
+      )) == 0 &&
+      length(setintersection(
+        toset(flatten([
+          for statement in data.aws_iam_policy_document.github_bootstrap_apply.statement : statement.actions
+        ])),
+        toset([
+          "iam:AddClientIDToOpenIDConnectProvider",
+          "iam:CreateOpenIDConnectProvider",
+          "iam:DeleteOpenIDConnectProvider",
+          "iam:DeletePolicy",
+          "iam:DeleteRole",
+          "iam:DeleteRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:RemoveClientIDFromOpenIDConnectProvider",
+          "iam:UpdateOpenIDConnectProviderThumbprint",
+        ])
+      )) == 0
+    )
+    error_message = "Bootstrap apply must not manage its lifecycle-owned identities or permit role, policy, attachment, or OIDC-provider destruction."
   }
 
   assert {
@@ -455,6 +642,7 @@ run "cold_region_recovery_profile" {
     bootstrap_state_bucket_name         = "home-in-cloud-terraform-state-123456789012-us-east-1"
     bootstrap_certificate_arn           = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
     bootstrap_hmac_key_arn              = "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000"
+    bootstrap_apply_external_id         = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     enable_cold_region_recovery_profile = true
     cold_region_recovery_region         = "eu-west-1"
   }

@@ -35,22 +35,44 @@ locals {
   lifecycle_table_index_arns = [
     for table_arn in local.lifecycle_table_arns : "${table_arn}/index/tenant-id-index"
   ]
-  lifecycle_connection_table_arn  = "arn:${data.aws_partition.current.partition}:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/hindsight-${var.stage}-websocket-connections"
-  lifecycle_cognito_user_pool_arn = "arn:${data.aws_partition.current.partition}:cognito-idp:${var.aws_region}:${data.aws_caller_identity.current.account_id}:userpool/*"
-  lifecycle_websocket_arn         = "arn:${data.aws_partition.current.partition}:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*/${var.stage}/DELETE/@connections/*"
-  expected_oidc_provider_arn      = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
-  expected_deploy_role_arn        = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-deploy"
-  bootstrap_state_key             = "hindsight/bootstrap/terraform.tfstate"
-  bootstrap_state_bucket_arn      = "arn:${data.aws_partition.current.partition}:s3:::${var.bootstrap_state_bucket_name}"
-  bootstrap_state_object_arn      = "${local.bootstrap_state_bucket_arn}/${local.bootstrap_state_key}"
-  bootstrap_state_lock_object_arn = "${local.bootstrap_state_object_arn}.tflock"
+  lifecycle_connection_table_arn            = "arn:${data.aws_partition.current.partition}:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/hindsight-${var.stage}-websocket-connections"
+  lifecycle_cognito_user_pool_arn           = "arn:${data.aws_partition.current.partition}:cognito-idp:${var.aws_region}:${data.aws_caller_identity.current.account_id}:userpool/*"
+  lifecycle_websocket_arn                   = "arn:${data.aws_partition.current.partition}:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*/${var.stage}/DELETE/@connections/*"
+  expected_oidc_provider_arn                = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
+  expected_deploy_role_arn                  = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-deploy"
+  bootstrap_state_key                       = "hindsight/bootstrap/terraform.tfstate"
+  bootstrap_state_bucket_arn                = "arn:${data.aws_partition.current.partition}:s3:::${var.bootstrap_state_bucket_name}"
+  bootstrap_state_object_arn                = "${local.bootstrap_state_bucket_arn}/${local.bootstrap_state_key}"
+  bootstrap_state_lock_object_arn           = "${local.bootstrap_state_object_arn}.tflock"
+  bootstrap_plan_role_arn                   = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-bootstrap-plan"
+  bootstrap_apply_role_arn                  = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-bootstrap-apply"
+  bootstrap_evidence_role_arn               = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-evidence"
+  bootstrap_observability_evidence_role_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-observability-evidence"
+  bootstrap_quarantine_redrive_role_arn     = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-quarantine-redrive"
+  bootstrap_worker_acceptance_role_arn      = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-worker-acceptance"
   bootstrap_role_arns = [
     local.expected_deploy_role_arn,
-    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-evidence",
-    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/hindsight-github-observability-evidence",
+    local.bootstrap_evidence_role_arn,
+    local.bootstrap_observability_evidence_role_arn,
+    local.bootstrap_quarantine_redrive_role_arn,
+    local.bootstrap_worker_acceptance_role_arn,
   ]
   bootstrap_observability_policy_arn = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/hindsight-github-deploy-observability"
-  bootstrap_evidence_bucket_arn      = "arn:${data.aws_partition.current.partition}:s3:::hindsight-${var.stage}-learning-evidence-${data.aws_caller_identity.current.account_id}"
+  bootstrap_encryption_policy_arn    = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/hindsight-github-deploy-encryption"
+  bootstrap_managed_policy_arns = [
+    local.bootstrap_observability_policy_arn,
+    local.bootstrap_encryption_policy_arn,
+  ]
+  bootstrap_apply_created_role_arns = [
+    local.bootstrap_quarantine_redrive_role_arn,
+    local.bootstrap_worker_acceptance_role_arn,
+  ]
+  bootstrap_apply_inline_policy_role_arns = [
+    local.bootstrap_observability_evidence_role_arn,
+    local.bootstrap_quarantine_redrive_role_arn,
+    local.bootstrap_worker_acceptance_role_arn,
+  ]
+  bootstrap_evidence_bucket_arn = "arn:${data.aws_partition.current.partition}:s3:::hindsight-${var.stage}-learning-evidence-${data.aws_caller_identity.current.account_id}"
 }
 
 check "expected_aws_account" {
@@ -336,6 +358,21 @@ data "aws_iam_policy_document" "github_bootstrap_plan_assume" {
   }
 }
 
+data "aws_iam_policy_document" "github_bootstrap_apply_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "AWS"
+      identifiers = [local.bootstrap_plan_role_arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "sts:ExternalId"
+      values   = [var.bootstrap_apply_external_id]
+    }
+  }
+}
+
 resource "aws_iam_role" "github_lifecycle" {
   name                 = "hindsight-github-lifecycle"
   assume_role_policy   = data.aws_iam_policy_document.github_assume.json
@@ -346,6 +383,13 @@ resource "aws_iam_role" "github_bootstrap_plan" {
   name                 = "hindsight-github-bootstrap-plan"
   assume_role_policy   = data.aws_iam_policy_document.github_bootstrap_plan_assume.json
   max_session_duration = 3600
+}
+
+resource "aws_iam_role" "github_bootstrap_apply" {
+  name                 = "hindsight-github-bootstrap-apply"
+  assume_role_policy   = data.aws_iam_policy_document.github_bootstrap_apply_assume.json
+  max_session_duration = 3600
+  depends_on           = [aws_iam_role.github_bootstrap_plan]
 }
 
 data "aws_iam_policy_document" "github_bootstrap_plan" {
@@ -428,7 +472,7 @@ data "aws_iam_policy_document" "github_bootstrap_plan" {
       "iam:GetPolicyVersion",
       "iam:ListPolicyTags",
     ]
-    resources = [local.bootstrap_observability_policy_arn]
+    resources = local.bootstrap_managed_policy_arns
   }
 
   statement {
@@ -458,6 +502,76 @@ data "aws_iam_policy_document" "github_bootstrap_plan" {
   }
 }
 
+data "aws_iam_policy_document" "github_bootstrap_apply_transition" {
+  statement {
+    sid       = "BootstrapApplyTransition"
+    actions   = ["sts:AssumeRole"]
+    resources = [local.bootstrap_apply_role_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "sts:ExternalId"
+      values   = [var.bootstrap_apply_external_id]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "github_bootstrap_apply" {
+  source_policy_documents = [data.aws_iam_policy_document.github_bootstrap_plan.json]
+
+  statement {
+    sid       = "BootstrapStateWrite"
+    actions   = ["s3:PutObject"]
+    resources = [local.bootstrap_state_object_arn]
+  }
+
+  statement {
+    sid = "BootstrapRoleCreate"
+    actions = [
+      "iam:CreateRole",
+      "iam:TagRole",
+    ]
+    resources = local.bootstrap_apply_created_role_arns
+  }
+
+  statement {
+    sid       = "BootstrapInlinePolicyUpdate"
+    actions   = ["iam:PutRolePolicy"]
+    resources = local.bootstrap_apply_inline_policy_role_arns
+  }
+
+  statement {
+    sid = "BootstrapManagedPolicyCreate"
+    actions = [
+      "iam:CreatePolicy",
+      "iam:TagPolicy",
+    ]
+    resources = [local.bootstrap_encryption_policy_arn]
+  }
+
+  statement {
+    sid = "BootstrapManagedPolicyVersionUpdate"
+    actions = [
+      "iam:CreatePolicyVersion",
+      "iam:DeletePolicyVersion",
+      "iam:ListPolicyVersions",
+    ]
+    resources = local.bootstrap_managed_policy_arns
+  }
+
+  statement {
+    sid       = "BootstrapManagedPolicyAttach"
+    actions   = ["iam:AttachRolePolicy"]
+    resources = [local.expected_deploy_role_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PolicyARN"
+      values   = [local.bootstrap_encryption_policy_arn]
+    }
+  }
+}
+
 resource "aws_iam_role_policy" "github_bootstrap_plan" {
   role   = aws_iam_role.github_bootstrap_plan.id
   policy = data.aws_iam_policy_document.github_bootstrap_plan.json
@@ -466,6 +580,31 @@ resource "aws_iam_role_policy" "github_bootstrap_plan" {
     precondition {
       condition     = length(regexall("\\S", data.aws_iam_policy_document.github_bootstrap_plan.json)) <= 10240
       error_message = "The bootstrap planning inline policy exceeds the IAM role-policy quota."
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "github_bootstrap_apply_transition" {
+  name   = "hindsight-github-bootstrap-apply-transition"
+  role   = aws_iam_role.github_bootstrap_plan.id
+  policy = data.aws_iam_policy_document.github_bootstrap_apply_transition.json
+
+  lifecycle {
+    precondition {
+      condition     = length(regexall("\\S", data.aws_iam_policy_document.github_bootstrap_apply_transition.json)) <= 10240
+      error_message = "The bootstrap apply transition inline policy exceeds the IAM role-policy quota."
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "github_bootstrap_apply" {
+  role   = aws_iam_role.github_bootstrap_apply.id
+  policy = data.aws_iam_policy_document.github_bootstrap_apply.json
+
+  lifecycle {
+    precondition {
+      condition     = length(regexall("\\S", data.aws_iam_policy_document.github_bootstrap_apply.json)) <= 10240
+      error_message = "The bootstrap apply inline policy exceeds the IAM role-policy quota."
     }
   }
 }
