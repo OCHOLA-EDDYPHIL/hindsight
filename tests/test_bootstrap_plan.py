@@ -274,6 +274,226 @@ def _plan_with_cloudflare_refresh_drift(validator):
     return plan
 
 
+GITHUB_DEPLOY_ROLE_ADDRESS = "aws_iam_role.github_deploy"
+GITHUB_DEPLOY_POLICY_NAME = "terraform-96877ae1e0309d9aea1db9eeb4"
+LIFECYCLE_EXPORT_ARNS = {
+    "arn:aws:s3:::hindsight-demo-lifecycle-exports-762397612117",
+    "arn:aws:s3:::hindsight-demo-lifecycle-exports-762397612117/*",
+}
+LIFECYCLE_RECOVERY_ARNS = {
+    "arn:aws:s3:::hindsight-demo-recovery-762397612117",
+    "arn:aws:s3:::hindsight-demo-recovery-762397612117/*",
+}
+LIFECYCLE_ARCHIVE_DENIED_ACTIONS = {
+    "s3:BypassGovernanceRetention",
+    "s3:DeleteBucket",
+    "s3:DeleteBucketPolicy",
+    "s3:DeleteObject",
+    "s3:DeleteObjectTagging",
+    "s3:DeleteObjectVersion",
+    "s3:PutBucketObjectLockConfiguration",
+    "s3:PutBucketOwnershipControls",
+    "s3:PutBucketPolicy",
+    "s3:PutBucketPublicAccessBlock",
+    "s3:PutBucketVersioning",
+    "s3:PutEncryptionConfiguration",
+    "s3:PutLifecycleConfiguration",
+    "s3:PutObject",
+    "s3:PutObjectLegalHold",
+    "s3:PutObjectRetention",
+    "s3:PutObjectTagging",
+    "s3:PutReplicationConfiguration",
+}
+GITHUB_DEPLOY_POLICY_SIDS = {
+    "ApplicationIam",
+    "ApplicationLifecycle",
+    "CertificateReadiness",
+    "ChangefeedConfigurationRead",
+    "CognitoUserPoolCreate",
+    "ControlledIncidentTelemetryRead",
+    "ControlledIncidentTelemetryWrite",
+    "EvidenceArchiveMutationDenied",
+    "LambdaVersionRefresh",
+    "LifecycleArchiveMutationDenied",
+    "ParameterReadiness",
+    "TerraformStateBucketMetadata",
+    "TerraformStateList",
+    "TerraformStateObject",
+}
+GITHUB_DEPLOY_ROLE_VALUE_FIELDS = {
+    "arn",
+    "assume_role_policy",
+    "create_date",
+    "description",
+    "force_detach_policies",
+    "id",
+    "inline_policy",
+    "managed_policy_arns",
+    "max_session_duration",
+    "name",
+    "name_prefix",
+    "path",
+    "permissions_boundary",
+    "tags",
+    "tags_all",
+    "unique_id",
+}
+GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES = {
+    "inline_policy": [{}],
+    "managed_policy_arns": [False],
+    "tags": {},
+    "tags_all": {},
+}
+
+
+def _github_deploy_policy(resources: set[str]):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            *[
+                {
+                    "Action": "s3:GetBucketLocation",
+                    "Effect": "Allow",
+                    "Resource": f"arn:aws:s3:::unchanged-{sid.lower()}",
+                    "Sid": sid,
+                }
+                for sid in sorted(
+                    GITHUB_DEPLOY_POLICY_SIDS
+                    - {"LifecycleArchiveMutationDenied"}
+                )
+            ],
+            {
+                "Action": sorted(LIFECYCLE_ARCHIVE_DENIED_ACTIONS),
+                "Effect": "Deny",
+                "Resource": sorted(resources),
+                "Sid": "LifecycleArchiveMutationDenied",
+            },
+        ],
+    }
+
+
+def _github_deploy_role_values(policy: dict):
+    return {
+        "arn": "arn:aws:iam::762397612117:role/hindsight-github-deploy",
+        "assume_role_policy": "unchanged",
+        "create_date": "unchanged",
+        "description": "",
+        "force_detach_policies": False,
+        "id": "hindsight-github-deploy",
+        "inline_policy": [
+            {
+                "name": GITHUB_DEPLOY_POLICY_NAME,
+                "policy": json.dumps(policy, separators=(",", ":")),
+            }
+        ],
+        "managed_policy_arns": [
+            "arn:aws:iam::762397612117:policy/hindsight-github-deploy-observability"
+        ],
+        "max_session_duration": 3600,
+        "name": "hindsight-github-deploy",
+        "name_prefix": "",
+        "path": "/",
+        "permissions_boundary": "",
+        "tags": {},
+        "tags_all": {"ManagedBy": "terraform-bootstrap", "Project": "hindsight"},
+        "unique_id": "unchanged",
+    }
+
+
+def _plan_with_github_deploy_role_refresh_drift(
+    validator,
+    *,
+    before_resources: set[str] | None = None,
+    after_resources: set[str] | None = None,
+):
+    plan = _plan(validator)
+    before = _github_deploy_role_values(
+        _github_deploy_policy(
+            LIFECYCLE_EXPORT_ARNS
+            if before_resources is None
+            else before_resources
+        )
+    )
+    refreshed = _github_deploy_role_values(
+        _github_deploy_policy(
+            LIFECYCLE_EXPORT_ARNS | LIFECYCLE_RECOVERY_ARNS
+            if after_resources is None
+            else after_resources
+        )
+    )
+    sensitivity = json.loads(json.dumps(GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES))
+    identity = {
+        "account_id": "762397612117",
+        "name": "hindsight-github-deploy",
+    }
+    desired = _resource(
+        GITHUB_DEPLOY_ROLE_ADDRESS,
+        ["no-op"],
+        before=json.loads(json.dumps(refreshed)),
+        after=json.loads(json.dumps(refreshed)),
+        before_identity=identity,
+        after_identity=json.loads(json.dumps(identity)),
+        before_sensitive=sensitivity,
+        after_sensitive=json.loads(json.dumps(sensitivity)),
+        after_unknown={},
+    )
+    drift = _resource(
+        GITHUB_DEPLOY_ROLE_ADDRESS,
+        ["update"],
+        before=before,
+        after=refreshed,
+        before_sensitive=json.loads(json.dumps(sensitivity)),
+        after_sensitive=json.loads(json.dumps(sensitivity)),
+        after_unknown={},
+    )
+    policy_values = {
+        "id": f"hindsight-github-deploy:{GITHUB_DEPLOY_POLICY_NAME}",
+        "name": GITHUB_DEPLOY_POLICY_NAME,
+        "name_prefix": "terraform-",
+        "policy": refreshed["inline_policy"][0]["policy"],
+        "role": "hindsight-github-deploy",
+    }
+    policy_identity = {
+        "account_id": "762397612117",
+        "name": GITHUB_DEPLOY_POLICY_NAME,
+        "role": "hindsight-github-deploy",
+    }
+    policy_change = _resource(
+        "aws_iam_role_policy.github_deploy",
+        ["no-op"],
+        resource_type="aws_iam_role_policy",
+        before=policy_values,
+        after=json.loads(json.dumps(policy_values)),
+        before_identity=policy_identity,
+        after_identity=json.loads(json.dumps(policy_identity)),
+        before_sensitive={},
+        after_sensitive={},
+        after_unknown={},
+    )
+    plan["resource_changes"].extend([desired, policy_change])
+    plan["resource_drift"].append(drift)
+    return plan
+
+
+def _inline_policy_document(entry: dict, value: str) -> dict:
+    policy = entry["change"][value]["inline_policy"][0]["policy"]
+    return json.loads(policy)
+
+
+def _set_inline_policy_document(entry: dict, value: str, policy: dict) -> None:
+    entry["change"][value]["inline_policy"][0]["policy"] = json.dumps(
+        policy, separators=(",", ":")
+    )
+
+
+def _lifecycle_statement(policy: dict) -> dict:
+    return next(
+        statement
+        for statement in policy["Statement"]
+        if statement.get("Sid") == "LifecycleArchiveMutationDenied"
+    )
+
+
 def _provenance(*, serial: int = 25):
     return {
         "lineage": "9f1383b4-4dae-30e4-bdba-649bc9346bc3",
@@ -519,8 +739,598 @@ def test_validator_rejects_every_non_cloudflare_resource_drift(actions):
         _resource("aws_iam_role.github_worker_acceptance", actions)
     ]
 
-    with pytest.raises(ValueError, match="non-Cloudflare resource drift is forbidden"):
+    with pytest.raises(ValueError, match="unapproved resource drift is forbidden"):
         validator.validate_plan(plan)
+
+
+def test_validator_accepts_only_the_exact_github_deploy_role_refresh_transition():
+    validator = _validator()
+
+    summary = validator.validate_plan(
+        _plan_with_github_deploy_role_refresh_drift(validator)
+    )
+
+    assert validator.LIFECYCLE_EXPORT_BUCKET_ARNS == LIFECYCLE_EXPORT_ARNS
+    assert validator.LIFECYCLE_RECOVERY_BUCKET_ARNS == LIFECYCLE_RECOVERY_ARNS
+    assert (
+        validator.LIFECYCLE_ARCHIVE_DENIED_ACTIONS
+        == LIFECYCLE_ARCHIVE_DENIED_ACTIONS
+    )
+    assert validator.GITHUB_DEPLOY_INLINE_POLICY_NAME == GITHUB_DEPLOY_POLICY_NAME
+    assert validator.GITHUB_DEPLOY_POLICY_STATEMENT_SIDS == GITHUB_DEPLOY_POLICY_SIDS
+    assert validator.GITHUB_DEPLOY_ROLE_VALUE_FIELDS == GITHUB_DEPLOY_ROLE_VALUE_FIELDS
+    assert (
+        validator.GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
+        == GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
+    )
+    assert summary["reconciled_refresh_drift"] == [GITHUB_DEPLOY_ROLE_ADDRESS]
+    role_drift = _resource_entry(
+        summary, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    assert role_drift["actions"] == ["update"]
+
+
+def test_validator_rejects_unrelated_drift_alongside_the_allowed_role_refresh():
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    plan["resource_drift"].append(
+        _resource("aws_iam_role.unapproved", ["no-op"])
+    )
+
+    with pytest.raises(ValueError, match="unapproved resource drift is forbidden"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("collection", ["resource_changes", "resource_drift"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "data"),
+        ("name", "different"),
+        ("provider_name", "registry.terraform.io/hashicorp/random"),
+        ("type", "aws_iam_policy"),
+        ("index", 0),
+        ("deposed", "deadbeef"),
+        ("module_address", "module.unapproved"),
+        ("previous_address", "aws_iam_role.previous"),
+        ("schema_version", 0),
+    ],
+)
+def test_validator_rejects_github_deploy_role_refresh_identity_variants(
+    collection, field, value
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    _resource_entry(plan, collection, GITHUB_DEPLOY_ROLE_ADDRESS)[field] = value
+
+    with pytest.raises(ValueError, match="GitHub deploy role refresh drift"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("collection", ["resource_changes", "resource_drift"])
+def test_validator_rejects_duplicate_github_deploy_role_entries(collection):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    plan[collection].append(
+        json.loads(
+            json.dumps(
+                _resource_entry(plan, collection, GITHUB_DEPLOY_ROLE_ADDRESS)
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="duplicate resource identities"):
+        validator.validate_plan(plan)
+
+
+def test_validator_requires_one_matching_github_deploy_role_desired_noop():
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    plan["resource_changes"] = [
+        entry
+        for entry in plan["resource_changes"]
+        if entry["address"] != GITHUB_DEPLOY_ROLE_ADDRESS
+    ]
+
+    with pytest.raises(ValueError, match="not uniquely reconciled"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("collection", "address", "message"),
+    [
+        (
+            "resource_drift",
+            GITHUB_DEPLOY_ROLE_ADDRESS,
+            "not uniquely represented",
+        ),
+        (
+            "resource_changes",
+            GITHUB_DEPLOY_ROLE_ADDRESS,
+            "not uniquely reconciled",
+        ),
+        (
+            "resource_changes",
+            "aws_iam_role_policy.github_deploy",
+            "not bound to one inline policy",
+        ),
+    ],
+)
+def test_validator_custom_cardinality_rejects_distinct_deposed_duplicates(
+    collection, address, message
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    duplicate = json.loads(
+        json.dumps(_resource_entry(plan, collection, address))
+    )
+    duplicate["deposed"] = "deadbeef"
+    plan[collection].append(duplicate)
+
+    with pytest.raises(ValueError, match=message):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("field", ["assume_role_policy", "tags_all", "unique_id"])
+def test_validator_requires_the_exact_role_snapshot_fields(field):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    drift["change"]["after"].pop(field)
+
+    with pytest.raises(ValueError, match="value identity is invalid"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("collection", "actions"),
+    [
+        ("resource_changes", ["read"]),
+        ("resource_changes", ["update"]),
+        ("resource_drift", ["no-op"]),
+        ("resource_drift", ["create"]),
+    ],
+)
+def test_validator_rejects_other_github_deploy_role_refresh_actions(
+    collection, actions
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    _resource_entry(plan, collection, GITHUB_DEPLOY_ROLE_ADDRESS)["change"][
+        "actions"
+    ] = actions
+
+    with pytest.raises(ValueError, match="GitHub deploy role refresh drift actions"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("before_resources", "after_resources"),
+    [
+        (
+            LIFECYCLE_EXPORT_ARNS | LIFECYCLE_RECOVERY_ARNS,
+            LIFECYCLE_EXPORT_ARNS,
+        ),
+        (
+            LIFECYCLE_EXPORT_ARNS,
+            LIFECYCLE_EXPORT_ARNS
+            | {"arn:aws:s3:::hindsight-demo-recovery-762397612117"},
+        ),
+        (
+            LIFECYCLE_EXPORT_ARNS,
+            LIFECYCLE_EXPORT_ARNS
+            | LIFECYCLE_RECOVERY_ARNS
+            | {"arn:aws:s3:::unapproved"},
+        ),
+        (
+            LIFECYCLE_EXPORT_ARNS | LIFECYCLE_RECOVERY_ARNS,
+            LIFECYCLE_EXPORT_ARNS | LIFECYCLE_RECOVERY_ARNS,
+        ),
+        (set(), LIFECYCLE_EXPORT_ARNS | LIFECYCLE_RECOVERY_ARNS),
+    ],
+)
+def test_validator_rejects_reversed_partial_or_expanded_role_policy_transitions(
+    before_resources, after_resources
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(
+        validator,
+        before_resources=before_resources,
+        after_resources=after_resources,
+    )
+
+    with pytest.raises(ValueError, match="target statement is invalid"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("variant", ["missing", "replaced", "duplicate", "scalar"])
+def test_validator_rejects_any_nonexact_lifecycle_deny_action_set(variant):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    policy = _inline_policy_document(drift, "after")
+    statement = _lifecycle_statement(policy)
+    if variant == "missing":
+        statement["Action"].pop()
+    elif variant == "replaced":
+        statement["Action"] = ["s3:GetObject"]
+    elif variant == "duplicate":
+        statement["Action"].append(statement["Action"][0])
+    else:
+        statement["Action"] = "s3:DeleteBucket"
+    _set_inline_policy_document(drift, "after", policy)
+
+    with pytest.raises(ValueError, match="target statement is invalid"):
+        validator.validate_plan(plan)
+
+
+def test_validator_accepts_semantically_reordered_actions_and_arns():
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    role_desired = _resource_entry(
+        plan, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    role_drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    policy_desired = _resource_entry(
+        plan, "resource_changes", "aws_iam_role_policy.github_deploy"
+    )
+    for entry, value in (
+        (role_desired, "before"),
+        (role_desired, "after"),
+        (role_drift, "before"),
+        (role_drift, "after"),
+    ):
+        policy = _inline_policy_document(entry, value)
+        statement = _lifecycle_statement(policy)
+        statement["Action"].reverse()
+        statement["Resource"].reverse()
+        _set_inline_policy_document(entry, value, policy)
+    for value in ("before", "after"):
+        policy = json.loads(policy_desired["change"][value]["policy"])
+        statement = _lifecycle_statement(policy)
+        statement["Action"].reverse()
+        statement["Resource"].reverse()
+        policy_desired["change"][value]["policy"] = json.dumps(
+            policy, separators=(",", ":")
+        )
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["reconciled_refresh_drift"] == [GITHUB_DEPLOY_ROLE_ADDRESS]
+
+
+def test_validator_rejects_other_role_or_policy_changes_in_the_refresh():
+    validator = _validator()
+
+    role_change = _plan_with_github_deploy_role_refresh_drift(validator)
+    _resource_entry(
+        role_change, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )["change"]["after"]["description"] = "changed"
+    with pytest.raises(ValueError, match="changed other role values"):
+        validator.validate_plan(role_change)
+
+    statement_change = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        statement_change, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    policy = _inline_policy_document(drift, "after")
+    policy["Statement"][0]["Action"] = "s3:GetObject"
+    _set_inline_policy_document(drift, "after", policy)
+    with pytest.raises(ValueError, match="changed other policy content"):
+        validator.validate_plan(statement_change)
+
+    action_change = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        action_change, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    policy = _inline_policy_document(drift, "after")
+    _lifecycle_statement(policy)["Action"].append("s3:GetObject")
+    _set_inline_policy_document(drift, "after", policy)
+    with pytest.raises(ValueError, match="target statement is invalid"):
+        validator.validate_plan(action_change)
+
+
+def test_validator_rejects_extra_or_ambiguous_inline_policy_content():
+    validator = _validator()
+
+    extra_policy = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        extra_policy, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    drift["change"]["after"]["inline_policy"].append(
+        json.loads(json.dumps(drift["change"]["after"]["inline_policy"][0]))
+    )
+    with pytest.raises(ValueError, match="one exact inline policy"):
+        validator.validate_plan(extra_policy)
+
+    extra_statement = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        extra_statement, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    policy = _inline_policy_document(drift, "after")
+    policy["Statement"].append(json.loads(json.dumps(policy["Statement"][0])))
+    policy["Statement"][-1]["Sid"] = "UnexpectedStatement"
+    _set_inline_policy_document(drift, "after", policy)
+    with pytest.raises(ValueError, match="policy is malformed"):
+        validator.validate_plan(extra_statement)
+
+    duplicate_target = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        duplicate_target, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    policy = _inline_policy_document(drift, "after")
+    policy["Statement"][0]["Sid"] = "LifecycleArchiveMutationDenied"
+    _set_inline_policy_document(drift, "after", policy)
+    with pytest.raises(ValueError, match="statement identities are invalid"):
+        validator.validate_plan(duplicate_target)
+
+    duplicate_arn = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        duplicate_arn, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    policy = _inline_policy_document(drift, "after")
+    _lifecycle_statement(policy)["Resource"].append(
+        "arn:aws:s3:::hindsight-demo-recovery-762397612117"
+    )
+    _set_inline_policy_document(drift, "after", policy)
+    with pytest.raises(ValueError, match="target statement is invalid"):
+        validator.validate_plan(duplicate_arn)
+
+
+def test_validator_rejects_a_self_consistent_generated_policy_name_mutation():
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    replacement = "terraform-" + "1" * 26
+    role_desired = _resource_entry(
+        plan, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    role_drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    for entry, value in (
+        (role_desired, "before"),
+        (role_desired, "after"),
+        (role_drift, "before"),
+        (role_drift, "after"),
+    ):
+        entry["change"][value]["inline_policy"][0]["name"] = replacement
+    policy_change = _resource_entry(
+        plan, "resource_changes", "aws_iam_role_policy.github_deploy"
+    )
+    for value in ("before", "after"):
+        policy_change["change"][value]["name"] = replacement
+        policy_change["change"][value]["id"] = (
+            f"hindsight-github-deploy:{replacement}"
+        )
+    for identity in ("before_identity", "after_identity"):
+        policy_change["change"][identity]["name"] = replacement
+
+    with pytest.raises(ValueError, match="inline policy identity is invalid"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_a_non_target_sid_swap_with_fourteen_unique_sids():
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    role_desired = _resource_entry(
+        plan, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    role_drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    for entry, value in (
+        (role_desired, "before"),
+        (role_desired, "after"),
+        (role_drift, "before"),
+        (role_drift, "after"),
+    ):
+        policy = _inline_policy_document(entry, value)
+        next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ApplicationIam"
+        )["Sid"] = "UnexpectedApplicationIam"
+        _set_inline_policy_document(entry, value, policy)
+    policy_change = _resource_entry(
+        plan, "resource_changes", "aws_iam_role_policy.github_deploy"
+    )
+    for value in ("before", "after"):
+        policy = json.loads(policy_change["change"][value]["policy"])
+        next(
+            statement
+            for statement in policy["Statement"]
+            if statement["Sid"] == "ApplicationIam"
+        )["Sid"] = "UnexpectedApplicationIam"
+        assert len({statement["Sid"] for statement in policy["Statement"]}) == 14
+        policy_change["change"][value]["policy"] = json.dumps(
+            policy, separators=(",", ":")
+        )
+
+    with pytest.raises(ValueError, match="statement identities are invalid"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("malformed", ["{", '{"Version":NaN}', '{"a":1,"a":2}'])
+def test_validator_rejects_malformed_non_json_or_duplicate_policy_values(malformed):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    drift["change"]["after"]["inline_policy"][0]["policy"] = malformed
+
+    with pytest.raises(ValueError, match="policy is malformed"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("policy_value", [None, {}, []])
+def test_validator_rejects_non_string_inline_policy_values(policy_value):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    drift["change"]["after"]["inline_policy"][0]["policy"] = policy_value
+
+    with pytest.raises(ValueError, match="policy is malformed"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("variant", ["duplicate-key", "nan"])
+def test_validator_rejects_valid_shape_policy_json_edge_cases(variant):
+    validator = _validator()
+    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    raw_policy = drift["change"]["after"]["inline_policy"][0]["policy"]
+    if variant == "duplicate-key":
+        raw_policy = raw_policy.replace(
+            '"Effect":"Deny"',
+            '"Effect":"Deny","Effect":"Deny"',
+            1,
+        )
+    else:
+        recovery_arn = json.dumps(
+            "arn:aws:s3:::hindsight-demo-recovery-762397612117"
+        )
+        raw_policy = raw_policy.replace(recovery_arn, "NaN", 1)
+    drift["change"]["after"]["inline_policy"][0]["policy"] = raw_policy
+
+    with pytest.raises(ValueError, match="policy is malformed"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_unmatched_role_noop_and_refresh_metadata():
+    validator = _validator()
+
+    unmatched = _plan_with_github_deploy_role_refresh_drift(validator)
+    desired = _resource_entry(
+        unmatched, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    desired["change"]["after"]["description"] = "different"
+    with pytest.raises(ValueError, match="not a matching desired no-op"):
+        validator.validate_plan(unmatched)
+
+    stale_noop = _plan_with_github_deploy_role_refresh_drift(validator)
+    desired = _resource_entry(
+        stale_noop, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    desired["change"]["before"]["description"] = "stale"
+    desired["change"]["after"]["description"] = "stale"
+    with pytest.raises(ValueError, match="not a matching desired no-op"):
+        validator.validate_plan(stale_noop)
+
+    unknown = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(unknown, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS)
+    drift["change"]["after_unknown"] = {"inline_policy": True}
+    with pytest.raises(ValueError, match="contains unknown values"):
+        validator.validate_plan(unknown)
+
+    importing = _plan_with_github_deploy_role_refresh_drift(validator)
+    desired = _resource_entry(
+        importing, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    desired["change"]["importing"] = {"id": "unexpected"}
+    with pytest.raises(ValueError, match="unexpected metadata"):
+        validator.validate_plan(importing)
+
+    identity = _plan_with_github_deploy_role_refresh_drift(validator)
+    desired = _resource_entry(
+        identity, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    desired["change"]["after_identity"]["account_id"] = "000000000000"
+    with pytest.raises(ValueError, match="change identity is invalid"):
+        validator.validate_plan(identity)
+
+    sensitivity = _plan_with_github_deploy_role_refresh_drift(validator)
+    drift = _resource_entry(
+        sensitivity, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    drift["change"]["after_sensitive"].pop("tags_all")
+    with pytest.raises(ValueError, match="snapshot is malformed"):
+        validator.validate_plan(sensitivity)
+
+
+def test_validator_requires_one_matching_managed_inline_policy_noop():
+    validator = _validator()
+    policy_address = "aws_iam_role_policy.github_deploy"
+
+    missing = _plan_with_github_deploy_role_refresh_drift(validator)
+    missing["resource_changes"] = [
+        entry
+        for entry in missing["resource_changes"]
+        if entry["address"] != policy_address
+    ]
+    with pytest.raises(ValueError, match="not bound to one inline policy"):
+        validator.validate_plan(missing)
+
+    duplicate = _plan_with_github_deploy_role_refresh_drift(validator)
+    duplicate["resource_changes"].append(
+        json.loads(
+            json.dumps(_resource_entry(duplicate, "resource_changes", policy_address))
+        )
+    )
+    with pytest.raises(ValueError, match="duplicate resource identities"):
+        validator.validate_plan(duplicate)
+
+    wrong_action = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(
+        wrong_action, "resource_changes", policy_address
+    )
+    policy_change["change"]["actions"] = ["read"]
+    with pytest.raises(ValueError, match="inline policy no-op is invalid"):
+        validator.validate_plan(wrong_action)
+
+    wrong_identity = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(
+        wrong_identity, "resource_changes", policy_address
+    )
+    policy_change["change"]["after_identity"]["account_id"] = "000000000000"
+    with pytest.raises(ValueError, match="policy change identity is invalid"):
+        validator.validate_plan(wrong_identity)
+
+    extra_metadata = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(
+        extra_metadata, "resource_changes", policy_address
+    )
+    policy_change["change"]["importing"] = {"id": "unexpected"}
+    with pytest.raises(ValueError, match="contains unexpected metadata"):
+        validator.validate_plan(extra_metadata)
+
+    changed = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(changed, "resource_changes", policy_address)
+    policy_change["change"]["after"]["role"] = "different"
+    with pytest.raises(ValueError, match="inline policy no-op is invalid"):
+        validator.validate_plan(changed)
+
+    mismatched = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(mismatched, "resource_changes", policy_address)
+    policy = json.loads(policy_change["change"]["after"]["policy"])
+    policy["Statement"][0]["Action"] = "s3:GetObject"
+    policy_change["change"]["before"]["policy"] = json.dumps(
+        policy, separators=(",", ":")
+    )
+    policy_change["change"]["after"]["policy"] = json.dumps(
+        policy, separators=(",", ":")
+    )
+    with pytest.raises(ValueError, match="does not match its inline policy"):
+        validator.validate_plan(mismatched)
+
+    malformed = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(malformed, "resource_changes", policy_address)
+    policy_change["change"]["before"]["policy"] = "{"
+    policy_change["change"]["after"]["policy"] = "{"
+    with pytest.raises(ValueError, match="policy is malformed"):
+        validator.validate_plan(malformed)
+
+    wrong_resource_identity = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(
+        wrong_resource_identity, "resource_changes", policy_address
+    )
+    policy_change["provider_name"] = "registry.terraform.io/hashicorp/random"
+    with pytest.raises(ValueError, match="inline policy identity is invalid"):
+        validator.validate_plan(wrong_resource_identity)
+
+    drifted = _plan_with_github_deploy_role_refresh_drift(validator)
+    policy_change = _resource_entry(drifted, "resource_changes", policy_address)
+    policy_drift = json.loads(json.dumps(policy_change))
+    policy_drift["change"].pop("before_identity")
+    policy_drift["change"].pop("after_identity")
+    policy_drift["change"]["actions"] = ["update"]
+    drifted["resource_drift"].append(policy_drift)
+    with pytest.raises(ValueError, match="inline policy drift is forbidden"):
+        validator.validate_plan(drifted)
 
 
 def test_validator_records_only_exact_reconciled_cloudflare_refresh_drift():
