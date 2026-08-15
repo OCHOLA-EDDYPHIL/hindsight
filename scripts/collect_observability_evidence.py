@@ -112,6 +112,7 @@ BROWSER_SIGNATURE_FIELDS = {
     "invalidated_memory_ids",
     "bad",
     "corrected",
+    "action_comparison",
 }
 BROWSER_SIGNATURE_RUN_FIELDS = {
     "run_id",
@@ -120,12 +121,28 @@ BROWSER_SIGNATURE_RUN_FIELDS = {
     "reflected_memory_id",
     "selection_fingerprint",
     "recommendation_id",
+    "operational_action",
     "approval_approved",
     "execution_status",
     "read_memory_ids",
     "read_count",
     "downstream_lineage_edge_count",
 }
+BROWSER_OPERATIONAL_ACTION_FIELDS = {"contract", "primary_action", "fingerprint"}
+BROWSER_ACTION_COMPARISON_FIELDS = {
+    "status",
+    "contract",
+    "before",
+    "after",
+    "context",
+    "memory_correction_proven",
+    "controlled_pair",
+}
+BROWSER_ACTION_COMPARISON_CONTEXT_FIELDS = {
+    "prompt_equal",
+    "normalized_telemetry_equal",
+}
+BROWSER_ACTION_COMPARISON_STATUSES = {"changed", "unchanged", "unavailable"}
 BROWSER_CAPTURE_ERROR_FIELDS = {"stage", "type"}
 BROWSER_CAPTURE_ERROR_STAGES = {"screenshot", "console", "operations", "database"}
 
@@ -260,6 +277,10 @@ def _validate_browser_evidence_projection(value: dict[str, Any]) -> None:
                 f"browser signature {label} run",
                 nullable=True,
             )
+            _validate_browser_operational_action(
+                run.get("operational_action"),
+                f"browser signature {label} run operational action",
+            )
             if "approval_approved" in run and type(run["approval_approved"]) is not bool:
                 raise ValueError(
                     f"browser signature {label} run approval_approved must be a boolean"
@@ -271,6 +292,7 @@ def _validate_browser_evidence_projection(value: dict[str, Any]) -> None:
                 _validate_browser_integer_field(
                     run, field, f"browser signature {label} run"
                 )
+        _validate_browser_action_comparison(signature.get("action_comparison"))
 
     for error in _browser_object_list(
         value.get("capture_errors", []), "browser capture error"
@@ -333,6 +355,39 @@ def _validate_browser_integer_field(
 ) -> None:
     if field in value and type(value[field]) is not int:
         raise ValueError(f"{label} {field} must be an integer")
+
+
+def _validate_browser_operational_action(value: Any, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != BROWSER_OPERATIONAL_ACTION_FIELDS:
+        raise ValueError(f"{label} has invalid fields")
+    for field in BROWSER_OPERATIONAL_ACTION_FIELDS:
+        _validate_browser_string_field(value, field, label)
+
+
+def _validate_browser_action_comparison(value: Any) -> None:
+    if value is None:
+        return
+    label = "browser signature action comparison"
+    if not isinstance(value, dict) or set(value) != BROWSER_ACTION_COMPARISON_FIELDS:
+        raise ValueError(f"{label} has invalid fields")
+    _validate_browser_string_field(value, "status", label)
+    if value["status"] not in BROWSER_ACTION_COMPARISON_STATUSES:
+        raise ValueError(f"{label} status is invalid")
+    _validate_browser_string_field(value, "contract", label, nullable=True)
+    for field in ("before", "after"):
+        _validate_browser_operational_action(value[field], f"{label} {field}")
+    context = value["context"]
+    if (
+        not isinstance(context, dict)
+        or set(context) != BROWSER_ACTION_COMPARISON_CONTEXT_FIELDS
+        or any(type(context[field]) is not bool for field in context)
+    ):
+        raise ValueError(f"{label} context is invalid")
+    for field in ("memory_correction_proven", "controlled_pair"):
+        if type(value[field]) is not bool:
+            raise ValueError(f"{label} {field} must be a boolean")
 
 
 def _is_safe_browser_scalar(value: Any) -> bool:

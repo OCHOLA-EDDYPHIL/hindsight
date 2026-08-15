@@ -115,3 +115,51 @@ def test_role_tool_requires_worker_dispatch_attempt_insert(monkeypatch):
             label="worker",
             deploy_url="postgresql://deploy@db.example/hindsight",
         )
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("deny_read", "cannot read demo replay context"),
+        ("allow_update", "can mutate demo replay context"),
+    ],
+)
+def test_role_tool_requires_read_only_worker_demo_replay_access(
+    monkeypatch, mode, message
+):
+    import apply_database_roles as roles
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, statement):
+            if statement == "SELECT current_user":
+                return type("Result", (), {"fetchone": lambda self: ("worker",)})()
+            if "rolsuper, rolbypassrls" in statement:
+                return type(
+                    "Result", (), {"fetchone": lambda self: (False, False)}
+                )()
+            if "INSERT INTO agent_run_dispatch_attempts" in statement:
+                return None
+            if statement == "SELECT id FROM demo_sessions WHERE false":
+                if mode == "deny_read":
+                    raise roles.psycopg.errors.InsufficientPrivilege()
+                return None
+            if statement == "UPDATE demo_sessions SET status = status WHERE false":
+                if mode == "allow_update":
+                    return None
+                raise roles.psycopg.errors.InsufficientPrivilege()
+            raise roles.psycopg.errors.InsufficientPrivilege()
+
+    monkeypatch.setattr(roles.psycopg, "connect", lambda *_args, **_kwargs: Connection())
+
+    with pytest.raises(RuntimeError, match=message):
+        roles._assert_restricted(
+            "postgresql://worker@db.example/hindsight",
+            label="worker",
+            deploy_url="postgresql://deploy@db.example/hindsight",
+        )

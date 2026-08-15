@@ -823,6 +823,101 @@ describe("cockpit historical snapshot selection", () => {
     expect(new URLSearchParams(window.location.search).get("as_of")).toBe(asOf);
   });
 
+  it("does not let periodic refresh supersede a pending scenario deep link", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?scenario_id=scenario-slow&namespace=stale",
+    );
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      defaultNamespace: "fallback",
+      pollIntervalMs: 1500,
+    };
+    const scenario: SignatureScenario = {
+      scenario_id: "scenario-slow",
+      namespace: "tenant:payments:slow-session",
+      status: "active",
+      session_status: "active",
+      rewind_anchor: null,
+      completed_at: null,
+      incident: { slug: "incident-slow", title: "Slow scenario load" },
+      runs: [],
+      memories: [],
+      stages: {},
+    };
+    const polls: Array<() => void> = [];
+    const setInterval = window.setInterval.bind(window);
+    vi.spyOn(window, "setInterval").mockImplementation(
+      ((handler: TimerHandler, timeout?: number, ...args: any[]) => {
+        if (timeout === 1500) {
+          polls.push(handler as () => void);
+          return polls.length;
+        }
+        return setInterval(handler, timeout, ...args);
+      }) as typeof window.setInterval,
+    );
+
+    let resolveScenario: (response: Response) => void = () => undefined;
+    const pendingScenario = new Promise<Response>((resolve) => {
+      resolveScenario = resolve;
+    });
+    let scenarioRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-slow") {
+          scenarioRequests += 1;
+          return scenarioRequests === 1
+            ? pendingScenario
+            : Promise.resolve(jsonResponse(scenario));
+        }
+        if (url.pathname === "/v1/namespaces/fallback/beliefs") {
+          return Promise.resolve(jsonResponse({ ...currentSnapshot, namespace: "fallback" }));
+        }
+        if (
+          url.pathname ===
+          "/v1/namespaces/tenant%3Apayments%3Aslow-session/beliefs"
+        ) {
+          return Promise.resolve(
+            jsonResponse({ ...currentSnapshot, namespace: scenario.namespace }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(scenarioRequests).toBe(1));
+    expect(result.current.loadState).toBe("loading");
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      for (const poll of [...polls]) poll();
+      await new Promise((resolve) => window.setTimeout(resolve, 5));
+    });
+    expect(scenarioRequests).toBe(1);
+
+    await act(async () => {
+      resolveScenario(jsonResponse(scenario));
+    });
+    await waitFor(() => expect(result.current.loadState).toBe("ready"));
+
+    expect(result.current.scenario).toMatchObject({
+      scenario_id: "scenario-slow",
+      session_status: "active",
+      namespace: "tenant:payments:slow-session",
+    });
+    expect(result.current.namespace).toBe("tenant:payments:slow-session");
+    expect(scenarioRequests).toBe(1);
+  });
+
   it("rehydrates replay identity on browser history navigation", async () => {
     window.history.replaceState({}, "", "/?scenario_id=scenario-a&namespace=tenant%3Aa");
     window.HINDSIGHT_CONFIG = {

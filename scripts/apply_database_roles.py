@@ -42,6 +42,22 @@ def _assert_restricted(url: str, *, label: str, deploy_url: str) -> str:
                 raise RuntimeError(
                     "worker database identity cannot insert dispatch attempts"
                 ) from exc
+            try:
+                connection.execute("SELECT id FROM demo_sessions WHERE false")
+            except psycopg.errors.InsufficientPrivilege as exc:
+                raise RuntimeError(
+                    "worker database identity cannot read demo replay context"
+                ) from exc
+            try:
+                connection.execute(
+                    "UPDATE demo_sessions SET status = status WHERE false"
+                )
+            except psycopg.errors.InsufficientPrivilege:
+                pass
+            else:
+                raise RuntimeError(
+                    "worker database identity can mutate demo replay context"
+                )
         for statement in (
             f"CREATE TABLE {table_name} (id INT PRIMARY KEY)",
             "DELETE FROM semantic_memories WHERE false",

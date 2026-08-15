@@ -241,7 +241,9 @@ def test_browser_demo_reset_isolates_sessions_and_incidents():
 
 
 @requires_db
-def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
+def test_browser_signature_boundary_preserves_seed_and_closes_later_memories(monkeypatch):
+    from hindsight import demo_state
+    from hindsight.db import connect
     from hindsight.db import database_url
     from hindsight.demo_state import (
         poison_demo_memory,
@@ -311,7 +313,29 @@ def test_browser_signature_boundary_preserves_seed_and_closes_later_memories():
         worker_id="test.browser-signature",
         db_url=database_url(),
     )
-    replay_context = signature_replay_context(namespace=namespace, db_url=database_url())
+    with connect(database_url()) as restricted_conn:
+        restricted_conn.execute((ROOT / "infra/db/roles.sql").read_text())
+        restricted_conn.commit()
+        restricted_conn.execute("SET ROLE hindsight_memory_worker")
+        restricted_conn.commit()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            restricted_conn.execute(
+                "UPDATE demo_sessions SET status = status WHERE namespace = %s",
+                (namespace,),
+            )
+        restricted_conn.rollback()
+        with monkeypatch.context() as replay_patch:
+            replay_patch.setattr(
+                demo_state,
+                "connect",
+                lambda *_args, **_kwargs: nullcontext(restricted_conn),
+            )
+            replay_context = signature_replay_context(
+                namespace=namespace,
+                db_url=database_url(),
+            )
+        restricted_conn.execute("RESET ROLE")
+        restricted_conn.commit()
 
     invalidated_ids = {str(value) for value in completed["invalidated_memory_ids"]}
     assert invalidated_ids == {

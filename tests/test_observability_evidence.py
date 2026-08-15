@@ -476,13 +476,74 @@ def test_observability_log_query_is_bounded_and_rejects_secret_fields():
 
 
 def test_observability_browser_evidence_binds_completed_product_run(tmp_path):
+    from tests.test_browser_ui import _browser_operation_receipt
+
     module = _script("collect_observability_evidence")
     operation = tmp_path / "operation.json"
-    operation.write_text(
-        json.dumps(
-            {"signature": {"corrected": {"run_id": "run-1", "status": "completed"}}}
-        )
+    def run(label: str, *, approved: bool, primary_action: str) -> dict:
+        return {
+            "run_id": f"run-{label}",
+            "decision_id": f"decision-{label}",
+            "status": "completed" if approved else "rejected",
+            "reflected_memory_id": None,
+            "reads": [],
+            "action_trace": {
+                "selection": {"fingerprint": "a" * 64},
+                "recommendation": {
+                    "id": f"recommendation:{label}",
+                    "operational_action": {
+                        "contract": "payments_retry_amplification.v1",
+                        "primary_action": primary_action,
+                        "fingerprint": f"operational_action:{primary_action}",
+                    },
+                },
+                "approval": {"approved": approved},
+                "execution": {
+                    "status": (
+                        "recommendation_approved" if approved else "not_executed"
+                    )
+                },
+            },
+        }
+
+    before = {
+        "contract": "payments_retry_amplification.v1",
+        "primary_action": "scale_workers",
+        "fingerprint": "operational_action:scale_workers",
+    }
+    after = {
+        "contract": "payments_retry_amplification.v1",
+        "primary_action": "throttle_retries",
+        "fingerprint": "operational_action:throttle_retries",
+    }
+    receipt = _browser_operation_receipt(
+        operation_id="operation-1",
+        observed=[],
+        persisted=None,
+        signature={
+            "namespace": "safe-namespace",
+            "operation_id": "operation-1",
+            "invalidated_memory_ids": ["memory-1"],
+            "bad": run("bad", approved=False, primary_action="scale_workers"),
+            "corrected": run(
+                "1", approved=True, primary_action="throttle_retries"
+            ),
+            "action_comparison": {
+                "status": "changed",
+                "contract": "payments_retry_amplification.v1",
+                "before": before,
+                "after": after,
+                "context": {
+                    "prompt_equal": True,
+                    "normalized_telemetry_equal": True,
+                },
+                "memory_correction_proven": True,
+                "controlled_pair": True,
+            },
+        },
+        capture_errors=[],
     )
+    operation.write_text(json.dumps(receipt))
     run_id, digest = module.validate_browser_evidence(operation)
     assert run_id == "run-1"
     assert digest == module.hashlib.sha256(operation.read_bytes()).hexdigest()
@@ -519,6 +580,37 @@ def test_observability_browser_evidence_rejects_unprojected_nested_fields(tmp_pa
             }
         },
         {
+            "signature": {
+                "corrected": {
+                    "run_id": "run-1",
+                    "status": "completed",
+                    "operational_action": {
+                        "contract": "payments_retry_amplification.v1",
+                        "primary_action": "throttle_retries",
+                        "fingerprint": "operational_action:valid",
+                        "parameters": {"credential": "unrestricted"},
+                    },
+                }
+            }
+        },
+        {
+            "signature": {
+                "corrected": {"run_id": "run-1", "status": "completed"},
+                "action_comparison": {
+                    "status": "changed",
+                    "contract": "payments_retry_amplification.v1",
+                    "before": None,
+                    "after": None,
+                    "context": {
+                        "prompt_equal": {"prompt": "unrestricted"},
+                        "normalized_telemetry_equal": True,
+                    },
+                    "memory_correction_proven": True,
+                    "controlled_pair": True,
+                },
+            }
+        },
+        {
             **base,
             "persisted": {
                 "events": [],
@@ -539,7 +631,7 @@ def test_observability_browser_evidence_rejects_unprojected_nested_fields(tmp_pa
 
     for value in cases:
         operation.write_text(json.dumps(value))
-        with pytest.raises(ValueError, match="unexpected fields"):
+        with pytest.raises(ValueError, match="unexpected fields|invalid"):
             module.validate_browser_evidence(operation)
 
 

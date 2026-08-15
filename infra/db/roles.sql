@@ -182,6 +182,7 @@ GRANT SELECT ON TABLE
     incident_events,
     runbooks,
     incident_runbooks,
+    demo_sessions,
     benchmark_experiments,
     benchmark_trials,
     benchmark_actions,

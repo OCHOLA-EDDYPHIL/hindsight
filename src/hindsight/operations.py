@@ -327,7 +327,11 @@ def preview_consolidation_review(
         )
 
     def build(cur: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        candidate = _lock_consolidation_candidate(cur, candidate_id=candidate_id)
+        candidate = _read_consolidation_candidate(
+            cur,
+            candidate_id=candidate_id,
+            for_update=False,
+        )
         if candidate is None or candidate["review_status"] != "pending":
             raise OperationConflictError("consolidation candidate is no longer pending")
         metadata = dict(candidate["metadata"] or {})
@@ -355,7 +359,11 @@ def preview_consolidation_review(
         if action == "approve" and validation.get("status") != "passed":
             raise OperationConflictError("candidate validation is not approval-eligible")
         if action == "approve":
-            _validate_consolidation_evidence(cur, candidate=candidate)
+            _validate_consolidation_evidence(
+                cur,
+                candidate=candidate,
+                for_update=False,
+            )
         request = {
             "candidate_id": candidate_id,
             "candidate_memory_id": str(candidate["lesson_memory_id"]),
@@ -383,21 +391,27 @@ def preview_consolidation_review(
     )
 
 
-def _lock_consolidation_candidate(cur: Any, *, candidate_id: str) -> dict[str, Any] | None:
+def _read_consolidation_candidate(
+    cur: Any,
+    *,
+    candidate_id: str,
+    for_update: bool,
+) -> dict[str, Any] | None:
+    lock_clause = " FOR UPDATE" if for_update else ""
     cur.execute(
-        "SELECT * FROM consolidation_jobs WHERE id = %s FOR UPDATE",
+        f"SELECT * FROM consolidation_jobs WHERE id = %s{lock_clause}",
         (candidate_id,),
     )
     job = cur.fetchone()
     if job is None or job["lesson_memory_id"] is None:
         return None
     cur.execute(
-        """
+        f"""
             SELECT namespace, content, content_schema, structured_payload,
                    metadata, trust_status, t_invalid, payload_digest, belief_id
             FROM semantic_memories
             WHERE id = %s
-            FOR UPDATE
+            {lock_clause}
         """,
         (job["lesson_memory_id"],),
     )
@@ -407,9 +421,15 @@ def _lock_consolidation_candidate(cur: Any, *, candidate_id: str) -> dict[str, A
     return {**dict(job), **dict(memory)}
 
 
-def _validate_consolidation_evidence(cur: Any, *, candidate: dict[str, Any]) -> None:
+def _validate_consolidation_evidence(
+    cur: Any,
+    *,
+    candidate: dict[str, Any],
+    for_update: bool = True,
+) -> None:
     """Revalidate every source row represented by the immutable evidence manifest."""
 
+    lock_clause = " FOR UPDATE" if for_update else ""
     manifest = dict(candidate.get("evidence_manifest") or {})
     if manifest.get("schema_version") != 1 or _digest(manifest) != str(
         candidate.get("evidence_fingerprint") or ""
@@ -432,10 +452,10 @@ def _validate_consolidation_evidence(cur: Any, *, candidate: dict[str, Any]) -> 
             if evidence_id != f"memory:{memory_id}":
                 raise OperationConflictError("candidate memory evidence identity changed")
             cur.execute(
-                """
+                f"""
                     SELECT id, namespace, content, trust_status,
                            lineage_status, t_invalid
-                    FROM semantic_memories WHERE id = %s FOR UPDATE
+                    FROM semantic_memories WHERE id = %s {lock_clause}
                 """,
                 (memory_id,),
             )
@@ -465,17 +485,17 @@ def _validate_consolidation_evidence(cur: Any, *, candidate: dict[str, Any]) -> 
         if evidence_id != f"event:{event_id}":
             raise OperationConflictError("candidate event evidence identity changed")
         cur.execute(
-            """
+            f"""
                 SELECT id, incident_id, event_type, event_schema, structured_payload
-                FROM incident_events WHERE id = %s FOR UPDATE
+                FROM incident_events WHERE id = %s {lock_clause}
             """,
             (event_id,),
         )
         event = cur.fetchone()
         cur.execute(
-            """
+            f"""
                 SELECT id, status, resolution_event_id
-                FROM incidents WHERE id = %s FOR UPDATE
+                FROM incidents WHERE id = %s {lock_clause}
             """,
             (candidate["incident_id"],),
         )
@@ -1171,9 +1191,10 @@ def _verify_effect_state(*, cur: Any, operation: dict[str, Any], preview: dict[s
             if [str(row["id"]) for row in closure] != effect["close_memory_ids"]:
                 raise OperationConflictError("review closure changed after preview")
     elif operation_type == "consolidation_approval":
-        candidate = _lock_consolidation_candidate(
+        candidate = _read_consolidation_candidate(
             cur,
             candidate_id=request["candidate_id"],
+            for_update=True,
         )
         if candidate is None or candidate["review_status"] != "pending":
             raise OperationConflictError("consolidation candidate is no longer pending")

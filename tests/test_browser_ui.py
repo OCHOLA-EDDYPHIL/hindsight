@@ -244,6 +244,7 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
     secret = "unrestricted-model-or-credential-material"
 
     def run(status: str, approved: bool) -> dict[str, Any]:
+        primary_action = "throttle_retries" if approved else "scale_workers"
         return {
             "run_id": f"run-{status}",
             "decision_id": f"decision-{status}",
@@ -260,7 +261,15 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
             ],
             "action_trace": {
                 "selection": {"fingerprint": "a" * 64},
-                "recommendation": {"id": f"recommendation:{'b' * 64}"},
+                "recommendation": {
+                    "id": f"recommendation:{'b' * 64}",
+                    "operational_action": {
+                        "contract": "payments_retry_amplification.v1",
+                        "primary_action": primary_action,
+                        "fingerprint": f"operational_action:{primary_action}",
+                        "directive": secret,
+                    },
+                },
                 "approval": {"approved": approved},
                 "execution": {"status": "recommendation_approved"},
                 "reasoning_steps": [{"decision": {"rationale": secret}}],
@@ -303,6 +312,30 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
             "invalidated_memory_ids": ["memory-1"],
             "bad": run("rejected", False),
             "corrected": run("completed", True),
+            "action_comparison": {
+                "status": "changed",
+                "contract": "payments_retry_amplification.v1",
+                "before": {
+                    "contract": "payments_retry_amplification.v1",
+                    "primary_action": "scale_workers",
+                    "fingerprint": "operational_action:scale_workers",
+                    "directive": secret,
+                },
+                "after": {
+                    "contract": "payments_retry_amplification.v1",
+                    "primary_action": "throttle_retries",
+                    "fingerprint": "operational_action:throttle_retries",
+                    "directive": secret,
+                },
+                "context": {
+                    "prompt_equal": True,
+                    "normalized_telemetry_equal": True,
+                    "raw_prompt": secret,
+                },
+                "memory_correction_proven": True,
+                "controlled_pair": True,
+                "raw_evidence": secret,
+            },
         },
         capture_errors=[{"stage": "database", "type": "capture_failed", "detail": secret}],
     )
@@ -337,6 +370,31 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
         "read_memory_ids",
         "read_count",
         "downstream_lineage_edge_count",
+    }
+    assert receipt["signature"]["corrected"]["operational_action"] == {
+        "contract": "payments_retry_amplification.v1",
+        "primary_action": "throttle_retries",
+        "fingerprint": "operational_action:throttle_retries",
+    }
+    assert receipt["signature"]["action_comparison"] == {
+        "status": "changed",
+        "contract": "payments_retry_amplification.v1",
+        "before": {
+            "contract": "payments_retry_amplification.v1",
+            "primary_action": "scale_workers",
+            "fingerprint": "operational_action:scale_workers",
+        },
+        "after": {
+            "contract": "payments_retry_amplification.v1",
+            "primary_action": "throttle_retries",
+            "fingerprint": "operational_action:throttle_retries",
+        },
+        "context": {
+            "prompt_equal": True,
+            "normalized_telemetry_equal": True,
+        },
+        "memory_correction_proven": True,
+        "controlled_pair": True,
     }
     assert receipt["capture_errors"] == [{"stage": "database", "type": "capture_failed"}]
     assert secret not in json.dumps(receipt, sort_keys=True)
@@ -881,6 +939,19 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(lambda browser: "0 invalid" in browser.find_element(By.ID, "memoryCount").text)
         assert not driver.find_elements(By.CSS_SELECTOR, ".memory.invalidated")
 
+        live_button = driver.find_element(By.ID, "liveButton")
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+            live_button,
+        )
+        wait.until(
+            lambda browser: browser.execute_script(
+                "const button = arguments[0].getBoundingClientRect();"
+                "const header = document.querySelector('.site-header').getBoundingClientRect();"
+                "return button.top >= header.bottom && button.bottom <= window.innerHeight;",
+                browser.find_element(By.ID, "liveButton"),
+            )
+        )
         driver.find_element(By.ID, "liveButton").click()
         wait.until(
             lambda browser: browser.find_element(By.ID, "beliefTitle").text == "Current Beliefs"
@@ -1281,9 +1352,9 @@ def _assert_controlled_causal_evidence_panel(panel) -> None:
         "causal evidence claimed unmeasured service recovery",
     )
     proof_states = {
-        item.find_element(By.TAG_NAME, "span").text.strip(): item.get_attribute(
-            "data-proof-status"
-        )
+        str(
+            item.find_element(By.TAG_NAME, "span").get_attribute("textContent") or ""
+        ).strip(): item.get_attribute("data-proof-status")
         for item in panel.find_elements(
             By.CSS_SELECTOR, '[aria-label="Causal evidence proof states"] > li'
         )
@@ -1484,11 +1555,23 @@ def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> di
     )
     from hindsight.db import connect, database_url
     from hindsight.operations import get_operation
-    from hindsight.runs import get_run
     from hindsight.server_tenants import PUBLIC_DEMO_TENANT_ID
 
-    run = get_run(run_id=run_id, db_url=database_url())
-    _require(run is not None, "completed remediation run was not persisted")
+    with connect(
+        database_url(),
+        application_name="hindsight-browser-remediation-run-receipt",
+    ) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM agent_runs WHERE id = %s", (run_id,))
+            run_row = cur.fetchone()
+            _require(run_row is not None, "completed remediation run was not persisted")
+            run = dict(run_row)
+            cur.execute(
+                "SELECT * FROM agent_run_events WHERE run_id = %s ORDER BY sequence",
+                (run_id,),
+            )
+            run["events"] = [dict(event) for event in cur.fetchall()]
+
     _require(run["status"] == "completed", "remediation run did not complete")
     _require(
         run["user_input"] == REMEDIATION_REPORT,
@@ -2484,15 +2567,7 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
             "recommendation_id": (
                 str(trace["recommendation"]["id"]) if trace.get("recommendation") else None
             ),
-            "operational_action": (
-                {
-                    "contract": str(operational_action["contract"]),
-                    "primary_action": str(operational_action["primary_action"]),
-                    "fingerprint": str(operational_action["fingerprint"]),
-                }
-                if operational_action
-                else None
-            ),
+            "operational_action": _operational_action_receipt(operational_action),
             "approval_approved": bool(trace["approval"]["approved"]),
             "execution_status": str(trace["execution"]["status"]),
             "read_memory_ids": [str(read["memory_id"]) for read in reads],
@@ -2508,7 +2583,47 @@ def _signature_receipt(signature: dict[str, Any] | None) -> dict[str, Any] | Non
         "invalidated_memory_ids": [str(value) for value in signature["invalidated_memory_ids"]],
         "bad": run_receipt(signature["bad"]),
         "corrected": run_receipt(signature["corrected"]),
-        "action_comparison": signature.get("action_comparison"),
+        "action_comparison": _action_comparison_receipt(
+            signature.get("action_comparison")
+        ),
+    }
+
+
+def _operational_action_receipt(
+    action: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if action is None:
+        return None
+    return {
+        "contract": str(action["contract"]),
+        "primary_action": str(action["primary_action"]),
+        "fingerprint": str(action["fingerprint"]),
+    }
+
+
+def _action_comparison_receipt(
+    comparison: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if comparison is None:
+        return None
+    context = comparison["context"]
+    return {
+        "status": str(comparison["status"]),
+        "contract": (
+            str(comparison["contract"])
+            if comparison.get("contract") is not None
+            else None
+        ),
+        "before": _operational_action_receipt(comparison.get("before")),
+        "after": _operational_action_receipt(comparison.get("after")),
+        "context": {
+            "prompt_equal": bool(context["prompt_equal"]),
+            "normalized_telemetry_equal": bool(
+                context["normalized_telemetry_equal"]
+            ),
+        },
+        "memory_correction_proven": bool(comparison["memory_correction_proven"]),
+        "controlled_pair": bool(comparison["controlled_pair"]),
     }
 
 

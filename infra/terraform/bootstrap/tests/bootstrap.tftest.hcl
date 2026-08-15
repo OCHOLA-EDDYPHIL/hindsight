@@ -131,12 +131,32 @@ run "isolated_bootstrap" {
         for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
         if statement.sid == "ApiDatabaseCredential"
       ]).resources) == toset([local.api_database_parameter_arn]) &&
+      toset(local.quarantine_key_arns) == toset(["arn:aws:kms:us-east-1:123456789012:key/*"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).actions) == toset(["kms:Decrypt"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).resources) == toset(local.quarantine_key_arns) &&
+      toset([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : "${condition.test}:${condition.variable}:${join(",", condition.values)}"
+        ]) == toset([
+        "ForAnyValue:StringEquals:kms:ResourceAliases:alias/hindsight-demo-quarantine",
+        "StringEquals:kms:ViaService:dynamodb.us-east-1.amazonaws.com",
+        "StringEquals:kms:EncryptionContext:aws:dynamodb:tableName:hindsight-demo-quarantine",
+        "StringEquals:kms:EncryptionContext:aws:dynamodb:subscriberId:123456789012",
+      ]) &&
       length([
         for statement in data.aws_iam_policy_document.github_quarantine_redrive.statement : statement
         if anytrue([for action in statement.actions : startswith(action, "kms:")])
-      ]) == 0
+      ]) == 1
     )
-    error_message = "Quarantine redrive must use a dedicated OIDC role with only one exact record and the API writer database credential."
+    error_message = "Quarantine redrive must use a dedicated OIDC role with exact record, database credential, and DynamoDB-bound decrypt authority."
   }
 
   assert {
@@ -222,6 +242,30 @@ run "isolated_bootstrap" {
         for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
         if statement.sid == "ApiDatabaseCredential"
       ]).resources) == toset([local.api_database_parameter_arn]) &&
+      toset(local.quarantine_key_arns) == toset(["arn:aws:kms:us-east-1:123456789012:key/*"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).actions) == toset(["kms:Decrypt"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).resources) == toset(local.quarantine_key_arns) &&
+      toset([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : "${condition.test}:${condition.variable}:${join(",", condition.values)}"
+        ]) == toset([
+        "ForAnyValue:StringEquals:kms:ResourceAliases:alias/hindsight-demo-quarantine",
+        "StringEquals:kms:ViaService:dynamodb.us-east-1.amazonaws.com",
+        "StringEquals:kms:EncryptionContext:aws:dynamodb:tableName:hindsight-demo-quarantine",
+        "StringEquals:kms:EncryptionContext:aws:dynamodb:subscriberId:123456789012",
+      ]) &&
+      length([
+        for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
+        if anytrue([for action in statement.actions : startswith(action, "kms:")])
+      ]) == 1 &&
       length([
         for statement in data.aws_iam_policy_document.github_worker_acceptance.statement : statement
         if contains(statement.actions, "dynamodb:Query") || contains(statement.actions, "dynamodb:UpdateItem")
@@ -231,7 +275,7 @@ run "isolated_bootstrap" {
         if contains(statement.actions, "sqs:SendMessage")
       ]) == 0
     )
-    error_message = "Hosted worker acceptance must use a dedicated role for exact enqueue, read, and synthetic cleanup authority."
+    error_message = "Hosted worker acceptance must use a dedicated role for exact enqueue, read, synthetic cleanup, and DynamoDB-bound decrypt authority."
   }
 
   assert {
