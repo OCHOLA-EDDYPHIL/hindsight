@@ -666,6 +666,29 @@ data "aws_iam_policy_document" "worker" {
     ]
   }
   statement {
+    sid       = "ExactQuarantineTableDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = [aws_kms_key.quarantine.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${var.aws_region}.${data.aws_partition.current.dns_suffix}"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:tableName"
+      values   = [aws_dynamodb_table.quarantine.name]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:subscriberId"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+  statement {
     sid       = "QuarantineMetrics"
     actions   = ["cloudwatch:PutMetricData"]
     resources = ["*"]

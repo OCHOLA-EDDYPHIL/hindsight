@@ -316,11 +316,68 @@ run "complete_demo_graph" {
         aws_dynamodb_table.quarantine.arn,
         "${aws_dynamodb_table.quarantine.arn}/index/quarantine-status-created-at-index",
       ]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).actions) == toset(["kms:Decrypt"]) &&
+      toset(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).resources) == toset([aws_kms_key.quarantine.arn]) &&
+      length(one([
+        for statement in data.aws_iam_policy_document.worker.statement : statement
+        if statement.sid == "ExactQuarantineTableDecrypt"
+      ]).condition) == 3 &&
+      one([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.worker.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : condition
+        if condition.variable == "kms:ViaService"
+      ]).test == "StringEquals" &&
+      toset(one([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.worker.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : condition
+        if condition.variable == "kms:ViaService"
+      ]).values) == toset(["dynamodb.us-east-1.amazonaws.com"]) &&
+      one([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.worker.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : condition
+        if condition.variable == "kms:EncryptionContext:aws:dynamodb:tableName"
+      ]).test == "StringEquals" &&
+      toset(one([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.worker.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : condition
+        if condition.variable == "kms:EncryptionContext:aws:dynamodb:tableName"
+      ]).values) == toset([aws_dynamodb_table.quarantine.name]) &&
+      one([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.worker.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : condition
+        if condition.variable == "kms:EncryptionContext:aws:dynamodb:subscriberId"
+      ]).test == "StringEquals" &&
+      toset(one([
+        for condition in one([
+          for statement in data.aws_iam_policy_document.worker.statement : statement
+          if statement.sid == "ExactQuarantineTableDecrypt"
+        ]).condition : condition
+        if condition.variable == "kms:EncryptionContext:aws:dynamodb:subscriberId"
+      ]).values) == toset([data.aws_caller_identity.current.account_id]) &&
       length([
         for statement in data.aws_iam_policy_document.worker.statement : statement
         if(
           (statement.sid == "QuarantineLedger" && contains(statement.actions, "dynamodb:UpdateItem")) ||
-          anytrue([for action in statement.actions : startswith(action, "kms:")])
+          (
+            statement.sid != "ExactQuarantineTableDecrypt" &&
+            anytrue([for action in statement.actions : startswith(action, "kms:")])
+          )
         )
       ]) == 0 &&
       toset(one(one([

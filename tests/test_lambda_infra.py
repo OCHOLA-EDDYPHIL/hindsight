@@ -186,7 +186,37 @@ def test_poison_quarantine_and_alert_delivery_have_fail_closed_aws_boundaries():
     assert '"dynamodb:Query"' in quarantine_ledger
     assert '"dynamodb:UpdateItem"' not in quarantine_ledger
     assert 'sid = "QuarantineEncryption"' not in worker_policy
-    assert '"kms:Decrypt"' not in worker_policy
+    assert 'sid       = "ExactQuarantineTableDecrypt"' in worker_policy
+    quarantine_decrypt = worker_policy.split(
+        'sid       = "ExactQuarantineTableDecrypt"', 1
+    )[1].split("  statement {", 1)[0]
+    assert 'actions   = ["kms:Decrypt"]' in quarantine_decrypt
+    assert "resources = [aws_kms_key.quarantine.arn]" in quarantine_decrypt
+    assert quarantine_decrypt.count("condition {") == 3
+    assert 'variable = "kms:ViaService"' in quarantine_decrypt
+    assert (
+        'values   = ["dynamodb.${var.aws_region}.'
+        '${data.aws_partition.current.dns_suffix}"]'
+    ) in quarantine_decrypt
+    assert (
+        'variable = "kms:EncryptionContext:aws:dynamodb:tableName"'
+    ) in quarantine_decrypt
+    assert "values   = [aws_dynamodb_table.quarantine.name]" in quarantine_decrypt
+    assert (
+        'variable = "kms:EncryptionContext:aws:dynamodb:subscriberId"'
+    ) in quarantine_decrypt
+    assert "values   = [data.aws_caller_identity.current.account_id]" in quarantine_decrypt
+    assert '"kms:ResourceAliases"' not in quarantine_decrypt
+    assert worker_policy.count('"kms:Decrypt"') == 1
+    for forbidden_kms_action in (
+        '"kms:CreateGrant"',
+        '"kms:DescribeKey"',
+        '"kms:Encrypt"',
+        '"kms:GenerateDataKey"',
+        '"kms:ReEncryptFrom"',
+        '"kms:ReEncryptTo"',
+    ):
+        assert forbidden_kms_action not in worker_policy
     assert 'sid       = "QuarantineMetrics"' in worker_policy
     assert 'values   = ["Hindsight/Quarantine"]' in worker_policy
 
