@@ -96,6 +96,16 @@ jobs:
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.source_revision }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Reauthorize exact release
+        env:
+          EXPECTED_DEPLOYED_URL: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
+          EXPECTED_SHA: ${{ needs.authorize.outputs.source_revision }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "$EXPECTED_SHA"
+          --workflow-path .github/workflows/observability-evidence.yml
+          --deployed-url "$EXPECTED_DEPLOYED_URL"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -104,26 +114,25 @@ jobs:
       - name: Download exact acceptance provenance
         uses: actions/download-artifact@v4
         with:
-          name: product-provenance-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_attempt }}
+          name: product-provenance-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_id }}
           path: build/observability-input
           run-id: ${{ needs.authorize.outputs.acceptance_run_id }}
           github-token: ${{ github.token }}
       - name: Download exact browser evidence
         uses: actions/download-artifact@v4
         with:
-          name: browser-evidence-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_attempt }}
+          name: browser-evidence-${{ needs.authorize.outputs.source_revision }}-${{ needs.authorize.outputs.acceptance_run_id }}
           path: build/observability-browser
           run-id: ${{ needs.authorize.outputs.acceptance_run_id }}
           github-token: ${{ github.token }}
-      - name: Fetch exact acceptance attempt metadata
+      - name: Fetch latest acceptance run metadata
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           ACCEPTANCE_RUN_ID: ${{ needs.authorize.outputs.acceptance_run_id }}
-          ACCEPTANCE_RUN_ATTEMPT: ${{ needs.authorize.outputs.acceptance_run_attempt }}
         run: >-
           gh api
-          "repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID/attempts/$ACCEPTANCE_RUN_ATTEMPT"
+          "repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID"
           > build/observability-input/acceptance-run.json
       - uses: aws-actions/configure-aws-credentials@v4
         with:

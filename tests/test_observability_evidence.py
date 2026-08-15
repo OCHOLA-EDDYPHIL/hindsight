@@ -328,7 +328,8 @@ def _acceptance_documents():
         "event": "workflow_dispatch",
         "path": ".github/workflows/live-acceptance.yml",
         "conclusion": "success",
-        "run_started_at": started.isoformat(),
+        "created_at": started.isoformat(),
+        "run_started_at": (started + timedelta(minutes=10)).isoformat(),
         "updated_at": (started + timedelta(minutes=30)).isoformat(),
         "repository": {"full_name": "owner/hindsight"},
         "actor": {"login": "owner"},
@@ -338,6 +339,7 @@ def _acceptance_documents():
         "repository": "owner/hindsight",
         "run_id": "123",
         "run_attempt": "2",
+        "artifact_scope": "workflow_run",
         "head_sha": SOURCE_REVISION,
         "acceptance_mode": "full",
         "deployment_environment": "demo",
@@ -362,6 +364,36 @@ def test_observability_provenance_requires_successful_bounded_full_acceptance():
 
     provenance["bounded_observability_enabled"] = False
     with pytest.raises(ValueError, match="did not enable bounded observability"):
+        module.validate_provenance(
+            run,
+            provenance,
+            repository="owner/hindsight",
+            source_revision=SOURCE_REVISION,
+            acceptance_run_id="123",
+            acceptance_run_attempt="2",
+            deployment_environment="demo",
+        )
+
+
+def test_observability_provenance_requires_latest_workflow_run_artifacts():
+    module = _script("collect_observability_evidence")
+    run, provenance = _acceptance_documents()
+
+    run["run_attempt"] = 3
+    with pytest.raises(ValueError, match="latest run attempt"):
+        module.validate_provenance(
+            run,
+            provenance,
+            repository="owner/hindsight",
+            source_revision=SOURCE_REVISION,
+            acceptance_run_id="123",
+            acceptance_run_attempt="2",
+            deployment_environment="demo",
+        )
+
+    run["run_attempt"] = 2
+    provenance["artifact_scope"] = "run_attempt"
+    with pytest.raises(ValueError, match="provenance artifact scope"):
         module.validate_provenance(
             run,
             provenance,

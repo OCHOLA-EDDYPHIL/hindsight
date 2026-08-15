@@ -19,7 +19,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: hindsight-quarantine-redrive-${{ inputs.quarantine_id }}-${{ inputs.digest }}
+  group: hindsight-demo-environment-v2
   cancel-in-progress: false
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
           DIGEST: ${{ inputs.digest }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.sha }}
-          PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
+          MONITORED_SHA: ${{ vars.HINDSIGHT_MONITORED_SHA }}
           QUARANTINE_ID: ${{ inputs.quarantine_id }}
           REF_NAME: ${{ github.ref }}
           REF_PROTECTED: ${{ github.ref_protected }}
@@ -51,17 +51,18 @@ jobs:
           [[ "$EVENT_NAME" == "workflow_dispatch" \
             && "$REPOSITORY" == "OCHOLA-EDDYPHIL/hindsight" \
             && "$REPOSITORY_OWNER" == "OCHOLA-EDDYPHIL" \
-            && "$PRIVATE_REPOSITORY" == "true" \
             && "$REF_NAME" == "refs/heads/main" \
             && "$REF_PROTECTED" == "true" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/redrive-quarantine.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
             && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
             && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ \
+            && "$MONITORED_SHA" =~ ^[0-9a-f]{40}$ \
+            && "$EVENT_SHA" == "$MONITORED_SHA" \
             && "$QUARANTINE_ID" =~ ^q_[0-9a-f]{64}$ \
             && "$DIGEST" =~ ^[0-9a-f]{64}$ \
             && "$CONFIRMATION" == "redrive:$QUARANTINE_ID:$DIGEST" ]] || {
-            echo "Quarantine redrive requires the repository owner, protected exact main, and the exact record-bound confirmation phrase." >&2
+            echo "Quarantine redrive requires the repository owner, the monitored protected-main release, and the exact record-bound confirmation phrase." >&2
             exit 1
           }
           echo "source_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
@@ -85,6 +86,17 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
+      - name: Reauthorize monitored deployed release
+        env:
+          DEPLOYED_URL: ${{ vars.HINDSIGHT_PUBLIC_ORIGIN || format('https://{0}', vars.HINDSIGHT_DOMAIN_NAME || 'hindsight.strathmoreedu.qzz.io') }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MONITORED_SHA: ${{ vars.HINDSIGHT_MONITORED_SHA }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "$SOURCE_SHA"
+          --workflow-path .github/workflows/redrive-quarantine.yml
+          --monitored-sha "$MONITORED_SHA"
+          --deployed-url "$DEPLOYED_URL"
       - name: Verify exact source revision
         shell: bash
         run: |

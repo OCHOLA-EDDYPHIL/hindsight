@@ -18,6 +18,7 @@ from scripts.run_dvi_qualification import (
     _drop_and_verify_database,
     _qualify_database,
 )
+from scripts.run_memory_infrastructure_audit import run_denial_probes
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,25 +28,30 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_infrastructure_auditor_executes_reads_but_denies_mutation_ddl_and_grant():
     with psycopg.connect(database_url(), autocommit=True) as conn:
         conn.execute((ROOT / "infra/db/roles.sql").read_text())
+
+    tenant_id = "00000000-0000-0000-0000-000000000001"
+    with psycopg.connect(database_url()) as conn:
+        conn.execute("SET TRANSACTION READ ONLY")
         conn.execute("SET ROLE hindsight_infrastructure_auditor")
         conn.execute(
-            "SELECT set_config('hindsight.tenant_id', %s, false)",
-            ("00000000-0000-0000-0000-000000000001",),
+            "SELECT set_config('hindsight.tenant_id', %s, true)",
+            (tenant_id,),
         )
-        conn.execute("SELECT count(*) FROM demo_sessions").fetchone()
-        probes = (
-            "INSERT INTO demo_sessions "
-            "(id, demo_kind, namespace, created_by, tenant_id) "
-            "SELECT gen_random_uuid(), 'probe', 'probe', 'probe', "
-            "'00000000-0000-0000-0000-000000000001'::UUID WHERE false",
-            "UPDATE demo_sessions SET status = status WHERE false",
-            "DELETE FROM demo_sessions WHERE false",
-            "CREATE TABLE infrastructure_auditor_forbidden (id INT PRIMARY KEY)",
-            "GRANT hindsight_agent_writer TO root",
-        )
-        for statement in probes:
-            with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                conn.execute(statement)
+        assert conn.execute("SELECT count(*) FROM demo_sessions").fetchone() is not None
+
+    receipt = run_denial_probes(db_url=database_url(), tenant_id=tenant_id)
+
+    assert receipt["status"] == "PASS"
+    assert {result["id"] for result in receipt["results"]} == {
+        "insert",
+        "update",
+        "delete",
+        "ddl",
+        "grant",
+    }
+    serialized = str(receipt)
+    assert tenant_id not in serialized
+    assert "INSERT INTO" not in serialized
 
 
 @requires_db

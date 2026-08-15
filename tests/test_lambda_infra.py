@@ -269,7 +269,9 @@ def test_poison_quarantine_and_alert_delivery_have_fail_closed_aws_boundaries():
     assert "  alert_delivery:\n" in live
     assert "scripts/exercise_alert_delivery.py" in live
     assert "ALERT_DELIVERY_RESULT" in live
-    worker_acceptance = live.split("  worker_product:\n", 1)[1].split("  browser_product:\n", 1)[0]
+    worker_acceptance = live.split("  worker_product:\n", 1)[1].split(
+        "  redrive_product:\n", 1
+    )[0]
     for variable, output in (
         ("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_URL", "run_queue_url"),
         ("HINDSIGHT_ACCEPTANCE_RUN_QUEUE_ARN", "run_queue_arn"),
@@ -286,10 +288,26 @@ def test_poison_quarantine_and_alert_delivery_have_fail_closed_aws_boundaries():
     assert "worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}" in (
         worker_acceptance
     )
-    assert "path: ${{ runner.temp }}/hindsight-worker-evidence/quarantine-evidence.json" in (
+    assert "${{ github.run_id }}" in worker_acceptance
+    assert "${{ github.run_attempt }}" not in worker_acceptance
+    assert "Download a prior stable worker handoff" in worker_acceptance
+    assert "continue-on-error: true" in worker_acceptance
+    assert "Confirm an unavailable prior handoff is absent" in worker_acceptance
+    assert "steps.prior_worker_evidence.outcome == 'failure'" in worker_acceptance
+    assert "Reclaim a prior stable worker handoff" in worker_acceptance
+    assert "steps.prior_worker_evidence.outcome == 'success'" in worker_acceptance
+    assert "prior-redrive-cleanup.json" in worker_acceptance
+    assert "${{ runner.temp }}/hindsight-worker-evidence/quarantine-evidence.json" in (
+        worker_acceptance
+    )
+    assert "${{ runner.temp }}/hindsight-worker-evidence/redrive-handoff.json" in (
         worker_acceptance
     )
     assert "if-no-files-found: error" in worker_acceptance
+    assert "overwrite: true" in worker_acceptance
+    assert "if: failure() && steps.worker_evidence.outcome != 'success'" in worker_acceptance
+    assert "scripts/cleanup_quarantine_acceptance.py" in worker_acceptance
+    assert "redrive-unpublished-cleanup.json" in worker_acceptance
     assert "if: always()" not in worker_acceptance
 
 
@@ -912,6 +930,12 @@ def test_observability_evidence_is_owner_authorized_and_exact_main():
     assert '"$REF_NAME" == "refs/heads/main"' in authorization
     assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorization
     assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorization
+    assert "Reauthorize exact release" in workflow
+    assert "scripts/verify_release_context.py" in workflow
+    assert '--source-revision "$EXPECTED_SHA"' in workflow
+    assert "--workflow-path .github/workflows/observability-evidence.yml" in workflow
+    assert '--deployed-url "$EXPECTED_DEPLOYED_URL"' in workflow
+    assert "GITHUB_TOKEN: ${{ github.token }}" in workflow
     assert "collect_observability_evidence.py" in workflow
     assert "Collect bounded observability evidence" in workflow
     assert "run-id: ${{ needs.authorize.outputs.acceptance_run_id }}" in workflow
@@ -919,7 +943,25 @@ def test_observability_evidence_is_owner_authorized_and_exact_main():
         "role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/"
         "hindsight-github-observability-evidence" in workflow
     )
-    assert "browser-evidence-${{ needs.authorize.outputs.source_revision }}" in workflow
+    assert (
+        "product-provenance-${{ needs.authorize.outputs.source_revision }}-"
+        "${{ needs.authorize.outputs.acceptance_run_id }}" in workflow
+    )
+    assert (
+        "browser-evidence-${{ needs.authorize.outputs.source_revision }}-"
+        "${{ needs.authorize.outputs.acceptance_run_id }}" in workflow
+    )
+    assert (
+        "product-provenance-${{ needs.authorize.outputs.source_revision }}-"
+        "${{ needs.authorize.outputs.acceptance_run_attempt }}" not in workflow
+    )
+    assert (
+        "browser-evidence-${{ needs.authorize.outputs.source_revision }}-"
+        "${{ needs.authorize.outputs.acceptance_run_attempt }}" not in workflow
+    )
+    assert "Fetch latest acceptance run metadata" in workflow
+    assert '"repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID"' in workflow
+    assert "/attempts/$ACCEPTANCE_RUN_ATTEMPT" not in workflow
     assert "--browser-evidence build/observability-browser/operation.json" in workflow
     assert "timeout-minutes: 15" in workflow
     assert "observability-evidence.sha256" in workflow

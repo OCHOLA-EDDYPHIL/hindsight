@@ -363,7 +363,10 @@ def validate_provenance(
     checks = {
         "repository": (str((run.get("repository") or {}).get("full_name") or ""), repository),
         "run id": (str(run.get("id") or ""), acceptance_run_id),
-        "run attempt": (str(run.get("run_attempt") or ""), acceptance_run_attempt),
+        "latest run attempt": (
+            str(run.get("run_attempt") or ""),
+            acceptance_run_attempt,
+        ),
         "head SHA": (str(run.get("head_sha") or ""), source_revision),
         "event": (str(run.get("event") or ""), "workflow_dispatch"),
         "branch": (str(run.get("head_branch") or ""), "main"),
@@ -380,6 +383,10 @@ def validate_provenance(
             str(provenance.get("run_attempt") or ""),
             acceptance_run_attempt,
         ),
+        "provenance artifact scope": (
+            str(provenance.get("artifact_scope") or ""),
+            "workflow_run",
+        ),
         "provenance SHA": (str(provenance.get("head_sha") or ""), source_revision),
         "acceptance mode": (str(provenance.get("acceptance_mode") or ""), "full"),
         "deployment environment": (
@@ -392,7 +399,7 @@ def validate_provenance(
             raise ValueError(f"{label} does not match the requested full acceptance run")
     if provenance.get("bounded_observability_enabled") is not True:
         raise ValueError("full acceptance did not enable bounded observability")
-    started = _timestamp(run.get("run_started_at") or run.get("created_at"), "run start")
+    started = _timestamp(run.get("created_at"), "run creation")
     completed = _timestamp(run.get("updated_at"), "run completion")
     if completed <= started:
         raise ValueError("acceptance run completion must follow its start")

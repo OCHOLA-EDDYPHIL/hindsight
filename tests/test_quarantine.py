@@ -3,18 +3,79 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from boto3.dynamodb.conditions import ConditionExpressionBuilder
 
-from tests.quarantine_fakes import InMemoryQuarantineTable, QueryingQuarantineTable
+from tests.quarantine_fakes import (
+    ConditionalCheckFailedException,
+    InMemoryQuarantineTable,
+    QueryingQuarantineTable,
+)
 
 SOURCE_ARN = "arn:aws:sqs:us-east-1:123456789012:hindsight-runs"
 MESSAGE_ID = "7d28c8e5-00a6-4ef7-b0c0-75db7f9a7fc3"
 TENANT_ID = "00000000-0000-0000-0000-000000000001"
 RUN_ID = "11111111-1111-4111-8111-111111111111"
+RACED_RUN_ID = "33333333-3333-4333-8333-333333333333"
+QUARANTINE_CORE_KEYS = frozenset(
+    {
+        "schema_version",
+        "quarantine_id",
+        "source_arn",
+        "source_message_id",
+        "raw_body_sha256",
+        "reason_code",
+        "work_kind",
+        "command",
+        "receive_count",
+        "tenant_id",
+        "run_id",
+        "operation_id",
+        "command_generation",
+    }
+)
+
+
+class RacingQuarantineTable(InMemoryQuarantineTable):
+    def __init__(self, *, race_phase: str) -> None:
+        super().__init__()
+        self.race_phase = race_phase
+        self.raced = False
+        self.raced_condition = None
+
+    def update_item(self, **kwargs):
+        phase = "claim" if ":pending" in kwargs["ExpressionAttributeValues"] else "completion"
+        if phase == self.race_phase and not self.raced:
+            self.raced = True
+            self.raced_condition = kwargs["ConditionExpression"]
+            _replace_stored_run_identity(
+                self.items[kwargs["Key"]["quarantine_id"]],
+                run_id=RACED_RUN_ID,
+            )
+            raise ConditionalCheckFailedException()
+        return super().update_item(**kwargs)
+
+
+def _replace_stored_run_identity(item: dict, *, run_id: str) -> None:
+    item["run_id"] = run_id
+    core = {key: item[key] for key in QUARANTINE_CORE_KEYS if key in item}
+    canonical = json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    item["record_sha256"] = hashlib.sha256(canonical).hexdigest()
+
+
+def _condition_attributes(condition) -> set[str]:
+    built = ConditionExpressionBuilder().build_expression(condition)
+    return set(built.attribute_name_placeholders.values())
 
 
 def _persist(table, *, raw_body='{"command":"start"}', receive_count=4, now=None):
@@ -247,6 +308,7 @@ def test_owner_gated_redrive_has_one_logical_effect(monkeypatch):
     monkeypatch.setattr(redrive, "get_run", get_run)
     monkeypatch.setattr(redrive, "redrive_exhausted_run", create_run)
     confirmation = f"redrive:{item['quarantine_id']}:{item['raw_body_sha256']}"
+    dispatch_available_at = datetime(2026, 8, 14, 12, 30, tzinfo=UTC) + timedelta(days=3650)
     common = {
         "table": table,
         "quarantine_id": item["quarantine_id"],
@@ -256,6 +318,7 @@ def test_owner_gated_redrive_has_one_logical_effect(monkeypatch):
         "actor": "owner",
         "triggering_actor": "owner",
         "db_url": "postgresql://db",
+        "dispatch_available_at": dispatch_available_at,
         "now": datetime(2026, 8, 14, 12, 30, tzinfo=UTC),
     }
 
@@ -267,7 +330,129 @@ def test_owner_gated_redrive_has_one_logical_effect(monkeypatch):
     assert repeated == {**first, "created": False}
     assert len(create_calls) == 1
     assert create_calls[0]["idempotency_key"].startswith("quarantine-redrive:")
+    assert create_calls[0]["dispatch_available_at"] == dispatch_available_at
     assert repeated["redrive_effect_id"] == first["redrive_effect_id"]
+
+
+def test_redrive_claim_rejects_a_core_record_race(monkeypatch):
+    import hindsight.quarantine_redrive as redrive
+
+    table = RacingQuarantineTable(race_phase="claim")
+    item = _persist(table).item
+    create_calls = []
+    monkeypatch.setattr(
+        redrive,
+        "redrive_exhausted_run",
+        lambda **kwargs: create_calls.append(kwargs),
+    )
+
+    with pytest.raises(redrive.QuarantineRedriveError, match="bound to another redrive"):
+        redrive.redrive_quarantined_run(
+            table=table,
+            quarantine_id=item["quarantine_id"],
+            raw_body_sha256=item["raw_body_sha256"],
+            confirmation=f"redrive:{item['quarantine_id']}:{item['raw_body_sha256']}",
+            repository_owner="owner",
+            actor="owner",
+            triggering_actor="owner",
+            db_url="postgresql://db",
+            expected_record_sha256=item["record_sha256"],
+        )
+
+    assert create_calls == []
+    assert table.items[item["quarantine_id"]]["status"] == "quarantined"
+    assert table.items[item["quarantine_id"]]["run_id"] == RACED_RUN_ID
+    assert {"status", "raw_body_sha256", "record_sha256"} <= _condition_attributes(
+        table.raced_condition
+    )
+
+
+def test_redrive_completion_rejects_a_core_record_race(monkeypatch):
+    import hindsight.quarantine_redrive as redrive
+    from hindsight.quarantine_redrive import QuarantineRedriveError
+
+    table = RacingQuarantineTable(race_phase="completion")
+    item = _persist(table).item
+    created_run = {"id": "22222222-2222-4222-8222-222222222222"}
+    create_calls = []
+    monkeypatch.setattr(
+        redrive,
+        "redrive_exhausted_run",
+        lambda **kwargs: create_calls.append(kwargs) or (created_run, True),
+    )
+
+    with pytest.raises(QuarantineRedriveError, match="completion conflicted"):
+        redrive.redrive_quarantined_run(
+            table=table,
+            quarantine_id=item["quarantine_id"],
+            raw_body_sha256=item["raw_body_sha256"],
+            confirmation=f"redrive:{item['quarantine_id']}:{item['raw_body_sha256']}",
+            repository_owner="owner",
+            actor="owner",
+            triggering_actor="owner",
+            db_url="postgresql://db",
+            expected_record_sha256=item["record_sha256"],
+        )
+
+    stored = table.items[item["quarantine_id"]]
+    assert len(create_calls) == 1
+    assert stored["status"] == "redrive_pending"
+    assert stored["run_id"] == RACED_RUN_ID
+    assert "redriven_at" not in stored
+    assert "redriven_run_id" not in stored
+    assert {
+        "status",
+        "redrive_effect_id",
+        "redrive_binding_sha256",
+        "raw_body_sha256",
+        "record_sha256",
+    } <= _condition_attributes(table.raced_condition)
+
+
+def test_redrive_rejects_naive_dispatch_fence_before_mutating_ledger():
+    from hindsight.quarantine_redrive import QuarantineRedriveError, redrive_quarantined_run
+
+    table = InMemoryQuarantineTable()
+    item = _persist(table).item
+
+    with pytest.raises(QuarantineRedriveError, match="timezone"):
+        redrive_quarantined_run(
+            table=table,
+            quarantine_id=item["quarantine_id"],
+            raw_body_sha256=item["raw_body_sha256"],
+            confirmation=f"redrive:{item['quarantine_id']}:{item['raw_body_sha256']}",
+            repository_owner="owner",
+            actor="owner",
+            triggering_actor="owner",
+            db_url="postgresql://db",
+            dispatch_available_at=datetime(2036, 8, 14),
+        )
+
+    assert table.items[item["quarantine_id"]]["status"] == "quarantined"
+
+
+def test_redrive_rejects_an_expected_record_digest_mismatch_before_claim():
+    from hindsight.quarantine_redrive import QuarantineRedriveError, redrive_quarantined_run
+
+    table = InMemoryQuarantineTable()
+    item = _persist(table).item
+
+    with pytest.raises(QuarantineRedriveError, match="record digest"):
+        redrive_quarantined_run(
+            table=table,
+            quarantine_id=item["quarantine_id"],
+            raw_body_sha256=item["raw_body_sha256"],
+            confirmation=f"redrive:{item['quarantine_id']}:{item['raw_body_sha256']}",
+            repository_owner="owner",
+            actor="owner",
+            triggering_actor="owner",
+            db_url="postgresql://db",
+            expected_record_sha256="f" * 64,
+        )
+
+    stored = table.items[item["quarantine_id"]]
+    assert stored["status"] == "quarantined"
+    assert "redrive_effect_id" not in stored
 
 
 @pytest.mark.parametrize(
