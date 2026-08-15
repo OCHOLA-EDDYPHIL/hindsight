@@ -160,6 +160,114 @@ GITHUB_DEPLOY_ENCRYPTION_POLICY_SENSITIVE_VALUES = {
     "tags": {},
     "tags_all": {},
 }
+ACCEPTANCE_ROLE_REFRESH_TARGETS = {
+    "aws_iam_role.github_observability_evidence": {
+        "name": "github_observability_evidence",
+        "policy_address": "aws_iam_role_policy.github_observability_evidence",
+        "policy_name": "hindsight-github-observability-evidence",
+        "role_name": "hindsight-github-observability-evidence",
+    },
+    "aws_iam_role.github_quarantine_redrive": {
+        "name": "github_quarantine_redrive",
+        "policy_address": "aws_iam_role_policy.github_quarantine_redrive",
+        "policy_name": "hindsight-github-quarantine-redrive",
+        "role_name": "hindsight-github-quarantine-redrive",
+    },
+    "aws_iam_role.github_worker_acceptance": {
+        "name": "github_worker_acceptance",
+        "policy_address": "aws_iam_role_policy.github_worker_acceptance",
+        "policy_name": "hindsight-github-worker-acceptance",
+        "role_name": "hindsight-github-worker-acceptance",
+    },
+}
+ACCEPTANCE_ROLE_TAGS_ALL = {
+    "ManagedBy": "terraform-bootstrap",
+    "Project": "hindsight",
+}
+OBSERVABILITY_COMMON_POLICY_STATEMENTS = {
+    "CallerIdentity": {
+        "actions": ("sts:GetCallerIdentity",),
+        "resources": ("*",),
+    },
+    "BoundedLogQuery": {
+        "actions": ("logs:StartQuery",),
+        "resources": tuple(
+            sorted(
+                (
+                    "arn:aws:logs:us-east-1:762397612117:log-group:"
+                    "/aws/lambda/hindsight-demo-worker:*",
+                    "arn:aws:logs:us-east-1:762397612117:log-group:"
+                    "/aws/lambda/hindsight-demo-changefeed:*",
+                    "arn:aws:logs:us-east-1:762397612117:log-group:"
+                    "/aws/lambda/hindsight-demo-api:*",
+                    "arn:aws:logs:us-east-1:762397612117:log-group:"
+                    "/aws/apigateway/hindsight-demo-websocket:*",
+                    "arn:aws:logs:us-east-1:762397612117:log-group:"
+                    "/aws/apigateway/hindsight-demo-http:*",
+                )
+            )
+        ),
+    },
+    "BoundedLogQueryResults": {
+        "actions": ("logs:GetQueryResults", "logs:StopQuery"),
+        "resources": ("*",),
+    },
+    "BoundedTraceRead": {
+        "actions": ("xray:BatchGetTraces",),
+        "resources": ("*",),
+    },
+}
+OBSERVABILITY_PRIOR_POLICY_STATEMENTS = {
+    **OBSERVABILITY_COMMON_POLICY_STATEMENTS,
+    "StageAlertPublish": {
+        "actions": ("sns:Publish",),
+        "resources": (
+            "arn:aws:sns:us-east-1:762397612117:hindsight-demo-alerts",
+        ),
+    },
+}
+OBSERVABILITY_CURRENT_POLICY_STATEMENTS = {
+    **OBSERVABILITY_COMMON_POLICY_STATEMENTS,
+    "StageAlertSubscriptions": {
+        "actions": (
+            "sns:GetSubscriptionAttributes",
+            "sns:ListSubscriptionsByTopic",
+        ),
+        "resources": tuple(
+            sorted(
+                (
+                    "arn:aws:sns:us-east-1:762397612117:"
+                    "hindsight-demo-budget-alerts:*",
+                    "arn:aws:sns:us-east-1:762397612117:"
+                    "hindsight-demo-budget-alerts",
+                    "arn:aws:sns:us-east-1:762397612117:hindsight-demo-alerts:*",
+                    "arn:aws:sns:us-east-1:762397612117:hindsight-demo-alerts",
+                )
+            )
+        ),
+    },
+    "ExactReleaseAlarmProbe": {
+        "actions": (
+            "cloudwatch:DescribeAlarms",
+            "cloudwatch:SetAlarmState",
+        ),
+        "resources": (
+            "arn:aws:cloudwatch:us-east-1:762397612117:alarm:"
+            "hindsight-demo-exact-release-probe",
+        ),
+    },
+    "ControlledAlertReceiver": {
+        "actions": (
+            "sqs:DeleteMessage",
+            "sqs:GetQueueAttributes",
+            "sqs:GetQueueUrl",
+            "sqs:ReceiveMessage",
+        ),
+        "resources": (
+            "arn:aws:sqs:us-east-1:762397612117:hindsight-demo-alert-receiver",
+        ),
+    },
+}
 LIFECYCLE_EXPORT_BUCKET_ARNS = frozenset(
     {
         (
@@ -1631,9 +1739,415 @@ def _validate_github_deploy_role_refresh_drift(
     return reconciled
 
 
-def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
+def _acceptance_role_inline_policy(
+    values: dict[str, Any], *, target: dict[str, Any], allow_empty: bool
+) -> str | None:
+    inline_policies = values.get("inline_policy")
+    if allow_empty and inline_policies == []:
+        return None
+    if (
+        not isinstance(inline_policies, list)
+        or len(inline_policies) != 1
+        or not isinstance(inline_policies[0], dict)
+        or set(inline_policies[0]) != {"name", "policy"}
+        or inline_policies[0].get("name") != target["policy_name"]
+        or not isinstance(inline_policies[0].get("policy"), str)
+        or not inline_policies[0]["policy"]
+    ):
+        raise ValueError("acceptance role refresh inline policy identity is invalid")
+    return inline_policies[0]["policy"]
+
+
+def _validate_acceptance_role_values_identity(
+    values: Any, *, target: dict[str, Any]
+) -> dict[str, Any]:
+    role_name = target["role_name"]
+    expected_arn = f"arn:aws:iam::{EXPECTED_AWS_ACCOUNT_ID}:role/{role_name}"
+    expected_trust = {
+        "Statement": [
+            {
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                    "StringEquals": {
+                        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                        "token.actions.githubusercontent.com:sub": (
+                            f"repo:{EXPECTED_REPOSITORY}:environment:demo"
+                        ),
+                    }
+                },
+                "Effect": "Allow",
+                "Principal": {
+                    "Federated": (
+                        f"arn:aws:iam::{EXPECTED_AWS_ACCOUNT_ID}:oidc-provider/"
+                        "token.actions.githubusercontent.com"
+                    )
+                },
+            }
+        ],
+        "Version": "2012-10-17",
+    }
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        document: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in document:
+                raise ValueError
+            document[key] = child
+        return document
+
+    def reject_non_json_constant(_: str) -> None:
+        raise ValueError
+
+    assume_role_policy = (
+        values.get("assume_role_policy") if isinstance(values, dict) else None
+    )
+    try:
+        parsed_trust = json.loads(
+            assume_role_policy,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_non_json_constant,
+        )
+    except (TypeError, ValueError):
+        parsed_trust = None
+    if (
+        not isinstance(values, dict)
+        or set(values) != GITHUB_DEPLOY_ROLE_VALUE_FIELDS
+        or values.get("arn") != expected_arn
+        or parsed_trust != expected_trust
+        or not isinstance(values.get("create_date"), str)
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+            values["create_date"],
+        )
+        is None
+        or values.get("description") != ""
+        or values.get("force_detach_policies") is not False
+        or values.get("id") != role_name
+        or values.get("name") != role_name
+        or values.get("managed_policy_arns") != []
+        or values.get("max_session_duration") != 3600
+        or values.get("name_prefix") != ""
+        or values.get("path") != "/"
+        or values.get("permissions_boundary") != ""
+        or values.get("tags") not in (None, {})
+        or values.get("tags_all") != ACCEPTANCE_ROLE_TAGS_ALL
+        or not isinstance(values.get("unique_id"), str)
+        or re.fullmatch(r"AROA[A-Z0-9]+", values["unique_id"]) is None
+    ):
+        raise ValueError("acceptance role refresh value identity is invalid")
+    return values
+
+
+def _acceptance_role_sensitive_values(values: dict[str, Any]) -> dict[str, Any]:
+    inline_policy = values.get("inline_policy")
+    tags = values.get("tags")
+    if not isinstance(inline_policy, list) or tags not in (None, {}):
+        raise ValueError("acceptance role refresh sensitivity is invalid")
+    sensitive: dict[str, Any] = {
+        "inline_policy": [{} for _ in inline_policy],
+        "managed_policy_arns": [],
+        "tags_all": {},
+    }
+    if tags == {}:
+        sensitive["tags"] = {}
+    return sensitive
+
+
+def _validate_acceptance_role_refresh_entry(
+    entry: Any,
+    *,
+    address: str,
+    target: dict[str, Any],
+    actions: list[str],
+    desired_change: bool,
+) -> dict[str, Any]:
+    if not isinstance(entry, dict) or set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    }:
+        raise ValueError("acceptance role refresh identity is invalid")
+    if (
+        entry.get("address") != address
+        or entry.get("mode") != "managed"
+        or entry.get("name") != target["name"]
+        or entry.get("provider_name") != AWS_PROVIDER
+        or entry.get("type") != "aws_iam_role"
+    ):
+        raise ValueError("acceptance role refresh identity is invalid")
+
+    change = entry.get("change")
+    expected_change_fields = {
+        "actions",
+        "after",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_sensitive",
+    }
+    if desired_change:
+        expected_change_fields.update({"after_identity", "before_identity"})
+    if not isinstance(change, dict) or set(change) != expected_change_fields:
+        raise ValueError("acceptance role refresh contains unexpected metadata")
+    if (
+        _actions(change, subject="acceptance role refresh") != actions
+        or change.get("after_unknown") != {}
+    ):
+        raise ValueError("acceptance role refresh change is invalid")
+    if desired_change:
+        identity = {
+            "account_id": EXPECTED_AWS_ACCOUNT_ID,
+            "name": target["role_name"],
+        }
+        if (
+            change.get("before_identity") != identity
+            or change.get("after_identity") != identity
+        ):
+            raise ValueError("acceptance role refresh change identity is invalid")
+    return change
+
+
+def _validate_acceptance_policy_values(
+    values: Any, *, target: dict[str, Any]
+) -> str:
+    role_name = target["role_name"]
+    policy_name = target["policy_name"]
+    if (
+        not isinstance(values, dict)
+        or set(values) != {"id", "name", "name_prefix", "policy", "role"}
+        or values.get("id") != f"{role_name}:{policy_name}"
+        or values.get("name") != policy_name
+        or values.get("name_prefix") != ""
+        or values.get("role") != role_name
+    ):
+        raise ValueError("acceptance role policy identity is invalid")
+    policy = values.get("policy")
+    if not isinstance(policy, str) or not policy:
+        raise ValueError("acceptance role policy is malformed")
+    return policy
+
+
+def _validate_acceptance_policy_refresh_entry(
+    entry: Any, *, target: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(entry, dict) or set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    }:
+        raise ValueError("acceptance role policy identity is invalid")
+    if (
+        entry.get("address") != target["policy_address"]
+        or entry.get("mode") != "managed"
+        or entry.get("name") != target["name"]
+        or entry.get("provider_name") != AWS_PROVIDER
+        or entry.get("type") != "aws_iam_role_policy"
+    ):
+        raise ValueError("acceptance role policy identity is invalid")
+    change = entry.get("change")
+    if not isinstance(change, dict) or set(change) != {
+        "actions",
+        "after",
+        "after_identity",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_identity",
+        "before_sensitive",
+    }:
+        raise ValueError("acceptance role policy contains unexpected metadata")
+    identity = {
+        "account_id": EXPECTED_AWS_ACCOUNT_ID,
+        "name": target["policy_name"],
+        "role": target["role_name"],
+    }
+    actions = _actions(change, subject="acceptance role policy")
+    if (
+        change.get("before_identity") != identity
+        or change.get("after_identity") != identity
+        or change.get("before_sensitive") != {}
+        or change.get("after_sensitive") != {}
+        or change.get("after_unknown") != {}
+    ):
+        raise ValueError("acceptance role policy change is invalid")
+    before_policy = _validate_acceptance_policy_values(
+        change.get("before"), target=target
+    )
+    after_policy = _validate_acceptance_policy_values(
+        change.get("after"), target=target
+    )
+    policy_address = target["policy_address"]
+    if policy_address in QUARANTINE_POLICY_TARGETS:
+        _validate_quarantine_policy_entry(
+            entry,
+            address=policy_address,
+            target=QUARANTINE_POLICY_TARGETS[policy_address],
+        )
+    elif actions != ["no-op"] or before_policy != after_policy:
+        raise ValueError("acceptance role policy no-op is invalid")
+    return change
+
+
+def _validate_acceptance_role_refresh_drift(
+    resource_changes: list[Any], resource_drift: list[Any]
+) -> list[str]:
+    reconciled: list[str] = []
+    for address, target in ACCEPTANCE_ROLE_REFRESH_TARGETS.items():
+        drift_entries = [
+            entry
+            for entry in resource_drift
+            if isinstance(entry, dict) and entry.get("address") == address
+        ]
+        if not drift_entries:
+            continue
+        if len(drift_entries) != 1:
+            raise ValueError("acceptance role refresh drift is not unique")
+        desired_roles = [
+            entry
+            for entry in resource_changes
+            if isinstance(entry, dict) and entry.get("address") == address
+        ]
+        desired_policies = [
+            entry
+            for entry in resource_changes
+            if isinstance(entry, dict)
+            and entry.get("address") == target["policy_address"]
+        ]
+        if len(desired_roles) != 1 or len(desired_policies) != 1:
+            raise ValueError("acceptance role refresh binding is incomplete")
+        if any(
+            isinstance(entry, dict)
+            and entry.get("address") == target["policy_address"]
+            for entry in resource_drift
+        ):
+            raise ValueError("acceptance role policy drift is forbidden")
+
+        drift_change = _validate_acceptance_role_refresh_entry(
+            drift_entries[0],
+            address=address,
+            target=target,
+            actions=["update"],
+            desired_change=False,
+        )
+        desired_change = _validate_acceptance_role_refresh_entry(
+            desired_roles[0],
+            address=address,
+            target=target,
+            actions=["no-op"],
+            desired_change=True,
+        )
+        policy_change = _validate_acceptance_policy_refresh_entry(
+            desired_policies[0], target=target
+        )
+        before = _validate_acceptance_role_values_identity(
+            drift_change.get("before"), target=target
+        )
+        refreshed = _validate_acceptance_role_values_identity(
+            drift_change.get("after"), target=target
+        )
+        desired_before = _validate_acceptance_role_values_identity(
+            desired_change.get("before"), target=target
+        )
+        desired_after = _validate_acceptance_role_values_identity(
+            desired_change.get("after"), target=target
+        )
+        allowed_changes = {"inline_policy"}
+        if before.get("tags") is None:
+            allowed_changes.add("tags")
+        if {
+            key for key in before if before[key] != refreshed[key]
+        } != allowed_changes:
+            raise ValueError("acceptance role refresh transition is invalid")
+        if refreshed.get("tags") != {}:
+            raise ValueError("acceptance role refresh tag transition is invalid")
+        if _canonical_refresh_json(
+            {
+                key: value
+                for key, value in before.items()
+                if key not in allowed_changes
+            }
+        ) != _canonical_refresh_json(
+            {
+                key: value
+                for key, value in refreshed.items()
+                if key not in allowed_changes
+            }
+        ):
+            raise ValueError("acceptance role refresh changed other role values")
+
+        prior_policy = _acceptance_role_inline_policy(
+            before, target=target, allow_empty=True
+        )
+        refreshed_policy = _acceptance_role_inline_policy(
+            refreshed, target=target, allow_empty=False
+        )
+        policy_before = _validate_acceptance_policy_values(
+            policy_change.get("before"), target=target
+        )
+        if refreshed_policy != policy_before:
+            raise ValueError("acceptance role refresh does not match its policy")
+        policy_address = target["policy_address"]
+        if policy_address in QUARANTINE_POLICY_TARGETS:
+            policy_actions = _actions(
+                policy_change, subject="acceptance role policy"
+            )
+            quarantine_target = QUARANTINE_POLICY_TARGETS[policy_address]
+            if policy_actions == ["update"]:
+                if prior_policy is not None:
+                    raise ValueError(
+                        "acceptance role refresh prior policy is not absent"
+                    )
+            elif (
+                prior_policy is None
+                or _load_acceptance_policy_document(prior_policy)
+                != quarantine_target["statements"]
+            ):
+                raise ValueError(
+                    "acceptance role refresh prior policy is not exact"
+                )
+        elif (
+            prior_policy is None
+            or _load_acceptance_policy_document(prior_policy)
+            != OBSERVABILITY_PRIOR_POLICY_STATEMENTS
+            or _load_acceptance_policy_document(refreshed_policy)
+            != OBSERVABILITY_CURRENT_POLICY_STATEMENTS
+        ):
+            raise ValueError(
+                "acceptance observability role refresh policy is not exact"
+            )
+        if (
+            _canonical_refresh_json(refreshed)
+            != _canonical_refresh_json(desired_before)
+            or _canonical_refresh_json(desired_before)
+            != _canonical_refresh_json(desired_after)
+        ):
+            raise ValueError("acceptance role refresh is not a desired no-op")
+
+        if (
+            drift_change.get("before_sensitive")
+            != _acceptance_role_sensitive_values(before)
+            or drift_change.get("after_sensitive")
+            != _acceptance_role_sensitive_values(refreshed)
+            or desired_change.get("before_sensitive")
+            != _acceptance_role_sensitive_values(desired_before)
+            or desired_change.get("after_sensitive")
+            != _acceptance_role_sensitive_values(desired_after)
+        ):
+            raise ValueError("acceptance role refresh sensitivity is invalid")
+        reconciled.append(address)
+
+    return sorted(reconciled)
+
+
+def _load_acceptance_policy_document(value: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(value, str):
-        raise ValueError("quarantine acceptance inline policy is malformed")
+        raise ValueError("acceptance inline policy is malformed")
 
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         document: dict[str, Any] = {}
@@ -1653,14 +2167,14 @@ def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
             parse_constant=reject_non_json_constant,
         )
     except (TypeError, ValueError):
-        raise ValueError("quarantine acceptance inline policy is malformed") from None
+        raise ValueError("acceptance inline policy is malformed") from None
     if (
         not isinstance(document, dict)
         or set(document) != {"Statement", "Version"}
         or document.get("Version") != "2012-10-17"
         or not isinstance(document.get("Statement"), list)
     ):
-        raise ValueError("quarantine acceptance inline policy is malformed")
+        raise ValueError("acceptance inline policy is malformed")
 
     def normalize_strings(child: Any) -> tuple[str, ...]:
         values = [child] if isinstance(child, str) else child
@@ -1670,13 +2184,13 @@ def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
             or not all(isinstance(item, str) and item for item in values)
             or len(values) != len(set(values))
         ):
-            raise ValueError("quarantine acceptance inline policy is malformed")
+            raise ValueError("acceptance inline policy is malformed")
         return tuple(sorted(values))
 
     normalized: dict[str, dict[str, Any]] = {}
     for statement in document["Statement"]:
         if not isinstance(statement, dict):
-            raise ValueError("quarantine acceptance inline policy is malformed")
+            raise ValueError("acceptance inline policy is malformed")
         expected_fields = {"Action", "Effect", "Resource", "Sid"}
         if "Condition" in statement:
             expected_fields.add("Condition")
@@ -1688,7 +2202,7 @@ def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
             or sid in normalized
             or statement.get("Effect") != "Allow"
         ):
-            raise ValueError("quarantine acceptance inline policy is malformed")
+            raise ValueError("acceptance inline policy is malformed")
         normalized_statement: dict[str, Any] = {
             "actions": normalize_strings(statement.get("Action")),
             "resources": normalize_strings(statement.get("Resource")),
@@ -1696,7 +2210,7 @@ def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
         if "Condition" in statement:
             condition = statement["Condition"]
             if not isinstance(condition, dict) or not condition:
-                raise ValueError("quarantine acceptance inline policy is malformed")
+                raise ValueError("acceptance inline policy is malformed")
             normalized_condition: dict[str, dict[str, tuple[str, ...]]] = {}
             for operator, clauses in condition.items():
                 if (
@@ -1705,15 +2219,11 @@ def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
                     or not isinstance(clauses, dict)
                     or not clauses
                 ):
-                    raise ValueError(
-                        "quarantine acceptance inline policy is malformed"
-                    )
+                    raise ValueError("acceptance inline policy is malformed")
                 normalized_clauses: dict[str, tuple[str, ...]] = {}
                 for variable, values in clauses.items():
                     if not isinstance(variable, str) or not variable:
-                        raise ValueError(
-                            "quarantine acceptance inline policy is malformed"
-                        )
+                        raise ValueError("acceptance inline policy is malformed")
                     normalized_clauses[variable] = normalize_strings(values)
                 normalized_condition[operator] = normalized_clauses
             normalized_statement["conditions"] = normalized_condition
@@ -1737,7 +2247,7 @@ def _quarantine_policy_values(
         or values.get("role") != role
     ):
         raise ValueError("quarantine acceptance inline policy identity is invalid")
-    return _load_quarantine_policy_document(values.get("policy"))
+    return _load_acceptance_policy_document(values.get("policy"))
 
 
 def _validate_quarantine_policy_entry(
@@ -2055,6 +2565,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 plan["resource_changes"], plan.get("resource_drift", [])
             ),
             *_validate_github_deploy_role_refresh_drift(
+                plan["resource_changes"], plan.get("resource_drift", [])
+            ),
+            *_validate_acceptance_role_refresh_drift(
                 plan["resource_changes"], plan.get("resource_drift", [])
             ),
         ]

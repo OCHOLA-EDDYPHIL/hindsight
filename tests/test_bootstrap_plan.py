@@ -798,6 +798,262 @@ def _plan_with_github_deploy_attachment_refresh_drift(validator):
     return plan
 
 
+def _reflected_policy(sid: str) -> str:
+    return json.dumps(
+        {
+            "Statement": [
+                {
+                    "Action": "sts:GetCallerIdentity",
+                    "Effect": "Allow",
+                    "Resource": "*",
+                    "Sid": sid,
+                }
+            ],
+            "Version": "2012-10-17",
+        },
+        separators=(",", ":"),
+    )
+
+
+def _policy_from_normalized_statements(statements: dict) -> str:
+    return json.dumps(
+        {
+            "Statement": [
+                {
+                    "Action": list(statement["actions"]),
+                    "Effect": "Allow",
+                    "Resource": list(statement["resources"]),
+                    "Sid": sid,
+                }
+                for sid, statement in statements.items()
+            ],
+            "Version": "2012-10-17",
+        },
+        separators=(",", ":"),
+    )
+
+
+ACCEPTANCE_ROLE_EMPTY_SENSITIVE_VALUES = {
+    "inline_policy": [],
+    "managed_policy_arns": [],
+    "tags_all": {},
+}
+ACCEPTANCE_ROLE_POLICY_SENSITIVE_VALUES = {
+    "inline_policy": [{}],
+    "managed_policy_arns": [],
+    "tags": {},
+    "tags_all": {},
+}
+
+
+def _acceptance_role_sensitive_values(values: dict) -> dict:
+    if values["inline_policy"]:
+        return json.loads(json.dumps(ACCEPTANCE_ROLE_POLICY_SENSITIVE_VALUES))
+    return json.loads(json.dumps(ACCEPTANCE_ROLE_EMPTY_SENSITIVE_VALUES))
+
+
+def _acceptance_role_values(
+    validator, *, target: dict, inline_policy: str | None, tags
+) -> dict:
+    role_name = target["role_name"]
+    policies = []
+    if inline_policy is not None:
+        policies.append({"name": target["policy_name"], "policy": inline_policy})
+    trust_policy = {
+        "Statement": [
+            {
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                    "StringEquals": {
+                        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                        "token.actions.githubusercontent.com:sub": (
+                            "repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"
+                        ),
+                    }
+                },
+                "Effect": "Allow",
+                "Principal": {
+                    "Federated": (
+                        "arn:aws:iam::762397612117:oidc-provider/"
+                        "token.actions.githubusercontent.com"
+                    )
+                },
+            }
+        ],
+        "Version": "2012-10-17",
+    }
+    return {
+        "arn": f"arn:aws:iam::762397612117:role/{role_name}",
+        "assume_role_policy": json.dumps(trust_policy, separators=(",", ":")),
+        "create_date": "2026-08-15T11:31:22Z",
+        "description": "",
+        "force_detach_policies": False,
+        "id": role_name,
+        "inline_policy": policies,
+        "managed_policy_arns": [],
+        "max_session_duration": 3600,
+        "name": role_name,
+        "name_prefix": "",
+        "path": "/",
+        "permissions_boundary": "",
+        "tags": tags,
+        "tags_all": json.loads(json.dumps(validator.ACCEPTANCE_ROLE_TAGS_ALL)),
+        "unique_id": "AROA3DATQLBKY3SK42NUE",
+    }
+
+
+def _plan_with_complete_post_apply_role_refresh(validator):
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
+    for address, target in validator.ACCEPTANCE_ROLE_REFRESH_TARGETS.items():
+        if address.endswith("github_observability_evidence"):
+            prior_policy = _policy_from_normalized_statements(
+                validator.OBSERVABILITY_PRIOR_POLICY_STATEMENTS
+            )
+            current_policy = _policy_from_normalized_statements(
+                validator.OBSERVABILITY_CURRENT_POLICY_STATEMENTS
+            )
+            policy_values = {
+                "id": f"{target['role_name']}:{target['policy_name']}",
+                "name": target["policy_name"],
+                "name_prefix": "",
+                "policy": current_policy,
+                "role": target["role_name"],
+            }
+            policy_identity = {
+                "account_id": "762397612117",
+                "name": target["policy_name"],
+                "role": target["role_name"],
+            }
+            policy_change = _resource(
+                target["policy_address"],
+                ["no-op"],
+                resource_type="aws_iam_role_policy",
+                before=policy_values,
+                after=json.loads(json.dumps(policy_values)),
+                before_identity=policy_identity,
+                after_identity=json.loads(json.dumps(policy_identity)),
+                before_sensitive={},
+                after_sensitive={},
+                after_unknown={},
+            )
+        else:
+            policy_change = _quarantine_policy_change(
+                target["policy_address"], ["update"]
+            )
+            prior_policy = None
+            current_policy = policy_change["change"]["before"]["policy"]
+
+        before_tags = {} if prior_policy is not None else None
+        before = _acceptance_role_values(
+            validator,
+            target=target,
+            inline_policy=prior_policy,
+            tags=before_tags,
+        )
+        refreshed = _acceptance_role_values(
+            validator, target=target, inline_policy=current_policy, tags={}
+        )
+        before_sensitive = _acceptance_role_sensitive_values(before)
+        role_identity = {
+            "account_id": "762397612117",
+            "name": target["role_name"],
+        }
+        desired_role = _resource(
+            address,
+            ["no-op"],
+            before=json.loads(json.dumps(refreshed)),
+            after=json.loads(json.dumps(refreshed)),
+            before_identity=role_identity,
+            after_identity=json.loads(json.dumps(role_identity)),
+            before_sensitive=json.loads(
+                json.dumps(ACCEPTANCE_ROLE_POLICY_SENSITIVE_VALUES)
+            ),
+            after_sensitive=json.loads(
+                json.dumps(ACCEPTANCE_ROLE_POLICY_SENSITIVE_VALUES)
+            ),
+            after_unknown={},
+        )
+        desired_role["name"] = target["name"]
+        role_drift = _resource(
+            address,
+            ["update"],
+            before=before,
+            after=refreshed,
+            before_sensitive=json.loads(json.dumps(before_sensitive)),
+            after_sensitive=json.loads(
+                json.dumps(ACCEPTANCE_ROLE_POLICY_SENSITIVE_VALUES)
+            ),
+            after_unknown={},
+        )
+        role_drift["name"] = target["name"]
+        plan["resource_changes"].extend([desired_role, policy_change])
+        plan["resource_drift"].append(role_drift)
+    plan["applyable"] = True
+    return plan
+
+
+def _keep_acceptance_role_drift(plan, validator, addresses: set[str]) -> None:
+    target_addresses = set(validator.ACCEPTANCE_ROLE_REFRESH_TARGETS)
+    plan["resource_drift"] = [
+        entry
+        for entry in plan["resource_drift"]
+        if entry["address"] not in target_addresses or entry["address"] in addresses
+    ]
+
+
+def _isolate_acceptance_role_refresh(plan, validator, role_address: str) -> None:
+    target = validator.ACCEPTANCE_ROLE_REFRESH_TARGETS[role_address]
+    allowed_changes = {role_address, target["policy_address"]}
+    plan["resource_changes"] = [
+        entry
+        for entry in plan["resource_changes"]
+        if entry["address"] in allowed_changes
+    ]
+    plan["resource_drift"] = [
+        entry for entry in plan["resource_drift"] if entry["address"] == role_address
+    ]
+    plan["applyable"] = False
+
+
+def _promote_quarantine_role_refreshes_to_decrypt(validator, plan) -> None:
+    for role_address, target in validator.ACCEPTANCE_ROLE_REFRESH_TARGETS.items():
+        policy_address = target["policy_address"]
+        if policy_address not in QUARANTINE_POLICY_IDENTITIES:
+            continue
+        policy_change = _quarantine_policy_change(policy_address, ["no-op"])
+        for index, entry in enumerate(plan["resource_changes"]):
+            if entry["address"] == policy_address:
+                plan["resource_changes"][index] = policy_change
+                break
+        else:
+            raise AssertionError(f"missing fixture policy {policy_address}")
+
+        role_drift = _resource_entry(plan, "resource_drift", role_address)
+        desired_role = _resource_entry(plan, "resource_changes", role_address)
+        prior = json.loads(json.dumps(role_drift["change"]["after"]))
+        refreshed = json.loads(json.dumps(prior))
+        refreshed["inline_policy"][0]["policy"] = policy_change["change"][
+            "before"
+        ]["policy"]
+        role_drift["change"]["before"] = prior
+        role_drift["change"]["after"] = refreshed
+        role_drift["change"]["before_sensitive"] = (
+            _acceptance_role_sensitive_values(prior)
+        )
+        role_drift["change"]["after_sensitive"] = (
+            _acceptance_role_sensitive_values(refreshed)
+        )
+        desired_role["change"]["before"] = json.loads(json.dumps(refreshed))
+        desired_role["change"]["after"] = json.loads(json.dumps(refreshed))
+        desired_role["change"]["before_sensitive"] = (
+            _acceptance_role_sensitive_values(refreshed)
+        )
+        desired_role["change"]["after_sensitive"] = (
+            _acceptance_role_sensitive_values(refreshed)
+        )
+    plan["applyable"] = False
+
+
 def _inline_policy_document(entry: dict, value: str) -> dict:
     policy = entry["change"][value]["inline_policy"][0]["policy"]
     return json.loads(policy)
@@ -1110,7 +1366,7 @@ def test_validator_rejects_inexact_quarantine_policy_transitions(mutation):
     with pytest.raises(
         ValueError,
         match=(
-            "quarantine acceptance inline policy "
+            "(quarantine )?acceptance inline policy "
             "(transition is not exact|is malformed)"
         ),
     ):
@@ -1223,7 +1479,7 @@ def test_validator_rejects_every_non_cloudflare_resource_drift(actions):
     validator = _validator()
     plan = _no_change_plan(validator)
     plan["resource_drift"] = [
-        _resource("aws_iam_role.github_worker_acceptance", actions)
+        _resource("aws_iam_role.unapproved", actions)
     ]
 
     with pytest.raises(ValueError, match="unapproved resource drift is forbidden"):
@@ -1270,6 +1526,347 @@ def test_validator_accepts_only_the_atomic_deploy_attachment_refresh_transition(
     assert {
         entry["address"] for entry in summary["resource_drift"]
     } == set(summary["reconciled_refresh_drift"])
+
+
+def test_validator_accepts_the_complete_post_apply_role_refresh_set():
+    validator = _validator()
+
+    summary = validator.validate_plan(
+        _plan_with_complete_post_apply_role_refresh(validator)
+    )
+
+    assert summary["reconciled_refresh_drift"] == sorted(
+        [
+            GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+            GITHUB_DEPLOY_ROLE_ADDRESS,
+            *validator.ACCEPTANCE_ROLE_REFRESH_TARGETS,
+        ]
+    )
+    assert {
+        entry["address"] for entry in summary["resource_drift"]
+    } == set(summary["reconciled_refresh_drift"])
+
+
+@pytest.mark.parametrize(
+    "role_addresses",
+    [
+        {"aws_iam_role.github_observability_evidence"},
+        {"aws_iam_role.github_quarantine_redrive"},
+        {"aws_iam_role.github_worker_acceptance"},
+        {
+            "aws_iam_role.github_observability_evidence",
+            "aws_iam_role.github_quarantine_redrive",
+        },
+        {
+            "aws_iam_role.github_quarantine_redrive",
+            "aws_iam_role.github_worker_acceptance",
+        },
+    ],
+)
+def test_validator_accepts_independent_acceptance_role_refresh_subsets(
+    role_addresses,
+):
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    _keep_acceptance_role_drift(plan, validator, role_addresses)
+
+    summary = validator.validate_plan(plan)
+
+    assert set(summary["reconciled_refresh_drift"]) == {
+        GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+        GITHUB_DEPLOY_ROLE_ADDRESS,
+        *role_addresses,
+    }
+
+
+@pytest.mark.parametrize(
+    "role_addresses",
+    [
+        {"aws_iam_role.github_quarantine_redrive"},
+        {"aws_iam_role.github_worker_acceptance"},
+        {
+            "aws_iam_role.github_quarantine_redrive",
+            "aws_iam_role.github_worker_acceptance",
+        },
+    ],
+)
+def test_validator_accepts_followup_role_refreshes_with_noop_kms_policies(
+    role_addresses,
+):
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    _promote_quarantine_role_refreshes_to_decrypt(validator, plan)
+    _keep_acceptance_role_drift(plan, validator, role_addresses)
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["applyable"] is False
+    assert set(summary["reconciled_refresh_drift"]) == {
+        GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+        GITHUB_DEPLOY_ROLE_ADDRESS,
+        *role_addresses,
+    }
+
+
+@pytest.mark.parametrize(
+    ("role_address", "followup"),
+    [
+        ("aws_iam_role.github_observability_evidence", False),
+        ("aws_iam_role.github_quarantine_redrive", True),
+        ("aws_iam_role.github_worker_acceptance", True),
+    ],
+)
+def test_validator_accepts_each_isolated_acceptance_role_refresh(
+    role_address, followup
+):
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    if followup:
+        _promote_quarantine_role_refreshes_to_decrypt(validator, plan)
+    _isolate_acceptance_role_refresh(plan, validator, role_address)
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["applyable"] is False
+    assert summary["reconciled_refresh_drift"] == [role_address]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_role",
+        "duplicate_role",
+        "missing_policy",
+        "duplicate_policy",
+        "duplicate_drift",
+        "policy_drift",
+    ],
+)
+def test_validator_rejects_incomplete_acceptance_role_refresh_bindings(mutation):
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    role_address = "aws_iam_role.github_worker_acceptance"
+    target = validator.ACCEPTANCE_ROLE_REFRESH_TARGETS[role_address]
+    _keep_acceptance_role_drift(plan, validator, {role_address})
+
+    if mutation == "missing_role":
+        plan["resource_changes"] = [
+            entry
+            for entry in plan["resource_changes"]
+            if entry["address"] != role_address
+        ]
+    elif mutation == "duplicate_role":
+        plan["resource_changes"].append(
+            json.loads(
+                json.dumps(_resource_entry(plan, "resource_changes", role_address))
+            )
+        )
+    elif mutation == "missing_policy":
+        plan["resource_changes"] = [
+            entry
+            for entry in plan["resource_changes"]
+            if entry["address"] != target["policy_address"]
+        ]
+    elif mutation == "duplicate_policy":
+        plan["resource_changes"].append(
+            json.loads(
+                json.dumps(
+                    _resource_entry(
+                        plan, "resource_changes", target["policy_address"]
+                    )
+                )
+            )
+        )
+    elif mutation == "duplicate_drift":
+        plan["resource_drift"].append(
+            json.loads(
+                json.dumps(_resource_entry(plan, "resource_drift", role_address))
+            )
+        )
+    else:
+        plan["resource_drift"].append(
+            json.loads(
+                json.dumps(
+                    _resource_entry(
+                        plan, "resource_changes", target["policy_address"]
+                    )
+                )
+            )
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "binding is incomplete|not unique|policy drift is forbidden|"
+            "duplicate resource identities"
+        ),
+    ):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "drift_action",
+        "extra_change_metadata",
+        "desired_identity",
+        "unknown_value",
+        "sensitivity",
+        "stable_role_value",
+        "tag_transition",
+        "inline_policy_name",
+        "duplicate_trust_key",
+        "policy_binding",
+    ],
+)
+def test_validator_rejects_acceptance_role_refresh_tampering(mutation):
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    role_address = "aws_iam_role.github_worker_acceptance"
+    _keep_acceptance_role_drift(plan, validator, {role_address})
+    drift = _resource_entry(plan, "resource_drift", role_address)
+    desired = _resource_entry(plan, "resource_changes", role_address)
+
+    if mutation == "drift_action":
+        drift["change"]["actions"] = ["no-op"]
+    elif mutation == "extra_change_metadata":
+        drift["change"]["replace_paths"] = []
+    elif mutation == "desired_identity":
+        desired["change"]["before_identity"]["name"] = "wrong-role"
+    elif mutation == "unknown_value":
+        drift["change"]["after_unknown"] = {"inline_policy": True}
+    elif mutation == "sensitivity":
+        del drift["change"]["after_sensitive"]["tags"]
+    elif mutation == "stable_role_value":
+        drift["change"]["after"]["max_session_duration"] = 7200
+    elif mutation == "tag_transition":
+        drift["change"]["after"]["tags"] = None
+    elif mutation == "inline_policy_name":
+        drift["change"]["after"]["inline_policy"][0]["name"] = "wrong-policy"
+    elif mutation == "duplicate_trust_key":
+        trust = drift["change"]["before"]["assume_role_policy"]
+        drift["change"]["before"]["assume_role_policy"] = trust.replace(
+            "{", '{"Version":"wrong",', 1
+        )
+    else:
+        wrong_policy = _reflected_policy("WrongPolicyBinding")
+        drift["change"]["after"]["inline_policy"][0]["policy"] = wrong_policy
+        desired["change"]["before"]["inline_policy"][0]["policy"] = wrong_policy
+        desired["change"]["after"]["inline_policy"][0]["policy"] = wrong_policy
+
+    with pytest.raises(ValueError, match="acceptance role refresh"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("entry_kind", "marker_name"),
+    [
+        ("resource_drift", "before_sensitive"),
+        ("resource_drift", "after_sensitive"),
+        ("resource_changes", "before_sensitive"),
+        ("resource_changes", "after_sensitive"),
+    ],
+)
+def test_validator_rejects_each_acceptance_role_policy_mask_tamper(
+    entry_kind, marker_name
+):
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    _promote_quarantine_role_refreshes_to_decrypt(validator, plan)
+    role_address = "aws_iam_role.github_worker_acceptance"
+    _isolate_acceptance_role_refresh(plan, validator, role_address)
+    role = _resource_entry(plan, entry_kind, role_address)
+    role["change"][marker_name]["inline_policy"] = []
+
+    with pytest.raises(ValueError, match="acceptance role refresh sensitivity"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_acceptance_policy_identity_tampering():
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    role_address = "aws_iam_role.github_worker_acceptance"
+    target = validator.ACCEPTANCE_ROLE_REFRESH_TARGETS[role_address]
+    _keep_acceptance_role_drift(plan, validator, {role_address})
+    policy = _resource_entry(plan, "resource_changes", target["policy_address"])
+    policy["change"]["after_identity"]["role"] = "wrong-role"
+
+    with pytest.raises(ValueError, match="acceptance role policy change is invalid"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_an_observability_policy_mutation_during_role_refresh():
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    role_address = "aws_iam_role.github_observability_evidence"
+    target = validator.ACCEPTANCE_ROLE_REFRESH_TARGETS[role_address]
+    _keep_acceptance_role_drift(plan, validator, {role_address})
+    policy = _resource_entry(plan, "resource_changes", target["policy_address"])
+    policy["change"]["actions"] = ["update"]
+
+    with pytest.raises(ValueError, match="acceptance role policy no-op is invalid"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_an_unapproved_prior_observability_policy():
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    role_address = "aws_iam_role.github_observability_evidence"
+    _keep_acceptance_role_drift(plan, validator, {role_address})
+    drift = _resource_entry(plan, "resource_drift", role_address)
+    drift["change"]["before"]["inline_policy"][0]["policy"] = (
+        _reflected_policy("ArbitraryUnapprovedPriorPolicy")
+    )
+
+    with pytest.raises(ValueError, match="observability role refresh policy is not exact"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_an_unapproved_prior_policy_in_followup_role_refresh():
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    _promote_quarantine_role_refreshes_to_decrypt(validator, plan)
+    role_addresses = {
+        "aws_iam_role.github_quarantine_redrive",
+        "aws_iam_role.github_worker_acceptance",
+    }
+    _keep_acceptance_role_drift(plan, validator, role_addresses)
+    for role_address in role_addresses:
+        drift = _resource_entry(plan, "resource_drift", role_address)
+        drift["change"]["before"]["inline_policy"][0]["policy"] = (
+            _reflected_policy("ArbitraryUnapprovedPriorPolicy")
+        )
+
+    with pytest.raises(ValueError, match="prior policy is not exact"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_inexact_noop_kms_policy_during_role_refresh():
+    validator = _validator()
+    plan = _plan_with_complete_post_apply_role_refresh(validator)
+    _promote_quarantine_role_refreshes_to_decrypt(validator, plan)
+    role_address = "aws_iam_role.github_worker_acceptance"
+    _keep_acceptance_role_drift(plan, validator, {role_address})
+    target = validator.ACCEPTANCE_ROLE_REFRESH_TARGETS[role_address]
+    policy = _resource_entry(plan, "resource_changes", target["policy_address"])
+    document = json.loads(policy["change"]["before"]["policy"])
+    decrypt = next(
+        statement
+        for statement in document["Statement"]
+        if statement["Sid"] == "ExactQuarantineTableDecrypt"
+    )
+    decrypt["Action"] = ["kms:Decrypt", "kms:DescribeKey"]
+    mutated_policy = json.dumps(document, separators=(",", ":"))
+    policy["change"]["before"]["policy"] = mutated_policy
+    policy["change"]["after"]["policy"] = mutated_policy
+    drift = _resource_entry(plan, "resource_drift", role_address)
+    desired = _resource_entry(plan, "resource_changes", role_address)
+    drift["change"]["after"]["inline_policy"][0]["policy"] = mutated_policy
+    desired["change"]["before"]["inline_policy"][0]["policy"] = mutated_policy
+    desired["change"]["after"]["inline_policy"][0]["policy"] = mutated_policy
+
+    with pytest.raises(ValueError, match="transition is not exact"):
+        validator.validate_plan(plan)
 
 
 def test_validator_accepts_semantically_reordered_managed_policy_arns():
