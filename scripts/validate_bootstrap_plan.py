@@ -57,7 +57,38 @@ GITHUB_DEPLOY_ROLE_POLICY = {
     "provider_name": AWS_PROVIDER,
     "type": "aws_iam_role_policy",
 }
+GITHUB_DEPLOY_ENCRYPTION_POLICY_REFRESH_DRIFT = {
+    "address": "aws_iam_policy.github_deploy_encryption",
+    "mode": "managed",
+    "name": "github_deploy_encryption",
+    "provider_name": AWS_PROVIDER,
+    "type": "aws_iam_policy",
+}
+GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT = {
+    "address": "aws_iam_role_policy_attachment.github_deploy_encryption",
+    "mode": "managed",
+    "name": "github_deploy_encryption",
+    "provider_name": AWS_PROVIDER,
+    "type": "aws_iam_role_policy_attachment",
+}
 GITHUB_DEPLOY_INLINE_POLICY_NAME = "terraform-96877ae1e0309d9aea1db9eeb4"
+GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN = (
+    f"arn:aws:iam::{EXPECTED_AWS_ACCOUNT_ID}:policy/"
+    "hindsight-github-deploy-observability"
+)
+GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN = (
+    f"arn:aws:iam::{EXPECTED_AWS_ACCOUNT_ID}:policy/"
+    "hindsight-github-deploy-encryption"
+)
+GITHUB_DEPLOY_MANAGED_POLICY_ARNS_BEFORE = frozenset(
+    {GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN}
+)
+GITHUB_DEPLOY_MANAGED_POLICY_ARNS_AFTER = frozenset(
+    {
+        GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN,
+    }
+)
 GITHUB_DEPLOY_ROLE_IDENTITY = {
     "account_id": EXPECTED_AWS_ACCOUNT_ID,
     "name": "hindsight-github-deploy",
@@ -89,9 +120,43 @@ GITHUB_DEPLOY_ROLE_VALUE_FIELDS = frozenset(
         "unique_id",
     }
 )
-GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES = {
-    "inline_policy": [{}],
-    "managed_policy_arns": [False],
+GITHUB_DEPLOY_ENCRYPTION_POLICY_VALUE_FIELDS = frozenset(
+    {
+        "arn",
+        "attachment_count",
+        "delay_after_policy_creation_in_ms",
+        "description",
+        "id",
+        "name",
+        "name_prefix",
+        "path",
+        "policy",
+        "policy_id",
+        "tags",
+        "tags_all",
+    }
+)
+GITHUB_DEPLOY_ENCRYPTION_POLICY_IDENTITY = {
+    "arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+    "description": (
+        "Stage-scoped deployment access for the quarantine encryption key."
+    ),
+    "id": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+    "name": "hindsight-github-deploy-encryption",
+    "name_prefix": "",
+    "path": "/",
+    "tags": {
+        "Environment": "demo",
+        "ManagedBy": "terraform-bootstrap",
+        "Project": "hindsight",
+    },
+    "tags_all": {
+        "Environment": "demo",
+        "ManagedBy": "terraform-bootstrap",
+        "Project": "hindsight",
+    },
+}
+GITHUB_DEPLOY_ENCRYPTION_POLICY_SENSITIVE_VALUES = {
     "tags": {},
     "tags_all": {},
 }
@@ -1051,6 +1116,25 @@ def _validate_role_values_identity(values: dict[str, Any]) -> None:
         raise ValueError("GitHub deploy role refresh drift value identity is invalid")
 
 
+def _expected_role_sensitive_values(values: dict[str, Any]) -> dict[str, Any]:
+    managed_policy_arns = values.get("managed_policy_arns")
+    if (
+        not isinstance(managed_policy_arns, list)
+        or not managed_policy_arns
+        or not all(isinstance(arn, str) and arn for arn in managed_policy_arns)
+        or len(managed_policy_arns) != len(set(managed_policy_arns))
+    ):
+        raise ValueError(
+            "GitHub deploy role refresh drift managed policies are malformed"
+        )
+    return {
+        "inline_policy": [{}],
+        "managed_policy_arns": [False] * len(managed_policy_arns),
+        "tags": {},
+        "tags_all": {},
+    }
+
+
 def _validate_role_refresh_entry(
     entry: Any,
     *,
@@ -1109,12 +1193,15 @@ def _validate_role_refresh_entry(
         or not isinstance(after, dict)
         or not isinstance(before_sensitive, dict)
         or not isinstance(after_sensitive, dict)
-        or before_sensitive != GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
-        or after_sensitive != GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
     ):
         raise ValueError("GitHub deploy role refresh drift snapshot is malformed")
     _validate_role_values_identity(before)
     _validate_role_values_identity(after)
+    if (
+        before_sensitive != _expected_role_sensitive_values(before)
+        or after_sensitive != _expected_role_sensitive_values(after)
+    ):
+        raise ValueError("GitHub deploy role refresh drift snapshot is malformed")
     return change
 
 
@@ -1205,6 +1292,261 @@ def _validate_github_deploy_role_policy_change(
         )
 
 
+def _validate_managed_policy_attachment_transition(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    before_arns = before.get("managed_policy_arns")
+    after_arns = after.get("managed_policy_arns")
+    if (
+        not isinstance(before_arns, list)
+        or not isinstance(after_arns, list)
+        or len(before_arns) != len(set(before_arns))
+        or len(after_arns) != len(set(after_arns))
+        or frozenset(before_arns) != GITHUB_DEPLOY_MANAGED_POLICY_ARNS_BEFORE
+        or frozenset(after_arns) != GITHUB_DEPLOY_MANAGED_POLICY_ARNS_AFTER
+    ):
+        raise ValueError(
+            "GitHub deploy role managed policy refresh transition is invalid"
+        )
+    if _canonical_refresh_json(
+        {
+            key: value
+            for key, value in before.items()
+            if key != "managed_policy_arns"
+        }
+    ) != _canonical_refresh_json(
+        {
+            key: value
+            for key, value in after.items()
+            if key != "managed_policy_arns"
+        }
+    ):
+        raise ValueError("GitHub deploy role refresh drift changed other role values")
+
+    before_name, before_policy, before_target = _inline_policy_snapshot(before)
+    after_name, after_policy, after_target = _inline_policy_snapshot(after)
+    if (
+        before_name != after_name
+        or before_target != after_target
+        or _canonical_refresh_json(before_policy)
+        != _canonical_refresh_json(after_policy)
+    ):
+        raise ValueError("GitHub deploy role refresh drift changed its inline policy")
+    _validate_lifecycle_statement(
+        after_policy["Statement"][after_target],
+        expected_resources=(
+            LIFECYCLE_EXPORT_BUCKET_ARNS | LIFECYCLE_RECOVERY_BUCKET_ARNS
+        ),
+    )
+    return after_policy
+
+
+def _validate_encryption_policy_values(
+    values: Any, *, attachment_count: int
+) -> dict[str, Any]:
+    if (
+        not isinstance(values, dict)
+        or set(values) != GITHUB_DEPLOY_ENCRYPTION_POLICY_VALUE_FIELDS
+        or any(
+            values.get(field) != expected
+            for field, expected in GITHUB_DEPLOY_ENCRYPTION_POLICY_IDENTITY.items()
+        )
+        or isinstance(values.get("attachment_count"), bool)
+        or values.get("attachment_count") != attachment_count
+        or values.get("delay_after_policy_creation_in_ms") is not None
+        or not isinstance(values.get("policy"), str)
+        or not values["policy"]
+        or not isinstance(values.get("policy_id"), str)
+        or re.fullmatch(r"ANPA[A-Z0-9]+", values["policy_id"]) is None
+    ):
+        raise ValueError(
+            "GitHub deploy encryption policy refresh snapshot is malformed"
+        )
+    return values
+
+
+def _validate_encryption_policy_refresh_entry(
+    entry: Any, *, actions: list[str], desired_change: bool
+) -> dict[str, Any]:
+    if not isinstance(entry, dict) or set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    }:
+        raise ValueError("GitHub deploy encryption policy refresh identity is invalid")
+    if any(
+        entry.get(field) != expected
+        for field, expected in GITHUB_DEPLOY_ENCRYPTION_POLICY_REFRESH_DRIFT.items()
+    ):
+        raise ValueError("GitHub deploy encryption policy refresh identity is invalid")
+
+    change = entry.get("change")
+    expected_change_fields = {
+        "actions",
+        "after",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_sensitive",
+    }
+    if desired_change:
+        expected_change_fields.update({"after_identity", "before_identity"})
+    if not isinstance(change, dict) or set(change) != expected_change_fields:
+        raise ValueError(
+            "GitHub deploy encryption policy refresh contains unexpected metadata"
+        )
+    if (
+        _actions(change, subject="GitHub deploy encryption policy refresh") != actions
+        or change.get("after_unknown") != {}
+        or change.get("before_sensitive")
+        != GITHUB_DEPLOY_ENCRYPTION_POLICY_SENSITIVE_VALUES
+        or change.get("after_sensitive")
+        != GITHUB_DEPLOY_ENCRYPTION_POLICY_SENSITIVE_VALUES
+    ):
+        raise ValueError("GitHub deploy encryption policy refresh change is invalid")
+    if desired_change:
+        identity = {"arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN}
+        if (
+            change.get("before_identity") != identity
+            or change.get("after_identity") != identity
+        ):
+            raise ValueError(
+                "GitHub deploy encryption policy refresh identity is invalid"
+            )
+    return change
+
+
+def _validate_encryption_attachment_entry(entry: Any) -> None:
+    if not isinstance(entry, dict) or set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    }:
+        raise ValueError("GitHub deploy encryption attachment identity is invalid")
+    if any(
+        entry.get(field) != expected
+        for field, expected in GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT.items()
+    ):
+        raise ValueError("GitHub deploy encryption attachment identity is invalid")
+    change = entry.get("change")
+    if not isinstance(change, dict) or set(change) != {
+        "actions",
+        "after",
+        "after_identity",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_identity",
+        "before_sensitive",
+    }:
+        raise ValueError(
+            "GitHub deploy encryption attachment contains unexpected metadata"
+        )
+    identity = {
+        "account_id": EXPECTED_AWS_ACCOUNT_ID,
+        "policy_arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        "role": GITHUB_DEPLOY_ROLE_VALUE_IDENTITY["name"],
+    }
+    values = {
+        "id": (
+            f"{GITHUB_DEPLOY_ROLE_VALUE_IDENTITY['name']}/"
+            f"{GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN}"
+        ),
+        "policy_arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        "role": GITHUB_DEPLOY_ROLE_VALUE_IDENTITY["name"],
+    }
+    if (
+        _actions(change, subject="GitHub deploy encryption attachment") != ["no-op"]
+        or change.get("before_identity") != identity
+        or change.get("after_identity") != identity
+        or change.get("before_sensitive") != {}
+        or change.get("after_sensitive") != {}
+        or change.get("after_unknown") != {}
+        or change.get("before") != values
+        or change.get("after") != values
+    ):
+        raise ValueError("GitHub deploy encryption attachment no-op is invalid")
+
+
+def _validate_github_deploy_encryption_attachment_refresh(
+    resource_changes: list[Any], resource_drift: list[Any]
+) -> list[str]:
+    policy_address = GITHUB_DEPLOY_ENCRYPTION_POLICY_REFRESH_DRIFT["address"]
+    policy_drift = [
+        entry
+        for entry in resource_drift
+        if isinstance(entry, dict) and entry.get("address") == policy_address
+    ]
+    policy_changes = [
+        entry
+        for entry in resource_changes
+        if isinstance(entry, dict) and entry.get("address") == policy_address
+    ]
+    if len(policy_drift) != 1 or len(policy_changes) != 1:
+        raise ValueError(
+            "GitHub deploy encryption policy refresh is not uniquely represented"
+        )
+    drift_change = _validate_encryption_policy_refresh_entry(
+        policy_drift[0], actions=["update"], desired_change=False
+    )
+    desired_change = _validate_encryption_policy_refresh_entry(
+        policy_changes[0], actions=["no-op"], desired_change=True
+    )
+    drift_before = _validate_encryption_policy_values(
+        drift_change.get("before"), attachment_count=0
+    )
+    refreshed = _validate_encryption_policy_values(
+        drift_change.get("after"), attachment_count=1
+    )
+    desired_before = _validate_encryption_policy_values(
+        desired_change.get("before"), attachment_count=1
+    )
+    desired_after = _validate_encryption_policy_values(
+        desired_change.get("after"), attachment_count=1
+    )
+
+    def without_count(values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in values.items()
+            if key != "attachment_count"
+        }
+
+    if (
+        _canonical_refresh_json(without_count(drift_before))
+        != _canonical_refresh_json(without_count(refreshed))
+        or _canonical_refresh_json(refreshed)
+        != _canonical_refresh_json(desired_before)
+        or _canonical_refresh_json(desired_before)
+        != _canonical_refresh_json(desired_after)
+    ):
+        raise ValueError(
+            "GitHub deploy encryption policy refresh transition is invalid"
+        )
+
+    attachment_address = GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT["address"]
+    if any(
+        isinstance(entry, dict) and entry.get("address") == attachment_address
+        for entry in resource_drift
+    ):
+        raise ValueError("GitHub deploy encryption attachment drift is forbidden")
+    attachments = [
+        entry
+        for entry in resource_changes
+        if isinstance(entry, dict) and entry.get("address") == attachment_address
+    ]
+    if len(attachments) != 1:
+        raise ValueError("GitHub deploy encryption attachment no-op is absent")
+    _validate_encryption_attachment_entry(attachments[0])
+    return [policy_address]
+
+
 def _validate_github_deploy_role_refresh_drift(
     resource_changes: list[Any],
     resource_drift: list[Any],
@@ -1241,15 +1583,30 @@ def _validate_github_deploy_role_refresh_drift(
     refreshed = drift_change["after"]
     desired_before = desired_change["before"]
     desired_after = desired_change["after"]
-    if set(drift_before) != set(refreshed) or _canonical_refresh_json(
-        {key: value for key, value in drift_before.items() if key != "inline_policy"}
-    ) != _canonical_refresh_json(
-        {key: value for key, value in refreshed.items() if key != "inline_policy"}
-    ):
+    if set(drift_before) != set(refreshed):
         raise ValueError("GitHub deploy role refresh drift changed other role values")
-    policy_name, refreshed_policy = _validate_inline_policy_transition(
-        drift_before, refreshed
-    )
+    changed_fields = {
+        key for key in drift_before if drift_before[key] != refreshed[key]
+    }
+    reconciled = [address]
+    consumed_inline_transition = False
+    if changed_fields.issubset({"inline_policy"}):
+        consumed_inline_transition = True
+        policy_name, refreshed_policy = _validate_inline_policy_transition(
+            drift_before, refreshed
+        )
+    elif changed_fields == {"managed_policy_arns"}:
+        refreshed_policy = _validate_managed_policy_attachment_transition(
+            drift_before, refreshed
+        )
+        policy_name, _, _ = _inline_policy_snapshot(refreshed)
+        reconciled.extend(
+            _validate_github_deploy_encryption_attachment_refresh(
+                resource_changes, resource_drift
+            )
+        )
+    else:
+        raise ValueError("GitHub deploy role refresh drift changed other role values")
     if (
         _canonical_refresh_json(refreshed)
         != _canonical_refresh_json(desired_before)
@@ -1267,7 +1624,11 @@ def _validate_github_deploy_role_refresh_drift(
         policy_name=policy_name,
         refreshed_policy=refreshed_policy,
     )
-    return [address]
+    if consumed_inline_transition:
+        raise ValueError(
+            "GitHub deploy role inline policy refresh was already consumed"
+        )
+    return reconciled
 
 
 def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:

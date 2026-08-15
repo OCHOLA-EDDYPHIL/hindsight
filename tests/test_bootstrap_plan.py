@@ -414,6 +414,18 @@ def _plan_with_cloudflare_refresh_drift(validator):
 
 GITHUB_DEPLOY_ROLE_ADDRESS = "aws_iam_role.github_deploy"
 GITHUB_DEPLOY_POLICY_NAME = "terraform-96877ae1e0309d9aea1db9eeb4"
+GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN = (
+    "arn:aws:iam::762397612117:policy/hindsight-github-deploy-observability"
+)
+GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN = (
+    "arn:aws:iam::762397612117:policy/hindsight-github-deploy-encryption"
+)
+GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS = (
+    "aws_iam_policy.github_deploy_encryption"
+)
+GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT_ADDRESS = (
+    "aws_iam_role_policy_attachment.github_deploy_encryption"
+)
 LIFECYCLE_EXPORT_ARNS = {
     "arn:aws:s3:::hindsight-demo-lifecycle-exports-762397612117",
     "arn:aws:s3:::hindsight-demo-lifecycle-exports-762397612117/*",
@@ -510,7 +522,9 @@ def _github_deploy_policy(resources: set[str]):
     }
 
 
-def _github_deploy_role_values(policy: dict):
+def _github_deploy_role_values(
+    policy: dict, *, managed_policy_arns: list[str] | None = None
+):
     return {
         "arn": "arn:aws:iam::762397612117:role/hindsight-github-deploy",
         "assume_role_policy": "unchanged",
@@ -524,9 +538,11 @@ def _github_deploy_role_values(policy: dict):
                 "policy": json.dumps(policy, separators=(",", ":")),
             }
         ],
-        "managed_policy_arns": [
-            "arn:aws:iam::762397612117:policy/hindsight-github-deploy-observability"
-        ],
+        "managed_policy_arns": (
+            [GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN]
+            if managed_policy_arns is None
+            else managed_policy_arns
+        ),
         "max_session_duration": 3600,
         "name": "hindsight-github-deploy",
         "name_prefix": "",
@@ -610,6 +626,175 @@ def _plan_with_github_deploy_role_refresh_drift(
     )
     plan["resource_changes"].extend([desired, policy_change])
     plan["resource_drift"].append(drift)
+    return plan
+
+
+def _github_deploy_encryption_policy_values(*, attachment_count: int) -> dict:
+    tags = {
+        "Environment": "demo",
+        "ManagedBy": "terraform-bootstrap",
+        "Project": "hindsight",
+    }
+    return {
+        "arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        "attachment_count": attachment_count,
+        "delay_after_policy_creation_in_ms": None,
+        "description": (
+            "Stage-scoped deployment access for the quarantine encryption key."
+        ),
+        "id": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        "name": "hindsight-github-deploy-encryption",
+        "name_prefix": "",
+        "path": "/",
+        "policy": json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Action": "kms:Decrypt",
+                        "Effect": "Allow",
+                        "Resource": (
+                            "arn:aws:kms:us-east-1:762397612117:key/unchanged"
+                        ),
+                        "Sid": "QuarantineKeyLifecycle",
+                    }
+                ],
+                "Version": "2012-10-17",
+            },
+            separators=(",", ":"),
+        ),
+        "policy_id": "ANPA3DATQLBKVYR7T4QNV",
+        "tags": tags,
+        "tags_all": json.loads(json.dumps(tags)),
+    }
+
+
+def _plan_with_github_deploy_attachment_refresh_drift(validator):
+    plan = _no_change_plan(validator)
+    policy = _github_deploy_policy(
+        LIFECYCLE_EXPORT_ARNS | LIFECYCLE_RECOVERY_ARNS
+    )
+    before = _github_deploy_role_values(
+        policy,
+        managed_policy_arns=[GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN],
+    )
+    refreshed = _github_deploy_role_values(
+        policy,
+        managed_policy_arns=[
+            GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+            GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN,
+        ],
+    )
+    before_sensitive = json.loads(json.dumps(GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES))
+    refreshed_sensitive = {
+        **json.loads(json.dumps(GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES)),
+        "managed_policy_arns": [False, False],
+    }
+    role_identity = {
+        "account_id": "762397612117",
+        "name": "hindsight-github-deploy",
+    }
+    desired_role = _resource(
+        GITHUB_DEPLOY_ROLE_ADDRESS,
+        ["no-op"],
+        before=json.loads(json.dumps(refreshed)),
+        after=json.loads(json.dumps(refreshed)),
+        before_identity=role_identity,
+        after_identity=json.loads(json.dumps(role_identity)),
+        before_sensitive=refreshed_sensitive,
+        after_sensitive=json.loads(json.dumps(refreshed_sensitive)),
+        after_unknown={},
+    )
+    role_drift = _resource(
+        GITHUB_DEPLOY_ROLE_ADDRESS,
+        ["update"],
+        before=before,
+        after=refreshed,
+        before_sensitive=before_sensitive,
+        after_sensitive=json.loads(json.dumps(refreshed_sensitive)),
+        after_unknown={},
+    )
+
+    inline_policy_values = {
+        "id": f"hindsight-github-deploy:{GITHUB_DEPLOY_POLICY_NAME}",
+        "name": GITHUB_DEPLOY_POLICY_NAME,
+        "name_prefix": "terraform-",
+        "policy": refreshed["inline_policy"][0]["policy"],
+        "role": "hindsight-github-deploy",
+    }
+    inline_policy_identity = {
+        "account_id": "762397612117",
+        "name": GITHUB_DEPLOY_POLICY_NAME,
+        "role": "hindsight-github-deploy",
+    }
+    inline_policy_change = _resource(
+        "aws_iam_role_policy.github_deploy",
+        ["no-op"],
+        resource_type="aws_iam_role_policy",
+        before=inline_policy_values,
+        after=json.loads(json.dumps(inline_policy_values)),
+        before_identity=inline_policy_identity,
+        after_identity=json.loads(json.dumps(inline_policy_identity)),
+        before_sensitive={},
+        after_sensitive={},
+        after_unknown={},
+    )
+
+    policy_before = _github_deploy_encryption_policy_values(attachment_count=0)
+    policy_refreshed = _github_deploy_encryption_policy_values(attachment_count=1)
+    policy_sensitive = {"tags": {}, "tags_all": {}}
+    policy_identity = {"arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN}
+    desired_policy = _resource(
+        GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+        ["no-op"],
+        resource_type="aws_iam_policy",
+        before=json.loads(json.dumps(policy_refreshed)),
+        after=json.loads(json.dumps(policy_refreshed)),
+        before_identity=policy_identity,
+        after_identity=json.loads(json.dumps(policy_identity)),
+        before_sensitive=policy_sensitive,
+        after_sensitive=json.loads(json.dumps(policy_sensitive)),
+        after_unknown={},
+    )
+    policy_drift = _resource(
+        GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+        ["update"],
+        resource_type="aws_iam_policy",
+        before=policy_before,
+        after=policy_refreshed,
+        before_sensitive=json.loads(json.dumps(policy_sensitive)),
+        after_sensitive=json.loads(json.dumps(policy_sensitive)),
+        after_unknown={},
+    )
+
+    attachment_values = {
+        "id": (
+            "hindsight-github-deploy/"
+            f"{GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN}"
+        ),
+        "policy_arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        "role": "hindsight-github-deploy",
+    }
+    attachment_identity = {
+        "account_id": "762397612117",
+        "policy_arn": GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+        "role": "hindsight-github-deploy",
+    }
+    attachment = _resource(
+        GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT_ADDRESS,
+        ["no-op"],
+        resource_type="aws_iam_role_policy_attachment",
+        before=attachment_values,
+        after=json.loads(json.dumps(attachment_values)),
+        before_identity=attachment_identity,
+        after_identity=json.loads(json.dumps(attachment_identity)),
+        before_sensitive={},
+        after_sensitive={},
+        after_unknown={},
+    )
+    plan["resource_changes"].extend(
+        [desired_role, inline_policy_change, desired_policy, attachment]
+    )
+    plan["resource_drift"].extend([role_drift, policy_drift])
     return plan
 
 
@@ -1045,12 +1230,8 @@ def test_validator_rejects_every_non_cloudflare_resource_drift(actions):
         validator.validate_plan(plan)
 
 
-def test_validator_accepts_only_the_exact_github_deploy_role_refresh_transition():
+def test_validator_rejects_the_consumed_github_deploy_role_refresh_transition():
     validator = _validator()
-
-    summary = validator.validate_plan(
-        _plan_with_github_deploy_role_refresh_drift(validator)
-    )
 
     assert validator.LIFECYCLE_EXPORT_BUCKET_ARNS == LIFECYCLE_EXPORT_ARNS
     assert validator.LIFECYCLE_RECOVERY_BUCKET_ARNS == LIFECYCLE_RECOVERY_ARNS
@@ -1061,20 +1242,228 @@ def test_validator_accepts_only_the_exact_github_deploy_role_refresh_transition(
     assert validator.GITHUB_DEPLOY_INLINE_POLICY_NAME == GITHUB_DEPLOY_POLICY_NAME
     assert validator.GITHUB_DEPLOY_POLICY_STATEMENT_SIDS == GITHUB_DEPLOY_POLICY_SIDS
     assert validator.GITHUB_DEPLOY_ROLE_VALUE_FIELDS == GITHUB_DEPLOY_ROLE_VALUE_FIELDS
-    assert (
-        validator.GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
-        == GITHUB_DEPLOY_ROLE_SENSITIVE_VALUES
+    with pytest.raises(ValueError, match="inline policy refresh was already consumed"):
+        validator.validate_plan(
+            _plan_with_github_deploy_role_refresh_drift(validator)
+        )
+
+
+def test_validator_accepts_only_the_atomic_deploy_attachment_refresh_transition():
+    validator = _validator()
+
+    summary = validator.validate_plan(
+        _plan_with_github_deploy_attachment_refresh_drift(validator)
     )
-    assert summary["reconciled_refresh_drift"] == [GITHUB_DEPLOY_ROLE_ADDRESS]
+
+    assert validator.GITHUB_DEPLOY_MANAGED_POLICY_ARNS_BEFORE == frozenset(
+        {GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN}
+    )
+    assert validator.GITHUB_DEPLOY_MANAGED_POLICY_ARNS_AFTER == frozenset(
+        {
+            GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+            GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN,
+        }
+    )
+    assert summary["reconciled_refresh_drift"] == sorted(
+        [GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS, GITHUB_DEPLOY_ROLE_ADDRESS]
+    )
+    assert {
+        entry["address"] for entry in summary["resource_drift"]
+    } == set(summary["reconciled_refresh_drift"])
+
+
+def test_validator_accepts_semantically_reordered_managed_policy_arns():
+    validator = _validator()
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
     role_drift = _resource_entry(
-        summary, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
+        plan, "resource_drift", GITHUB_DEPLOY_ROLE_ADDRESS
     )
-    assert role_drift["actions"] == ["update"]
+    role_desired = _resource_entry(
+        plan, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
+    )
+    for entry, value in (
+        (role_drift, "after"),
+        (role_desired, "before"),
+        (role_desired, "after"),
+    ):
+        entry["change"][value]["managed_policy_arns"].reverse()
+
+    summary = validator.validate_plan(plan)
+
+    assert summary["reconciled_refresh_drift"] == sorted(
+        [GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS, GITHUB_DEPLOY_ROLE_ADDRESS]
+    )
+
+
+@pytest.mark.parametrize(
+    ("collection", "value_name", "sensitivity"),
+    [
+        ("resource_drift", "before_sensitive", [False, False]),
+        ("resource_drift", "after_sensitive", [False]),
+        ("resource_drift", "after_sensitive", [False, True]),
+        ("resource_changes", "before_sensitive", [False]),
+        ("resource_changes", "after_sensitive", [False, False, False]),
+    ],
+)
+def test_validator_rejects_nonexact_attachment_refresh_sensitivity(
+    collection, value_name, sensitivity
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
+    role = _resource_entry(plan, collection, GITHUB_DEPLOY_ROLE_ADDRESS)
+    role["change"][value_name]["managed_policy_arns"] = sensitivity
+
+    with pytest.raises(ValueError, match="snapshot is malformed|sensitive values"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("collection", "value_name", "managed_policy_arns"),
+    [
+        ("resource_drift", "before", []),
+        (
+            "resource_drift",
+            "before",
+            [GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN],
+        ),
+        (
+            "resource_drift",
+            "after",
+            [GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN],
+        ),
+        (
+            "resource_drift",
+            "after",
+            [
+                GITHUB_DEPLOY_ENCRYPTION_POLICY_ARN,
+                GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN,
+                "arn:aws:iam::762397612117:policy/unapproved",
+            ],
+        ),
+        (
+            "resource_changes",
+            "before",
+            [GITHUB_DEPLOY_OBSERVABILITY_POLICY_ARN],
+        ),
+    ],
+)
+def test_validator_rejects_nonexact_managed_policy_attachment_transition(
+    collection, value_name, managed_policy_arns
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
+    role = _resource_entry(plan, collection, GITHUB_DEPLOY_ROLE_ADDRESS)
+    role["change"][value_name]["managed_policy_arns"] = managed_policy_arns
+    role["change"][f"{value_name}_sensitive"]["managed_policy_arns"] = [
+        False
+    ] * len(managed_policy_arns)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "managed polic|matching desired no-op|changed other role values|"
+            "target statement is invalid"
+        ),
+    ):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("collection", "address", "message"),
+    [
+        (
+            "resource_drift",
+            GITHUB_DEPLOY_ROLE_ADDRESS,
+            "unapproved resource drift is forbidden",
+        ),
+        (
+            "resource_changes",
+            GITHUB_DEPLOY_ROLE_ADDRESS,
+            "role refresh drift is not uniquely reconciled",
+        ),
+        (
+            "resource_drift",
+            GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+            "encryption policy refresh is not uniquely represented",
+        ),
+        (
+            "resource_changes",
+            GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS,
+            "encryption policy refresh is not uniquely represented",
+        ),
+        (
+            "resource_changes",
+            GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT_ADDRESS,
+            "encryption attachment no-op is absent",
+        ),
+        (
+            "resource_changes",
+            "aws_iam_role_policy.github_deploy",
+            "not bound to one inline policy",
+        ),
+    ],
+)
+def test_validator_requires_the_complete_atomic_attachment_refresh(
+    collection, address, message
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
+    plan[collection] = [
+        entry for entry in plan[collection] if entry["address"] != address
+    ]
+
+    with pytest.raises(ValueError, match=message):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("collection", "value_name", "attachment_count"),
+    [
+        ("resource_drift", "before", 1),
+        ("resource_drift", "before", False),
+        ("resource_drift", "after", 0),
+        ("resource_drift", "after", True),
+        ("resource_changes", "before", 0),
+        ("resource_changes", "after", 2),
+    ],
+)
+def test_validator_rejects_nonexact_encryption_policy_attachment_count(
+    collection, value_name, attachment_count
+):
+    validator = _validator()
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
+    policy = _resource_entry(
+        plan, collection, GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS
+    )
+    policy["change"][value_name]["attachment_count"] = attachment_count
+
+    with pytest.raises(ValueError, match="refresh snapshot is malformed"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("actions", ["update"]),
+        ("after_unknown", {"role": True}),
+        ("before_identity", {"account_id": "000000000000"}),
+    ],
+)
+def test_validator_rejects_nonexact_encryption_attachment_noop(field, value):
+    validator = _validator()
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
+    attachment = _resource_entry(
+        plan, "resource_changes", GITHUB_DEPLOY_ENCRYPTION_ATTACHMENT_ADDRESS
+    )
+    attachment["change"][field] = value
+
+    with pytest.raises(ValueError, match="encryption attachment"):
+        validator.validate_plan(plan)
 
 
 def test_validator_rejects_unrelated_drift_alongside_the_allowed_role_refresh():
     validator = _validator()
-    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
     plan["resource_drift"].append(
         _resource("aws_iam_role.unapproved", ["no-op"])
     )
@@ -1268,7 +1657,7 @@ def test_validator_rejects_any_nonexact_lifecycle_deny_action_set(variant):
 
 def test_validator_accepts_semantically_reordered_actions_and_arns():
     validator = _validator()
-    plan = _plan_with_github_deploy_role_refresh_drift(validator)
+    plan = _plan_with_github_deploy_attachment_refresh_drift(validator)
     role_desired = _resource_entry(
         plan, "resource_changes", GITHUB_DEPLOY_ROLE_ADDRESS
     )
@@ -1298,7 +1687,9 @@ def test_validator_accepts_semantically_reordered_actions_and_arns():
 
     summary = validator.validate_plan(plan)
 
-    assert summary["reconciled_refresh_drift"] == [GITHUB_DEPLOY_ROLE_ADDRESS]
+    assert summary["reconciled_refresh_drift"] == sorted(
+        [GITHUB_DEPLOY_ENCRYPTION_POLICY_ADDRESS, GITHUB_DEPLOY_ROLE_ADDRESS]
+    )
 
 
 def test_validator_rejects_other_role_or_policy_changes_in_the_refresh():
