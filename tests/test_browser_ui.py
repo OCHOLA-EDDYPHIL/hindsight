@@ -74,6 +74,86 @@ CONTROLLED_DIAGNOSTIC_CONTRACTS = {
 }
 
 
+def test_completed_governed_remediation_receipt_retries_serialization_failure(monkeypatch):
+    from psycopg.errors import SerializationFailure
+
+    attempts = []
+    expected = {"status": "completed"}
+
+    def receipt_once(*, namespace, run_id):
+        attempts.append((namespace, run_id))
+        if len(attempts) == 1:
+            raise SerializationFailure("restart transaction")
+        return expected
+
+    monkeypatch.setitem(
+        globals(),
+        "_assert_completed_governed_remediation_once",
+        receipt_once,
+    )
+
+    receipt = _assert_completed_governed_remediation(
+        namespace="demo:retry",
+        run_id="run-retry",
+    )
+
+    assert receipt is expected
+    assert attempts == [
+        ("demo:retry", "run-retry"),
+        ("demo:retry", "run-retry"),
+    ]
+
+
+def test_completed_governed_remediation_receipt_exhausts_serialization_retries(monkeypatch):
+    from psycopg.errors import SerializationFailure
+
+    attempts = []
+
+    def receipt_once(*, namespace, run_id):
+        attempts.append((namespace, run_id))
+        raise SerializationFailure("restart transaction")
+
+    monkeypatch.setitem(
+        globals(),
+        "_assert_completed_governed_remediation_once",
+        receipt_once,
+    )
+
+    with pytest.raises(SerializationFailure, match="restart transaction"):
+        _assert_completed_governed_remediation(
+            namespace="demo:exhausted",
+            run_id="run-exhausted",
+        )
+
+    assert attempts == [
+        ("demo:exhausted", "run-exhausted"),
+        ("demo:exhausted", "run-exhausted"),
+        ("demo:exhausted", "run-exhausted"),
+    ]
+
+
+def test_completed_governed_remediation_receipt_propagates_nonretryable_error(monkeypatch):
+    attempts = []
+
+    def receipt_once(*, namespace, run_id):
+        attempts.append((namespace, run_id))
+        raise RuntimeError("receipt is invalid")
+
+    monkeypatch.setitem(
+        globals(),
+        "_assert_completed_governed_remediation_once",
+        receipt_once,
+    )
+
+    with pytest.raises(RuntimeError, match="receipt is invalid"):
+        _assert_completed_governed_remediation(
+            namespace="demo:invalid",
+            run_id="run-invalid",
+        )
+
+    assert attempts == [("demo:invalid", "run-invalid")]
+
+
 @pytest.mark.parametrize(
     ("state", "expected_status"),
     [
@@ -1545,6 +1625,26 @@ def _awaiting_remediation_identity(*, namespace: str) -> dict[str, Any]:
 
 
 def _assert_completed_governed_remediation(*, namespace: str, run_id: str) -> dict[str, Any]:
+    from psycopg.errors import SerializationFailure
+
+    attempts_remaining = 3
+    while True:
+        try:
+            return _assert_completed_governed_remediation_once(
+                namespace=namespace,
+                run_id=run_id,
+            )
+        except SerializationFailure:
+            attempts_remaining -= 1
+            if attempts_remaining == 0:
+                raise
+
+
+def _assert_completed_governed_remediation_once(
+    *,
+    namespace: str,
+    run_id: str,
+) -> dict[str, Any]:
     from psycopg.rows import dict_row
 
     from hindsight.agent_decision import (
