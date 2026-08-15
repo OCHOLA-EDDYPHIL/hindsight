@@ -650,10 +650,13 @@ def test_lifecycle_terraform_ownership_is_cloudflare_free_and_non_overlapping():
         '"tenant_lifecycle_recovery"',
         'resource "aws_iam_role" "github_lifecycle"',
         'resource "aws_iam_role" "github_bootstrap_plan"',
+        'resource "aws_iam_role" "github_bootstrap_apply"',
         'resource "aws_iam_role" "lifecycle_export_replication"',
         'resource "aws_iam_role_policy" "lifecycle_export_replication"',
         'resource "aws_iam_role_policy" "github_lifecycle"',
         'resource "aws_iam_role_policy" "github_bootstrap_plan"',
+        'resource "aws_iam_role_policy" "github_bootstrap_apply_transition"',
+        'resource "aws_iam_role_policy" "github_bootstrap_apply"',
         'resource "aws_s3_bucket_policy" "tenant_lifecycle_exports"',
         'resource "aws_s3_bucket_policy" "tenant_lifecycle_recovery"',
         'resource "aws_s3_bucket_replication_configuration" '
@@ -675,16 +678,115 @@ def test_lifecycle_terraform_ownership_is_cloudflare_free_and_non_overlapping():
     assert 'variable "bootstrap_state_bucket_name"' in lifecycle_variables
     assert 'variable "bootstrap_certificate_arn"' in lifecycle_variables
     assert 'variable "bootstrap_hmac_key_arn"' in lifecycle_variables
+    external_id_variable = lifecycle_variables.split(
+        'variable "bootstrap_apply_external_id" {', 1
+    )[1].split("\n}\n", 1)[0]
+    assert "sensitive   = true" in external_id_variable
+    assert "default" not in external_id_variable
+    assert (
+        'can(regex("^[0-9a-f]{64}$", var.bootstrap_apply_external_id))'
+        in external_id_variable
+    )
     assert "aws_ssm_parameter" not in lifecycle
     assert 'output "lifecycle_database_url_parameter_name"' in lifecycle_outputs
     assert 'output "lifecycle_database_url_parameter_arn"' in lifecycle_outputs
     assert 'output "github_bootstrap_plan_role_arn"' in lifecycle_outputs
+    assert 'output "github_bootstrap_apply_role_arn"' in lifecycle_outputs
     assert 'name                 = "hindsight-github-bootstrap-plan"' in lifecycle
-    assert 'data "aws_iam_policy_document" "github_bootstrap_plan_assume"' in lifecycle
-    assert 'values   = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"]' in lifecycle
+    assert 'name                 = "hindsight-github-bootstrap-apply"' in lifecycle
+    plan_trust = lifecycle.split(
+        'data "aws_iam_policy_document" "github_bootstrap_plan_assume"', 1
+    )[1].split(
+        'data "aws_iam_policy_document" "github_bootstrap_apply_assume"', 1
+    )[0]
+    apply_trust = lifecycle.split(
+        'data "aws_iam_policy_document" "github_bootstrap_apply_assume"', 1
+    )[1].split('resource "aws_iam_role" "github_lifecycle"', 1)[0]
+    apply_role = lifecycle.split(
+        'resource "aws_iam_role" "github_bootstrap_apply"', 1
+    )[1].split('data "aws_iam_policy_document" "github_bootstrap_plan"', 1)[0]
+    assert 'actions = ["sts:AssumeRoleWithWebIdentity"]' in plan_trust
+    assert 'type        = "Federated"' in plan_trust
+    assert "identifiers = [var.github_oidc_provider_arn]" in plan_trust
+    assert 'values   = ["repo:OCHOLA-EDDYPHIL/hindsight:environment:demo"]' in plan_trust
+    assert "sts:ExternalId" not in plan_trust
+    assert apply_trust.count('actions = ["sts:AssumeRole"]') == 1
+    assert 'type        = "AWS"' in apply_trust
+    assert "identifiers = [local.bootstrap_plan_role_arn]" in apply_trust
+    assert 'test     = "StringEquals"' in apply_trust
+    assert 'variable = "sts:ExternalId"' in apply_trust
+    assert "values   = [var.bootstrap_apply_external_id]" in apply_trust
+    assert "AssumeRoleWithWebIdentity" not in apply_trust
+    assert "github_oidc_provider_arn" not in apply_trust
+    assert (
+        "assume_role_policy   = "
+        "data.aws_iam_policy_document.github_bootstrap_apply_assume.json"
+    ) in apply_role
+    assert "depends_on           = [aws_iam_role.github_bootstrap_plan]" in apply_role
     assert 'sid       = "BootstrapStateRead"' in lifecycle
     assert 'sid = "BootstrapStateLock"' in lifecycle
-    assert "iam:PutRolePolicy" not in lifecycle
+    plan_policy = lifecycle.split(
+        'data "aws_iam_policy_document" "github_bootstrap_plan"', 1
+    )[1].split(
+        'data "aws_iam_policy_document" "github_bootstrap_apply_transition"', 1
+    )[0]
+    transition_policy = lifecycle.split(
+        'data "aws_iam_policy_document" "github_bootstrap_apply_transition"', 1
+    )[1].split('data "aws_iam_policy_document" "github_bootstrap_apply"', 1)[0]
+    apply_policy = lifecycle.split(
+        'data "aws_iam_policy_document" "github_bootstrap_apply"', 1
+    )[1].split('resource "aws_iam_role_policy" "github_bootstrap_plan"', 1)[0]
+    assert "iam:PutRolePolicy" not in plan_policy
+    assert "iam:CreateRole" not in plan_policy
+    assert "iam:AttachRolePolicy" not in plan_policy
+    assert "sts:AssumeRole" not in plan_policy
+    assert 'sid       = "BootstrapApplyTransition"' in transition_policy
+    assert transition_policy.count('actions   = ["sts:AssumeRole"]') == 1
+    assert "resources = [local.bootstrap_apply_role_arn]" in transition_policy
+    assert 'test     = "StringEquals"' in transition_policy
+    assert 'variable = "sts:ExternalId"' in transition_policy
+    assert "values   = [var.bootstrap_apply_external_id]" in transition_policy
+    assert "principals" not in transition_policy
+    transition_resource = lifecycle.split(
+        'resource "aws_iam_role_policy" "github_bootstrap_apply_transition"', 1
+    )[1].split('resource "aws_iam_role_policy" "github_bootstrap_apply"', 1)[0]
+    assert 'name   = "hindsight-github-bootstrap-apply-transition"' in (
+        transition_resource
+    )
+    assert "role   = aws_iam_role.github_bootstrap_plan.id" in transition_resource
+    assert (
+        "policy = data.aws_iam_policy_document.github_bootstrap_apply_transition.json"
+        in transition_resource
+    )
+    assert (
+        "source_policy_documents = "
+        "[data.aws_iam_policy_document.github_bootstrap_plan.json]"
+    ) in apply_policy
+    assert "github_bootstrap_apply_transition" not in apply_policy
+    assert "sts:AssumeRole" not in apply_policy
+    assert 'sid       = "BootstrapStateWrite"' in apply_policy
+    assert 'actions   = ["s3:PutObject"]' in apply_policy
+    assert "local.bootstrap_state_object_arn" in apply_policy
+    assert "local.bootstrap_state_lock_object_arn" not in apply_policy
+    assert '"iam:CreateRole"' in apply_policy
+    assert '"iam:TagRole"' in apply_policy
+    assert 'actions   = ["iam:PutRolePolicy"]' in apply_policy
+    assert 'actions   = ["iam:AttachRolePolicy"]' in apply_policy
+    attach_policy = apply_policy.split('sid       = "BootstrapManagedPolicyAttach"', 1)[
+        1
+    ].split("\n  }", 1)[0]
+    assert "resources = [local.expected_deploy_role_arn]" in attach_policy
+    assert 'variable = "iam:PolicyARN"' in attach_policy
+    assert "values   = [local.bootstrap_encryption_policy_arn]" in attach_policy
+    assert '"iam:CreatePolicyVersion"' in apply_policy
+    assert '"iam:DeletePolicyVersion"' in apply_policy
+    assert '"iam:DeletePolicy"' not in apply_policy
+    assert '"iam:DeleteRole"' not in apply_policy
+    assert '"iam:DeleteRolePolicy"' not in apply_policy
+    assert '"iam:DetachRolePolicy"' not in apply_policy
+    assert "OpenIDConnectProvider" not in apply_policy
+    assert "hindsight-github-bootstrap-plan" not in apply_policy
+    assert "hindsight-github-bootstrap-apply" not in apply_policy
     assert 'key          = "hindsight/demo/lifecycle/terraform.tfstate"' in (
         lifecycle_versions
     )

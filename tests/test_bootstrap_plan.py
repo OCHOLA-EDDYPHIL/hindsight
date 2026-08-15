@@ -82,35 +82,58 @@ def _plan(validator):
         "variables": {},
         "planned_values": {"outputs": {}, "root_module": {}},
         "resource_changes": [
-            _resource("aws_iam_role.github_deploy", ["update"]),
+            _resource(
+                "aws_iam_policy.github_deploy_encryption",
+                ["create"],
+                resource_type="aws_iam_policy",
+            ),
+            _resource(
+                "aws_iam_policy.github_deploy_observability",
+                ["update"],
+                resource_type="aws_iam_policy",
+            ),
+            _resource("aws_iam_role.github_quarantine_redrive", ["create"]),
+            _resource("aws_iam_role.github_worker_acceptance", ["create"]),
+            _resource(
+                "aws_iam_role_policy.github_observability_evidence",
+                ["update"],
+                resource_type="aws_iam_role_policy",
+            ),
+            _resource(
+                "aws_iam_role_policy.github_quarantine_redrive",
+                ["create"],
+                resource_type="aws_iam_role_policy",
+            ),
+            _resource(
+                "aws_iam_role_policy.github_worker_acceptance",
+                ["create"],
+                resource_type="aws_iam_role_policy",
+            ),
+            _resource(
+                "aws_iam_role_policy_attachment.github_deploy_encryption",
+                ["create"],
+                resource_type="aws_iam_role_policy_attachment",
+            ),
             _resource(
                 "cloudflare_dns_record.acm_validation",
                 ["no-op"],
                 resource_type="cloudflare_dns_record",
                 provider="registry.terraform.io/cloudflare/cloudflare",
             ),
-            _resource(
-                "data.aws_s3_bucket.state",
-                ["delete"],
-                mode="data",
-                resource_type="aws_s3_bucket",
-            ),
         ],
-        "resource_drift": [
-            _resource("aws_iam_policy.github_deploy_observability", ["update"])
-        ],
+        "resource_drift": [],
         "output_changes": {
-            "github_deploy_role_arn": {
-                "actions": ["no-op"],
-                "before": "arn:old",
-                "after": "arn:old",
+            "github_quarantine_redrive_role_arn": {
+                "actions": ["create"],
+                "before": None,
+                "after": "arn:quarantine-redrive",
                 "before_sensitive": False,
                 "after_sensitive": False,
             },
-            "learning_corpus_kms_key_arn": {
-                "actions": ["delete"],
-                "before": "arn:retired",
-                "after": None,
+            "github_worker_acceptance_role_arn": {
+                "actions": ["create"],
+                "before": None,
+                "after": "arn:worker-acceptance",
                 "before_sensitive": False,
                 "after_sensitive": False,
             },
@@ -134,6 +157,19 @@ def _plan(validator):
         "complete": True,
         "errored": False,
     }
+
+
+def _no_change_plan(validator):
+    plan = _plan(validator)
+    plan["resource_changes"] = [
+        entry
+        for entry in plan["resource_changes"]
+        if entry["address"] == "cloudflare_dns_record.acm_validation"
+    ]
+    plan["resource_drift"] = []
+    plan["output_changes"] = {}
+    plan["applyable"] = False
+    return plan
 
 
 def _plan_with_null_sensitive_placeholders(validator):
@@ -246,33 +282,130 @@ def _provenance(*, serial: int = 25):
     }
 
 
-def test_validator_records_every_resource_drift_and_output_action():
+def _receipt_inputs(
+    directory: Path,
+    validator,
+    *,
+    plan: dict | None = None,
+    after_serial: int = 26,
+):
+    directory.mkdir()
+    paths = {
+        **{
+            key: directory / name
+            for key, name in validator.EXPECTED_ARTIFACT_NAMES.items()
+        },
+        **{
+            key: directory / name
+            for key, name in validator.EXPECTED_RECEIPT_NAMES.items()
+        },
+    }
+    paths["plan"].write_bytes(b"saved terraform plan")
+    paths["plan_json"].write_text(
+        json.dumps(plan or _plan(validator)), encoding="utf-8"
+    )
+    paths["lock"].write_text("provider lock", encoding="utf-8")
+    paths["state_before"].write_text(json.dumps(_provenance()), encoding="utf-8")
+    paths["state_after"].write_text(json.dumps(_provenance()), encoding="utf-8")
+    validator.build_manifest(
+        plan_json=paths["plan_json"],
+        plan_file=paths["plan"],
+        lock_file=paths["lock"],
+        state_before_file=paths["state_before"],
+        state_after_file=paths["state_after"],
+        actions_file=paths["actions"],
+        manifest_file=paths["manifest"],
+        source_revision=SOURCE_REVISION,
+        repository=validator.EXPECTED_REPOSITORY,
+        workflow_ref=WORKFLOW_REF,
+        aws_account_id=validator.EXPECTED_AWS_ACCOUNT_ID,
+        environment="demo",
+        role_arn=(
+            "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan"
+        ),
+        run_id="1234",
+        run_attempt="2",
+    )
+    paths["state_before_apply"].write_text(
+        json.dumps(_provenance()), encoding="utf-8"
+    )
+    paths["state_after_apply"].write_text(
+        json.dumps(_provenance(serial=after_serial)), encoding="utf-8"
+    )
+    paths["state_after_postcheck"].write_text(
+        json.dumps(_provenance(serial=after_serial)), encoding="utf-8"
+    )
+    kwargs = {
+        "manifest_file": paths["manifest"],
+        "actions_file": paths["actions"],
+        "state_before_apply_file": paths["state_before_apply"],
+        "state_after_apply_file": paths["state_after_apply"],
+        "state_after_postcheck_file": paths["state_after_postcheck"],
+        "receipt_file": paths["receipt"],
+        "source_revision": SOURCE_REVISION,
+        "repository": validator.EXPECTED_REPOSITORY,
+        "workflow_ref": WORKFLOW_REF,
+        "aws_account_id": validator.EXPECTED_AWS_ACCOUNT_ID,
+        "environment": "demo",
+        "plan_role_arn": (
+            "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan"
+        ),
+        "apply_role_arn": (
+            "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-apply"
+        ),
+        "run_id": "1234",
+        "run_attempt": "2",
+        "plan_exit_code": "2",
+        "postcheck_exit_code": "0",
+    }
+    return paths, kwargs
+
+
+def _preapply_kwargs(paths: dict[str, Path], *, plan_exit_code: str = "2"):
+    return {
+        "manifest_file": paths["manifest"],
+        "actions_file": paths["actions"],
+        "plan_file": paths["plan"],
+        "plan_json_file": paths["plan_json"],
+        "lock_file": paths["lock"],
+        "state_before_plan_file": paths["state_before"],
+        "state_after_plan_file": paths["state_after"],
+        "state_before_apply_file": paths["state_before_apply"],
+        "plan_exit_code": plan_exit_code,
+    }
+
+
+def test_validator_records_the_exact_authorized_desired_state_mutations():
     validator = _validator()
 
     summary = validator.validate_plan(_plan(validator))
 
     assert [row["address"] for row in summary["resource_changes"]] == [
-        "aws_iam_role.github_deploy",
+        "aws_iam_policy.github_deploy_encryption",
+        "aws_iam_policy.github_deploy_observability",
+        "aws_iam_role.github_quarantine_redrive",
+        "aws_iam_role.github_worker_acceptance",
+        "aws_iam_role_policy.github_observability_evidence",
+        "aws_iam_role_policy.github_quarantine_redrive",
+        "aws_iam_role_policy.github_worker_acceptance",
+        "aws_iam_role_policy_attachment.github_deploy_encryption",
         "cloudflare_dns_record.acm_validation",
-        "data.aws_s3_bucket.state",
     ]
-    assert [row["address"] for row in summary["resource_drift"]] == [
-        "aws_iam_policy.github_deploy_observability"
-    ]
+    assert summary["resource_drift"] == []
     assert [row["name"] for row in summary["output_changes"]] == [
-        "github_deploy_role_arn",
-        "learning_corpus_kms_key_arn",
+        "github_quarantine_redrive_role_arn",
+        "github_worker_acceptance_role_arn",
     ]
     assert summary["totals"] == {
         "checks": 2,
-        "resource_changes": 3,
-        "resource_drift": 1,
+        "resource_changes": 9,
+        "resource_drift": 0,
         "output_changes": 2,
     }
-    assert summary["action_counts"] == {"delete": 2, "no-op": 2, "update": 2}
+    assert summary["action_counts"] == {"create": 8, "no-op": 1, "update": 2}
     assert summary["observed_allowed_removals"] == {
-        "data_resources": ["data.aws_s3_bucket.state"],
-        "outputs": ["learning_corpus_kms_key_arn"],
+        "data_resources": [],
+        "outputs": [],
     }
     assert summary["null_sensitive_placeholders"] == []
     assert summary["reconciled_refresh_drift"] == []
@@ -280,6 +413,114 @@ def test_validator_records_every_resource_drift_and_output_action():
         validator.REQUIRED_CHECKS
     )
     assert all(row["status"] == "pass" for row in summary["checks"])
+
+
+def test_validator_allows_only_the_exact_resource_and_output_mutation_pairs():
+    validator = _validator()
+    expected_resources = {
+        ("aws_iam_policy.github_deploy_encryption", ("create",)),
+        ("aws_iam_policy.github_deploy_observability", ("update",)),
+        ("aws_iam_role.github_quarantine_redrive", ("create",)),
+        ("aws_iam_role.github_worker_acceptance", ("create",)),
+        ("aws_iam_role_policy.github_observability_evidence", ("update",)),
+        ("aws_iam_role_policy.github_quarantine_redrive", ("create",)),
+        ("aws_iam_role_policy.github_worker_acceptance", ("create",)),
+        ("aws_iam_role_policy_attachment.github_deploy_encryption", ("create",)),
+    }
+    expected_outputs = {
+        ("github_quarantine_redrive_role_arn", ("create",)),
+        ("github_worker_acceptance_role_arn", ("create",)),
+    }
+
+    assert validator.ALLOWED_RESOURCE_MUTATIONS == expected_resources
+    assert validator.ALLOWED_OUTPUT_MUTATIONS == expected_outputs
+    summary = validator.validate_plan(_plan(validator))
+    assert {
+        (entry["address"], tuple(entry["actions"]))
+        for entry in summary["resource_changes"]
+        if not validator.MUTATING_ACTIONS.isdisjoint(entry["actions"])
+    } == expected_resources
+    assert {
+        (entry["name"], tuple(entry["actions"]))
+        for entry in summary["output_changes"]
+        if not validator.MUTATING_ACTIONS.isdisjoint(entry["actions"])
+    } == expected_outputs
+
+
+def test_validator_accepts_a_plan_with_no_desired_state_mutations():
+    validator = _validator()
+
+    summary = validator.validate_plan(_no_change_plan(validator))
+
+    assert summary["applyable"] is False
+    assert summary["action_counts"] == {"no-op": 1}
+    assert summary["resource_drift"] == []
+
+
+@pytest.mark.parametrize(
+    ("address", "actions"),
+    [
+        ("aws_iam_policy.github_deploy_encryption", ["update"]),
+        ("aws_iam_policy.github_deploy_observability", ["create"]),
+        ("aws_iam_role.github_quarantine_redrive", ["update"]),
+        ("aws_iam_role.github_worker_acceptance", ["update"]),
+        ("aws_iam_role_policy.github_observability_evidence", ["create"]),
+        ("aws_iam_role_policy.github_quarantine_redrive", ["update"]),
+        ("aws_iam_role_policy.github_worker_acceptance", ["update"]),
+        ("aws_iam_role_policy_attachment.github_deploy_encryption", ["update"]),
+        ("aws_iam_role.unapproved", ["create"]),
+        ("aws_iam_role.unapproved", ["update"]),
+    ],
+)
+def test_validator_rejects_every_other_resource_mutation_pair(address, actions):
+    validator = _validator()
+    plan = _no_change_plan(validator)
+    plan["resource_changes"].append(
+        _resource(address, actions, resource_type=address.split(".", 1)[0])
+    )
+    plan["applyable"] = True
+
+    with pytest.raises(ValueError, match="unapproved desired-state resource mutation"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("name", "actions"),
+    [
+        ("github_quarantine_redrive_role_arn", ["update"]),
+        ("github_worker_acceptance_role_arn", ["update"]),
+        ("unapproved", ["create"]),
+        ("unapproved", ["update"]),
+    ],
+)
+def test_validator_rejects_every_other_output_mutation_pair(name, actions):
+    validator = _validator()
+    plan = _no_change_plan(validator)
+    plan["output_changes"] = {
+        name: {
+            "actions": actions,
+            "before": None,
+            "after": "value",
+            "before_sensitive": False,
+            "after_sensitive": False,
+        }
+    }
+    plan["applyable"] = True
+
+    with pytest.raises(ValueError, match="unapproved desired-state output mutation"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize("actions", [["no-op"], ["read"], ["create"], ["update"]])
+def test_validator_rejects_every_non_cloudflare_resource_drift(actions):
+    validator = _validator()
+    plan = _no_change_plan(validator)
+    plan["resource_drift"] = [
+        _resource("aws_iam_role.github_worker_acceptance", actions)
+    ]
+
+    with pytest.raises(ValueError, match="non-Cloudflare resource drift is forbidden"):
+        validator.validate_plan(plan)
 
 
 def test_validator_records_only_exact_reconciled_cloudflare_refresh_drift():
@@ -903,7 +1144,9 @@ def test_validator_rejects_malformed_and_unapproved_sensitivity_masks():
     assert "must-never-appear-in-the-error" not in str(raised.value)
 
     output = _plan(validator)
-    output["output_changes"]["github_deploy_role_arn"]["after_sensitive"] = True
+    output["output_changes"]["github_quarantine_redrive_role_arn"][
+        "after_sensitive"
+    ] = True
     with pytest.raises(ValueError, match="sensitive"):
         validator.validate_plan(output)
 
@@ -982,13 +1225,10 @@ def test_validator_rejects_unapproved_output_removal():
         "tenant_lifecycle_export_bucket_arn",
     ],
 )
-def test_validator_accepts_only_explicitly_retired_outputs(output_name):
+def test_validator_rejects_retired_output_removals_outside_the_exact_rollout(
+    output_name,
+):
     validator = _validator()
-    assert validator.ALLOWED_OUTPUT_REMOVALS == {
-        "learning_corpus_kms_key_alias",
-        "learning_corpus_kms_key_arn",
-        "tenant_lifecycle_export_bucket_arn",
-    }
     plan = _plan(validator)
     plan["output_changes"] = {
         output_name: {
@@ -1000,9 +1240,24 @@ def test_validator_accepts_only_explicitly_retired_outputs(output_name):
         }
     }
 
-    summary = validator.validate_plan(plan)
+    with pytest.raises(ValueError, match="unapproved desired-state output mutation"):
+        validator.validate_plan(plan)
 
-    assert summary["observed_allowed_removals"]["outputs"] == [output_name]
+
+def test_validator_rejects_the_previously_allowed_data_resource_removal():
+    validator = _validator()
+    plan = _no_change_plan(validator)
+    plan["resource_changes"].append(
+        _resource(
+            "data.aws_s3_bucket.state",
+            ["delete"],
+            mode="data",
+            resource_type="aws_s3_bucket",
+        )
+    )
+
+    with pytest.raises(ValueError, match="unapproved desired-state resource mutation"):
+        validator.validate_plan(plan)
 
 
 def test_state_provenance_retains_only_lineage_serial_and_terraform_version():
@@ -1078,8 +1333,8 @@ def test_manifest_binds_exact_files_metadata_actions_and_unchanged_state(tmp_pat
     assert json.loads(paths["manifest"].read_text()) == manifest
     assert json.loads(paths["actions"].read_text())["totals"] == {
         "checks": 2,
-        "resource_changes": 3,
-        "resource_drift": 1,
+        "resource_changes": 9,
+        "resource_drift": 0,
         "output_changes": 2,
     }
 
@@ -1247,21 +1502,382 @@ def test_manifest_refuses_a_different_well_formed_aws_account(tmp_path: Path):
         )
 
 
-def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
+def test_preapply_revalidates_all_saved_artifacts_without_rewriting_evidence(
+    tmp_path: Path,
+):
+    validator = _validator()
+    paths, _ = _receipt_inputs(tmp_path / "valid", validator)
+    original_manifest = paths["manifest"].read_bytes()
+    original_actions = paths["actions"].read_bytes()
+
+    result = validator.validate_preapply(**_preapply_kwargs(paths))
+
+    assert result is None
+    assert paths["manifest"].read_bytes() == original_manifest
+    assert paths["actions"].read_bytes() == original_actions
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["plan", "plan_json", "actions", "lock", "state_before", "state_after"],
+)
+def test_preapply_rejects_any_saved_artifact_changed_after_manifest_creation(
+    tmp_path: Path, artifact: str
+):
+    validator = _validator()
+    paths, _ = _receipt_inputs(tmp_path / artifact, validator)
+    paths[artifact].write_bytes(paths[artifact].read_bytes() + b"tampered")
+
+    with pytest.raises(ValueError, match="no longer match their manifest"):
+        validator.validate_preapply(**_preapply_kwargs(paths))
+
+
+def test_preapply_requires_the_manifest_exact_artifact_digest_map(tmp_path: Path):
+    validator = _validator()
+    paths, _ = _receipt_inputs(tmp_path / "missing", validator)
+    manifest = json.loads(paths["manifest"].read_text())
+    manifest["artifacts"].pop("bootstrap.tfplan")
+    paths["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact set is incomplete"):
+        validator.validate_preapply(**_preapply_kwargs(paths))
+
+    paths, _ = _receipt_inputs(tmp_path / "extra", validator)
+    manifest = json.loads(paths["manifest"].read_text())
+    manifest["artifacts"]["unapproved.json"] = "0" * 64
+    paths["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact set is incomplete"):
+        validator.validate_preapply(**_preapply_kwargs(paths))
+
+
+def test_preapply_requires_current_state_to_equal_the_planned_provenance(
+    tmp_path: Path,
+):
+    validator = _validator()
+    paths, _ = _receipt_inputs(tmp_path / "stale", validator)
+    paths["state_before_apply"].write_text(
+        json.dumps(_provenance(serial=26)), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="does not match the saved plan"):
+        validator.validate_preapply(**_preapply_kwargs(paths))
+
+
+def test_preapply_requires_initial_exit_code_to_match_sanitized_actions(
+    tmp_path: Path,
+):
+    validator = _validator()
+    paths, _ = _receipt_inputs(tmp_path / "mutations", validator)
+    with pytest.raises(ValueError, match="exit code is inconsistent"):
+        validator.validate_preapply(
+            **_preapply_kwargs(paths, plan_exit_code="0")
+        )
+    with pytest.raises(ValueError, match="detailed exit code"):
+        validator.validate_preapply(
+            **_preapply_kwargs(paths, plan_exit_code="1")
+        )
+
+    plan = _plan(validator)
+    for entry in plan["resource_changes"]:
+        entry["change"]["actions"] = ["no-op"]
+    for change in plan["output_changes"].values():
+        change["actions"] = ["no-op"]
+    plan["applyable"] = False
+    noop_paths, _ = _receipt_inputs(
+        tmp_path / "noop", validator, plan=plan, after_serial=25
+    )
+
+    assert (
+        validator.validate_preapply(
+            **_preapply_kwargs(noop_paths, plan_exit_code="0")
+        )
+        is None
+    )
+
+
+def test_receipt_binds_apply_metadata_actions_and_state_without_raw_values(
+    tmp_path: Path,
+):
+    validator = _validator()
+    paths, kwargs = _receipt_inputs(tmp_path / "applied", validator)
+
+    receipt = validator.build_receipt(**kwargs)
+
+    assert receipt["schema_version"] == validator.RECEIPT_SCHEMA_VERSION
+    assert receipt["source_revision"] == SOURCE_REVISION
+    assert receipt["repository"] == validator.EXPECTED_REPOSITORY
+    assert receipt["workflow_ref"] == WORKFLOW_REF
+    assert receipt["run_id"] == 1234
+    assert receipt["run_attempt"] == 2
+    assert receipt["environment"] == "demo"
+    assert receipt["aws"] == {
+        "account_id": "762397612117",
+        "apply_role_arn": (
+            "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-apply"
+        ),
+        "plan_role_arn": (
+            "arn:aws:iam::762397612117:role/hindsight-github-bootstrap-plan"
+        ),
+        "region": "us-east-1",
+    }
+    assert receipt["plan"] == {
+        "action_counts": {"create": 8, "no-op": 1, "update": 2},
+        "applied": True,
+        "applyable": True,
+        "detailed_exit_code": 2,
+        "mutation_action_counts": {"create": 8, "update": 2},
+        "totals": {
+            "checks": 2,
+            "output_changes": 2,
+            "resource_changes": 9,
+            "resource_drift": 0,
+        },
+    }
+    assert receipt["postcheck"] == {
+        "detailed_exit_code": 0,
+        "succeeded": True,
+    }
+    assert receipt["state_provenance"] == {
+        "plan": _provenance(),
+        "before_apply": _provenance(),
+        "after_apply": _provenance(serial=26),
+        "after_postcheck": _provenance(serial=26),
+    }
+    assert set(receipt["artifacts"]) == {
+        "bootstrap-plan-actions.json",
+        "bootstrap-plan-manifest.json",
+    }
+    assert all(
+        len(digest) == 64 and set(digest) <= set("0123456789abcdef")
+        for digest in receipt["artifacts"].values()
+    )
+    assert json.loads(paths["receipt"].read_text()) == receipt
+    serialized = json.dumps(receipt)
+    for raw_plan_detail in (
+        "aws_iam_role.github_worker_acceptance",
+        "cloudflare_dns_record.acm_validation",
+        "github_worker_acceptance_role_arn",
+    ):
+        assert raw_plan_detail not in serialized
+
+
+def test_receipt_accepts_exit_zero_only_for_a_non_applyable_noop_plan(
+    tmp_path: Path,
+):
+    validator = _validator()
+    plan = _plan(validator)
+    for entry in plan["resource_changes"]:
+        entry["change"]["actions"] = ["no-op"]
+    for change in plan["output_changes"].values():
+        change["actions"] = ["no-op"]
+    plan["applyable"] = False
+    paths, kwargs = _receipt_inputs(
+        tmp_path / "noop", validator, plan=plan, after_serial=25
+    )
+    kwargs["plan_exit_code"] = "0"
+
+    receipt = validator.build_receipt(**kwargs)
+
+    assert receipt["plan"]["applied"] is False
+    assert receipt["plan"]["applyable"] is False
+    assert receipt["plan"]["detailed_exit_code"] == 0
+    assert receipt["plan"]["mutation_action_counts"] == {}
+    assert receipt["plan"]["action_counts"] == {"no-op": 11}
+    assert receipt["state_provenance"]["before_apply"] == _provenance()
+    assert receipt["state_provenance"]["after_apply"] == _provenance()
+    assert json.loads(paths["receipt"].read_text()) == receipt
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source_revision", "A" * 40, "source revision"),
+        ("repository", "different/repository", "repository identity"),
+        (
+            "workflow_ref",
+            "OCHOLA-EDDYPHIL/hindsight/.github/workflows/other.yml@refs/heads/main",
+            "workflow identity",
+        ),
+        ("aws_account_id", "123456789012", "account identity"),
+        ("environment", "production", "demo environment"),
+        (
+            "plan_role_arn",
+            "arn:aws:iam::762397612117:role/different-plan-role",
+            "plan role identity",
+        ),
+        (
+            "apply_role_arn",
+            "arn:aws:iam::762397612117:role/different-apply-role",
+            "apply role identity",
+        ),
+        ("run_id", "0", "positive decimal"),
+        ("run_attempt", "01", "positive decimal"),
+    ],
+)
+def test_receipt_rejects_any_execution_identity_variant(
+    tmp_path: Path, field: str, value: str, message: str
+):
+    validator = _validator()
+    _, kwargs = _receipt_inputs(tmp_path / field, validator)
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        validator.build_receipt(**kwargs)
+
+
+def test_receipt_rejects_tampered_actions_or_manifest_binding(tmp_path: Path):
+    validator = _validator()
+    paths, kwargs = _receipt_inputs(tmp_path / "tampered-actions", validator)
+    actions = json.loads(paths["actions"].read_text())
+    actions["action_counts"]["update"] += 1
+    paths["actions"].write_text(json.dumps(actions), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="actions digest"):
+        validator.build_receipt(**kwargs)
+    assert not paths["receipt"].exists()
+
+    paths, kwargs = _receipt_inputs(tmp_path / "tampered-manifest", validator)
+    manifest = json.loads(paths["manifest"].read_text())
+    manifest["source_revision"] = "b" * 40
+    paths["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="execution identity"):
+        validator.build_receipt(**kwargs)
+    assert not paths["receipt"].exists()
+
+
+def test_receipt_rejects_exit_codes_inconsistent_with_applyability_and_mutations(
+    tmp_path: Path,
+):
+    validator = _validator()
+    _, applied_kwargs = _receipt_inputs(tmp_path / "applied", validator)
+    applied_kwargs["plan_exit_code"] = "0"
+    with pytest.raises(ValueError, match="exit code is inconsistent"):
+        validator.build_receipt(**applied_kwargs)
+
+    plan = _plan(validator)
+    for entry in plan["resource_changes"]:
+        entry["change"]["actions"] = ["no-op"]
+    for change in plan["output_changes"].values():
+        change["actions"] = ["no-op"]
+    plan["applyable"] = False
+    _, noop_kwargs = _receipt_inputs(
+        tmp_path / "noop", validator, plan=plan, after_serial=25
+    )
+    with pytest.raises(ValueError, match="exit code is inconsistent"):
+        validator.build_receipt(**noop_kwargs)
+
+    _, invalid_kwargs = _receipt_inputs(tmp_path / "invalid", validator)
+    invalid_kwargs["plan_exit_code"] = "1"
+    with pytest.raises(ValueError, match="detailed exit code"):
+        validator.build_receipt(**invalid_kwargs)
+
+
+def test_receipt_rejects_an_applyable_flag_without_desired_state_mutations(
+    tmp_path: Path,
+):
+    validator = _validator()
+    plan = _plan(validator)
+    for entry in plan["resource_changes"]:
+        entry["change"]["actions"] = ["no-op"]
+    for change in plan["output_changes"].values():
+        change["actions"] = ["no-op"]
+    plan["applyable"] = True
+    _, kwargs = _receipt_inputs(tmp_path / "inconsistent", validator, plan=plan)
+
+    with pytest.raises(ValueError, match="applyable status"):
+        validator.build_receipt(**kwargs)
+
+
+def test_receipt_rejects_state_before_apply_that_is_not_the_planned_state(
+    tmp_path: Path,
+):
+    validator = _validator()
+    paths, kwargs = _receipt_inputs(tmp_path / "stale", validator)
+    paths["state_before_apply"].write_text(
+        json.dumps(_provenance(serial=24)), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="does not match the saved plan"):
+        validator.build_receipt(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lineage", "8372fb11-fcec-4fb0-84fa-0ab76fed9e2b"),
+        ("terraform_version", "1.15.9"),
+    ],
+)
+def test_receipt_rejects_state_lineage_or_version_changes(
+    tmp_path: Path, field: str, value: str
+):
+    validator = _validator()
+    paths, kwargs = _receipt_inputs(tmp_path / field, validator)
+    after = _provenance(serial=26)
+    after[field] = value
+    paths["state_after_apply"].write_text(json.dumps(after), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lineage or Terraform version"):
+        validator.build_receipt(**kwargs)
+
+
+def test_receipt_requires_serial_transition_matching_whether_apply_ran(
+    tmp_path: Path,
+):
+    validator = _validator()
+    _, applied_kwargs = _receipt_inputs(
+        tmp_path / "applied", validator, after_serial=25
+    )
+    with pytest.raises(ValueError, match="serial did not increase"):
+        validator.build_receipt(**applied_kwargs)
+
+    plan = _plan(validator)
+    for entry in plan["resource_changes"]:
+        entry["change"]["actions"] = ["no-op"]
+    for change in plan["output_changes"].values():
+        change["actions"] = ["no-op"]
+    plan["applyable"] = False
+    _, noop_kwargs = _receipt_inputs(
+        tmp_path / "noop", validator, plan=plan, after_serial=26
+    )
+    noop_kwargs["plan_exit_code"] = "0"
+    with pytest.raises(ValueError, match="no-op plan changed"):
+        validator.build_receipt(**noop_kwargs)
+
+
+def test_receipt_requires_postcheck_zero_and_unchanged_state(tmp_path: Path):
+    validator = _validator()
+    _, exit_kwargs = _receipt_inputs(tmp_path / "exit", validator)
+    exit_kwargs["postcheck_exit_code"] = "2"
+    with pytest.raises(ValueError, match="post-apply check"):
+        validator.build_receipt(**exit_kwargs)
+
+    paths, state_kwargs = _receipt_inputs(tmp_path / "state", validator)
+    paths["state_after_postcheck"].write_text(
+        json.dumps(_provenance(serial=27)), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="state changed during"):
+        validator.build_receipt(**state_kwargs)
+
+
+def test_bootstrap_plan_workflow_is_publicly_gated_and_applies_the_bound_plan():
     workflow_path = ROOT / ".github/workflows/plan-bootstrap.yml"
     text = workflow_path.read_text()
     workflow = yaml.safe_load(text)
     jobs = workflow["jobs"]
     authorize = jobs["authorize"]
-    plan = jobs["plan"]
+    apply = jobs["apply"]
 
+    assert set(jobs) == {"authorize", "apply"}
     assert workflow["permissions"] == {}
     triggers = workflow.get("on", workflow.get(True))
     confirmation = triggers["workflow_dispatch"]["inputs"]["confirmation"]
     assert confirmation["required"] is True
     assert confirmation["type"] == "string"
     assert workflow["concurrency"] == {
-        "group": "hindsight-bootstrap-plan-demo",
+        "group": "hindsight-bootstrap-apply-demo",
         "cancel-in-progress": False,
     }
     assert authorize["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
@@ -1270,118 +1886,300 @@ def test_bootstrap_plan_workflow_is_owner_gated_read_only_and_reviewable():
     for required in (
         '"$EVENT_NAME" == "workflow_dispatch"',
         '"$REPOSITORY" == "OCHOLA-EDDYPHIL/hindsight"',
-        '"$PRIVATE_REPOSITORY" == "true"',
+        '"$REPOSITORY_OWNER" == "OCHOLA-EDDYPHIL"',
+        '"$PRIVATE_REPOSITORY" == "false"',
+        '"$REPOSITORY_VISIBILITY" == "public"',
         '"$REF_NAME" == "refs/heads/main"',
         '"$REF_PROTECTED" == "true"',
-        '"$CONFIRMATION" == "plan-bootstrap-$EVENT_SHA"',
+        '"$CONFIRMATION" == "apply-bootstrap-$EVENT_SHA"',
+        (
+            '"$WORKFLOW_REF" == '
+            '"$REPOSITORY/.github/workflows/plan-bootstrap.yml@$REF_NAME"'
+        ),
         '"$ACTOR" == "$REPOSITORY_OWNER"',
         '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"',
     ):
         assert required in authorization
 
-    assert plan["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
-    assert plan["environment"] == "demo"
-    assert plan["permissions"] == {"contents": "read", "id-token": "write"}
-    assert plan["env"]["AWS_REGION"] == "us-east-1"
-    assert plan["env"]["EXPECTED_AWS_ACCOUNT_ID"] == "762397612117"
-    assert plan["env"]["CONFIGURED_AWS_ACCOUNT_ID"] == "${{ vars.AWS_ACCOUNT_ID }}"
-    assert plan["env"]["TF_VAR_expected_aws_account_id"] == "762397612117"
-    assert plan["env"]["TF_VAR_existing_github_oidc_provider_arn"] == (
+    assert apply["runs-on"] == "${{ vars.HINDSIGHT_RUNNER_LABEL }}"
+    assert apply["environment"] == "demo"
+    assert apply["permissions"] == {"contents": "read", "id-token": "write"}
+    assert apply["env"]["AWS_REGION"] == "us-east-1"
+    assert apply["env"]["EXPECTED_AWS_ACCOUNT_ID"] == "762397612117"
+    assert apply["env"]["CONFIGURED_AWS_ACCOUNT_ID"] == "${{ vars.AWS_ACCOUNT_ID }}"
+    assert apply["env"]["TF_VAR_expected_aws_account_id"] == "762397612117"
+    assert apply["env"]["TF_VAR_existing_github_oidc_provider_arn"] == (
         "arn:aws:iam::762397612117:oidc-provider/token.actions.githubusercontent.com"
     )
-    assert plan["env"]["TF_STATE_KEY"] == "hindsight/bootstrap/terraform.tfstate"
-    assert plan["env"]["PLAN_ROLE_ARN"] == "${{ vars.AWS_BOOTSTRAP_PLAN_ROLE_ARN }}"
+    assert apply["env"]["TF_STATE_KEY"] == "hindsight/bootstrap/terraform.tfstate"
+    assert apply["env"]["PLAN_ROLE_ARN"] == "${{ vars.AWS_BOOTSTRAP_PLAN_ROLE_ARN }}"
+    assert apply["env"]["APPLY_ROLE_ARN"] == "${{ vars.AWS_BOOTSTRAP_APPLY_ROLE_ARN }}"
+    assert "CLOUDFLARE_API_TOKEN" not in apply["env"]
 
-    checkout = next(step for step in plan["steps"] if step.get("uses") == "actions/checkout@v4")
+    checkout = next(step for step in apply["steps"] if step.get("uses") == "actions/checkout@v4")
     assert checkout["with"] == {
         "ref": "${{ needs.authorize.outputs.source_revision }}",
         "persist-credentials": False,
     }
     terraform = next(
-        step for step in plan["steps"] if step.get("uses") == "hashicorp/setup-terraform@v3"
+        step for step in apply["steps"] if step.get("uses") == "hashicorp/setup-terraform@v3"
     )
     assert terraform["with"] == {
         "terraform_version": "1.13.5",
         "terraform_wrapper": False,
     }
-    credentials = next(
+    credential_steps = [
         step
-        for step in plan["steps"]
+        for step in apply["steps"]
         if step.get("uses") == "aws-actions/configure-aws-credentials@v4"
+    ]
+    assert [step["name"] for step in credential_steps] == [
+        "Assume bootstrap plan role",
+        "Assume lifecycle-owned bootstrap apply role",
+        "Reassume bootstrap plan role",
+    ]
+    assert [step["with"]["role-to-assume"] for step in credential_steps] == [
+        "${{ env.PLAN_ROLE_ARN }}",
+        "${{ env.APPLY_ROLE_ARN }}",
+        "${{ env.PLAN_ROLE_ARN }}",
+    ]
+    initial_credentials, chained_credentials, reassumed_credentials = credential_steps
+    assert initial_credentials["with"]["unset-current-credentials"] is True
+    assert reassumed_credentials["with"]["unset-current-credentials"] is True
+    assert "unset-current-credentials" not in chained_credentials["with"]
+    assert chained_credentials["with"]["role-chaining"] is True
+    assert chained_credentials["with"]["role-external-id"] == (
+        "${{ secrets.AWS_BOOTSTRAP_APPLY_EXTERNAL_ID }}"
     )
-    assert credentials["with"]["role-to-assume"] == "${{ env.PLAN_ROLE_ARN }}"
-    assert credentials["with"]["unset-current-credentials"] is True
+    assert chained_credentials["with"]["role-skip-session-tagging"] is True
+    assert all(
+        "role-chaining" not in step["with"]
+        and "role-external-id" not in step["with"]
+        for step in (initial_credentials, reassumed_credentials)
+    )
+    assert text.count("AWS_BOOTSTRAP_APPLY_EXTERNAL_ID") == 1
+    assert "AWS_BOOTSTRAP_APPLY_EXTERNAL_ID" not in apply["env"]
+    assert all(
+        "AWS_BOOTSTRAP_APPLY_EXTERNAL_ID" not in step.get("env", {})
+        and "AWS_BOOTSTRAP_APPLY_EXTERNAL_ID" not in step.get("run", "")
+        for step in apply["steps"]
+    )
+    assert chained_credentials["if"] == "steps.bootstrap_plan.outputs.exit_code == '2'"
     protected_configuration = next(
         step
-        for step in plan["steps"]
-        if step.get("name") == "Verify protected planning configuration"
+        for step in apply["steps"]
+        if step.get("name") == "Verify protected apply configuration"
     )["run"]
     assert 'test "$CONFIGURED_AWS_ACCOUNT_ID" = "$EXPECTED_AWS_ACCOUNT_ID"' in (
         protected_configuration
     )
+    assert (
+        'test "$PLAN_ROLE_ARN" = '
+        '"arn:aws:iam::${EXPECTED_AWS_ACCOUNT_ID}:role/hindsight-github-bootstrap-plan"'
+    ) in protected_configuration
+    assert (
+        'test "$APPLY_ROLE_ARN" = '
+        '"arn:aws:iam::${EXPECTED_AWS_ACCOUNT_ID}:role/hindsight-github-bootstrap-apply"'
+    ) in protected_configuration
 
     plan_step = next(
-        step for step in plan["steps"] if step.get("name") == "Create full refreshed locked bootstrap plan"
+        step for step in apply["steps"] if step.get("name") == "Create full refreshed locked bootstrap plan"
     )
     assert plan_step["env"] == {
         "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}"
     }
-    for flag in ("-input=false", "-lock=true", "-lock-timeout=5m", "-refresh=true"):
+    assert plan_step["id"] == "bootstrap_plan"
+    for flag in (
+        "-input=false",
+        "-lock=true",
+        "-lock-timeout=5m",
+        "-refresh=true",
+        "-detailed-exitcode",
+    ):
         assert flag in plan_step["run"]
-    for forbidden in ("-target", "-destroy", "-refresh=false", " apply "):
-        assert forbidden not in plan_step["run"]
-    assert "terraform -chdir=infra/terraform/bootstrap apply" not in text
+    assert '-out="$PLAN_DIR/bootstrap.tfplan"' in plan_step["run"]
+    assert "printf 'exit_code=%s\\n'" in plan_step["run"]
+    for forbidden in ("-target", "-destroy", "-refresh=false"):
+        assert forbidden not in text
+
+    step_names = [step.get("name") for step in apply["steps"]]
+    ordered_names = [
+        "Create full refreshed locked bootstrap plan",
+        "Validate and bind complete plan actions",
+        "Record state provenance before apply",
+        "Revalidate exact saved plan before apply",
+        "Assume lifecycle-owned bootstrap apply role",
+        "Verify bootstrap apply identity",
+        "Apply exact saved bootstrap plan",
+        "Reassume bootstrap plan role",
+        "Verify bootstrap postcheck identity",
+        "Record state provenance after apply",
+        "Require clean full refreshed bootstrap postcheck",
+        "Record state provenance after postcheck",
+        "Create sanitized bootstrap apply receipt",
+        "Upload sanitized bootstrap apply evidence",
+        "Remove exact temporary workspace",
+    ]
+    assert [step_names.index(name) for name in ordered_names] == sorted(
+        step_names.index(name) for name in ordered_names
+    )
+
+    validate = next(
+        step
+        for step in apply["steps"]
+        if step.get("name") == "Validate and bind complete plan actions"
+    )
+    for path_argument in (
+        '--plan-file "$PLAN_DIR/bootstrap.tfplan"',
+        '--actions-output "$PLAN_DIR/bootstrap-plan-actions.json"',
+        '--manifest-output "$PLAN_DIR/bootstrap-plan-manifest.json"',
+    ):
+        assert path_argument in validate["run"]
+
+    preapply = next(
+        step
+        for step in apply["steps"]
+        if step.get("name") == "Revalidate exact saved plan before apply"
+    )
+    assert preapply["env"] == {
+        "PLAN_EXIT_CODE": "${{ steps.bootstrap_plan.outputs.exit_code }}"
+    }
+    for argument in (
+        "validate_bootstrap_plan.py preapply",
+        '--manifest "$PLAN_DIR/bootstrap-plan-manifest.json"',
+        '--actions "$PLAN_DIR/bootstrap-plan-actions.json"',
+        '--plan-file "$PLAN_DIR/bootstrap.tfplan"',
+        '--plan-json "$PLAN_DIR/bootstrap.tfplan.json"',
+        '--lock-file "$PLAN_DIR/bootstrap.terraform.lock.hcl"',
+        '--state-before-plan "$PLAN_DIR/bootstrap-state-before.json"',
+        '--state-after-plan "$PLAN_DIR/bootstrap-state-after.json"',
+        '--state-before-apply "$PLAN_DIR/bootstrap-state-before-apply.json"',
+        '--plan-exit-code "$PLAN_EXIT_CODE"',
+    ):
+        assert argument in preapply["run"]
+
+    apply_step = next(
+        step
+        for step in apply["steps"]
+        if step.get("name") == "Apply exact saved bootstrap plan"
+    )
+    assert apply_step["if"] == "steps.bootstrap_plan.outputs.exit_code == '2'"
+    assert apply_step["env"] == {
+        "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+    }
+    assert "terraform -chdir=infra/terraform/bootstrap apply" in apply_step["run"]
+    assert '"$PLAN_DIR/bootstrap.tfplan"' in apply_step["run"]
+
+    postcheck = next(
+        step
+        for step in apply["steps"]
+        if step.get("name") == "Require clean full refreshed bootstrap postcheck"
+    )
+    assert postcheck["id"] == "postcheck"
+    assert postcheck["env"] == {
+        "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+    }
+    for flag in ("-refresh=true", "-detailed-exitcode", "-lock=true"):
+        assert flag in postcheck["run"]
+    assert 'test "$POSTCHECK_EXIT_CODE" -eq 0' in postcheck["run"]
+
+    receipt = next(
+        step
+        for step in apply["steps"]
+        if step.get("name") == "Create sanitized bootstrap apply receipt"
+    )
+    assert receipt["env"]["PLAN_EXIT_CODE"] == (
+        "${{ steps.bootstrap_plan.outputs.exit_code }}"
+    )
+    assert receipt["env"]["POSTCHECK_EXIT_CODE"] == (
+        "${{ steps.postcheck.outputs.exit_code }}"
+    )
+    for argument in (
+        "validate_bootstrap_plan.py receipt",
+        '--manifest "$PLAN_DIR/bootstrap-plan-manifest.json"',
+        '--actions "$PLAN_DIR/bootstrap-plan-actions.json"',
+        '--state-before-apply "$PLAN_DIR/bootstrap-state-before-apply.json"',
+        '--state-after-apply "$PLAN_DIR/bootstrap-state-after-apply.json"',
+        '--state-after-postcheck "$PLAN_DIR/bootstrap-state-after-postcheck.json"',
+        '--output "$PLAN_DIR/bootstrap-apply-receipt.json"',
+        '--plan-exit-code "$PLAN_EXIT_CODE"',
+        '--postcheck-exit-code "$POSTCHECK_EXIT_CODE"',
+    ):
+        assert argument in receipt["run"]
+
+    token_steps = [
+        step
+        for step in apply["steps"]
+        if "CLOUDFLARE_API_TOKEN" in step.get("env", {})
+    ]
+    assert [step["name"] for step in token_steps] == [
+        "Create full refreshed locked bootstrap plan",
+        "Apply exact saved bootstrap plan",
+        "Require clean full refreshed bootstrap postcheck",
+    ]
+    assert text.count("secrets.CLOUDFLARE_API_TOKEN") == 3
+    assert all(
+        "CLOUDFLARE_API_TOKEN" not in step.get("run", "")
+        for step in apply["steps"]
+    )
+
     assert "-target" not in text
     assert "-destroy" not in text
     assert "-refresh=false" not in text
-    assert text.count("secrets.CLOUDFLARE_API_TOKEN") == 1
-    assert "PLAN_DIR" not in plan["env"]
-    assert "TF_DATA_DIR" not in plan["env"]
-    assert "TF_PLUGIN_CACHE_DIR" not in plan["env"]
-    assert all("runner.temp" not in str(value) for value in plan["env"].values())
+    assert "PLAN_DIR" not in apply["env"]
+    assert "TF_DATA_DIR" not in apply["env"]
+    assert "TF_PLUGIN_CACHE_DIR" not in apply["env"]
+    assert all("runner.temp" not in str(value) for value in apply["env"].values())
     prepare = next(
-        step for step in plan["steps"] if step.get("name") == "Prepare exact temporary workspace"
+        step for step in apply["steps"] if step.get("name") == "Prepare exact temporary workspace"
     )
-    assert 'PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-plan-' in prepare["run"]
+    assert 'PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-apply-' in prepare["run"]
     assert 'test "$TF_DATA_DIR" = "$PLAN_DIR/terraform-data"' in prepare["run"]
     assert 'mkdir -m 0700 -- "$PLAN_DIR/terraform-data"' in prepare["run"]
     assert 'printf \'PLAN_DIR=%s\\n\'' in prepare["run"]
     assert '>> "$GITHUB_ENV"' in prepare["run"]
 
-    before = next(
-        step for step in plan["steps"] if step.get("name") == "Record state provenance before planning"
-    )
-    after = next(
-        step for step in plan["steps"] if step.get("name") == "Record state provenance after planning"
-    )
-    for step in (before, after):
+    provenance_steps = [
+        step
+        for step in apply["steps"]
+        if step.get("name", "").startswith("Record state provenance")
+    ]
+    assert len(provenance_steps) == 5
+    for step in provenance_steps:
         assert 'aws s3 cp "s3://$TF_STATE_BUCKET/$TF_STATE_KEY" -' in step["run"]
         assert "state-provenance" in step["run"]
 
     upload = next(
-        step for step in plan["steps"] if step.get("uses") == "actions/upload-artifact@v4"
+        step for step in apply["steps"] if step.get("uses") == "actions/upload-artifact@v4"
     )
-    assert upload["with"]["retention-days"] == 1
-    for artifact in (
+    assert upload["with"]["retention-days"] == 14
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["path"].splitlines() == [
+        "${{ env.PLAN_DIR }}/bootstrap-plan-actions.json",
+        "${{ env.PLAN_DIR }}/bootstrap-plan-manifest.json",
+        "${{ env.PLAN_DIR }}/bootstrap-apply-receipt.json",
+    ]
+    for raw_artifact in (
         "bootstrap.tfplan",
         "bootstrap.tfplan.json",
-        "bootstrap-plan-actions.json",
-        "bootstrap-plan-manifest.json",
         "bootstrap.terraform.lock.hcl",
         "bootstrap-state-before.json",
         "bootstrap-state-after.json",
-        "SHA256SUMS",
+        "bootstrap-state-before-apply.json",
+        "bootstrap-state-after-apply.json",
+        "bootstrap-state-after-postcheck.json",
+        "bootstrap-postcheck.tfplan",
     ):
-        assert artifact in upload["with"]["path"]
+        assert raw_artifact not in upload["with"]["path"]
+
     cleanup = next(
-        step for step in plan["steps"] if step.get("name") == "Remove exact temporary workspace"
+        step for step in apply["steps"] if step.get("name") == "Remove exact temporary workspace"
     )
     assert cleanup["if"] == "always()"
-    assert "hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" in cleanup["run"]
+    assert "hindsight-bootstrap-apply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" in cleanup["run"]
     assert 'test -n "$RUNNER_TEMP"' in cleanup["run"]
     assert 'test "$RUNNER_TEMP" != "/"' in cleanup["run"]
     assert 'test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"' in cleanup["run"]
     assert 'ACTUAL_PLAN_DIR="${PLAN_DIR:-$EXPECTED_PLAN_DIR}"' in cleanup["run"]
     assert 'test "$ACTUAL_PLAN_DIR" = "$EXPECTED_PLAN_DIR"' in cleanup["run"]
     assert 'rm -rf -- "$EXPECTED_PLAN_DIR"' in cleanup["run"]
-    assert "sha256sum --check SHA256SUMS" in text

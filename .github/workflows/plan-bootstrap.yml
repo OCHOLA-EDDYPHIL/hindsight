@@ -1,17 +1,17 @@
-name: plan bootstrap
+name: apply bootstrap
 
 on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type plan-bootstrap-<exact main SHA>
+        description: Type apply-bootstrap-<exact main SHA>
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: hindsight-bootstrap-plan-demo
+  group: hindsight-bootstrap-apply-demo
   cancel-in-progress: false
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
       source_revision: ${{ steps.authorization.outputs.source_revision }}
     steps:
       - id: authorization
-        name: Authorize exact-main bootstrap planning
+        name: Authorize exact-main bootstrap application
         env:
           ACTOR: ${{ github.actor }}
           CONFIRMATION: ${{ inputs.confirmation }}
@@ -33,6 +33,7 @@ jobs:
           REF_PROTECTED: ${{ github.ref_protected }}
           REPOSITORY: ${{ github.repository }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
         shell: bash
@@ -41,31 +42,33 @@ jobs:
           [[ "$EVENT_NAME" == "workflow_dispatch" \
             && "$REPOSITORY" == "OCHOLA-EDDYPHIL/hindsight" \
             && "$REPOSITORY_OWNER" == "OCHOLA-EDDYPHIL" \
-            && "$PRIVATE_REPOSITORY" == "true" \
+            && "$PRIVATE_REPOSITORY" == "false" \
+            && "$REPOSITORY_VISIBILITY" == "public" \
             && "$REF_NAME" == "refs/heads/main" \
             && "$REF_PROTECTED" == "true" \
-            && "$CONFIRMATION" == "plan-bootstrap-$EVENT_SHA" \
+            && "$CONFIRMATION" == "apply-bootstrap-$EVENT_SHA" \
             && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/plan-bootstrap.yml@$REF_NAME" \
             && "$ACTOR" == "$REPOSITORY_OWNER" \
             && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" ]] || {
-            echo "Bootstrap planning requires the repository owner on protected main in the private canonical repository." >&2
+            echo "Bootstrap application requires the repository owner on protected main in the public canonical repository." >&2
             exit 1
           }
           [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "Bootstrap planning did not resolve an exact commit SHA." >&2
+            echo "Bootstrap application did not resolve an exact commit SHA." >&2
             exit 1
           }
           echo "source_revision=$EVENT_SHA" >> "$GITHUB_OUTPUT"
 
-  plan:
+  apply:
     needs: authorize
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: demo
     permissions:
       contents: read
       id-token: write
     env:
+      APPLY_ROLE_ARN: ${{ vars.AWS_BOOTSTRAP_APPLY_ROLE_ARN }}
       AWS_REGION: us-east-1
       CONFIGURED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
       EXPECTED_AWS_ACCOUNT_ID: "762397612117"
@@ -107,13 +110,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           test -n "$RUNNER_TEMP"
           test "$RUNNER_TEMP" != "/"
           test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"
-          PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-apply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           TF_DATA_DIR="$PLAN_DIR/terraform-data"
           TF_PLUGIN_CACHE_DIR="$PLAN_DIR/plugin-cache"
-          test "$PLAN_DIR" = "$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test "$PLAN_DIR" = "$RUNNER_TEMP/hindsight-bootstrap-apply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           test "$TF_DATA_DIR" = "$PLAN_DIR/terraform-data"
           test "$TF_PLUGIN_CACHE_DIR" = "$PLAN_DIR/plugin-cache"
           test "$PLAN_DIR" != "$RUNNER_TEMP"
@@ -126,7 +130,7 @@ jobs:
             printf 'TF_DATA_DIR=%s\n' "$TF_DATA_DIR"
             printf 'TF_PLUGIN_CACHE_DIR=%s\n' "$TF_PLUGIN_CACHE_DIR"
           } >> "$GITHUB_ENV"
-      - name: Verify protected planning configuration
+      - name: Verify protected apply configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -140,16 +144,18 @@ jobs:
           test "$TF_STATE_BUCKET" = "home-in-cloud-terraform-state-${EXPECTED_AWS_ACCOUNT_ID}-us-east-1"
           test "$TF_VAR_state_bucket_name" = "$TF_STATE_BUCKET"
           test "$PLAN_ROLE_ARN" = "arn:aws:iam::${EXPECTED_AWS_ACCOUNT_ID}:role/hindsight-github-bootstrap-plan"
+          test "$APPLY_ROLE_ARN" = "arn:aws:iam::${EXPECTED_AWS_ACCOUNT_ID}:role/hindsight-github-bootstrap-apply"
           test "$TF_VAR_existing_github_oidc_provider_arn" = "arn:aws:iam::${EXPECTED_AWS_ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com"
           [[ "$TF_VAR_cloudflare_zone_id" =~ ^[0-9a-f]{32}$ ]]
           test -n "$TF_VAR_domain_name"
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Assume bootstrap plan role
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.PLAN_ROLE_ARN }}
           role-session-name: hindsight-bootstrap-plan-${{ github.run_id }}-${{ github.run_attempt }}
           aws-region: ${{ env.AWS_REGION }}
           unset-current-credentials: true
-      - name: Verify read-only AWS identity
+      - name: Verify bootstrap plan identity
         shell: bash
         run: |
           set -euo pipefail
@@ -161,6 +167,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           aws s3 cp "s3://$TF_STATE_BUCKET/$TF_STATE_KEY" - --only-show-errors \
             | python scripts/validate_bootstrap_plan.py state-provenance \
                 --output "$PLAN_DIR/bootstrap-state-before.json"
@@ -168,6 +175,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           terraform -chdir=infra/terraform/bootstrap init \
             -input=false \
             -lockfile=readonly \
@@ -177,23 +185,35 @@ jobs:
             -backend-config="region=$AWS_REGION" \
             -backend-config="encrypt=true" \
             -backend-config="use_lockfile=true"
-      - name: Create full refreshed locked bootstrap plan
+      - id: bootstrap_plan
+        name: Create full refreshed locked bootstrap plan
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          set +e
           terraform -chdir=infra/terraform/bootstrap plan \
             -input=false \
             -lock=true \
             -lock-timeout=5m \
             -refresh=true \
+            -detailed-exitcode \
             -no-color \
             -out="$PLAN_DIR/bootstrap.tfplan"
+          PLAN_EXIT_CODE="$?"
+          set -e
+          printf 'exit_code=%s\n' "$PLAN_EXIT_CODE" >> "$GITHUB_OUTPUT"
+          case "$PLAN_EXIT_CODE" in
+            0|2) ;;
+            *) exit "$PLAN_EXIT_CODE" ;;
+          esac
       - name: Record state provenance after planning
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           aws s3 cp "s3://$TF_STATE_BUCKET/$TF_STATE_KEY" - --only-show-errors \
             | python scripts/validate_bootstrap_plan.py state-provenance \
                 --output "$PLAN_DIR/bootstrap-state-after.json"
@@ -203,6 +223,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           terraform -chdir=infra/terraform/bootstrap show -json \
             "$PLAN_DIR/bootstrap.tfplan" > "$PLAN_DIR/bootstrap.tfplan.json"
           install -m 0600 infra/terraform/bootstrap/.terraform.lock.hcl \
@@ -223,34 +244,160 @@ jobs:
             --role-arn "$PLAN_ROLE_ARN" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Record and verify artifact checksums
+      - name: Record state provenance before apply
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PLAN_DIR"
-          sha256sum \
-            bootstrap.tfplan \
-            bootstrap.tfplan.json \
-            bootstrap-plan-actions.json \
-            bootstrap-plan-manifest.json \
-            bootstrap.terraform.lock.hcl \
-            bootstrap-state-before.json \
-            bootstrap-state-after.json > SHA256SUMS
-          sha256sum --check SHA256SUMS
-      - uses: actions/upload-artifact@v4
+          umask 077
+          aws s3 cp "s3://$TF_STATE_BUCKET/$TF_STATE_KEY" - --only-show-errors \
+            | python scripts/validate_bootstrap_plan.py state-provenance \
+                --output "$PLAN_DIR/bootstrap-state-before-apply.json"
+          cmp -s \
+            "$PLAN_DIR/bootstrap-state-after.json" \
+            "$PLAN_DIR/bootstrap-state-before-apply.json" || {
+            echo "Bootstrap state changed after the saved plan was validated." >&2
+            exit 1
+          }
+      - name: Revalidate exact saved plan before apply
+        env:
+          PLAN_EXIT_CODE: ${{ steps.bootstrap_plan.outputs.exit_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/validate_bootstrap_plan.py preapply \
+            --manifest "$PLAN_DIR/bootstrap-plan-manifest.json" \
+            --actions "$PLAN_DIR/bootstrap-plan-actions.json" \
+            --plan-file "$PLAN_DIR/bootstrap.tfplan" \
+            --plan-json "$PLAN_DIR/bootstrap.tfplan.json" \
+            --lock-file "$PLAN_DIR/bootstrap.terraform.lock.hcl" \
+            --state-before-plan "$PLAN_DIR/bootstrap-state-before.json" \
+            --state-after-plan "$PLAN_DIR/bootstrap-state-after.json" \
+            --state-before-apply "$PLAN_DIR/bootstrap-state-before-apply.json" \
+            --plan-exit-code "$PLAN_EXIT_CODE"
+      - name: Assume lifecycle-owned bootstrap apply role
+        if: steps.bootstrap_plan.outputs.exit_code == '2'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          name: bootstrap-plan-${{ needs.authorize.outputs.source_revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          role-to-assume: ${{ env.APPLY_ROLE_ARN }}
+          role-chaining: true
+          role-external-id: ${{ secrets.AWS_BOOTSTRAP_APPLY_EXTERNAL_ID }}
+          role-skip-session-tagging: true
+          role-session-name: hindsight-bootstrap-apply-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Verify bootstrap apply identity
+        if: steps.bootstrap_plan.outputs.exit_code == '2'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ACTUAL_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          test "$ACTUAL_ACCOUNT_ID" = "$EXPECTED_AWS_ACCOUNT_ID"
+          [[ "$ACTUAL_ARN" == "arn:aws:sts::${EXPECTED_AWS_ACCOUNT_ID}:assumed-role/hindsight-github-bootstrap-apply/"* ]]
+      - name: Apply exact saved bootstrap plan
+        if: steps.bootstrap_plan.outputs.exit_code == '2'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/terraform/bootstrap apply \
+            -input=false \
+            -lock=true \
+            -lock-timeout=5m \
+            -no-color \
+            "$PLAN_DIR/bootstrap.tfplan"
+      - name: Reassume bootstrap plan role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.PLAN_ROLE_ARN }}
+          role-session-name: hindsight-bootstrap-postcheck-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ env.AWS_REGION }}
+          unset-current-credentials: true
+      - name: Verify bootstrap postcheck identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ACTUAL_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          test "$ACTUAL_ACCOUNT_ID" = "$EXPECTED_AWS_ACCOUNT_ID"
+          [[ "$ACTUAL_ARN" == "arn:aws:sts::${EXPECTED_AWS_ACCOUNT_ID}:assumed-role/hindsight-github-bootstrap-plan/"* ]]
+      - name: Record state provenance after apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          aws s3 cp "s3://$TF_STATE_BUCKET/$TF_STATE_KEY" - --only-show-errors \
+            | python scripts/validate_bootstrap_plan.py state-provenance \
+                --output "$PLAN_DIR/bootstrap-state-after-apply.json"
+      - id: postcheck
+        name: Require clean full refreshed bootstrap postcheck
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          set +e
+          terraform -chdir=infra/terraform/bootstrap plan \
+            -input=false \
+            -lock=true \
+            -lock-timeout=5m \
+            -refresh=true \
+            -detailed-exitcode \
+            -no-color \
+            -out="$PLAN_DIR/bootstrap-postcheck.tfplan"
+          POSTCHECK_EXIT_CODE="$?"
+          set -e
+          printf 'exit_code=%s\n' "$POSTCHECK_EXIT_CODE" >> "$GITHUB_OUTPUT"
+          test "$POSTCHECK_EXIT_CODE" -eq 0 || {
+            echo "Bootstrap postcheck did not converge to a clean plan." >&2
+            exit 1
+          }
+      - name: Record state provenance after postcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          aws s3 cp "s3://$TF_STATE_BUCKET/$TF_STATE_KEY" - --only-show-errors \
+            | python scripts/validate_bootstrap_plan.py state-provenance \
+                --output "$PLAN_DIR/bootstrap-state-after-postcheck.json"
+      - name: Create sanitized bootstrap apply receipt
+        env:
+          PLAN_EXIT_CODE: ${{ steps.bootstrap_plan.outputs.exit_code }}
+          POSTCHECK_EXIT_CODE: ${{ steps.postcheck.outputs.exit_code }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python scripts/validate_bootstrap_plan.py receipt \
+            --manifest "$PLAN_DIR/bootstrap-plan-manifest.json" \
+            --actions "$PLAN_DIR/bootstrap-plan-actions.json" \
+            --state-before-apply "$PLAN_DIR/bootstrap-state-before-apply.json" \
+            --state-after-apply "$PLAN_DIR/bootstrap-state-after-apply.json" \
+            --state-after-postcheck "$PLAN_DIR/bootstrap-state-after-postcheck.json" \
+            --output "$PLAN_DIR/bootstrap-apply-receipt.json" \
+            --source-revision "$SOURCE_REVISION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$WORKFLOW_REF" \
+            --aws-account-id "$EXPECTED_AWS_ACCOUNT_ID" \
+            --environment "$TF_VAR_stage" \
+            --plan-role-arn "$PLAN_ROLE_ARN" \
+            --apply-role-arn "$APPLY_ROLE_ARN" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --plan-exit-code "$PLAN_EXIT_CODE" \
+            --postcheck-exit-code "$POSTCHECK_EXIT_CODE"
+      - name: Upload sanitized bootstrap apply evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-apply-${{ needs.authorize.outputs.source_revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.PLAN_DIR }}/bootstrap.tfplan
-            ${{ env.PLAN_DIR }}/bootstrap.tfplan.json
             ${{ env.PLAN_DIR }}/bootstrap-plan-actions.json
             ${{ env.PLAN_DIR }}/bootstrap-plan-manifest.json
-            ${{ env.PLAN_DIR }}/bootstrap.terraform.lock.hcl
-            ${{ env.PLAN_DIR }}/bootstrap-state-before.json
-            ${{ env.PLAN_DIR }}/bootstrap-state-after.json
-            ${{ env.PLAN_DIR }}/SHA256SUMS
+            ${{ env.PLAN_DIR }}/bootstrap-apply-receipt.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
       - name: Remove exact temporary workspace
         if: always()
         shell: bash
@@ -259,11 +406,11 @@ jobs:
           test -n "$RUNNER_TEMP"
           test "$RUNNER_TEMP" != "/"
           test "$RUNNER_TEMP" != "$GITHUB_WORKSPACE"
-          EXPECTED_PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-plan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          EXPECTED_PLAN_DIR="$RUNNER_TEMP/hindsight-bootstrap-apply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ACTUAL_PLAN_DIR="${PLAN_DIR:-$EXPECTED_PLAN_DIR}"
           test "$ACTUAL_PLAN_DIR" = "$EXPECTED_PLAN_DIR"
           test "$EXPECTED_PLAN_DIR" != "$RUNNER_TEMP"
-          [[ "$EXPECTED_PLAN_DIR" == "$RUNNER_TEMP/hindsight-bootstrap-plan-"* ]]
+          [[ "$EXPECTED_PLAN_DIR" == "$RUNNER_TEMP/hindsight-bootstrap-apply-"* ]]
           if [[ -e "$EXPECTED_PLAN_DIR" ]]; then
             rm -rf -- "$EXPECTED_PLAN_DIR"
           fi
