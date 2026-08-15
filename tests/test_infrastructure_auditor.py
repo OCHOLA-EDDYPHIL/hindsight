@@ -28,7 +28,6 @@ REFERENCE_FIXTURE = b"""\
 SHOW USERS
 SHOW GRANTS ON ROLE admin
 """
-CLUSTER_ID = "c37737d6-5963-40db-8631-a6535b130bb8"
 
 
 def _fixture_fetcher(path: str) -> bytes:
@@ -70,12 +69,7 @@ class _AuditConnection:
                     [(0,)],
                     [(5, 0, 0, 1, 0, 0, 1)],
                     [(1, 1, 1, 1, 1, True)],
-                    [
-                        (
-                            "CockroachDB CCL v25.4.5",
-                            CLUSTER_ID,
-                        )
-                    ],
+                    [("CockroachDB CCL v25.4.5",)],
                 ),
                 strict=True,
             )
@@ -192,6 +186,7 @@ def test_application_owned_catalog_is_fixed_and_read_only():
     }
     for query in auditor.AUDIT_CATALOG:
         assert query.statement.strip().split(maxsplit=1)[0].upper() in {"SELECT", "SHOW", "WITH"}
+        assert "crdb_internal." not in query.statement
 
     with pytest.raises(auditor.InfrastructureAuditError, match="not read-only"):
         auditor.validate_read_only_catalog(
@@ -240,12 +235,10 @@ def test_repeated_audits_have_identical_redacted_conclusions(monkeypatch):
     assert "private-customer-namespace" not in serialized
     assert "deploy-user" not in serialized
     assert "postgresql://" not in serialized
-    assert CLUSTER_ID not in serialized
-    cluster_finding = next(
-        finding for finding in first["findings"] if finding["id"] == "cluster_identity"
+    version_finding = next(
+        finding for finding in first["findings"] if finding["id"] == "cockroach_version"
     )
-    assert cluster_finding["measurements"] == {
-        "cluster_id_sha256": sha256(CLUSTER_ID.encode()).hexdigest(),
+    assert version_finding["measurements"] == {
         "version_sha256": sha256(b"CockroachDB CCL v25.4.5").hexdigest(),
     }
     assert any(isinstance(statement, sql.Composed) for statement, _params in connection.calls)
