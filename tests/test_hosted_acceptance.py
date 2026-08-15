@@ -37,8 +37,6 @@ QUARANTINE_EVIDENCE_KEYS = (
     "created_at",
     "record_sha256",
 )
-
-
 requires_hosted_acceptance = pytest.mark.skipif(
     os.environ.get("RUN_HOSTED_ACCEPTANCE") != "1",
     reason="hosted acceptance is opt-in",
@@ -601,6 +599,8 @@ def test_scheduled_dispatch_reclaims_and_source_terminalizes_with_quarantine(
     assert missing_run_id not in repr(malformed_quarantine)
     assert get_run(run_id=missing_run_id, db_url=database_url) is None
     _write_quarantine_evidence(quarantine_records)
+    _write_redrive_handoff(exhausted_quarantine)
+    quarantine_records.remove(exhausted_cleanup)
 
 
 def _write_quarantine_evidence(records: list[dict[str, object]]) -> None:
@@ -638,10 +638,53 @@ def _write_quarantine_evidence(records: list[dict[str, object]]) -> None:
     )
 
 
+def _write_redrive_handoff(record: dict[str, object]) -> None:
+    from scripts.exercise_quarantine_redrive import (
+        HANDOFF_RECORD_KEYS,
+        load_redrive_handoff,
+    )
+    from hindsight.quarantine import validate_stored_quarantine_item
+
+    source_revision = _required_env("HINDSIGHT_ACCEPTANCE_SOURCE_REVISION")
+    if SOURCE_REVISION_PATTERN.fullmatch(source_revision) is None:
+        raise ValueError("HINDSIGHT_ACCEPTANCE_SOURCE_REVISION must be a full lowercase SHA")
+    artifact_dir = Path(_required_env("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR")).resolve()
+    handoff_path = Path(_required_env("HINDSIGHT_REDRIVE_HANDOFF_PATH")).resolve()
+    if handoff_path.parent != artifact_dir or handoff_path.name != "redrive-handoff.json":
+        raise ValueError("redrive handoff path must be the configured acceptance artifact")
+    validated = validate_stored_quarantine_item(record)
+    if (
+        validated.get("status") != "quarantined"
+        or validated.get("reason_code") != "run_attempts_exhausted"
+        or validated.get("work_kind") != "run"
+    ):
+        raise ValueError("redrive handoff must bind one exhausted quarantined run")
+    payload = {
+        "schema_version": 1,
+        "source_revision": source_revision,
+        "record": {key: validated[key] for key in sorted(HANDOFF_RECORD_KEYS)},
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    evidence = {**payload, "payload_sha256": hashlib.sha256(canonical).hexdigest()}
+    handoff_path.write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_redrive_handoff(handoff_path)
+    if loaded.source_revision != source_revision or loaded.record != payload["record"]:
+        raise ValueError("redrive handoff did not round-trip through its consumer contract")
+
+
 def test_quarantine_evidence_is_revision_bound_redacted_and_digestible(
     monkeypatch,
     tmp_path,
 ):
+    from scripts.exercise_quarantine_redrive import HANDOFF_RECORD_KEYS
     from hindsight.quarantine import persist_quarantine_record
     from tests.quarantine_fakes import InMemoryQuarantineTable
 
@@ -660,11 +703,14 @@ def test_quarantine_evidence_is_revision_bound_redacted_and_digestible(
         command_generation=0,
     ).item
     evidence_path = tmp_path / "quarantine-evidence.json"
+    handoff_path = tmp_path / "redrive-handoff.json"
     monkeypatch.setenv("HINDSIGHT_ACCEPTANCE_SOURCE_REVISION", "a" * 40)
     monkeypatch.setenv("HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR", str(tmp_path))
     monkeypatch.setenv("HINDSIGHT_QUARANTINE_EVIDENCE_PATH", str(evidence_path))
+    monkeypatch.setenv("HINDSIGHT_REDRIVE_HANDOFF_PATH", str(handoff_path))
 
     _write_quarantine_evidence([record])
+    _write_redrive_handoff(record)
 
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     payload_digest = evidence.pop("payload_sha256")
@@ -681,6 +727,22 @@ def test_quarantine_evidence_is_revision_bound_redacted_and_digestible(
     ]
     assert raw_body not in evidence_path.read_text(encoding="utf-8")
     assert "must-not-leak" not in evidence_path.read_text(encoding="utf-8")
+    handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    handoff_digest = handoff.pop("payload_sha256")
+    canonical_handoff = json.dumps(
+        handoff,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert handoff_digest == hashlib.sha256(canonical_handoff).hexdigest()
+    assert handoff == {
+        "schema_version": 1,
+        "source_revision": "a" * 40,
+        "record": {key: record[key] for key in HANDOFF_RECORD_KEYS},
+    }
+    assert raw_body not in handoff_path.read_text(encoding="utf-8")
+    assert "must-not-leak" not in handoff_path.read_text(encoding="utf-8")
 
 
 def test_synthetic_quarantine_cleanup_is_bound_to_each_validated_record(monkeypatch):

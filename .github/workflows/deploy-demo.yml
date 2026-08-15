@@ -299,6 +299,15 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
+      - name: Reauthorize exact release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_WORKFLOW_PATH: ${{ inputs.validation_mode && '.github/workflows/live-acceptance.yml' || '.github/workflows/deploy-demo.yml' }}
+          SOURCE_REVISION: ${{ needs.authorize.outputs.source_sha }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "$SOURCE_REVISION"
+          --workflow-path "$RELEASE_WORKFLOW_PATH"
       - name: Verify exact source revision
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}
@@ -437,6 +446,15 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.source_sha }}
           persist-credentials: false
+      - name: Reauthorize exact release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_WORKFLOW_PATH: ${{ inputs.validation_mode && '.github/workflows/live-acceptance.yml' || '.github/workflows/deploy-demo.yml' }}
+          SOURCE_REVISION: ${{ needs.authorize.outputs.source_sha }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "$SOURCE_REVISION"
+          --workflow-path "$RELEASE_WORKFLOW_PATH"
       - name: Verify exact source revision
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.source_sha }}

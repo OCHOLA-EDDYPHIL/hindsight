@@ -23,7 +23,7 @@ AUDITOR_TABLES = (
 )
 AUDIT_SCHEMA_VERSION = "hindsight.infrastructure-audit.v1"
 OFFICIAL_SKILL_REPOSITORY = "cockroachlabs/cockroachdb-skills"
-OFFICIAL_SKILL_COMMIT = "e14e86d23ce8ee2e7d40a34ce2944c2502b6eadd"
+OFFICIAL_SKILL_COMMIT = "e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd"
 OFFICIAL_SKILL_PATH = (
     "skills/cockroachdb-security-and-governance/hardening-user-privileges/SKILL.md"
 )
@@ -144,6 +144,17 @@ def _fetch_pinned_file(path: str) -> bytes:
 
 @cache
 def _pinned_tree() -> dict[str, str]:
+    commit = _github_json(
+        f"git/commits/{OFFICIAL_SKILL_COMMIT}",
+        maximum_bytes=MAX_SKILL_BYTES,
+    )
+    commit_tree = commit.get("tree")
+    if (
+        commit.get("sha") != OFFICIAL_SKILL_COMMIT
+        or not isinstance(commit_tree, dict)
+        or commit_tree.get("sha") != OFFICIAL_SKILL_TREE
+    ):
+        raise SkillVerificationError("official Skill commit does not match the pinned tree")
     document = _github_json(
         f"git/trees/{OFFICIAL_SKILL_TREE}?recursive=1",
         maximum_bytes=MAX_SKILL_BYTES * 2,
@@ -350,7 +361,10 @@ def _cluster_evaluator(rows: Sequence[Sequence[Any]]) -> tuple[AuditStatus, str,
     return (
         "PASS" if valid else "FAIL",
         "cockroach_cluster_identified" if valid else "cluster_identity_invalid",
-        {"cluster_id": cluster, "version_sha256": _sha256(version_text)},
+        {
+            "cluster_id_sha256": _sha256(cluster),
+            "version_sha256": _sha256(version_text),
+        },
     )
 
 

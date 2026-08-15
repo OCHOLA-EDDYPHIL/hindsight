@@ -28,6 +28,7 @@ REFERENCE_FIXTURE = b"""\
 SHOW USERS
 SHOW GRANTS ON ROLE admin
 """
+CLUSTER_ID = "c37737d6-5963-40db-8631-a6535b130bb8"
 
 
 def _fixture_fetcher(path: str) -> bytes:
@@ -72,7 +73,7 @@ class _AuditConnection:
                     [
                         (
                             "CockroachDB CCL v25.4.5",
-                            "c37737d6-5963-40db-8631-a6535b130bb8",
+                            CLUSTER_ID,
                         )
                     ],
                 ),
@@ -107,6 +108,79 @@ def test_official_skill_material_is_digest_and_marker_verified(monkeypatch):
         auditor.verify_official_skill(
             lambda path: b"corrupt" if path == auditor.OFFICIAL_SKILL_PATH else REFERENCE_FIXTURE
         )
+
+
+def test_pinned_tree_authenticates_the_exact_commit_before_fetching_tree(monkeypatch):
+    calls = []
+
+    def github_json(endpoint, *, maximum_bytes):
+        calls.append((endpoint, maximum_bytes))
+        if endpoint == f"git/commits/{auditor.OFFICIAL_SKILL_COMMIT}":
+            return {
+                "sha": auditor.OFFICIAL_SKILL_COMMIT,
+                "tree": {"sha": auditor.OFFICIAL_SKILL_TREE},
+            }
+        if endpoint == f"git/trees/{auditor.OFFICIAL_SKILL_TREE}?recursive=1":
+            return {
+                "sha": auditor.OFFICIAL_SKILL_TREE,
+                "truncated": False,
+                "tree": [
+                    {
+                        "path": auditor.OFFICIAL_SKILL_PATH,
+                        "sha": auditor.OFFICIAL_SKILL_GIT_BLOB,
+                        "type": "blob",
+                    },
+                    {
+                        "path": auditor.OFFICIAL_REFERENCE_PATH,
+                        "sha": auditor.OFFICIAL_REFERENCE_GIT_BLOB,
+                        "type": "blob",
+                    },
+                ],
+            }
+        raise AssertionError(endpoint)
+
+    auditor._pinned_tree.cache_clear()  # noqa: SLF001
+    monkeypatch.setattr(auditor, "_github_json", github_json)
+    try:
+        mapping = auditor._pinned_tree()  # noqa: SLF001
+    finally:
+        auditor._pinned_tree.cache_clear()  # noqa: SLF001
+
+    assert mapping == {
+        auditor.OFFICIAL_SKILL_PATH: auditor.OFFICIAL_SKILL_GIT_BLOB,
+        auditor.OFFICIAL_REFERENCE_PATH: auditor.OFFICIAL_REFERENCE_GIT_BLOB,
+    }
+    assert [endpoint for endpoint, _maximum_bytes in calls] == [
+        f"git/commits/{auditor.OFFICIAL_SKILL_COMMIT}",
+        f"git/trees/{auditor.OFFICIAL_SKILL_TREE}?recursive=1",
+    ]
+
+
+@pytest.mark.parametrize(
+    "commit",
+    [
+        {"sha": "0" * 40, "tree": {"sha": auditor.OFFICIAL_SKILL_TREE}},
+        {"sha": auditor.OFFICIAL_SKILL_COMMIT, "tree": {"sha": "0" * 40}},
+    ],
+)
+def test_pinned_tree_rejects_commit_or_tree_identity_mismatch(monkeypatch, commit):
+    calls = []
+
+    def github_json(endpoint, *, maximum_bytes):
+        calls.append((endpoint, maximum_bytes))
+        return commit
+
+    auditor._pinned_tree.cache_clear()  # noqa: SLF001
+    monkeypatch.setattr(auditor, "_github_json", github_json)
+    try:
+        with pytest.raises(auditor.SkillVerificationError, match="commit.*pinned tree"):
+            auditor._pinned_tree()  # noqa: SLF001
+    finally:
+        auditor._pinned_tree.cache_clear()  # noqa: SLF001
+
+    assert [endpoint for endpoint, _maximum_bytes in calls] == [
+        f"git/commits/{auditor.OFFICIAL_SKILL_COMMIT}"
+    ]
 
 
 def test_application_owned_catalog_is_fixed_and_read_only():
@@ -166,6 +240,14 @@ def test_repeated_audits_have_identical_redacted_conclusions(monkeypatch):
     assert "private-customer-namespace" not in serialized
     assert "deploy-user" not in serialized
     assert "postgresql://" not in serialized
+    assert CLUSTER_ID not in serialized
+    cluster_finding = next(
+        finding for finding in first["findings"] if finding["id"] == "cluster_identity"
+    )
+    assert cluster_finding["measurements"] == {
+        "cluster_id_sha256": sha256(CLUSTER_ID.encode()).hexdigest(),
+        "version_sha256": sha256(b"CockroachDB CCL v25.4.5").hexdigest(),
+    }
     assert any(isinstance(statement, sql.Composed) for statement, _params in connection.calls)
 
 

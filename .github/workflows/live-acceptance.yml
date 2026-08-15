@@ -51,6 +51,17 @@ jobs:
       deployment_environment: ${{ steps.authorization.outputs.deployment_environment }}
       acceptance_mode: ${{ steps.authorization.outputs.acceptance_mode }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Reauthorize exact release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ github.sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
       - id: authorization
         name: Resolve owner-authorized product revision
         env:
@@ -106,6 +117,13 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
       - name: Verify exact product revision
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
@@ -146,6 +164,13 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
       - name: Verify exact product revision
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
@@ -192,6 +217,13 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
       - name: Verify exact product revision
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
@@ -276,6 +308,80 @@ jobs:
       source_sha: ${{ needs.authorize.outputs.product_sha }}
       deployment_environment: ${{ needs.authorize.outputs.deployment_environment }}
 
+  dvi_qualification:
+    needs: [authorize, deploy]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          unset-current-credentials: true
+      - name: Load qualification database setting
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
+          echo "::add-mask::$DATABASE_URL"
+          printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Qualify natural distributed vector indexing
+        run: >-
+          uv run python scripts/run_dvi_qualification.py
+          --source-revision "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+          --output "$RUNNER_TEMP/dvi-qualification.json"
+      - name: Require exact redacted DVI receipt
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = json.loads((Path(os.environ["RUNNER_TEMP"]) / "dvi-qualification.json").read_text())
+          assert receipt["source_revision"] == os.environ["HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"]
+          assert receipt["status"] == "PASS"
+          assert receipt["index"] == "semantic_memory_vectors_tenant_namespace_profile_embedding_idx"
+          assert receipt["known_neighbor_rank"] == 1
+          assert receipt["cleanup"] == {"database_absent": True}
+          assert len(receipt["receipt_sha256"]) == 64
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dvi-qualification-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/dvi-qualification.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+
   semantic_product:
     needs: [authorize, deploy]
     if: needs.authorize.outputs.acceptance_mode == 'full'
@@ -298,6 +404,14 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -351,6 +465,14 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
       - name: Verify exact product revision
         env:
           EXPECTED_SHA: ${{ needs.authorize.outputs.product_sha }}
@@ -378,9 +500,10 @@ jobs:
           --output build/alert-delivery-evidence.json
       - uses: actions/upload-artifact@v4
         with:
-          name: alert-delivery-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
+          name: alert-delivery-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
           path: build/alert-delivery-evidence.json
           if-no-files-found: error
+          overwrite: true
           retention-days: 90
 
   consolidation_product:
@@ -410,6 +533,14 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -455,6 +586,7 @@ jobs:
     environment: ${{ needs.authorize.outputs.deployment_environment }}
     timeout-minutes: 25
     permissions:
+      actions: read
       contents: read
       id-token: write
     env:
@@ -474,6 +606,14 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
       - name: Verify exact product revision and prepare worker evidence
         shell: bash
         run: |
@@ -484,7 +624,55 @@ jobs:
           {
             echo "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR=$EVIDENCE_DIR"
             echo "HINDSIGHT_QUARANTINE_EVIDENCE_PATH=$EVIDENCE_DIR/quarantine-evidence.json"
+            echo "HINDSIGHT_REDRIVE_HANDOFF_PATH=$EVIDENCE_DIR/redrive-handoff.json"
           } >> "$GITHUB_ENV"
+      - id: prior_worker_evidence
+        name: Download a prior stable worker handoff
+        if: github.run_attempt > 1
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-prior-worker-evidence
+      - name: Confirm an unavailable prior handoff is absent
+        if: >-
+          github.run_attempt > 1 &&
+          steps.prior_worker_evidence.outcome == 'failure'
+        env:
+          ARTIFACT_NAME: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib import request
+
+          endpoint = (
+              f"{os.environ['GITHUB_API_URL'].rstrip('/')}/repos/"
+              f"{os.environ['REPOSITORY']}/actions/runs/{os.environ['RUN_ID']}/artifacts"
+              "?per_page=100"
+          )
+          artifact_request = request.Request(
+              endpoint,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with request.urlopen(artifact_request, timeout=30) as response:  # noqa: S310
+              payload = json.load(response)
+          artifact_name = os.environ["ARTIFACT_NAME"]
+          if any(
+              artifact.get("name") == artifact_name
+              for artifact in payload.get("artifacts", [])
+          ):
+              raise RuntimeError("the prior stable worker artifact could not be downloaded")
+          PY
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -501,12 +689,152 @@ jobs:
           [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
           echo "::add-mask::$DATABASE_URL"
           printf 'DATABASE_URL=%s\n' "$DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Reclaim a prior stable worker handoff
+        if: >-
+          github.run_attempt > 1 &&
+          steps.prior_worker_evidence.outcome == 'success'
+        shell: bash
+        run: |
+          prior_handoff="$RUNNER_TEMP/hindsight-prior-worker-evidence/redrive-handoff.json"
+          [[ -f "$prior_handoff" ]]
+          uv run python scripts/cleanup_quarantine_acceptance.py \
+            --handoff "$prior_handoff" \
+            --output "$HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR/prior-redrive-cleanup.json"
       - run: uv run python scripts/run_live_acceptance.py hosted-product --phase worker
+      - id: worker_evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/hindsight-worker-evidence/quarantine-evidence.json
+            ${{ runner.temp }}/hindsight-worker-evidence/redrive-handoff.json
+            ${{ runner.temp }}/hindsight-worker-evidence/prior-redrive-cleanup.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Reclaim an unpublished redrive handoff
+        if: failure() && steps.worker_evidence.outcome != 'success'
+        shell: bash
+        run: |
+          handoff="$RUNNER_TEMP/hindsight-worker-evidence/redrive-handoff.json"
+          [[ -f "$handoff" ]] || exit 0
+          uv run python scripts/cleanup_quarantine_acceptance.py \
+            --handoff "$handoff" \
+            --output "$RUNNER_TEMP/redrive-unpublished-cleanup.json"
+
+  redrive_product:
+    needs: [authorize, deploy, worker_product]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}
+      HINDSIGHT_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+      HINDSIGHT_QUARANTINE_TABLE: ${{ needs.deploy.outputs.quarantine_table }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-redrive-input
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-quarantine-redrive
+          aws-region: ${{ env.AWS_REGION }}
+          unset-current-credentials: true
+      - name: Exercise exact idempotent redrive
+        run: >-
+          uv run python scripts/exercise_quarantine_redrive.py
+          --handoff "$RUNNER_TEMP/hindsight-redrive-input/redrive-handoff.json"
+          --output "$RUNNER_TEMP/redrive-evidence.json"
       - uses: actions/upload-artifact@v4
         with:
-          name: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hindsight-worker-evidence/quarantine-evidence.json
+          name: quarantine-redrive-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/redrive-evidence.json
           if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+
+  redrive_cleanup:
+    needs: [authorize, deploy, worker_product, redrive_product]
+    if: >-
+      always() &&
+      needs.authorize.outputs.acceptance_mode == 'full' &&
+      needs.worker_product.result == 'success'
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}
+      HINDSIGHT_DATABASE_URL_PARAM: ${{ vars.HINDSIGHT_API_DATABASE_URL_PARAM || '/hindsight/demo/api-database-url' }}
+      HINDSIGHT_QUARANTINE_TABLE: ${{ needs.deploy.outputs.quarantine_table }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-redrive-input
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-worker-acceptance
+          aws-region: ${{ env.AWS_REGION }}
+          unset-current-credentials: true
+      - name: Terminalize and remove the exact synthetic record
+        run: >-
+          uv run python scripts/cleanup_quarantine_acceptance.py
+          --handoff "$RUNNER_TEMP/hindsight-redrive-input/redrive-handoff.json"
+          --output "$RUNNER_TEMP/redrive-cleanup-evidence.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quarantine-redrive-cleanup-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/redrive-cleanup-evidence.json
+          if-no-files-found: error
+          overwrite: true
           retention-days: 90
 
   browser_product:
@@ -547,6 +875,14 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "$HOSTED_API_URL"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -627,9 +963,182 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
+          name: browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
           path: ${{ runner.temp }}/hindsight-browser-evidence
           if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+
+  infrastructure_audit:
+    needs: [authorize, deploy, browser_product]
+    if: needs.authorize.outputs.acceptance_mode == 'full'
+    runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    environment: ${{ needs.authorize.outputs.deployment_environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEPLOY_DATABASE_PARAMETER: ${{ vars.HINDSIGHT_DEPLOY_DATABASE_URL_PARAM || '/hindsight/demo/database-url' }}
+      HINDSIGHT_ACCEPTANCE_SOURCE_REVISION: ${{ needs.authorize.outputs.product_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
+      - name: Verify exact product revision
+        run: test "$(git rev-parse HEAD)" = "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-browser-receipt
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          unset-current-credentials: true
+      - name: Resolve the exact browser scenario and database
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINDING_PATH="$RUNNER_TEMP/hindsight-browser-receipt/causal-evidence-binding.json"
+          SCENARIO_ID="$(BINDING_PATH="$BINDING_PATH" uv run python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from uuid import UUID
+
+          path = Path(os.environ["BINDING_PATH"])
+          assert path.is_file() and path.stat().st_size <= 1_000_000
+          binding = json.loads(path.read_text(encoding="utf-8"))
+          assert binding["source_revision"] == os.environ["HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"]
+          scenario_id = str(UUID(binding["scenario_id"]))
+          assert scenario_id == binding["scenario_id"]
+          assert re.fullmatch(r"[0-9a-f]{64}", binding["namespace_sha256"])
+          supplied = binding["payload_sha256"]
+          payload = {key: value for key, value in binding.items() if key != "payload_sha256"}
+          observed = hashlib.sha256(
+              json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+          ).hexdigest()
+          assert supplied == observed
+          print(scenario_id)
+          PY
+          )"
+          DATABASE_URL="$(aws ssm get-parameter --name "$DEPLOY_DATABASE_PARAMETER" --with-decryption --query Parameter.Value --output text)"
+          [[ -n "$DATABASE_URL" && "$DATABASE_URL" != "None" ]] || exit 1
+          echo "::add-mask::$DATABASE_URL"
+          {
+            printf 'HINDSIGHT_AUDIT_SCENARIO_ID=%s\n' "$SCENARIO_ID"
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+          } >> "$GITHUB_ENV"
+      - name: Run the exact restricted-role Skill audit twice
+        run: >-
+          uv run python scripts/run_memory_infrastructure_audit.py
+          --tenant-id 00000000-0000-0000-0000-000000000002
+          --scenario-id "$HINDSIGHT_AUDIT_SCENARIO_ID"
+          --source-revision "$HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"
+          --repeat 2
+          --output "$RUNNER_TEMP/infrastructure-audit.json"
+      - name: Require matching redacted Skill and denial receipts
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          from hindsight import infrastructure_auditor as auditor
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          document = json.loads((root / "infrastructure-audit.json").read_text())
+          binding = json.loads(
+              (root / "hindsight-browser-receipt/causal-evidence-binding.json").read_text()
+          )
+          expected_skill = {
+              "repository": auditor.OFFICIAL_SKILL_REPOSITORY,
+              "commit": auditor.OFFICIAL_SKILL_COMMIT,
+              "commit_tree": auditor.OFFICIAL_SKILL_TREE,
+              "version": "1.0",
+              "skill_path": auditor.OFFICIAL_SKILL_PATH,
+              "skill_sha256": auditor.OFFICIAL_SKILL_SHA256,
+              "skill_git_blob": auditor.OFFICIAL_SKILL_GIT_BLOB,
+              "reference_path": auditor.OFFICIAL_REFERENCE_PATH,
+              "reference_sha256": auditor.OFFICIAL_REFERENCE_SHA256,
+              "reference_git_blob": auditor.OFFICIAL_REFERENCE_GIT_BLOB,
+          }
+          source_revision = os.environ["HINDSIGHT_ACCEPTANCE_SOURCE_REVISION"]
+          assert document["schema_version"] == "hindsight.infrastructure-audit-run.v2"
+          assert document["source_revision"] == source_revision
+          assert document["repeat_count"] == 2
+          assert document["conclusions_match"] is True
+          assert document["receipts_match"] is True
+          assert document["status"] == "PASS"
+          assert re.fullmatch(r"[0-9a-f]{64}", document["receipt_sha256"])
+          receipts = document["receipts"]
+          assert len(receipts) == 2
+          assert re.fullmatch(r"[0-9a-f]{64}", document["repeated_receipt_sha256"])
+          assert {receipt["receipt_sha256"] for receipt in receipts} == {
+              document["repeated_receipt_sha256"]
+          }
+          assert {receipt["conclusion_sha256"] for receipt in receipts} == {
+              document["conclusion_sha256"]
+          }
+          for receipt in receipts:
+              assert receipt["source_revision"] == source_revision
+              assert receipt["status"] == "PASS"
+              catalog = receipt["catalog_receipt"]
+              denials = receipt["denial_receipt"]
+              assert catalog["source_revision"] == source_revision
+              assert catalog["status"] == "PASS"
+              assert catalog["auditor_role"] == auditor.AUDITOR_ROLE
+              assert catalog["official_skill"] == expected_skill
+              assert catalog["scope"]["namespace_sha256"] == binding["namespace_sha256"]
+              assert catalog["tool_policy"]["catalog_mode"] == "fixed-read-only"
+              assert {finding["execution_scope"] for finding in catalog["findings"]} == {
+                  "control",
+                  "auditor",
+              }
+              assert all(finding["status"] == "PASS" for finding in catalog["findings"])
+              assert denials["status"] == "PASS"
+              assert denials["auditor_role"] == auditor.AUDITOR_ROLE
+              assert denials["scope"]["tenant_id_sha256"] == catalog["scope"]["tenant_id_sha256"]
+              assert {result["id"] for result in denials["results"]} == {
+                  "insert",
+                  "update",
+                  "delete",
+                  "ddl",
+                  "grant",
+              }
+              assert all(
+                  result["status"] == "PASS"
+                  and result["expected_sqlstate"] == "42501"
+                  and result["observed_sqlstate"] == "42501"
+                  and result["transaction_rolled_back"] is True
+                  for result in denials["results"]
+              )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: infrastructure-audit-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/infrastructure-audit.json
+          if-no-files-found: error
+          overwrite: true
           retention-days: 90
 
   database_roles:
@@ -651,6 +1160,14 @@ jobs:
         with:
           ref: ${{ needs.authorize.outputs.product_sha }}
           persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -669,16 +1186,32 @@ jobs:
       - exact_main_ci
       - product_preflight
       - deploy
+      - dvi_qualification
       - alert_delivery
       - semantic_product
       - consolidation_product
       - worker_product
+      - redrive_product
+      - redrive_cleanup
       - browser_product
+      - infrastructure_audit
       - database_roles
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.product_sha }}
+          persist-credentials: false
+      - name: Reauthorize exact deployed release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/verify_release_context.py
+          --source-revision "${{ needs.authorize.outputs.product_sha }}"
+          --workflow-path .github/workflows/live-acceptance.yml
+          --deployed-url "${{ needs.deploy.outputs.api_url }}"
       - name: Require every product gate
         env:
           HEAD_SHA: ${{ needs.authorize.outputs.product_sha }}
@@ -689,11 +1222,15 @@ jobs:
           EXACT_MAIN_CI_RESULT: ${{ needs.exact_main_ci.result }}
           PREFLIGHT_RESULT: ${{ needs.product_preflight.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          DVI_RESULT: ${{ needs.dvi_qualification.result }}
           ALERT_DELIVERY_RESULT: ${{ needs.alert_delivery.result }}
           SEMANTIC_RESULT: ${{ needs.semantic_product.result }}
           CONSOLIDATION_RESULT: ${{ needs.consolidation_product.result }}
           WORKER_RESULT: ${{ needs.worker_product.result }}
+          REDRIVE_RESULT: ${{ needs.redrive_product.result }}
+          REDRIVE_CLEANUP_RESULT: ${{ needs.redrive_cleanup.result }}
           BROWSER_RESULT: ${{ needs.browser_product.result }}
+          INFRASTRUCTURE_AUDIT_RESULT: ${{ needs.infrastructure_audit.result }}
           DATABASE_ROLES_RESULT: ${{ needs.database_roles.result }}
         shell: bash
         run: |
@@ -703,11 +1240,15 @@ jobs:
             "$EXACT_MAIN_CI_RESULT" \
             "$PREFLIGHT_RESULT" \
             "$DEPLOY_RESULT" \
+            "$DVI_RESULT" \
             "$ALERT_DELIVERY_RESULT" \
             "$SEMANTIC_RESULT" \
             "$CONSOLIDATION_RESULT" \
             "$WORKER_RESULT" \
+            "$REDRIVE_RESULT" \
+            "$REDRIVE_CLEANUP_RESULT" \
             "$BROWSER_RESULT" \
+            "$INFRASTRUCTURE_AUDIT_RESULT" \
             "$DATABASE_ROLES_RESULT"; do
             [[ "$result" == "success" ]] || {
               echo "A required product-acceptance job did not succeed: $result" >&2
@@ -715,6 +1256,26 @@ jobs:
             }
           done
           [[ "$UI_URL" == https://* && "$API_URL" == https://* ]]
+      - uses: actions/download-artifact@v4
+        with:
+          name: dvi-qualification-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-product-receipts/dvi
+      - uses: actions/download-artifact@v4
+        with:
+          name: infrastructure-audit-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-product-receipts/infrastructure
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-product-receipts/browser
+      - uses: actions/download-artifact@v4
+        with:
+          name: quarantine-redrive-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-product-receipts/redrive
+      - uses: actions/download-artifact@v4
+        with:
+          name: quarantine-redrive-cleanup-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/hindsight-product-receipts/redrive-cleanup
       - name: Build exact-SHA product provenance
         env:
           HEAD_SHA: ${{ needs.authorize.outputs.product_sha }}
@@ -728,13 +1289,57 @@ jobs:
           ACCEPTANCE_MODE: ${{ needs.authorize.outputs.acceptance_mode }}
           DEPLOYMENT_ENVIRONMENT: ${{ needs.authorize.outputs.deployment_environment }}
           BOUNDED_OBSERVABILITY_ENABLED: ${{ inputs.enable_bounded_observability }}
+          RECEIPT_ROOT: ${{ runner.temp }}/hindsight-product-receipts
         run: |
           python - <<'PY'
+          import hashlib
           import json
           import os
+          import re
           from pathlib import Path
 
+          head_sha = os.environ["HEAD_SHA"]
+          root = Path(os.environ["RECEIPT_ROOT"])
+          receipt_specs = {
+              "dvi_qualification": (root / "dvi/dvi-qualification.json", "receipt_sha256"),
+              "infrastructure_audit": (
+                  root / "infrastructure/infrastructure-audit.json",
+                  "receipt_sha256",
+              ),
+              "causal_evidence": (
+                  root / "browser/causal-evidence-binding.json",
+                  "payload_sha256",
+              ),
+              "quarantine_redrive": (
+                  root / "redrive/redrive-evidence.json",
+                  "payload_sha256",
+              ),
+              "quarantine_redrive_cleanup": (
+                  root / "redrive-cleanup/redrive-cleanup-evidence.json",
+                  "payload_sha256",
+              ),
+          }
+          receipt_digests = {}
+          for name, (path, digest_key) in receipt_specs.items():
+              assert path.is_file() and path.stat().st_size <= 2_000_000
+              document = json.loads(path.read_text(encoding="utf-8"))
+              assert document["source_revision"] == head_sha
+              supplied = document[digest_key]
+              assert re.fullmatch(r"[0-9a-f]{64}", supplied)
+              payload = {key: value for key, value in document.items() if key != digest_key}
+              observed = hashlib.sha256(
+                  json.dumps(
+                      payload,
+                      sort_keys=True,
+                      separators=(",", ":"),
+                      ensure_ascii=True,
+                  ).encode("utf-8")
+              ).hexdigest()
+              assert supplied == observed
+              receipt_digests[name] = supplied
+
           Path("product-provenance.json").write_text(json.dumps({
+              "artifact_scope": "workflow_run",
               "repository": os.environ["GITHUB_REPOSITORY"],
               "run_id": os.environ["GITHUB_RUN_ID"],
               "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
@@ -749,10 +1354,12 @@ jobs:
               "ui_url": os.environ["UI_URL"],
               "api_url": os.environ["API_URL"],
               "websocket_url": os.environ["WEBSOCKET_URL"],
+              "receipt_digests": receipt_digests,
           }, sort_keys=True))
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: product-provenance-${{ needs.authorize.outputs.product_sha }}-${{ github.run_attempt }}
+          name: product-provenance-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}
           path: product-provenance.json
+          overwrite: true
           retention-days: 90

@@ -329,9 +329,79 @@ def test_live_acceptance_is_product_only_and_never_fences_changefeed():
         assert forbidden not in workflow
 
 
+def test_live_acceptance_reauthorizes_every_rerunnable_job_before_work():
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
+    jobs = workflow["jobs"]
+    post_deploy = {
+        "dvi_qualification",
+        "semantic_product",
+        "alert_delivery",
+        "consolidation_product",
+        "worker_product",
+        "redrive_product",
+        "redrive_cleanup",
+        "browser_product",
+        "infrastructure_audit",
+        "database_roles",
+        "product_acceptance_complete",
+    }
+
+    for job_name, job in jobs.items():
+        if job_name == "deploy":
+            assert job["uses"] == "./.github/workflows/deploy-demo.yml"
+            continue
+        steps = job["steps"]
+        checkout_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses") == "actions/checkout@v4"
+        )
+        verifier_index = next(
+            index
+            for index, step in enumerate(steps)
+            if "scripts/verify_release_context.py" in step.get("run", "")
+        )
+        verifier = steps[verifier_index]
+        assert checkout_index == 0
+        assert verifier_index == 1
+        if job_name == "authorize":
+            assert steps[checkout_index]["with"]["ref"] == "refs/heads/main"
+        assert verifier["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+        assert "--workflow-path .github/workflows/live-acceptance.yml" in verifier["run"]
+        if job_name in post_deploy:
+            assert "--deployed-url" in verifier["run"]
+        else:
+            assert "--deployed-url" not in verifier["run"]
+
+
+def test_deploy_plan_and_apply_reauthorize_the_exact_caller_before_work():
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/deploy-demo.yml").read_text())
+
+    for job_name in ("plan", "apply"):
+        steps = workflow["jobs"][job_name]["steps"]
+        assert steps[0]["uses"] == "actions/checkout@v4"
+        verifier = steps[1]
+        assert verifier["name"] == "Reauthorize exact release context"
+        assert verifier["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+        assert verifier["env"]["SOURCE_REVISION"] == (
+            "${{ needs.authorize.outputs.source_sha }}"
+        )
+        assert "inputs.validation_mode" in verifier["env"]["RELEASE_WORKFLOW_PATH"]
+        assert '.github/workflows/live-acceptance.yml' in verifier["env"][
+            "RELEASE_WORKFLOW_PATH"
+        ]
+        assert '.github/workflows/deploy-demo.yml' in verifier["env"][
+            "RELEASE_WORKFLOW_PATH"
+        ]
+        assert '--source-revision "$SOURCE_REVISION"' in verifier["run"]
+        assert '--workflow-path "$RELEASE_WORKFLOW_PATH"' in verifier["run"]
+
+
 def test_live_acceptance_exercises_the_hosted_websocket_subscription_lifecycle():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    browser_job = workflow.split("  browser_product:\n", 1)[1].split("  database_roles:\n", 1)[0]
+    browser_job = workflow.split("  browser_product:\n", 1)[1].split(
+        "  infrastructure_audit:\n", 1
+    )[0]
     roles_job = workflow.split("  database_roles:\n", 1)[1].split(
         "  product_acceptance_complete:\n", 1
     )[0]
@@ -393,14 +463,143 @@ def test_live_acceptance_exercises_alert_delivery_in_parallel_after_deploy():
     assert "alert-delivery-evidence-${{ needs.authorize.outputs.product_sha }}" in rendered
 
 
+def test_live_acceptance_binds_qualifying_receipts_before_product_provenance():
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
+    jobs = workflow["jobs"]
+    audit = jobs["infrastructure_audit"]
+
+    assert audit["needs"] == ["authorize", "deploy", "browser_product"]
+    assert audit["if"] == "needs.authorize.outputs.acceptance_mode == 'full'"
+    assert audit["permissions"] == {"contents": "read", "id-token": "write"}
+    audit_text = json.dumps(audit)
+    for required in (
+        "causal-evidence-binding.json",
+        "run_memory_infrastructure_audit.py",
+        "--scenario-id",
+        "--repeat 2",
+        "OFFICIAL_SKILL_COMMIT",
+        "fixed-read-only",
+        "observed_sqlstate",
+        "receipts_match",
+        "repeated_receipt_sha256",
+        "infrastructure-audit-${{ needs.authorize.outputs.product_sha }}",
+    ):
+        assert required in audit_text
+
+    terminal = jobs["product_acceptance_complete"]
+    downloaded = {
+        step["with"]["name"]
+        for step in terminal["steps"]
+        if step.get("uses") == "actions/download-artifact@v4"
+    }
+    assert downloaded == {
+        "dvi-qualification-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}",
+        "infrastructure-audit-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}",
+        "browser-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}",
+        "quarantine-redrive-evidence-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}",
+        "quarantine-redrive-cleanup-${{ needs.authorize.outputs.product_sha }}-${{ github.run_id }}",
+    }
+    upload_steps = [
+        step
+        for job in jobs.values()
+        for step in job.get("steps", ())
+        if step.get("uses") == "actions/upload-artifact@v4"
+    ]
+    assert upload_steps
+    for step in upload_steps:
+        artifact_name = step["with"]["name"]
+        assert "${{ needs.authorize.outputs.product_sha }}" in artifact_name
+        assert "${{ github.run_id }}" in artifact_name
+        assert "github.run_attempt" not in artifact_name
+        assert step["with"]["overwrite"] is True
+    download_steps = [
+        step
+        for job in jobs.values()
+        for step in job.get("steps", ())
+        if step.get("uses") == "actions/download-artifact@v4"
+    ]
+    for step in download_steps:
+        artifact_selector = step["with"].get("name") or step["with"].get("pattern")
+        assert artifact_selector is not None
+        assert "${{ needs.authorize.outputs.product_sha }}" in artifact_selector
+        assert "${{ github.run_id }}" in artifact_selector
+        assert "github.run_attempt" not in artifact_selector
+    provenance = next(
+        step for step in terminal["steps"] if step.get("name") == "Build exact-SHA product provenance"
+    )["run"]
+    for required in (
+        "dvi-qualification.json",
+        "infrastructure-audit.json",
+        "causal-evidence-binding.json",
+        "redrive-evidence.json",
+        "redrive-cleanup-evidence.json",
+        'document["source_revision"] == head_sha',
+        "supplied == observed",
+        '"artifact_scope": "workflow_run"',
+        '"receipt_digests": receipt_digests',
+    ):
+        assert required in provenance
+
+
+def test_worker_rerun_reclaims_the_stable_handoff_before_replacement():
+    workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
+    worker = workflow["jobs"]["worker_product"]
+    steps = worker["steps"]
+    prior_download = next(
+        step for step in steps if step.get("name") == "Download a prior stable worker handoff"
+    )
+    prior_cleanup = next(
+        step for step in steps if step.get("name") == "Reclaim a prior stable worker handoff"
+    )
+    worker_phase = next(
+        step
+        for step in steps
+        if "hosted-product --phase worker" in step.get("run", "")
+    )
+    artifact_upload = next(step for step in steps if step.get("id") == "worker_evidence")
+    missing_guard = next(
+        step
+        for step in steps
+        if step.get("name") == "Confirm an unavailable prior handoff is absent"
+    )
+
+    assert prior_download["if"] == "github.run_attempt > 1"
+    assert worker["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert prior_download["continue-on-error"] is True
+    assert prior_download["with"] == {
+        "name": (
+            "worker-quarantine-evidence-${{ needs.authorize.outputs.product_sha }}-"
+            "${{ github.run_id }}"
+        ),
+        "path": "${{ runner.temp }}/hindsight-prior-worker-evidence",
+    }
+    assert "steps.prior_worker_evidence.outcome == 'failure'" in missing_guard["if"]
+    assert "actions/runs/{os.environ['RUN_ID']}/artifacts" in missing_guard["run"]
+    assert "artifact.get(\"name\") == artifact_name" in missing_guard["run"]
+    assert "steps.prior_worker_evidence.outcome == 'success'" in prior_cleanup["if"]
+    assert "scripts/cleanup_quarantine_acceptance.py" in prior_cleanup["run"]
+    assert "prior-redrive-cleanup.json" in prior_cleanup["run"]
+    assert steps.index(prior_download) < steps.index(missing_guard)
+    assert steps.index(missing_guard) < steps.index(prior_cleanup)
+    assert steps.index(prior_cleanup) < steps.index(worker_phase)
+    assert steps.index(worker_phase) < steps.index(artifact_upload)
+    assert artifact_upload["with"]["overwrite"] is True
+
+
 def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     live = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
     deploy = pathlib.Path(".github/workflows/deploy-demo.yml").read_text()
     destroy = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
+    redrive = pathlib.Path(".github/workflows/redrive-quarantine.yml").read_text()
 
     live_concurrency = live.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     deploy_concurrency = deploy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
     destroy_concurrency = destroy.split("\nconcurrency:\n", 1)[1].split("\nenv:\n", 1)[0]
+    redrive_concurrency = redrive.split("\nconcurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
 
     assert (
         "group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2"
@@ -413,10 +612,12 @@ def test_hosted_environment_mutations_share_one_outer_concurrency_lock():
     assert "inputs.validation_mode" in deploy_concurrency
     assert "format('hindsight-live-deploy-{0}-{1}'" in deploy_concurrency
     assert "format('hindsight-{0}-environment-v2'" in deploy_concurrency
+    assert "group: hindsight-demo-environment-v2" in redrive_concurrency
     for concurrency in (
         live_concurrency,
         deploy_concurrency,
         destroy_concurrency,
+        redrive_concurrency,
     ):
         assert "cancel-in-progress: false" in concurrency
 
@@ -441,11 +642,15 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "acceptance_plan",
         "product_preflight",
         "deploy",
+        "dvi_qualification",
         "alert_delivery",
         "semantic_product",
         "consolidation_product",
         "worker_product",
+        "redrive_product",
+        "redrive_cleanup",
         "browser_product",
+        "infrastructure_audit",
         "database_roles",
         "product_acceptance_complete",
     }
@@ -470,6 +675,7 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "product_preflight",
     ]
     for job_name in (
+        "dvi_qualification",
         "semantic_product",
         "consolidation_product",
         "worker_product",
@@ -481,16 +687,36 @@ def test_live_acceptance_resolves_one_owner_authorized_revision():
         "acceptance_plan",
         "deploy",
     ]
+    assert parsed["jobs"]["redrive_product"]["needs"] == [
+        "authorize",
+        "deploy",
+        "worker_product",
+    ]
+    assert parsed["jobs"]["redrive_cleanup"]["needs"] == [
+        "authorize",
+        "deploy",
+        "worker_product",
+        "redrive_product",
+    ]
+    assert parsed["jobs"]["infrastructure_audit"]["needs"] == [
+        "authorize",
+        "deploy",
+        "browser_product",
+    ]
     assert parsed["jobs"]["product_acceptance_complete"]["needs"] == [
         "authorize",
         "exact_main_ci",
         "product_preflight",
         "deploy",
+        "dvi_qualification",
         "alert_delivery",
         "semantic_product",
         "consolidation_product",
         "worker_product",
+        "redrive_product",
+        "redrive_cleanup",
         "browser_product",
+        "infrastructure_audit",
         "database_roles",
     ]
 
@@ -515,13 +741,17 @@ def test_live_acceptance_modes_preserve_full_gate_and_isolate_browser_diagnostic
         "needs.acceptance_plan.outputs.run_product_preflight == 'true'"
     )
     for job_name in (
+        "dvi_qualification",
         "semantic_product",
         "consolidation_product",
         "worker_product",
+        "redrive_product",
+        "infrastructure_audit",
         "database_roles",
     ):
         assert jobs[job_name]["if"] == ("needs.authorize.outputs.acceptance_mode == 'full'")
     assert jobs["worker_product"]["needs"] == ["authorize", "deploy"]
+    assert "acceptance_mode == 'full'" in jobs["redrive_cleanup"]["if"]
     assert "reuse_candidate" in jobs["browser_product"]["if"]
     assert jobs["product_acceptance_complete"]["if"] == (
         "always() && needs.authorize.outputs.acceptance_mode == 'full'"
@@ -760,17 +990,25 @@ def test_live_acceptance_authorization_fails_closed(tmp_path):
         "EXACT_MAIN_CI_RESULT",
         "PREFLIGHT_RESULT",
         "DEPLOY_RESULT",
+        "DVI_RESULT",
         "ALERT_DELIVERY_RESULT",
         "SEMANTIC_RESULT",
         "CONSOLIDATION_RESULT",
         "WORKER_RESULT",
+        "REDRIVE_RESULT",
+        "REDRIVE_CLEANUP_RESULT",
         "BROWSER_RESULT",
+        "INFRASTRUCTURE_AUDIT_RESULT",
         "DATABASE_ROLES_RESULT",
     ),
 )
 def test_product_completion_requires_every_product_job(tmp_path, failed_result):
     workflow = yaml.safe_load(pathlib.Path(".github/workflows/live-acceptance.yml").read_text())
-    step = workflow["jobs"]["product_acceptance_complete"]["steps"][0]
+    step = next(
+        item
+        for item in workflow["jobs"]["product_acceptance_complete"]["steps"]
+        if item.get("name") == "Require every product gate"
+    )
     script = step["run"]
     base = {
         "AUTHORIZED": "true",
@@ -778,11 +1016,15 @@ def test_product_completion_requires_every_product_job(tmp_path, failed_result):
         "EXACT_MAIN_CI_RESULT": "success",
         "PREFLIGHT_RESULT": "success",
         "DEPLOY_RESULT": "success",
+        "DVI_RESULT": "success",
         "ALERT_DELIVERY_RESULT": "success",
         "SEMANTIC_RESULT": "success",
         "CONSOLIDATION_RESULT": "success",
         "WORKER_RESULT": "success",
+        "REDRIVE_RESULT": "success",
+        "REDRIVE_CLEANUP_RESULT": "success",
         "BROWSER_RESULT": "success",
+        "INFRASTRUCTURE_AUDIT_RESULT": "success",
         "DATABASE_ROLES_RESULT": "success",
         "HEAD_SHA": "a" * 40,
         "UI_URL": "https://ui.example.invalid",
@@ -1040,7 +1282,9 @@ def test_validation_deployment_selects_bounded_runtime_timing():
 
 def test_hosted_browser_preserves_failure_evidence_without_learning_dependency():
     workflow = pathlib.Path(".github/workflows/live-acceptance.yml").read_text()
-    browser = workflow.split("  browser_product:\n", 1)[1].split("  database_roles:\n", 1)[0]
+    browser = workflow.split("  browser_product:\n", 1)[1].split(
+        "  infrastructure_audit:\n", 1
+    )[0]
 
     assert "HINDSIGHT_ACCEPTANCE_ARTIFACT_DIR" in browser
     job_environment = browser.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
@@ -1082,6 +1326,10 @@ def test_quarantine_redrive_is_owner_gated_exact_main_without_free_idempotency_i
     assert jobs["redrive"]["needs"] == "authorize"
     assert jobs["redrive"]["environment"] == "demo"
     assert jobs["redrive"]["permissions"] == {"contents": "read", "id-token": "write"}
+    assert parsed["concurrency"] == {
+        "group": "hindsight-demo-environment-v2",
+        "cancel-in-progress": False,
+    }
 
     quarantine_id = f"q_{'a' * 64}"
     digest = "b" * 64
@@ -1093,7 +1341,7 @@ def test_quarantine_redrive_is_owner_gated_exact_main_without_free_idempotency_i
         "DIGEST": digest,
         "EVENT_NAME": "workflow_dispatch",
         "EVENT_SHA": "c" * 40,
-        "PRIVATE_REPOSITORY": "true",
+        "MONITORED_SHA": "c" * 40,
         "QUARANTINE_ID": quarantine_id,
         "REF_NAME": "refs/heads/main",
         "REF_PROTECTED": "true",
@@ -1111,6 +1359,11 @@ def test_quarantine_redrive_is_owner_gated_exact_main_without_free_idempotency_i
     )
     assert accepted.returncode == 0, accepted.stderr
     assert f"source_sha={'c' * 40}" in accepted_output.read_text()
+    assert "PRIVATE_REPOSITORY" not in jobs["authorize"]["steps"][0]["env"]
+    assert "PRIVATE_REPOSITORY" not in jobs["authorize"]["steps"][0]["run"]
+    assert jobs["authorize"]["steps"][0]["env"]["MONITORED_SHA"] == (
+        "${{ vars.HINDSIGHT_MONITORED_SHA }}"
+    )
 
     rejected = _run_authorization_script(
         workflow_path,
@@ -1118,6 +1371,12 @@ def test_quarantine_redrive_is_owner_gated_exact_main_without_free_idempotency_i
         output_path=tmp_path / "rejected-output",
     )
     assert rejected.returncode != 0
+    stale_release = _run_authorization_script(
+        workflow_path,
+        values={**authorization_values, "MONITORED_SHA": "d" * 40},
+        output_path=tmp_path / "stale-release-output",
+    )
+    assert stale_release.returncode != 0
 
     redrive = workflow.split("  redrive:\n", 1)[1]
     assert "ref: ${{ needs.authorize.outputs.source_sha }}" in redrive
@@ -1132,3 +1391,33 @@ def test_quarantine_redrive_is_owner_gated_exact_main_without_free_idempotency_i
     assert "--idempotency-key" not in redrive
     assert "GITHUB_RUN_ID" not in workflow
     assert "GITHUB_RUN_ATTEMPT" not in workflow
+
+    redrive_steps = jobs["redrive"]["steps"]
+    checkout = next(
+        step for step in redrive_steps if step.get("uses") == "actions/checkout@v4"
+    )
+    reauthorization = next(
+        step
+        for step in redrive_steps
+        if "scripts/verify_release_context.py" in step.get("run", "")
+    )
+    aws_credentials = next(
+        step
+        for step in redrive_steps
+        if step.get("uses") == "aws-actions/configure-aws-credentials@v4"
+    )
+    mutation = next(
+        step
+        for step in redrive_steps
+        if "scripts/redrive_quarantine.py" in step.get("run", "")
+    )
+    assert redrive_steps.index(checkout) < redrive_steps.index(reauthorization)
+    assert redrive_steps.index(reauthorization) < redrive_steps.index(aws_credentials)
+    assert redrive_steps.index(reauthorization) < redrive_steps.index(mutation)
+    assert reauthorization["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    assert reauthorization["env"]["MONITORED_SHA"] == (
+        "${{ vars.HINDSIGHT_MONITORED_SHA }}"
+    )
+    assert "vars.HINDSIGHT_PUBLIC_ORIGIN" in reauthorization["env"]["DEPLOYED_URL"]
+    assert '--monitored-sha "$MONITORED_SHA"' in reauthorization["run"]
+    assert '--deployed-url "$DEPLOYED_URL"' in reauthorization["run"]

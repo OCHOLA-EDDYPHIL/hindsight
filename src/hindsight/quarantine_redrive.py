@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -25,6 +26,47 @@ class QuarantineRedriveError(RuntimeError):
     """Raised when a quarantine redrive is not exactly authorized or eligible."""
 
 
+@dataclass(frozen=True)
+class QuarantineRedriveBinding:
+    """Deterministic identity shared by redrive execution and recovery."""
+
+    quarantine_id: str
+    raw_body_sha256: str
+    confirmation: str
+    binding_sha256: str
+    effect_id: str
+    idempotency_key: str
+
+
+def quarantine_redrive_binding(
+    *,
+    quarantine_id: str,
+    raw_body_sha256: str,
+) -> QuarantineRedriveBinding:
+    """Return the canonical confirmation and one-effect identity."""
+
+    normalized_id = _quarantine_id(quarantine_id)
+    normalized_digest = _digest(raw_body_sha256)
+    confirmation = f"redrive:{normalized_id}:{normalized_digest}"
+    binding_sha256 = hashlib.sha256(
+        f"{normalized_id}:{normalized_digest}".encode("utf-8")
+    ).hexdigest()
+    effect_id = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"hindsight:quarantine-redrive:{normalized_id}:{normalized_digest}",
+        )
+    )
+    return QuarantineRedriveBinding(
+        quarantine_id=normalized_id,
+        raw_body_sha256=normalized_digest,
+        confirmation=confirmation,
+        binding_sha256=binding_sha256,
+        effect_id=effect_id,
+        idempotency_key=f"quarantine-redrive:{effect_id}",
+    )
+
+
 def redrive_quarantined_run(
     *,
     table: Any,
@@ -35,6 +77,8 @@ def redrive_quarantined_run(
     actor: str,
     triggering_actor: str,
     db_url: str,
+    expected_record_sha256: str | None = None,
+    dispatch_available_at: datetime | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Create one fresh run from an exhausted source under an exact owner gate."""
@@ -44,30 +88,43 @@ def redrive_quarantined_run(
         actor=actor,
         triggering_actor=triggering_actor,
     )
-    normalized_id = _quarantine_id(quarantine_id)
-    normalized_digest = _digest(raw_body_sha256)
-    expected_confirmation = f"redrive:{normalized_id}:{normalized_digest}"
-    if not hmac.compare_digest(confirmation, expected_confirmation):
+    if dispatch_available_at is not None and (
+        not isinstance(dispatch_available_at, datetime)
+        or dispatch_available_at.tzinfo is None
+        or dispatch_available_at.utcoffset() is None
+    ):
+        raise QuarantineRedriveError("dispatch_available_at must include a timezone")
+    binding = quarantine_redrive_binding(
+        quarantine_id=quarantine_id,
+        raw_body_sha256=raw_body_sha256,
+    )
+    if not hmac.compare_digest(confirmation, binding.confirmation):
         raise QuarantineRedriveError("redrive confirmation phrase does not match")
-    binding_sha256 = hashlib.sha256(
-        f"{normalized_id}:{normalized_digest}".encode("utf-8")
-    ).hexdigest()
-    effect_id = str(
-        uuid5(
-            NAMESPACE_URL,
-            f"hindsight:quarantine-redrive:{normalized_id}:{normalized_digest}",
-        )
+    expected_record_digest = (
+        _digest(expected_record_sha256) if expected_record_sha256 is not None else None
     )
 
-    item = _get_item(table=table, quarantine_id=normalized_id)
-    if not hmac.compare_digest(str(item["raw_body_sha256"]), normalized_digest):
-        raise QuarantineRedriveError("quarantine body digest does not match")
+    item = _get_item(table=table, quarantine_id=binding.quarantine_id)
+    record_sha256 = str(item["record_sha256"])
+    _require_record_identity(
+        item=item,
+        binding=binding,
+        record_sha256=record_sha256,
+        error="quarantine record identity does not match",
+    )
+    if expected_record_digest is not None and not hmac.compare_digest(
+        record_sha256,
+        expected_record_digest,
+    ):
+        raise QuarantineRedriveError("quarantine record digest does not match")
     _require_run_item(item)
     item = _claim_redrive(
         table=table,
         item=item,
-        effect_id=effect_id,
-        binding_sha256=binding_sha256,
+        effect_id=binding.effect_id,
+        binding_sha256=binding.binding_sha256,
+        raw_body_sha256=binding.raw_body_sha256,
+        record_sha256=record_sha256,
         now=now,
     )
     if item["status"] == "redriven":
@@ -86,7 +143,8 @@ def redrive_quarantined_run(
                 run_id=str(item["run_id"]),
                 command=str(item["command"]),
                 command_generation=int(item["command_generation"]),
-                idempotency_key=f"quarantine-redrive:{effect_id}",
+                idempotency_key=binding.idempotency_key,
+                dispatch_available_at=dispatch_available_at,
                 db_url=db_url,
             )
         except (RunConflictError, RunIdempotencyConflictError, RunNotFoundError, ValueError) as exc:
@@ -94,15 +152,17 @@ def redrive_quarantined_run(
     completed_at = _timestamp(now or datetime.now(UTC))
     try:
         response = table.update_item(
-            Key={"quarantine_id": normalized_id},
+            Key={"quarantine_id": binding.quarantine_id},
             UpdateExpression=(
                 "SET #status = :redriven, redriven_at = if_not_exists(redriven_at, :at), "
                 "redriven_run_id = if_not_exists(redriven_run_id, :run_id)"
             ),
             ConditionExpression=(
                 Attr("status").eq("redrive_pending")
-                & Attr("redrive_effect_id").eq(effect_id)
-                & Attr("redrive_binding_sha256").eq(binding_sha256)
+                & Attr("redrive_effect_id").eq(binding.effect_id)
+                & Attr("redrive_binding_sha256").eq(binding.binding_sha256)
+                & Attr("raw_body_sha256").eq(binding.raw_body_sha256)
+                & Attr("record_sha256").eq(record_sha256)
             ),
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={
@@ -113,13 +173,31 @@ def redrive_quarantined_run(
             ReturnValues="ALL_NEW",
         )
         completed = validate_stored_quarantine_item(response.get("Attributes"))
-    except table.meta.client.exceptions.ConditionalCheckFailedException:
-        completed = _get_item(table=table, quarantine_id=normalized_id)
+        _require_record_identity(
+            item=completed,
+            binding=binding,
+            record_sha256=record_sha256,
+            error="quarantine redrive completion conflicted",
+        )
         if (
             completed.get("status") != "redriven"
-            or completed.get("redrive_effect_id") != effect_id
-            or completed.get("redrive_binding_sha256") != binding_sha256
+            or completed.get("redrive_effect_id") != binding.effect_id
+            or completed.get("redrive_binding_sha256") != binding.binding_sha256
             or completed.get("redriven_run_id") != str(run["id"])
+        ):
+            raise QuarantineRedriveError("quarantine redrive completion conflicted")
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        completed = _get_item(table=table, quarantine_id=binding.quarantine_id)
+        if (
+            completed.get("status") != "redriven"
+            or completed.get("redrive_effect_id") != binding.effect_id
+            or completed.get("redrive_binding_sha256") != binding.binding_sha256
+            or completed.get("redriven_run_id") != str(run["id"])
+            or not _has_record_identity(
+                item=completed,
+                binding=binding,
+                record_sha256=record_sha256,
+            )
         ):
             raise QuarantineRedriveError("quarantine redrive completion conflicted") from None
     return _result(item=completed, run=run, created=created)
@@ -131,6 +209,8 @@ def _claim_redrive(
     item: dict[str, Any],
     effect_id: str,
     binding_sha256: str,
+    raw_body_sha256: str,
+    record_sha256: str,
     now: datetime | None,
 ) -> dict[str, Any]:
     status = item["status"]
@@ -138,6 +218,8 @@ def _claim_redrive(
         if (
             item.get("redrive_effect_id") != effect_id
             or item.get("redrive_binding_sha256") != binding_sha256
+            or item.get("raw_body_sha256") != raw_body_sha256
+            or item.get("record_sha256") != record_sha256
         ):
             raise QuarantineRedriveError("quarantine item is bound to another redrive")
         return item
@@ -152,7 +234,11 @@ def _claim_redrive(
                 "redrive_binding_sha256 = :binding_sha256, "
                 "redrive_started_at = :started_at"
             ),
-            ConditionExpression=Attr("status").eq("quarantined"),
+            ConditionExpression=(
+                Attr("status").eq("quarantined")
+                & Attr("raw_body_sha256").eq(raw_body_sha256)
+                & Attr("record_sha256").eq(record_sha256)
+            ),
             ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={
                 ":pending": "redrive_pending",
@@ -162,13 +248,24 @@ def _claim_redrive(
             },
             ReturnValues="ALL_NEW",
         )
-        return validate_stored_quarantine_item(response.get("Attributes"))
+        claimed = validate_stored_quarantine_item(response.get("Attributes"))
+        if (
+            claimed.get("status") != "redrive_pending"
+            or claimed.get("redrive_effect_id") != effect_id
+            or claimed.get("redrive_binding_sha256") != binding_sha256
+            or claimed.get("raw_body_sha256") != raw_body_sha256
+            or claimed.get("record_sha256") != record_sha256
+        ):
+            raise QuarantineRedriveError("quarantine item is bound to another redrive")
+        return claimed
     except table.meta.client.exceptions.ConditionalCheckFailedException:
         raced = _get_item(table=table, quarantine_id=str(item["quarantine_id"]))
         if (
             raced.get("status") not in {"redrive_pending", "redriven"}
             or raced.get("redrive_effect_id") != effect_id
             or raced.get("redrive_binding_sha256") != binding_sha256
+            or raced.get("raw_body_sha256") != raw_body_sha256
+            or raced.get("record_sha256") != record_sha256
         ):
             raise QuarantineRedriveError("quarantine item is bound to another redrive") from None
         return raced
@@ -188,6 +285,34 @@ def _get_item(*, table: Any, quarantine_id: str) -> dict[str, Any]:
 def _require_run_item(item: dict[str, Any]) -> None:
     if item.get("work_kind") != "run" or item.get("reason_code") != "run_attempts_exhausted":
         raise QuarantineRedriveError("only exhausted run items may be redriven")
+
+
+def _has_record_identity(
+    *,
+    item: dict[str, Any],
+    binding: QuarantineRedriveBinding,
+    record_sha256: str,
+) -> bool:
+    return (
+        item.get("quarantine_id") == binding.quarantine_id
+        and hmac.compare_digest(str(item.get("raw_body_sha256") or ""), binding.raw_body_sha256)
+        and hmac.compare_digest(str(item.get("record_sha256") or ""), record_sha256)
+    )
+
+
+def _require_record_identity(
+    *,
+    item: dict[str, Any],
+    binding: QuarantineRedriveBinding,
+    record_sha256: str,
+    error: str,
+) -> None:
+    if not _has_record_identity(
+        item=item,
+        binding=binding,
+        record_sha256=record_sha256,
+    ):
+        raise QuarantineRedriveError(error)
 
 
 def _require_owner_gate(*, repository_owner: str, actor: str, triggering_actor: str) -> None:

@@ -559,6 +559,7 @@ def redrive_exhausted_run(
     command: str,
     command_generation: int,
     idempotency_key: str,
+    dispatch_available_at: datetime | None = None,
     db_url: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Create one idempotent fresh run from an exact exhausted source."""
@@ -567,6 +568,12 @@ def redrive_exhausted_run(
         raise ValueError(f"unsupported worker command: {command}")
     if type(command_generation) is not int or command_generation < 0:
         raise ValueError("command_generation must be a non-negative integer")
+    if dispatch_available_at is not None and (
+        not isinstance(dispatch_available_at, datetime)
+        or dispatch_available_at.tzinfo is None
+        or dispatch_available_at.utcoffset() is None
+    ):
+        raise ValueError("dispatch_available_at must include a timezone")
     with connect(db_url, application_name="hindsight-quarantine-redrive") as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT * FROM agent_runs WHERE id = %s", (run_id,))
@@ -592,6 +599,7 @@ def redrive_exhausted_run(
         ),
         idempotency_key=idempotency_key,
         retrieval_policy=str(source.get("retrieval_policy") or "semantic_strict"),
+        dispatch_available_at=dispatch_available_at,
         db_url=db_url,
     )
 

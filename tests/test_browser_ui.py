@@ -8,7 +8,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib import request
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
@@ -339,6 +340,68 @@ def test_browser_operation_receipt_excludes_unrestricted_payloads():
     }
     assert receipt["capture_errors"] == [{"stage": "database", "type": "capture_failed"}]
     assert secret not in json.dumps(receipt, sort_keys=True)
+
+
+def test_causal_evidence_binding_requires_body_header_ui_and_release_agreement():
+    source_revision = "a" * 40
+    scenario_id = "11111111-1111-4111-8111-111111111111"
+    proof_states = {
+        "memory_correction_proven": {"status": "proven", "reason": "verified"}
+    }
+    checks = [
+        {
+            "field": "identity.release_revision",
+            "status": "matched",
+            "reason": "identity_release_revision_matched",
+        }
+    ]
+    document = {
+        "scenario": {"scenario_id": scenario_id, "namespace": "[redacted-namespace]"},
+        "proof_states": proof_states,
+        "controlled_pair_checks": checks,
+        "recommendations": {
+            label: {
+                "causal_envelope": {
+                    "identity": {"release_revision": source_revision},
+                }
+            }
+            for label in ("before", "after")
+        },
+    }
+    evidence_bytes = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    digest = f"sha256:{hashlib.sha256(evidence_bytes).hexdigest()}"
+    signature = {
+        "scenario_id": scenario_id,
+        "namespace": "demo:session:one",
+        "causal_evidence": {
+            "proof_states": proof_states,
+            "controlled_pair_checks": checks,
+            "download": {"sha256": digest},
+        },
+    }
+
+    binding = _causal_evidence_binding(
+        signature=signature,
+        evidence_bytes=evidence_bytes,
+        header_digest=digest,
+        source_revision=source_revision,
+    )
+
+    payload_digest = binding.pop("payload_sha256")
+    assert payload_digest == hashlib.sha256(
+        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert binding["evidence_sha256"] == digest
+    assert binding["namespace_sha256"] == hashlib.sha256(
+        b"demo:session:one"
+    ).hexdigest()
+    with pytest.raises(AssertionError, match="body, header, and replay digests differ"):
+        _causal_evidence_binding(
+            signature=signature,
+            evidence_bytes=evidence_bytes + b" ",
+            header_digest=digest,
+            source_revision=source_revision,
+        )
 
 
 @pytest.mark.parametrize(
@@ -862,9 +925,12 @@ def test_operator_can_run_and_explain_signature_workflow():
         wait.until(
             lambda browser: browser.find_element(By.ID, "identityLabel").text == "Sign in"
         )
-        driver.get(_public_browser_url())
+        visible_scenario_id = str(signature["scenario_id"])
+        driver.get(_browser_scenario_url(visible_scenario_id))
         wait.until(expected.presence_of_element_located((By.ID, "memories")))
         _capture_console_errors(driver)
+        visible_query = dict(parse_qsl(urlsplit(driver.current_url).query, keep_blank_values=True))
+        assert visible_query.get("scenario_id") == visible_scenario_id
         wait.until(
             lambda browser: (
                 "resolved"
@@ -885,6 +951,29 @@ def test_operator_can_run_and_explain_signature_workflow():
         assert "demo.fixture-import" not in current_evidence
         assert "memory:" in current_evidence
         assert not driver.find_elements(By.CSS_SELECTOR, ".operator-console")
+        causal_panel = wait.until(
+            expected.presence_of_element_located(
+                (By.CSS_SELECTOR, '.causal-evidence[data-evidence-state="changed"]')
+            )
+        )
+        _assert_controlled_causal_evidence_panel(causal_panel)
+        expected_evidence_digest = str(signature["causal_evidence"]["download"]["sha256"])
+        assert (
+            causal_panel.find_element(By.CSS_SELECTOR, ".evidence-digest button").get_attribute(
+                "title"
+            )
+            == expected_evidence_digest
+        )
+        _capture_remediation_screenshot(driver, "causal-evidence-panel.png", causal_panel)
+        causal_panel.find_element(By.CSS_SELECTOR, ".evidence-download").click()
+        wait.until(
+            lambda browser: (
+                "Verified causal evidence downloaded."
+                in browser.find_element(By.ID, "notice").text
+            )
+        )
+        if os.environ.get("RUN_HOSTED_ACCEPTANCE") == "1":
+            _archive_hosted_causal_evidence(signature)
         _assert_no_browser_errors(driver)
     finally:
         _write_browser_evidence(driver, operation_id=operation_id, signature=signature)
@@ -1178,6 +1267,158 @@ def _capture_remediation_screenshot(driver, name: str, element) -> None:
         path.is_file() and path.stat().st_size > 0,
         "browser remediation screenshot was not persisted",
     )
+
+
+def _assert_controlled_causal_evidence_panel(panel) -> None:
+    from selenium.webdriver.common.by import By
+
+    _require(
+        "recommendation behavior only" in panel.text.casefold(),
+        "causal evidence did not preserve the recommendation-only boundary",
+    )
+    _require(
+        "service recovered" not in panel.text.casefold(),
+        "causal evidence claimed unmeasured service recovery",
+    )
+    proof_states = {
+        item.find_element(By.TAG_NAME, "span").text.strip(): item.get_attribute(
+            "data-proof-status"
+        )
+        for item in panel.find_elements(
+            By.CSS_SELECTOR, '[aria-label="Causal evidence proof states"] > li'
+        )
+    }
+    _require(
+        proof_states
+        == {
+            "Memory correction": "proven",
+            "Recommendation action delta": "proven",
+            "Controlled-pair eligibility": "proven",
+            "Repeatability": "unavailable",
+            "Service recovery": "unavailable",
+        },
+        "causal evidence proof states did not match the controlled replay",
+    )
+    checks = panel.find_elements(
+        By.CSS_SELECTOR, ".invariant-comparison tbody tr[data-check-status]"
+    )
+    _require(bool(checks), "causal evidence invariant matrix was empty")
+    _require(
+        all(check.get_attribute("data-check-status") == "matched" for check in checks),
+        "causal evidence invariant matrix contained a mismatch",
+    )
+    envelopes = panel.find_elements(By.CSS_SELECTOR, ".causal-envelope-details")
+    _require(len(envelopes) == 2, "causal evidence omitted a before/after envelope")
+    for envelope in envelopes:
+        observations = envelope.find_elements(By.CSS_SELECTOR, ".envelope-observations article")
+        _require(bool(observations), "causal evidence omitted raw telemetry")
+        for observation in observations:
+            _require(
+                bool(observation.find_elements(By.CSS_SELECTOR, "tbody tr")),
+                "causal evidence telemetry omitted ordered datapoints",
+            )
+            fingerprint = observation.find_element(By.CSS_SELECTOR, ".query-fingerprint").text
+            _require(
+                "Unavailable" not in fingerprint,
+                "causal evidence telemetry omitted its query fingerprint",
+            )
+
+
+def _archive_hosted_causal_evidence(signature: dict[str, Any]) -> None:
+    directory = _browser_evidence_directory()
+    _require(directory is not None, "browser causal evidence directory is not configured")
+    source_revision = (os.environ.get("HINDSIGHT_EXPECTED_DEPLOYED_REVISION") or "").strip()
+    _require(
+        re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None,
+        "causal evidence source revision is not exact",
+    )
+    scenario_id = str(signature.get("scenario_id") or "")
+    _require(
+        re.fullmatch(r"[0-9a-f-]{36}", scenario_id) is not None,
+        "causal evidence scenario identity is invalid",
+    )
+    summary = signature.get("causal_evidence")
+    _require(isinstance(summary, dict), "causal evidence summary is missing")
+    download = summary.get("download")
+    _require(isinstance(download, dict), "causal evidence download binding is missing")
+    expected_path = f"/v1/signature-scenarios/{scenario_id}/evidence"
+    _require(download.get("url") == expected_path, "causal evidence download path changed")
+    base_url = (os.environ.get("HOSTED_API_URL") or "").strip()
+    parts = urlsplit(base_url)
+    _require(
+        parts.scheme == "https" and bool(parts.netloc),
+        "hosted causal evidence API URL is not HTTPS",
+    )
+    evidence_request = request.Request(
+        urljoin(f"{base_url.rstrip('/')}/", expected_path.lstrip("/")),
+        headers={"Accept": "application/json"},
+    )
+    with request.urlopen(evidence_request, timeout=30) as response:  # noqa: S310
+        _require(response.status == 200, "causal evidence download did not return HTTP 200")
+        header_digest = response.headers.get("x-hindsight-evidence-sha256")
+        evidence_bytes = response.read(2_000_001)
+    _require(len(evidence_bytes) <= 2_000_000, "causal evidence download exceeded its bound")
+    binding = _causal_evidence_binding(
+        signature=signature,
+        evidence_bytes=evidence_bytes,
+        header_digest=header_digest,
+        source_revision=source_revision,
+    )
+    (directory / "causal-evidence.json").write_bytes(evidence_bytes)
+    (directory / "causal-evidence-binding.json").write_text(
+        json.dumps(binding, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _causal_evidence_binding(
+    *,
+    signature: dict[str, Any],
+    evidence_bytes: bytes,
+    header_digest: str | None,
+    source_revision: str,
+) -> dict[str, Any]:
+    scenario_id = str(signature["scenario_id"])
+    summary = signature["causal_evidence"]
+    expected_digest = str(summary["download"]["sha256"])
+    observed_digest = f"sha256:{hashlib.sha256(evidence_bytes).hexdigest()}"
+    _require(
+        observed_digest == expected_digest == header_digest,
+        "causal evidence body, header, and replay digests differ",
+    )
+    document = json.loads(evidence_bytes)
+    _require(isinstance(document, dict), "causal evidence download is not an object")
+    _require(
+        document.get("scenario", {}).get("scenario_id") == scenario_id
+        and document.get("scenario", {}).get("namespace") == "[redacted-namespace]",
+        "causal evidence download is not bound to the redacted replay",
+    )
+    _require(
+        document.get("proof_states") == summary.get("proof_states")
+        and document.get("controlled_pair_checks") == summary.get("controlled_pair_checks"),
+        "causal evidence download differs from the displayed proof summary",
+    )
+    for label in ("before", "after"):
+        envelope = document.get("recommendations", {}).get(label, {}).get("causal_envelope", {})
+        _require(
+            envelope.get("identity", {}).get("release_revision") == source_revision,
+            "causal evidence envelope is not bound to the exact release",
+        )
+    payload = {
+        "schema_version": 1,
+        "source_revision": source_revision,
+        "scenario_id": scenario_id,
+        "namespace_sha256": hashlib.sha256(
+            str(signature["namespace"]).encode("utf-8")
+        ).hexdigest(),
+        "evidence_sha256": observed_digest,
+        "header_sha256": header_digest,
+        "proof_states": summary["proof_states"],
+    }
+    payload["payload_sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _awaiting_remediation_identity(*, namespace: str) -> dict[str, Any]:
@@ -2450,12 +2691,14 @@ def _assert_signature_trace(*, namespace: str, operation_id: str) -> dict:
     assert comparison["memory_correction_proven"] is True
     assert comparison["controlled_pair"] is True
     return {
+        "scenario_id": str(public_trace["scenario_id"]),
         "namespace": namespace,
         "operation_id": operation_id,
         "invalidated_memory_ids": sorted(invalidated),
         "bad": bad,
         "corrected": corrected,
         "action_comparison": comparison,
+        "causal_evidence": public_trace["causal_evidence"],
     }
 
 
@@ -2706,12 +2949,4 @@ def _browser_scenario_url(scenario_id: str) -> str:
     query.pop("namespace", None)
     query.pop("as_of", None)
     query["scenario_id"] = scenario_id
-    return urlunsplit(parts._replace(query=urlencode(query)))
-
-
-def _public_browser_url() -> str:
-    parts = urlsplit(BASE_URL)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.pop("namespace", None)
-    query.pop("as_of", None)
     return urlunsplit(parts._replace(query=urlencode(query)))
