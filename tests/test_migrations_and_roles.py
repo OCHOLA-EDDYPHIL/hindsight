@@ -38,6 +38,7 @@ def test_agent_writer_can_fence_and_enqueue_but_cannot_administer_embedding_inde
         "TO hindsight_memory_worker;", 1
     )[0]
     assert "incident_semantic_beliefs" in worker_update_grant
+    assert "incident_events" not in worker_update_grant
 
     assert "CREATE ROLE IF NOT EXISTS hindsight_agent_writer LOGIN" in migration
     assert "CREATE ROLE IF NOT EXISTS hindsight_memory_worker LOGIN" in migration

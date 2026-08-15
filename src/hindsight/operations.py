@@ -484,10 +484,11 @@ def _validate_consolidation_evidence(
         event_id = str(item.get("event_id") or "")
         if evidence_id != f"event:{event_id}":
             raise OperationConflictError("candidate event evidence identity changed")
+        # Incident events are immutable; the parent incident remains locked below.
         cur.execute(
-            f"""
+            """
                 SELECT id, incident_id, event_type, event_schema, structured_payload
-                FROM incident_events WHERE id = %s {lock_clause}
+                FROM incident_events WHERE id = %s
             """,
             (event_id,),
         )
