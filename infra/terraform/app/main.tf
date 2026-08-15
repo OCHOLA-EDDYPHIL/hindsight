@@ -856,6 +856,7 @@ resource "aws_lambda_function" "worker" {
   environment {
     variables = {
       HINDSIGHT_DATABASE_URL_PARAM          = var.worker_database_url_parameter_name
+      HINDSIGHT_DEPLOYED_REVISION           = var.deployed_revision
       HINDSIGHT_GEMINI_API_KEYS_PARAM       = var.gemini_api_keys_parameter_name
       HINDSIGHT_GEMINI_KEY_HEALTH_TABLE     = aws_dynamodb_table.gemini_key_health.name
       HINDSIGHT_QUARANTINE_INDEX            = "quarantine-status-created-at-index"

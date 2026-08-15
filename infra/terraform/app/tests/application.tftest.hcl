@@ -473,6 +473,14 @@ run "complete_demo_graph" {
 
   assert {
     condition = (
+      aws_lambda_function.api.environment[0].variables.HINDSIGHT_DEPLOYED_REVISION == var.deployed_revision &&
+      aws_lambda_function.worker.environment[0].variables.HINDSIGHT_DEPLOYED_REVISION == var.deployed_revision
+    )
+    error_message = "The API and worker must share the exact deployed revision."
+  }
+
+  assert {
+    condition = (
       aws_apigatewayv2_authorizer.product.authorizer_type == "JWT" &&
       toset(aws_apigatewayv2_authorizer.product.identity_sources) == toset(["$request.header.Authorization"]) &&
       aws_apigatewayv2_route.public_v1_root_get.route_key == "GET /v1" &&
