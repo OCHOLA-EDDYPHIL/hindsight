@@ -66,6 +66,76 @@ def _database_url(name: str) -> str:
     return urlunsplit(parts._replace(path=f"/{name}"))
 
 
+def test_complete_run_dispatch_retries_one_serialization_failure(monkeypatch):
+    import hindsight.run_dispatch as run_dispatch
+
+    completion = {
+        "dispatch_id": "dispatch-1",
+        "dispatch_attempt_id": "attempt-1",
+        "lease_owner": "lease-1",
+        "message_id": "message-1",
+        "db_url": "postgresql://unused",
+    }
+    calls = []
+
+    def complete_once(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise psycopg.errors.SerializationFailure("restart transaction")
+        return True
+
+    monkeypatch.setattr(run_dispatch, "_complete_run_dispatch_once", complete_once)
+
+    assert run_dispatch._complete_run_dispatch(**completion) is True
+    assert calls == [completion, completion]
+
+
+def test_complete_run_dispatch_bounds_serialization_retries(monkeypatch):
+    import hindsight.run_dispatch as run_dispatch
+
+    calls = 0
+
+    def complete_once(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise psycopg.errors.SerializationFailure("restart transaction")
+
+    monkeypatch.setattr(run_dispatch, "_complete_run_dispatch_once", complete_once)
+
+    with pytest.raises(psycopg.errors.SerializationFailure, match="restart transaction"):
+        run_dispatch._complete_run_dispatch(
+            dispatch_id="dispatch-1",
+            dispatch_attempt_id="attempt-1",
+            lease_owner="lease-1",
+            message_id="message-1",
+            db_url="postgresql://unused",
+        )
+    assert calls == run_dispatch.RUN_DISPATCH_TRANSACTION_ATTEMPTS
+
+
+def test_complete_run_dispatch_does_not_retry_non_serialization_error(monkeypatch):
+    import hindsight.run_dispatch as run_dispatch
+
+    calls = 0
+
+    def complete_once(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("completion failed")
+
+    monkeypatch.setattr(run_dispatch, "_complete_run_dispatch_once", complete_once)
+
+    with pytest.raises(RuntimeError, match="completion failed"):
+        run_dispatch._complete_run_dispatch(
+            dispatch_id="dispatch-1",
+            dispatch_attempt_id="attempt-1",
+            lease_owner="lease-1",
+            message_id="message-1",
+            db_url="postgresql://unused",
+        )
+    assert calls == 1
+
+
 @requires_db
 @pytest.mark.migration_acceptance
 def test_outbox_migration_backfills_queued_and_resuming_runs():

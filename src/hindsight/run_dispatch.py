@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 
 from hindsight.db import connect
@@ -17,6 +18,7 @@ from hindsight.security import safe_error_detail
 RUN_DISPATCH_LEASE_TTL = timedelta(seconds=30)
 RUN_DISPATCH_ACK_TTL = timedelta(minutes=5)
 RUN_DISPATCH_BATCH_LIMIT = 25
+RUN_DISPATCH_TRANSACTION_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.INFO)
 
@@ -200,6 +202,29 @@ def _lease_run_dispatches(
 
 
 def _complete_run_dispatch(
+    *,
+    dispatch_id: str | UUID,
+    dispatch_attempt_id: str | UUID,
+    lease_owner: str | UUID,
+    message_id: str,
+    db_url: str | None,
+) -> bool:
+    for attempt in range(RUN_DISPATCH_TRANSACTION_ATTEMPTS):
+        try:
+            return _complete_run_dispatch_once(
+                dispatch_id=dispatch_id,
+                dispatch_attempt_id=dispatch_attempt_id,
+                lease_owner=lease_owner,
+                message_id=message_id,
+                db_url=db_url,
+            )
+        except SerializationFailure:
+            if attempt + 1 == RUN_DISPATCH_TRANSACTION_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable run dispatch completion retry state")
+
+
+def _complete_run_dispatch_once(
     *,
     dispatch_id: str | UUID,
     dispatch_attempt_id: str | UUID,

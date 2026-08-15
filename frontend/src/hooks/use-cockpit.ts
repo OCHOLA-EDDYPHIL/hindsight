@@ -856,7 +856,9 @@ export function useCockpit(options: UseCockpitOptions = {}) {
   }, []);
 
   useEffect(() => {
-    if (!initialized.current || authStatus === "initializing") return;
+    if (!initialized.current || authStatus === "initializing" || loadState === "loading") {
+      return;
+    }
     let disposed = false;
     let reconnectTimer: number | undefined;
     let interval: number | undefined;
@@ -938,6 +940,7 @@ export function useCockpit(options: UseCockpitOptions = {}) {
     authStatus,
     config,
     handleLiveEvent,
+    loadState,
     loadRun,
     loadSnapshot,
     namespace,

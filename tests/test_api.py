@@ -121,9 +121,10 @@ def test_consolidation_review_preview_binds_authenticated_operator(monkeypatch):
     ]
 
 
-def test_public_surface_has_no_mutation_or_operator_session():
+def test_public_surface_has_no_mutation_or_operator_session(monkeypatch):
     from hindsight.api import app
 
+    monkeypatch.delenv("HINDSIGHT_DEPLOYED_REVISION", raising=False)
     client = TestClient(app)
 
     assert client.get("/v1/health/live").json() == {

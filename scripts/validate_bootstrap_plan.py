@@ -223,7 +223,9 @@ ALLOWED_RESOURCE_MUTATIONS = frozenset(
         ("aws_iam_role.github_worker_acceptance", ("create",)),
         ("aws_iam_role_policy.github_observability_evidence", ("update",)),
         ("aws_iam_role_policy.github_quarantine_redrive", ("create",)),
+        ("aws_iam_role_policy.github_quarantine_redrive", ("update",)),
         ("aws_iam_role_policy.github_worker_acceptance", ("create",)),
+        ("aws_iam_role_policy.github_worker_acceptance", ("update",)),
         ("aws_iam_role_policy_attachment.github_deploy_encryption", ("create",)),
     }
 )
@@ -233,6 +235,77 @@ ALLOWED_OUTPUT_MUTATIONS = frozenset(
         ("github_worker_acceptance_role_arn", ("create",)),
     }
 )
+
+QUARANTINE_POLICY_TARGETS = {
+    "aws_iam_role_policy.github_quarantine_redrive": {
+        "name": "github_quarantine_redrive",
+        "policy_name": "hindsight-github-quarantine-redrive",
+        "role": "hindsight-github-quarantine-redrive",
+        "statements": {
+            "ApiDatabaseCredential": {
+                "actions": ("ssm:GetParameter",),
+                "resources": (
+                    "arn:aws:ssm:us-east-1:762397612117:parameter/"
+                    "hindsight/demo/api-database-url",
+                ),
+            },
+            "ExactQuarantineRecord": {
+                "actions": ("dynamodb:GetItem", "dynamodb:UpdateItem"),
+                "resources": (
+                    "arn:aws:dynamodb:us-east-1:762397612117:table/"
+                    "hindsight-demo-quarantine",
+                ),
+            },
+        },
+    },
+    "aws_iam_role_policy.github_worker_acceptance": {
+        "name": "github_worker_acceptance",
+        "policy_name": "hindsight-github-worker-acceptance",
+        "role": "hindsight-github-worker-acceptance",
+        "statements": {
+            "ApiDatabaseCredential": {
+                "actions": ("ssm:GetParameter",),
+                "resources": (
+                    "arn:aws:ssm:us-east-1:762397612117:parameter/"
+                    "hindsight/demo/api-database-url",
+                ),
+            },
+            "ExactWorkerSourceEnqueue": {
+                "actions": ("sqs:SendMessage",),
+                "resources": (
+                    "arn:aws:sqs:us-east-1:762397612117:hindsight-demo-runs",
+                ),
+            },
+            "SyntheticQuarantineReadCleanup": {
+                "actions": ("dynamodb:DeleteItem", "dynamodb:GetItem"),
+                "resources": (
+                    "arn:aws:dynamodb:us-east-1:762397612117:table/"
+                    "hindsight-demo-quarantine",
+                ),
+            },
+        },
+    },
+}
+QUARANTINE_DECRYPT_STATEMENT = {
+    "actions": ("kms:Decrypt",),
+    "conditions": {
+        "ForAnyValue:StringEquals": {
+            "kms:ResourceAliases": ("alias/hindsight-demo-quarantine",),
+        },
+        "StringEquals": {
+            "kms:EncryptionContext:aws:dynamodb:subscriberId": (
+                EXPECTED_AWS_ACCOUNT_ID,
+            ),
+            "kms:EncryptionContext:aws:dynamodb:tableName": (
+                "hindsight-demo-quarantine",
+            ),
+            "kms:ViaService": ("dynamodb.us-east-1.amazonaws.com",),
+        },
+    },
+    "resources": (
+        f"arn:aws:kms:us-east-1:{EXPECTED_AWS_ACCOUNT_ID}:key/*",
+    ),
+}
 
 
 def _write_json(path: Path, document: dict[str, Any]) -> None:
@@ -1197,6 +1270,218 @@ def _validate_github_deploy_role_refresh_drift(
     return [address]
 
 
+def _load_quarantine_policy_document(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, str):
+        raise ValueError("quarantine acceptance inline policy is malformed")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        document: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in document:
+                raise ValueError
+            document[key] = child
+        return document
+
+    def reject_non_json_constant(_: str) -> None:
+        raise ValueError
+
+    try:
+        document = json.loads(
+            value,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_non_json_constant,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("quarantine acceptance inline policy is malformed") from None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"Statement", "Version"}
+        or document.get("Version") != "2012-10-17"
+        or not isinstance(document.get("Statement"), list)
+    ):
+        raise ValueError("quarantine acceptance inline policy is malformed")
+
+    def normalize_strings(child: Any) -> tuple[str, ...]:
+        values = [child] if isinstance(child, str) else child
+        if (
+            not isinstance(values, list)
+            or not values
+            or not all(isinstance(item, str) and item for item in values)
+            or len(values) != len(set(values))
+        ):
+            raise ValueError("quarantine acceptance inline policy is malformed")
+        return tuple(sorted(values))
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for statement in document["Statement"]:
+        if not isinstance(statement, dict):
+            raise ValueError("quarantine acceptance inline policy is malformed")
+        expected_fields = {"Action", "Effect", "Resource", "Sid"}
+        if "Condition" in statement:
+            expected_fields.add("Condition")
+        sid = statement.get("Sid")
+        if (
+            set(statement) != expected_fields
+            or not isinstance(sid, str)
+            or not sid
+            or sid in normalized
+            or statement.get("Effect") != "Allow"
+        ):
+            raise ValueError("quarantine acceptance inline policy is malformed")
+        normalized_statement: dict[str, Any] = {
+            "actions": normalize_strings(statement.get("Action")),
+            "resources": normalize_strings(statement.get("Resource")),
+        }
+        if "Condition" in statement:
+            condition = statement["Condition"]
+            if not isinstance(condition, dict) or not condition:
+                raise ValueError("quarantine acceptance inline policy is malformed")
+            normalized_condition: dict[str, dict[str, tuple[str, ...]]] = {}
+            for operator, clauses in condition.items():
+                if (
+                    not isinstance(operator, str)
+                    or not operator
+                    or not isinstance(clauses, dict)
+                    or not clauses
+                ):
+                    raise ValueError(
+                        "quarantine acceptance inline policy is malformed"
+                    )
+                normalized_clauses: dict[str, tuple[str, ...]] = {}
+                for variable, values in clauses.items():
+                    if not isinstance(variable, str) or not variable:
+                        raise ValueError(
+                            "quarantine acceptance inline policy is malformed"
+                        )
+                    normalized_clauses[variable] = normalize_strings(values)
+                normalized_condition[operator] = normalized_clauses
+            normalized_statement["conditions"] = normalized_condition
+        normalized[sid] = normalized_statement
+    return normalized
+
+
+def _quarantine_policy_values(
+    values: Any,
+    *,
+    target: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    policy_name = target["policy_name"]
+    role = target["role"]
+    if (
+        not isinstance(values, dict)
+        or set(values) != {"id", "name", "name_prefix", "policy", "role"}
+        or values.get("id") != f"{role}:{policy_name}"
+        or values.get("name") != policy_name
+        or values.get("name_prefix") != ""
+        or values.get("role") != role
+    ):
+        raise ValueError("quarantine acceptance inline policy identity is invalid")
+    return _load_quarantine_policy_document(values.get("policy"))
+
+
+def _validate_quarantine_policy_entry(
+    entry: Any,
+    *,
+    address: str,
+    target: dict[str, Any],
+) -> None:
+    if not isinstance(entry, dict) or set(entry) != {
+        "address",
+        "change",
+        "mode",
+        "name",
+        "provider_name",
+        "type",
+    }:
+        raise ValueError("quarantine acceptance inline policy identity is invalid")
+    if (
+        entry.get("address") != address
+        or entry.get("mode") != "managed"
+        or entry.get("name") != target["name"]
+        or entry.get("provider_name") != AWS_PROVIDER
+        or entry.get("type") != "aws_iam_role_policy"
+    ):
+        raise ValueError("quarantine acceptance inline policy identity is invalid")
+
+    change = entry.get("change")
+    if not isinstance(change, dict) or set(change) != {
+        "actions",
+        "after",
+        "after_identity",
+        "after_sensitive",
+        "after_unknown",
+        "before",
+        "before_identity",
+        "before_sensitive",
+    }:
+        raise ValueError(
+            "quarantine acceptance inline policy contains unexpected metadata"
+        )
+    actions = _actions(change, subject=f"quarantine acceptance policy {address}")
+    if actions not in (["no-op"], ["update"]):
+        raise ValueError("quarantine acceptance inline policy actions are invalid")
+    identity = {
+        "account_id": EXPECTED_AWS_ACCOUNT_ID,
+        "name": target["policy_name"],
+        "role": target["role"],
+    }
+    if (
+        change.get("before_identity") != identity
+        or change.get("after_identity") != identity
+        or change.get("before_sensitive") != {}
+        or change.get("after_sensitive") != {}
+        or change.get("after_unknown") != {}
+    ):
+        raise ValueError(
+            "quarantine acceptance inline policy change identity is invalid"
+        )
+
+    before = _quarantine_policy_values(change.get("before"), target=target)
+    after = _quarantine_policy_values(change.get("after"), target=target)
+    prior = target["statements"]
+    desired = {
+        **prior,
+        "ExactQuarantineTableDecrypt": QUARANTINE_DECRYPT_STATEMENT,
+    }
+    expected_before = desired if actions == ["no-op"] else prior
+    if before != expected_before or after != desired:
+        raise ValueError(
+            "quarantine acceptance inline policy transition is not exact"
+        )
+
+
+def _validate_quarantine_policy_updates(
+    resource_changes: list[Any], resource_drift: list[Any]
+) -> None:
+    target_addresses = frozenset(QUARANTINE_POLICY_TARGETS)
+    target_entries = [
+        entry
+        for entry in resource_changes
+        if isinstance(entry, dict) and entry.get("address") in target_addresses
+    ]
+    has_update = any(
+        isinstance(entry.get("change"), dict)
+        and entry["change"].get("actions") == ["update"]
+        for entry in target_entries
+    )
+    if not has_update:
+        return
+    if any(
+        isinstance(entry, dict) and entry.get("address") in target_addresses
+        for entry in resource_drift
+    ):
+        raise ValueError("quarantine acceptance inline policy drift is forbidden")
+    for address, target in QUARANTINE_POLICY_TARGETS.items():
+        matching = [entry for entry in target_entries if entry.get("address") == address]
+        if len(matching) != 1:
+            raise ValueError(
+                "quarantine acceptance inline policy updates must be complete"
+            )
+        _validate_quarantine_policy_entry(
+            matching[0], address=address, target=target
+        )
+
+
 def _output_actions(entries: Any) -> list[dict[str, Any]]:
     if not isinstance(entries, dict):
         raise ValueError("Terraform plan output_changes must be a complete object")
@@ -1412,6 +1697,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 plan["resource_changes"], plan.get("resource_drift", [])
             ),
         ]
+    )
+    _validate_quarantine_policy_updates(
+        plan["resource_changes"], plan.get("resource_drift", [])
     )
     outputs = _output_actions(plan["output_changes"])
     unapproved_drift = sorted(

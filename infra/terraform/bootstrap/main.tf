@@ -954,6 +954,36 @@ data "aws_iam_policy_document" "github_quarantine_redrive" {
     actions   = ["ssm:GetParameter"]
     resources = [local.api_database_parameter_arn]
   }
+
+  statement {
+    sid       = "ExactQuarantineTableDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = local.quarantine_key_arns
+
+    condition {
+      test     = "ForAnyValue:StringEquals"
+      variable = "kms:ResourceAliases"
+      values   = ["alias/hindsight-${var.stage}-quarantine"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${var.aws_region}.${data.aws_partition.current.dns_suffix}"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:tableName"
+      values   = ["hindsight-${var.stage}-quarantine"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:subscriberId"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "github_quarantine_redrive" {
@@ -979,6 +1009,36 @@ data "aws_iam_policy_document" "github_worker_acceptance" {
     sid       = "ApiDatabaseCredential"
     actions   = ["ssm:GetParameter"]
     resources = [local.api_database_parameter_arn]
+  }
+
+  statement {
+    sid       = "ExactQuarantineTableDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = local.quarantine_key_arns
+
+    condition {
+      test     = "ForAnyValue:StringEquals"
+      variable = "kms:ResourceAliases"
+      values   = ["alias/hindsight-${var.stage}-quarantine"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${var.aws_region}.${data.aws_partition.current.dns_suffix}"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:tableName"
+      values   = ["hindsight-${var.stage}-quarantine"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:dynamodb:subscriberId"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
   }
 }
 

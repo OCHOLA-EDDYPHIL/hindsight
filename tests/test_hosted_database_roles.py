@@ -72,10 +72,18 @@ def test_hosted_runtime_database_identities_are_distinct_and_restricted():
                 assert connection.execute(
                     "SELECT count(*) FROM benchmark_variant_preparations"
                 ).fetchone()[0] >= 0
+                assert connection.execute(
+                    "SELECT count(*) FROM demo_sessions"
+                ).fetchone()[0] >= 0
                 with pytest.raises(psycopg.errors.InsufficientPrivilege):
                     with connection.transaction():
                         connection.execute(
                             "UPDATE benchmark_variant_preparations "
                             "SET phase = 'complete' WHERE false"
+                        )
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    with connection.transaction():
+                        connection.execute(
+                            "UPDATE demo_sessions SET status = status WHERE false"
                         )
     assert len(set(identities.values())) == 3

@@ -201,6 +201,18 @@ def test_product_writers_have_only_foreign_key_read_access_to_learning_preparati
     assert "benchmark_variant_preparations" not in worker_update
 
 
+def test_worker_demo_replay_context_access_is_read_only():
+    roles = (ROOT / "infra/db/roles.sql").read_text()
+    worker_section = roles.split("TO hindsight_agent_writer;", 3)[-1]
+    worker_select, worker_insert, worker_update = worker_section.split(
+        "TO hindsight_memory_worker;", 3
+    )[:3]
+
+    assert "demo_sessions" in worker_select
+    assert "demo_sessions" not in worker_insert
+    assert "demo_sessions" not in worker_update
+
+
 def test_product_principal_roles_and_prompt_safety_are_staged_fail_closed():
     columns_path = MIGRATIONS / "0028_product_identity_and_prompt_safety_columns.sql"
     guards_path = MIGRATIONS / "0028a_product_identity_and_prompt_safety_guards.sql"

@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 import os
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -15,6 +16,7 @@ from tests.fakes import (
 )
 
 requires_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL not set")
+ROOT = Path(__file__).resolve().parents[1]
 
 SERVICE_SLUG = "payments-api"
 ROOT_CAUSE = "Retry fanout amplified downstream payment processor timeouts."
@@ -384,8 +386,12 @@ def test_semantic_validator_rejects_destructive_claim_with_unrelated_quote():
 
 
 @requires_db
-def test_consolidation_requires_fingerprint_bound_approval_before_retrieval():
+def test_consolidation_requires_fingerprint_bound_approval_before_retrieval(monkeypatch):
+    from contextlib import nullcontext
+
     import hindsight.consolidation as consolidation
+    import hindsight.operations as operations
+    import psycopg
     from hindsight.db import connect, database_url
     from tests.fakes import DeterministicEmbeddingProvider
     from hindsight.memory import MemoryStore
@@ -447,13 +453,33 @@ def test_consolidation_requires_fingerprint_bound_approval_before_retrieval():
         )
     assert str(first.memory["id"]) not in {str(hit["id"]) for hit in retrieval.hits}
 
-    preview = preview_consolidation_review(
-        candidate_id=str(first.job_id),
-        action="approve",
-        actor="operator:test",
-        reason="Evidence and operational safety reviewed",
-        db_url=database_url(),
-    )
+    with connect(database_url()) as restricted_conn:
+        restricted_conn.execute((ROOT / "infra/db/roles.sql").read_text())
+        restricted_conn.commit()
+        restricted_conn.execute("SET ROLE hindsight_agent_writer")
+        restricted_conn.commit()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            restricted_conn.execute(
+                "UPDATE consolidation_jobs SET review_reason = review_reason WHERE id = %s",
+                (first.job_id,),
+            )
+        restricted_conn.rollback()
+        with monkeypatch.context() as preview_patch:
+            preview_patch.setattr(
+                operations,
+                "connect",
+                lambda *_args, **_kwargs: nullcontext(restricted_conn),
+            )
+            preview = preview_consolidation_review(
+                candidate_id=str(first.job_id),
+                action="approve",
+                actor="operator:test",
+                reason="Evidence and operational safety reviewed",
+                db_url=database_url(),
+            )
+        restricted_conn.commit()
+        restricted_conn.execute("RESET ROLE")
+        restricted_conn.commit()
     operation, created = enqueue_operation(
         preview_id=str(preview["id"]),
         fingerprint=str(preview["fingerprint"]),

@@ -172,6 +172,144 @@ def _no_change_plan(validator):
     return plan
 
 
+QUARANTINE_POLICY_IDENTITIES = {
+    "aws_iam_role_policy.github_quarantine_redrive": (
+        "hindsight-github-quarantine-redrive",
+        "hindsight-github-quarantine-redrive",
+    ),
+    "aws_iam_role_policy.github_worker_acceptance": (
+        "hindsight-github-worker-acceptance",
+        "hindsight-github-worker-acceptance",
+    ),
+}
+QUARANTINE_TABLE_ARN = (
+    "arn:aws:dynamodb:us-east-1:762397612117:table/hindsight-demo-quarantine"
+)
+API_DATABASE_PARAMETER_ARN = (
+    "arn:aws:ssm:us-east-1:762397612117:parameter/"
+    "hindsight/demo/api-database-url"
+)
+
+
+def _quarantine_policy(address: str, *, include_decrypt: bool) -> dict:
+    if address.endswith("github_quarantine_redrive"):
+        statements = [
+            {
+                "Action": ["dynamodb:UpdateItem", "dynamodb:GetItem"],
+                "Effect": "Allow",
+                "Resource": QUARANTINE_TABLE_ARN,
+                "Sid": "ExactQuarantineRecord",
+            },
+            {
+                "Action": "ssm:GetParameter",
+                "Effect": "Allow",
+                "Resource": API_DATABASE_PARAMETER_ARN,
+                "Sid": "ApiDatabaseCredential",
+            },
+        ]
+    else:
+        statements = [
+            {
+                "Action": "sqs:SendMessage",
+                "Effect": "Allow",
+                "Resource": (
+                    "arn:aws:sqs:us-east-1:762397612117:hindsight-demo-runs"
+                ),
+                "Sid": "ExactWorkerSourceEnqueue",
+            },
+            {
+                "Action": ["dynamodb:GetItem", "dynamodb:DeleteItem"],
+                "Effect": "Allow",
+                "Resource": QUARANTINE_TABLE_ARN,
+                "Sid": "SyntheticQuarantineReadCleanup",
+            },
+            {
+                "Action": "ssm:GetParameter",
+                "Effect": "Allow",
+                "Resource": API_DATABASE_PARAMETER_ARN,
+                "Sid": "ApiDatabaseCredential",
+            },
+        ]
+    if include_decrypt:
+        statements.append(
+            {
+                "Action": "kms:Decrypt",
+                "Condition": {
+                    "ForAnyValue:StringEquals": {
+                        "kms:ResourceAliases": "alias/hindsight-demo-quarantine",
+                    },
+                    "StringEquals": {
+                        "kms:EncryptionContext:aws:dynamodb:subscriberId": (
+                            "762397612117"
+                        ),
+                        "kms:EncryptionContext:aws:dynamodb:tableName": (
+                            "hindsight-demo-quarantine"
+                        ),
+                        "kms:ViaService": "dynamodb.us-east-1.amazonaws.com",
+                    },
+                },
+                "Effect": "Allow",
+                "Resource": "arn:aws:kms:us-east-1:762397612117:key/*",
+                "Sid": "ExactQuarantineTableDecrypt",
+            }
+        )
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
+def _quarantine_policy_values(address: str, *, include_decrypt: bool) -> dict:
+    policy_name, role = QUARANTINE_POLICY_IDENTITIES[address]
+    return {
+        "id": f"{role}:{policy_name}",
+        "name": policy_name,
+        "name_prefix": "",
+        "policy": json.dumps(
+            _quarantine_policy(address, include_decrypt=include_decrypt),
+            separators=(",", ":"),
+        ),
+        "role": role,
+    }
+
+
+def _quarantine_policy_change(address: str, actions: list[str]) -> dict:
+    policy_name, role = QUARANTINE_POLICY_IDENTITIES[address]
+    desired = _quarantine_policy_values(address, include_decrypt=True)
+    before = (
+        json.loads(json.dumps(desired))
+        if actions == ["no-op"]
+        else _quarantine_policy_values(address, include_decrypt=False)
+    )
+    identity = {
+        "account_id": "762397612117",
+        "name": policy_name,
+        "role": role,
+    }
+    return _resource(
+        address,
+        actions,
+        resource_type="aws_iam_role_policy",
+        before=before,
+        after=desired,
+        before_identity=identity,
+        after_identity=json.loads(json.dumps(identity)),
+        before_sensitive={},
+        after_sensitive={},
+        after_unknown={},
+    )
+
+
+def _plan_with_quarantine_policy_updates(
+    validator, *, already_updated: str | None = None
+):
+    plan = _no_change_plan(validator)
+    for address in QUARANTINE_POLICY_IDENTITIES:
+        actions = ["no-op"] if address == already_updated else ["update"]
+        plan["resource_changes"].append(
+            _quarantine_policy_change(address, actions)
+        )
+    plan["applyable"] = True
+    return plan
+
+
 def _plan_with_null_sensitive_placeholders(validator):
     plan = _plan(validator)
     acm_values = _value_resource(
@@ -644,7 +782,9 @@ def test_validator_allows_only_the_exact_resource_and_output_mutation_pairs():
         ("aws_iam_role.github_worker_acceptance", ("create",)),
         ("aws_iam_role_policy.github_observability_evidence", ("update",)),
         ("aws_iam_role_policy.github_quarantine_redrive", ("create",)),
+        ("aws_iam_role_policy.github_quarantine_redrive", ("update",)),
         ("aws_iam_role_policy.github_worker_acceptance", ("create",)),
+        ("aws_iam_role_policy.github_worker_acceptance", ("update",)),
         ("aws_iam_role_policy_attachment.github_deploy_encryption", ("create",)),
     }
     expected_outputs = {
@@ -659,7 +799,10 @@ def test_validator_allows_only_the_exact_resource_and_output_mutation_pairs():
         (entry["address"], tuple(entry["actions"]))
         for entry in summary["resource_changes"]
         if not validator.MUTATING_ACTIONS.isdisjoint(entry["actions"])
-    } == expected_resources
+    } == expected_resources - {
+        ("aws_iam_role_policy.github_quarantine_redrive", ("update",)),
+        ("aws_iam_role_policy.github_worker_acceptance", ("update",)),
+    }
     assert {
         (entry["name"], tuple(entry["actions"]))
         for entry in summary["output_changes"]
@@ -677,6 +820,167 @@ def test_validator_accepts_a_plan_with_no_desired_state_mutations():
     assert summary["resource_drift"] == []
 
 
+def test_validator_accepts_only_the_two_exact_quarantine_policy_updates():
+    validator = _validator()
+
+    summary = validator.validate_plan(
+        _plan_with_quarantine_policy_updates(validator)
+    )
+
+    assert summary["action_counts"] == {"no-op": 1, "update": 2}
+    assert {
+        (entry["address"], tuple(entry["actions"]))
+        for entry in summary["resource_changes"]
+        if entry["address"] in QUARANTINE_POLICY_IDENTITIES
+    } == {
+        (
+            "aws_iam_role_policy.github_quarantine_redrive",
+            ("update",),
+        ),
+        (
+            "aws_iam_role_policy.github_worker_acceptance",
+            ("update",),
+        ),
+    }
+
+
+@pytest.mark.parametrize("already_updated", QUARANTINE_POLICY_IDENTITIES)
+def test_validator_accepts_exact_quarantine_policy_partial_apply_recovery(
+    already_updated,
+):
+    validator = _validator()
+
+    summary = validator.validate_plan(
+        _plan_with_quarantine_policy_updates(
+            validator, already_updated=already_updated
+        )
+    )
+
+    assert summary["action_counts"] == {"no-op": 2, "update": 1}
+
+
+def test_validator_requires_both_quarantine_policy_updates_to_be_represented():
+    validator = _validator()
+    plan = _plan_with_quarantine_policy_updates(validator)
+    plan["resource_changes"] = [
+        entry
+        for entry in plan["resource_changes"]
+        if entry["address"]
+        != "aws_iam_role_policy.github_worker_acceptance"
+    ]
+
+    with pytest.raises(ValueError, match="updates must be complete"):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "broader_action",
+        "broader_resource",
+        "missing_condition",
+        "changed_prior_statement",
+        "extra_statement",
+        "duplicate_sid",
+    ],
+)
+def test_validator_rejects_inexact_quarantine_policy_transitions(mutation):
+    validator = _validator()
+    plan = _plan_with_quarantine_policy_updates(validator)
+    entry = _resource_entry(
+        plan,
+        "resource_changes",
+        "aws_iam_role_policy.github_quarantine_redrive",
+    )
+    after = json.loads(entry["change"]["after"]["policy"])
+    decrypt = next(
+        statement
+        for statement in after["Statement"]
+        if statement["Sid"] == "ExactQuarantineTableDecrypt"
+    )
+    if mutation == "broader_action":
+        decrypt["Action"] = ["kms:Decrypt", "kms:DescribeKey"]
+    elif mutation == "broader_resource":
+        decrypt["Resource"] = "*"
+    elif mutation == "missing_condition":
+        del decrypt["Condition"]["StringEquals"]["kms:ViaService"]
+    elif mutation == "changed_prior_statement":
+        before = json.loads(entry["change"]["before"]["policy"])
+        before["Statement"][0]["Action"] = "dynamodb:*"
+        entry["change"]["before"]["policy"] = json.dumps(before)
+    elif mutation == "extra_statement":
+        after["Statement"].append(
+            {
+                "Action": "kms:DescribeKey",
+                "Effect": "Allow",
+                "Resource": "*",
+                "Sid": "Extra",
+            }
+        )
+    else:
+        after["Statement"].append(json.loads(json.dumps(decrypt)))
+    if mutation != "changed_prior_statement":
+        entry["change"]["after"]["policy"] = json.dumps(after)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "quarantine acceptance inline policy "
+            "(transition is not exact|is malformed)"
+        ),
+    ):
+        validator.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        '{"Version":"2012-10-17","Version":"2012-10-17","Statement":[]}',
+        '{"Version":NaN,"Statement":[]}',
+    ],
+)
+def test_validator_rejects_non_strict_quarantine_policy_json(policy):
+    validator = _validator()
+    plan = _plan_with_quarantine_policy_updates(validator)
+    entry = _resource_entry(
+        plan,
+        "resource_changes",
+        "aws_iam_role_policy.github_worker_acceptance",
+    )
+    entry["change"]["after"]["policy"] = policy
+
+    with pytest.raises(ValueError, match="inline policy is malformed"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_stale_quarantine_policy_noop_during_recovery():
+    validator = _validator()
+    address = "aws_iam_role_policy.github_quarantine_redrive"
+    plan = _plan_with_quarantine_policy_updates(
+        validator, already_updated=address
+    )
+    entry = _resource_entry(plan, "resource_changes", address)
+    stale = _quarantine_policy_values(address, include_decrypt=False)
+    entry["change"]["before"] = stale
+    entry["change"]["after"] = json.loads(json.dumps(stale))
+
+    with pytest.raises(ValueError, match="transition is not exact"):
+        validator.validate_plan(plan)
+
+
+def test_validator_rejects_quarantine_policy_drift_during_update():
+    validator = _validator()
+    plan = _plan_with_quarantine_policy_updates(validator)
+    plan["resource_drift"] = [
+        _quarantine_policy_change(
+            "aws_iam_role_policy.github_worker_acceptance", ["update"]
+        )
+    ]
+
+    with pytest.raises(ValueError, match="inline policy drift is forbidden"):
+        validator.validate_plan(plan)
+
+
 @pytest.mark.parametrize(
     ("address", "actions"),
     [
@@ -685,8 +989,6 @@ def test_validator_accepts_a_plan_with_no_desired_state_mutations():
         ("aws_iam_role.github_quarantine_redrive", ["update"]),
         ("aws_iam_role.github_worker_acceptance", ["update"]),
         ("aws_iam_role_policy.github_observability_evidence", ["create"]),
-        ("aws_iam_role_policy.github_quarantine_redrive", ["update"]),
-        ("aws_iam_role_policy.github_worker_acceptance", ["update"]),
         ("aws_iam_role_policy_attachment.github_deploy_encryption", ["update"]),
         ("aws_iam_role.unapproved", ["create"]),
         ("aws_iam_role.unapproved", ["update"]),
