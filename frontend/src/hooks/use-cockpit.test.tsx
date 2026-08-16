@@ -1115,6 +1115,81 @@ describe("cockpit historical snapshot selection", () => {
     expect(result.current.influence).toEqual([]);
   });
 
+  it("restores citations after a bare run update reaches awaiting approval", async () => {
+    window.HINDSIGHT_CONFIG = {
+      publicApiBase: "/v1",
+      websocketUrl: "wss://socket.example.test/demo",
+      defaultNamespace: currentSnapshot.namespace,
+    };
+    const citedRead = { id: "read-live", memory_id: "memory-live" };
+    let projectedScenario: SignatureScenario = {
+      ...approvalScenario(),
+      scenario_id: "scenario-live",
+      status: "active",
+      runs: [{ id: "run-live", status: "running" }],
+    };
+    let scenarioDetailRequests = 0;
+    let resolveRun: (response: Response) => void = () => undefined;
+    const pendingRun = new Promise<Response>((resolve) => {
+      resolveRun = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = new URL(String(input), window.location.origin);
+        if (url.pathname === "/v1/incidents") {
+          return Promise.resolve(jsonResponse({ items: [] }));
+        }
+        if (url.pathname === "/v1/signature-scenarios") {
+          return Promise.resolve(jsonResponse(projectedScenario));
+        }
+        if (url.pathname === "/v1/signature-scenarios/scenario-live") {
+          scenarioDetailRequests += 1;
+          return Promise.resolve(jsonResponse(projectedScenario));
+        }
+        if (url.pathname === "/v1/runs/run-live") return pendingRun;
+        if (url.pathname === "/v1/namespaces/test%3Ahistory-race/beliefs") {
+          return Promise.resolve(jsonResponse(currentSnapshot));
+        }
+        if (url.pathname === "/v1/realtime/ticket") {
+          return Promise.resolve(jsonResponse({ ticket: "signed-ticket" }));
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.scenario?.scenario_id).toBe("scenario-live"));
+    await waitFor(() => expect(fakeSocketInstances).toHaveLength(1));
+
+    projectedScenario = {
+      ...projectedScenario,
+      runs: [
+        {
+          id: "run-live",
+          status: "awaiting_approval",
+          trace: { reads: [citedRead] },
+        },
+      ],
+    };
+    act(() => fakeSocketInstances[0].open());
+    await waitFor(() => expect(result.current.run?.trace?.reads).toEqual([citedRead]));
+    expect(scenarioDetailRequests).toBe(1);
+
+    await act(async () => {
+      resolveRun(jsonResponse({ id: "run-live", status: "awaiting_approval" }));
+      await pendingRun;
+    });
+
+    await waitFor(() => expect(scenarioDetailRequests).toBe(2));
+    expect(result.current.run).toMatchObject({
+      id: "run-live",
+      status: "awaiting_approval",
+      trace: { reads: [citedRead] },
+    });
+  });
+
   it("refreshes the scenario projection after a realtime operation event", async () => {
     window.HINDSIGHT_CONFIG = {
       publicApiBase: "/v1",
