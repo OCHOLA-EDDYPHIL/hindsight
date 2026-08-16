@@ -422,7 +422,9 @@ export function useCockpit(options: UseCockpitOptions = {}) {
         if (TERMINAL_RUN_STATES.has(next.status) && snapshotView.current === "live") {
           await loadSnapshot(null).catch(() => undefined);
           refreshScenarioRef.current();
-        } else if (poll && next.status !== "awaiting_approval") {
+        } else if (next.status === "awaiting_approval" && snapshotView.current === "live") {
+          refreshScenarioRef.current();
+        } else if (poll) {
           window.setTimeout(() => void loadRun(runId, true), 1400);
         }
       } catch (error) {
