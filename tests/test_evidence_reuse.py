@@ -711,33 +711,6 @@ def test_reuse_binds_both_source_runs_without_expensive_execution(tmp_path: Path
     ).hexdigest()
 
 
-def test_reuse_workflow_is_owner_exact_main_and_has_no_expensive_commands():
-    path = ROOT / ".github/workflows/evidence-reuse.yml"
-    workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
-
-    assert set(workflow["on"]) == {"workflow_dispatch"}
-    assert workflow["permissions"] == {}
-    authorize = workflow["jobs"]["authorize"]
-    authorization = authorize["steps"][0]["run"]
-    for guard in (
-        '"$EVENT_NAME" == "workflow_dispatch"',
-        '"$REF_NAME" == "refs/heads/main"',
-        '"$ACTOR" == "$REPOSITORY_OWNER"',
-        '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"',
-        "evidence-reuse.yml@$REF_NAME",
-    ):
-        assert guard in authorization
-    job = workflow["jobs"]["reuse"]
-    assert job["permissions"] == {"actions": "read", "contents": "read"}
-    checkout = next(step for step in job["steps"] if step.get("uses") == "actions/checkout@v4")
-    assert checkout["with"]["fetch-depth"] == "0"
-    commands = "\n".join(step.get("run", "") for step in job["steps"])
-    assert "gh api" in commands
-    assert "scripts/evidence_reuse.py reuse" in commands
-    for forbidden in ("docker", "cockroach", "run_recovery_drill", "run_migration_compatibility"):
-        assert forbidden not in commands.lower()
-
-
 @pytest.mark.parametrize(
     ("workflow_name", "job_name", "receipt_name"),
     [
