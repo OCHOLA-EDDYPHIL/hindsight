@@ -127,13 +127,17 @@ jobs:
           github-token: ${{ github.token }}
       - name: Fetch latest acceptance run metadata
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           ACCEPTANCE_RUN_ID: ${{ needs.authorize.outputs.acceptance_run_id }}
         run: >-
-          gh api
-          "repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID"
-          > build/observability-input/acceptance-run.json
+          curl --fail --silent --show-error --location
+          --header "Accept: application/vnd.github+json"
+          --header "Authorization: Bearer $GITHUB_TOKEN"
+          --header "X-GitHub-Api-Version: 2022-11-28"
+          "$GITHUB_API_URL/repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID"
+          --output build/observability-input/acceptance-run.json
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/hindsight-github-observability-evidence

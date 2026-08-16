@@ -1092,7 +1092,16 @@ def test_observability_evidence_is_owner_authorized_and_exact_main():
         "${{ needs.authorize.outputs.acceptance_run_attempt }}" not in workflow
     )
     assert "Fetch latest acceptance run metadata" in workflow
-    assert '"repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID"' in workflow
+    metadata_fetch = workflow.split(
+        "      - name: Fetch latest acceptance run metadata\n", 1
+    )[1].split("      - uses: aws-actions/configure-aws-credentials@v4\n", 1)[0]
+    assert "gh api" not in metadata_fetch
+    assert "curl --fail --silent --show-error --location" in metadata_fetch
+    assert "GITHUB_API_URL: ${{ github.api_url }}" in metadata_fetch
+    assert '"Authorization: Bearer $GITHUB_TOKEN"' in metadata_fetch
+    assert '"$GITHUB_API_URL/repos/$REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID"' in (
+        metadata_fetch
+    )
     assert "/attempts/$ACCEPTANCE_RUN_ATTEMPT" not in workflow
     assert "--browser-evidence build/observability-browser/operation.json" in workflow
     assert "timeout-minutes: 15" in workflow
