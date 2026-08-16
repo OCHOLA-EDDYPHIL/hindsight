@@ -258,16 +258,13 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
     }
 
     assert set(workflows) == {
-        "capacity-qualification.yml",
         "ci.yml",
         "deploy-demo.yml",
         "destroy-demo.yml",
-        "evidence-reuse.yml",
         "live-acceptance.yml",
         "migration-compatibility.yml",
         "observability-evidence.yml",
         "plan-bootstrap.yml",
-        "provision-lifecycle-fixture.yml",
         "recovery-drill.yml",
         "redrive-quarantine.yml",
         "tenant-lifecycle.yml",
@@ -276,14 +273,11 @@ def test_active_workflow_triggers_preserve_automatic_and_manual_boundaries():
     assert set(workflows["ci.yml"]) == {"push", "pull_request"}
     assert set(workflows["deploy-demo.yml"]) == {"workflow_call", "workflow_dispatch"}
     for name in (
-        "capacity-qualification.yml",
         "destroy-demo.yml",
-        "evidence-reuse.yml",
         "live-acceptance.yml",
         "migration-compatibility.yml",
         "observability-evidence.yml",
         "plan-bootstrap.yml",
-        "provision-lifecycle-fixture.yml",
         "recovery-drill.yml",
         "redrive-quarantine.yml",
         "tenant-lifecycle.yml",
