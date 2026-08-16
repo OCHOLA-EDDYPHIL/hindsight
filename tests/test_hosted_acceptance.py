@@ -179,35 +179,12 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
     )
     event_id = str(resolution["event"]["id"])
 
-    deadline = time.monotonic() + 600
-    job = None
-    while time.monotonic() < deadline:
-        with connect(
-            settings.database_url,
-            application_name="hindsight-hosted-acceptance",
-        ) as conn:
-            row = conn.execute(
-                """
-                    SELECT id, source_event_id, decision_id, status, lesson_memory_id,
-                           error_code, error_detail
-                    FROM consolidation_jobs
-                    WHERE incident_id = %s AND source_event_id = %s
-                """,
-                (incident["id"], event_id),
-            ).fetchone()
-        if row is not None:
-            job = row
-            if row[3] == "completed":
-                break
-            if row[3] in {"failed", "not_eligible"}:
-                pytest.fail(
-                    "managed consolidation terminated without a lesson: "
-                    f"status={row[3]} code={row[5]} detail={row[6]}"
-                )
-        time.sleep(2)
-
-    assert job is not None, "managed changefeed never created a consolidation job"
-    assert job[3] == "completed", "managed consolidation did not complete before timeout"
+    job = _wait_for_managed_consolidation_job(
+        incident_id=incident["id"],
+        event_id=event_id,
+        database_url=settings.database_url,
+        timeout=300,
+    )
     assert str(job[1]) == event_id
     assert job[2]
     assert job[4]
@@ -279,7 +256,7 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
         payload={"preview_id": preview["id"], "fingerprint": preview["fingerprint"]},
         extra_headers={"Idempotency-Key": uuid4().hex},
     )
-    operation_deadline = time.monotonic() + 300
+    operation_deadline = time.monotonic() + 180
     operation_status = None
     approved_memory_id = None
     while time.monotonic() < operation_deadline:
@@ -320,6 +297,141 @@ def test_resolved_transition_reaches_managed_changefeed_worker_and_cited_lesson(
         store.seal_decision(decision_id=retrieval_decision)
     assert retrieval.selected_strategy == "semantic_vector"
     assert str(approved_memory_id) in {str(hit["id"]) for hit in retrieval.hits}
+
+    rejection_token = uuid4().hex
+    rejection_namespace = f"live-managed-consolidation:{rejection_token}"
+    rejection_slug = f"live-managed-consolidation:{rejection_token}"
+    rejection_incident = create_incident(
+        slug=rejection_slug,
+        title="Checkout stalls under downstream retry amplification",
+        severity="sev2",
+        summary="Purchases stall in waves when downstream work multiplies.",
+        db_url=settings.database_url,
+    )
+    with MemoryStore(url=settings.database_url, embedding_provider=embeddings) as store:
+        rejection_source = store.remember(
+            memory_kind="semantic",
+            namespace=rejection_namespace,
+            content=(
+                "Checkout latency rose as processor timeouts amplified retry fanout "
+                "and queue depth."
+            ),
+            provenance=Provenance(
+                "live.hosted_acceptance",
+                f"incident:{rejection_incident['id']}:summary",
+                "Verified source evidence for managed consolidation rejection",
+            ),
+            content_schema="incident_summary.v1",
+            structured_payload={"incident_id": str(rejection_incident["id"])},
+        )
+    with connect(settings.database_url, application_name="hindsight-hosted-acceptance") as conn:
+        conn.execute(
+            """
+                INSERT INTO incident_semantic_memories (incident_id, memory_id, relationship)
+                VALUES (%s, %s, 'summary')
+            """,
+            (rejection_incident["id"], rejection_source["id"]),
+        )
+        conn.commit()
+
+    rejection_resolution = _post_json(
+        f"{api_url}/v2/incidents/{rejection_slug}/resolution",
+        token=operator_token,
+        payload={
+            "root_cause": "Retry amplification overloaded an unhealthy payment processor.",
+            "action": "Inspect processor health and throttle retry fanout.",
+            "observation": "Timeout rate and queue depth recovered after fanout was throttled.",
+            "recovered": True,
+        },
+    )
+    rejection_event_id = str(rejection_resolution["event"]["id"])
+
+    rejection_job = _wait_for_managed_consolidation_job(
+        incident_id=rejection_incident["id"],
+        event_id=rejection_event_id,
+        database_url=settings.database_url,
+        timeout=300,
+    )
+    assert str(rejection_job[1]) == rejection_event_id
+    assert rejection_job[2]
+    assert rejection_job[4]
+    assert rejection_namespace != namespace
+    assert rejection_job[0] != job[0]
+    assert rejection_job[4] != job[4]
+
+    rejection_reason = "The proposed response is too broad for safe operational reuse"
+    rejection_preview = _post_json(
+        f"{api_url}/v2/memory/consolidation-candidates/{rejection_job[0]}/review-preview",
+        token=operator_token,
+        payload={"action": "reject", "reason": rejection_reason},
+    )
+    rejected = _post_json(
+        f"{api_url}/v2/memory/operations",
+        token=operator_token,
+        payload={
+            "preview_id": rejection_preview["id"],
+            "fingerprint": rejection_preview["fingerprint"],
+        },
+        extra_headers={"Idempotency-Key": uuid4().hex},
+    )
+    rejection_operation_deadline = time.monotonic() + 180
+    rejection_operation_status = None
+    while time.monotonic() < rejection_operation_deadline:
+        with connect(
+            settings.database_url,
+            application_name="hindsight-hosted-acceptance",
+        ) as conn:
+            rejection_operation_status = conn.execute(
+                "SELECT status FROM memory_operations WHERE id = %s",
+                (rejected["operation_id"],),
+            ).fetchone()[0]
+        if rejection_operation_status == "completed":
+            break
+        if rejection_operation_status in {"conflict", "failed"}:
+            pytest.fail(f"candidate rejection ended in {rejection_operation_status}")
+        time.sleep(2)
+    assert rejection_operation_status == "completed"
+
+    with connect(settings.database_url, application_name="hindsight-hosted-acceptance") as conn:
+        rejection_review = conn.execute(
+            """
+                SELECT review_status, review_reason, review_operation_id::text,
+                       approved_memory_id
+                FROM consolidation_jobs WHERE id = %s
+            """,
+            (rejection_job[0],),
+        ).fetchone()
+        rejected_memory = conn.execute(
+            """
+                SELECT trust_status, t_invalid
+                FROM semantic_memories WHERE id = %s
+            """,
+            (rejection_job[4],),
+        ).fetchone()
+    assert rejection_review == (
+        "rejected",
+        rejection_reason,
+        rejected["operation_id"],
+        None,
+    )
+    assert rejected_memory == ("review_required", None)
+
+    rejected_decision = f"live-managed-rejected-exclusion:{rejection_token}"
+    with MemoryStore(url=settings.database_url, embedding_provider=embeddings) as store:
+        rejected_retrieval = store.retrieve_semantic(
+            namespace=rejection_namespace,
+            query=(
+                "What reusable response should we take when a remote payment processor "
+                "stalls and repeated attempts multiply the queue?"
+            ),
+            decision_id=rejected_decision,
+            reader="live.hosted_acceptance",
+            purpose="Verify the operator-rejected candidate remains excluded",
+            policy="semantic_strict",
+            limit=5,
+        )
+        store.seal_decision(decision_id=rejected_decision)
+    assert str(rejection_job[4]) not in {str(hit["id"]) for hit in rejected_retrieval.hits}
 
 
 @requires_hosted_acceptance
@@ -854,6 +966,42 @@ def _wait_for_run_status(
             pytest.fail(f"run reached unexpected terminal status: {last['status']}")
         time.sleep(2)
     pytest.fail(f"run did not reach {sorted(expected)} before timeout: {last}")
+
+
+def _wait_for_managed_consolidation_job(
+    *,
+    incident_id,
+    event_id: str,
+    database_url: str,
+    timeout: int,
+):
+    from hindsight.db import connect
+
+    deadline = time.monotonic() + timeout
+    job = None
+    while time.monotonic() < deadline:
+        with connect(
+            database_url,
+            application_name="hindsight-hosted-acceptance",
+        ) as conn:
+            job = conn.execute(
+                """
+                    SELECT id, source_event_id, decision_id, status, lesson_memory_id,
+                           error_code, error_detail
+                    FROM consolidation_jobs
+                    WHERE incident_id = %s AND source_event_id = %s
+                """,
+                (incident_id, event_id),
+            ).fetchone()
+        if job is not None and job[3] == "completed":
+            return job
+        if job is not None and job[3] in {"failed", "not_eligible"}:
+            pytest.fail(
+                "managed consolidation terminated without a lesson: "
+                f"status={job[3]} code={job[5]} detail={job[6]}"
+            )
+        time.sleep(2)
+    pytest.fail(f"managed consolidation did not complete before timeout: {job}")
 
 
 def _acceptance_token(label: str) -> str:
