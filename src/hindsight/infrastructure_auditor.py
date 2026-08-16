@@ -353,18 +353,16 @@ def _tenant_provenance_evaluator(
     return "PASS", "tenant_provenance_consistent", values
 
 
-def _cluster_evaluator(rows: Sequence[Sequence[Any]]) -> tuple[AuditStatus, str, dict[str, Any]]:
-    version, cluster_id = _single_row(rows, "cluster_identity")
-    cluster = str(cluster_id)
+def _cockroach_version_evaluator(
+    rows: Sequence[Sequence[Any]],
+) -> tuple[AuditStatus, str, dict[str, Any]]:
+    (version,) = _single_row(rows, "cockroach_version")
     version_text = str(version)
-    valid = bool(re.fullmatch(r"[0-9a-f-]{36}", cluster)) and "cockroach" in version_text.lower()
+    valid = "cockroach" in version_text.lower()
     return (
         "PASS" if valid else "FAIL",
-        "cockroach_cluster_identified" if valid else "cluster_identity_invalid",
-        {
-            "cluster_id_sha256": _sha256(cluster),
-            "version_sha256": _sha256(version_text),
-        },
+        "cockroach_version_identified" if valid else "cockroach_version_invalid",
+        {"version_sha256": _sha256(version_text)},
     )
 
 
@@ -481,9 +479,9 @@ AUDIT_CATALOG: tuple[AuditQuery, ...] = (
         parameters=("namespace",),
     ),
     AuditQuery(
-        "cluster_identity",
-        "SELECT version()::STRING, crdb_internal.cluster_id()::STRING",
-        _cluster_evaluator,
+        "cockroach_version",
+        "SELECT version()::STRING",
+        _cockroach_version_evaluator,
     ),
 )
 

@@ -11,6 +11,7 @@ import psycopg
 import pytest
 
 from hindsight.db import database_url
+from hindsight.infrastructure_auditor import AUDIT_CATALOG
 from hindsight.vector_index_qualification import finalize_dvi_receipt
 from scripts.run_dvi_qualification import (
     _admin_and_target_urls,
@@ -38,6 +39,11 @@ def test_infrastructure_auditor_executes_reads_but_denies_mutation_ddl_and_grant
             (tenant_id,),
         )
         assert conn.execute("SELECT count(*) FROM demo_sessions").fetchone() is not None
+        version_query = next(
+            query for query in AUDIT_CATALOG if query.query_id == "cockroach_version"
+        )
+        version = conn.execute(version_query.statement).fetchone()
+        assert version is not None and "cockroach" in str(version[0]).lower()
 
     receipt = run_denial_probes(db_url=database_url(), tenant_id=tenant_id)
 
