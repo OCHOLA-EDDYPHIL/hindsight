@@ -2,7 +2,7 @@
 
 ## Deployment boundary
 
-The application Terraform stack packages and deploys the UI, API and worker Lambdas, Cognito, SQS queues, HTTP and WebSocket APIs, changefeed relay, DynamoDB projection state, CloudFront, logs, and alarms. CockroachDB Cloud and SSM SecureString values are external dependencies. Bootstrap, lifecycle, and edge concerns have separate state and permissions.
+The application Terraform stack packages and deploys the UI, API and worker Lambdas, Cognito, SQS queues, HTTP and WebSocket APIs, the changefeed relay, DynamoDB projection and quarantine state, CloudFront, logs, and alarms. CockroachDB Cloud and SSM SecureString values are external dependencies. Bootstrap, lifecycle, and edge concerns have separate state and permissions.
 
 Deployment preserves this order:
 
@@ -10,19 +10,19 @@ Deployment preserves this order:
 2. validate Terraform and the target AWS account and environment;
 3. apply forward database migrations with the deployment identity;
 4. apply restricted database roles and initialize durable agent storage;
-5. deploy the application with the exact 40-character source revision;
+5. deploy the application with the source revision embedded in its health responses;
 6. configure or verify the CockroachDB changefeed against the deployed webhook; and
-7. verify health, revision identity, identity boundaries, queue/worker behavior, realtime delivery, model behavior, and browser behavior.
+7. verify the public and protected boundaries appropriate to the environment.
 
-The repository workflows are the executable deployment contract. Do not hand-apply only part of this sequence to a shared environment.
+The repository workflows preserve this ordering and their identity checks. Do not hand-apply only part of the sequence to a shared environment.
 
-## Health and revision monitoring
+## Health and monitored revision
 
-`GET /v1/health/live` reports process liveness and deployed revision. `GET /v1/health/ready` also verifies a database query. A deployment candidate is reusable only when both health responses report the exact requested main SHA; an absent, shortened, or different revision fails closed.
+`GET /v1/health/live` reports process liveness and the embedded source revision. `GET /v1/health/ready` adds a database query. These endpoints identify the serving build and database reachability; they are not availability, capacity, or end-to-end correctness guarantees.
 
-Normal PR CI verifies code, artifacts, infrastructure, and schema behavior. Full live acceptance is the integrated exact-main gate for providers, semantic retrieval, consolidation, database roles, worker delivery/recovery, Cognito and public boundaries, realtime behavior, governed remediation, historical replay, and the deployed origin.
+The scheduled deployed verifier resolves its expected revision from the repository-level Actions variable `HINDSIGHT_MONITORED_SHA` before entering the protected `demo` environment. It rejects an absent or malformed full revision and fails when the direct liveness or readiness response reports a different value. It also checks the UI-proxied readiness response and a ticketed WebSocket connection. An owner-triggered run may supply an explicit expected revision and choose the supported deployment environment.
 
-`.github/workflows/verify-deployed.yml` runs at minute 17 every six hours. It reads `HINDSIGHT_MONITORED_SHA`, checks the deployed health endpoints, and fails if the configured SHA is absent or differs. Update that repository variable only after the corresponding revision has passed the final deployment verification. A deliberate mismatch dispatch is the safe way to test the monitor's red path; restore the accepted SHA immediately afterward.
+The repository variable is a monitoring target. Changing it does not deploy code, inspect the current branch automatically, or make a mismatched deployment healthy. Update it only as part of an intentional deployment handoff.
 
 The public read-only deployment is <https://hindsight.strathmoreedu.qzz.io>.
 
@@ -33,47 +33,62 @@ Store API, worker, and deployment database URLs; Gemini key-pool material; and t
 Use separate SQL identities:
 
 - deployment identity for migrations, role grants, storage initialization, and changefeed lifecycle;
-- API identity for product reads/writes and dispatch creation; and
+- API identity for product reads and writes plus dispatch creation; and
 - worker identity for leased execution, correction, consolidation, and embedding-profile activation.
 
 Cognito access tokens are short-lived and API Gateway verified. Product authorization also requires an active opaque principal mapping and active tenant. Rotate one runtime credential or identity mapping at a time, verify readiness and one bounded operation, then retire the previous credential.
 
-## Diagnostics and observability
+## Diagnostics, alarms, and notification limits
 
-The incident agent cannot issue arbitrary AWS queries. Its CloudWatch tool has a server-owned account, region, namespace, dimensions, statistic, period, and query-key allow-list. A run can make at most three `GetMetricStatistics` calls, each within a maximum 15-minute window. Controlled demonstrations publish explicitly labeled metrics separately; the agent tool itself is read-only.
+The incident agent cannot issue arbitrary AWS queries. Its CloudWatch tool has a server-owned account, region, namespace, dimensions, statistic, period, and query-key allow-list. A run can make at most three `GetMetricStatistics` calls, each within a maximum 15-minute window. Controlled metrics are published separately; the agent tool itself is read-only.
 
-CloudWatch alarms cover Lambda errors and a non-empty run DLQ. Alarm destinations are optional Terraform inputs and must be configured for an operational environment. OpenTelemetry and structured logs correlate API, dispatch, worker, operation, and realtime boundaries without persisting model payloads or credentials.
+CloudWatch alarms cover Lambda errors, queue age and depth, scheduler failures, terminal quarantine, and other bounded service metrics. The application stack always subscribes an encrypted, exact-stage SQS receiver to its operational and budget SNS topics. The controlled probe can show that a selected alarm transition reached that receiver.
 
-`.github/workflows/observability-evidence.yml` is a bounded audit workflow. It binds collection to a successful full acceptance run and exact SHA, exercises one SNS publish, samples only configured log and trace boundaries, scans the result for secrets, and records that provider acknowledgement is not proof of endpoint delivery.
+The controlled receiver is not an on-call destination and does not prove delivery to a person, email provider, webhook, or another external subscriber. Configure and confirm the optional email subscriber or additional operational SNS actions for the deployment's notification policy. Keep the SQS receiver as a bounded delivery-inspection surface rather than treating it as incident response.
 
-## Queues, retries, and recovery
+Runtime instrumentation emits OpenTelemetry spans with bounded sampling through AWS Distro for OpenTelemetry (ADOT) to AWS X-Ray. Trace attributes correlate API, dispatch, worker, memory-read, reflection, and memory-write boundaries. Realtime is separately traced and correlated by run and tenant. Span attributes and structured logs exclude model payloads, memory content, and credentials; operators must still keep credentials out of incident text and model input.
 
-The run queue uses server-side encryption, 14-day source and DLQ retention, one message per worker batch, partial batch failure reporting, and visibility longer than the Lambda timeout and attempt lease. A scheduled dispatcher recovers unsent commands and expired active attempts; a scheduled reaper recovers expired memory operations. Attempt ownership and monotonic command sequence prevent an expired worker from committing over a newer owner.
+## Queue attempts, terminal quarantine, and redrive
 
-On a DLQ alarm:
+The run queue uses server-side encryption, 14-day source and DLQ retention, one message per worker batch, partial batch failure reporting, and visibility longer than the Lambda timeout and attempt lease. A scheduled dispatcher recovers unsent commands and expired active attempts; a scheduled reaper handles expired memory operations. Attempt ownership and monotonic command sequence prevent an expired worker from committing over a newer owner.
 
-1. inspect the exact message, dispatch, attempt, run, and correlated logs;
-2. verify the deployed revision and runtime parameter locators;
-3. classify provider, database, permission, timeout, and invariant failures;
-4. reproduce and correct the cause locally where possible; and
-5. use the bounded recovery path rather than rewriting durable run state manually.
+Retryable worker failures return the record to SQS. Deterministic terminal conditions such as a malformed envelope, unsupported command, missing run, or exhausted run attempts are written to a strict DynamoDB quarantine ledger. A successful quarantine write acknowledges the SQS record. If the ledger write fails, the message remains failed and can eventually reach the raw fallback DLQ. That DLQ has no event-source consumer.
 
-Persisted failure details redact common URL passwords, tokens, secrets, and API keys. Operators must still keep credentials out of incident text and model input.
+A quarantine record derives a stable ID from the trusted queue and message identities. It stores only allow-listed routing identities, reason, attempt metadata, the exact raw-body SHA-256 digest, and a digest of the canonical record; it does not retain the raw message body. Duplicate writes are idempotent only when the stored identity still matches. Unknown fields, invalid state combinations, and identity or digest conflicts fail closed.
+
+Only records for runs finalized with `RunAttemptsExhausted` are redrivable. The workflow requires the repository owner on protected main, the monitored deployed revision, the exact quarantine ID, the stored body digest, and the matching confirmation phrase. The redrive code revalidates the canonical record digest and uses conditional transitions from `quarantined` to `redrive_pending` to `redriven`.
+
+Redrive does not feed the raw message back to SQS or reopen the failed run. It creates one idempotent fresh run from the source run's incident, namespace, user input, service, and retrieval policy, then records that new run ID in the quarantine ledger. Repeating the same bound request returns the same logical effect; a different binding is rejected.
+
+When terminal-work alarms fire:
+
+1. identify whether the work is in the strict quarantine ledger or the raw fallback DLQ;
+2. inspect the bound run, dispatch, attempt, reason code, and correlated logs without copying raw payloads into tickets or chat;
+3. correct the provider, database, permission, timeout, or invariant cause; and
+4. use the owner-gated redrive only for an eligible exhausted run.
+
+Do not rewrite durable run state or manually requeue an unverified body.
 
 ## Changefeed and realtime lifecycle
 
 The CockroachDB changefeed projects committed outbox rows to an authenticated webhook. The relay uses owner-fenced leases, permits takeover only after expiry, completes only after the durable delivery boundary, and deduplicates stable event identities. The browser also deduplicates replayed projections while retaining newer state.
 
-Before destroying or replacing the application endpoint, pause the exact changefeed. After deployment, apply or resume it with `scripts/configure_changefeed.py`, confirm the database and webhook identity, and exercise reconnect plus state reload. If realtime delivery is delayed, HTTP remains authoritative; inspect changefeed job state, webhook authentication, Lambda errors, DynamoDB TTL/idempotency records, API Gateway connection errors, and ticket/subscription flow.
+Before destroying or replacing the application endpoint, pause the exact changefeed. After deployment, apply or resume it with `scripts/configure_changefeed.py`, confirm the database and webhook identity, and exercise reconnect plus state reload. If realtime delivery is delayed, HTTP remains authoritative; inspect changefeed job state, webhook authentication, Lambda errors, DynamoDB TTL and idempotency records, API Gateway connection errors, and ticket and subscription flow.
 
-## Database lifecycle and rollback
+## Database history, rewind, and lifecycle
 
-Migrations are forward-only, filename-ordered, recorded in `schema_migrations`, and tested from both a fresh database and a populated historical fixture. Application rollback means deploying a compatible prior revision; it does not mean reversing migrations or restoring old rows blindly.
+Migrations are forward-only, filename-ordered, and recorded in `schema_migrations`. Application rollback means deploying a compatible prior revision; it does not mean reversing migrations or restoring old rows blindly.
 
-Memory rewind is a product operation, not a database rollback. Tenant retirement is a separate privileged export-and-purge workflow with leases, versioned S3 data and manifest objects, schema and content fingerprints, explicit confirmation, lifecycle fences, catalog-driven deletion, and a tombstone. The repository does not claim a completed hosted lifecycle drill. Validate backup, retention, restore, purge, and recovery policy before enabling that path for non-fixture tenants.
+CockroachDB `AS OF SYSTEM TIME` powers read-only historical inspection. A Hindsight rewind is a product operation that closes current memory versions and writes audited reassertion versions; it is not a database rollback and does not alter past run events.
 
-## Capacity and limitations
+Tenant retirement is a separate privileged export-and-purge workflow with leases, versioned S3 data and manifest objects, schema and content fingerprints, explicit confirmation, lifecycle fences, catalog-driven deletion, and a tombstone. Establish backup, retention, restore, purge, and recovery policy before enabling that path for a tenant.
 
-Terraform deliberately bounds concurrency, duration, batch size, retries, and log retention. A direct resource diagnostic completed with 75,000 synthetic vectors across 15 tenants. That diagnostic explicitly is not capacity qualification. The exact-main 100,000-vector, 20-tenant qualification attempt reached its 20-minute bound before completion, so that target remains unproven.
+## Database audit surfaces
 
-No result establishes maximum requests per second, arbitrary tenant count, queue backlog recovery time, availability, or multi-region disaster recovery. Monitor CockroachDB request units, storage and vector-index health; Gemini quota and latency; Lambda throttles, duration and errors; queue age, depth and DLQ; changefeed lag; WebSocket failures; and end-to-end run latency before changing limits or making production capacity claims.
+The repository infrastructure audit authenticates pinned CockroachDB guidance, runs an application-owned fixed read-only SQL catalog, and performs separate denial probes against the restricted auditor role. Its receipts cover only the catalog, tenant-bound persisted provenance, and the tested privilege denials.
+
+CockroachDB Managed MCP is separate development tooling for inspecting schema shape and selected persisted identities. It is not a runtime database connection, the restricted-role privilege audit, a vector-index plan or capacity probe, or an assertion that a later deployment still matches the inspected database.
+
+## Capacity and recovery limits
+
+Terraform bounds concurrency, duration, batch size, retries, and log retention, but those settings do not establish a maximum request rate, tenant count, queue-backlog time, availability objective, or multi-region recovery posture. Monitor CockroachDB request units, storage and vector-index health; Gemini quota and latency; Lambda throttles, duration and errors; queue age, depth and terminal work; changefeed lag; WebSocket failures; and end-to-end run latency before changing limits.

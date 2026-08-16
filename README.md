@@ -1,28 +1,33 @@
 # Hindsight
 
-Hindsight is an incident-response copilot with inspectable, rewindable agent memory. It records what an agent recalled, what Gemini observed and decided, and which memory versions influenced the decision. An operator can then approve a governed correction without deleting history and replay the incident against the corrected belief state.
+Stale runbooks teach incident agents the wrong lesson. Hindsight gives those agents governed memory: every recalled belief is versioned, recorded influence is traceable, and every correction preserves the history that explains why a recommendation changed.
+
+## Rewind what your incident agent learned
+
+When guidance goes bad, Hindsight does not erase the audit trail. An operator can inspect the exact memory versions an agent used, preview a correction, approve a new current belief state, and compare a later recorded recommendation against the earlier one under a controlled evidence contract.
+
+CockroachDB is the product's system of record, not a cache behind the model. Bi-temporal memory versions, vector embeddings, provenance, run events, correction operations, and dispatch identities share one transactional store. CockroachDB historical reads expose what was persisted at a past cutoff; a Hindsight rewind is a separate governed write that creates new versions while retaining the old ones.
 
 The product includes:
 
-- a React incident cockpit with public evidence and protected operator controls;
-- FastAPI HTTP APIs, Cognito authorization-code sign-in with PKCE, and tenant-bound WebSocket updates;
-- CockroachDB-backed incidents, runs, checkpoints, vector memory, provenance, immutable history, correction operations, and transactional dispatch;
-- schema-constrained Gemini reasoning and embeddings with bounded read-only CloudWatch diagnostics; and
-- durable asynchronous execution through AWS Lambda, SQS, EventBridge, DynamoDB, S3, SSM, API Gateway, and CloudFront.
+- a React incident cockpit with a public, redacted walkthrough and protected operator controls;
+- FastAPI HTTP APIs, Cognito authorization-code sign-in with PKCE, and tenant-bound WebSocket notifications;
+- CockroachDB-backed incidents, runs, checkpoints, vector memory, provenance, immutable memory history, and transactional dispatch;
+- schema-constrained Gemini reasoning and bounded, read-only CloudWatch diagnostics;
+- generated lesson candidates that remain audit-only until an authenticated, fingerprint-bound review approves a successor; and
+- AWS Lambda, SQS, EventBridge, DynamoDB, S3, SSM, API Gateway, and CloudFront deployment components.
 
-The deployed read-only demo is available at <https://hindsight.strathmoreedu.qzz.io>.
-
-See [Architecture](docs/architecture.md), [API and security](docs/api-security.md), and [Operations](docs/operations.md) for the boundaries behind these capabilities.
+The public cockpit is available at <https://hindsight.strathmoreedu.qzz.io>.
 
 ## Public walkthrough
 
-The public cockpit opens to a credential-free, persisted payments replay. Follow the cited stale memory into the rejected `scale_workers` recommendation, the governed rewind that preserves the historical version, and the approved `throttle_retries` recommendation produced from the same incident input and normalized CloudWatch observations.
+The credential-free cockpit presents a persisted payments scenario. It shows the stale guidance selected before one rejected recommendation, the governed rewind that retains that guidance as history, and a later recommendation recorded from the corrected memory selection.
 
-Hindsight labels the result as a recorded action change only when the structured actions validate and differ, the controlled inputs match, the correction is proven, and the invalidated memory is absent from the later run. Otherwise it shows only the narrower supported result. Operator mutations require the protected Cognito operator role.
+The comparison is deliberately narrow. Hindsight reports a controlled recommendation change only when the structured action fingerprints differ, the invariant inputs match, and the declared memory intervention is bound to the completed correction. It does not claim that either recommendation was executed, that the service recovered, or that one comparison establishes a repeatable causal effect.
 
 - [Open the cockpit](https://hindsight.strathmoreedu.qzz.io)
-- [Check readiness and deployed revision](https://hindsight.strathmoreedu.qzz.io/v1/health/ready)
-- [Inspect the persisted scenario evidence](https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios)
+- [Inspect service readiness](https://hindsight.strathmoreedu.qzz.io/v1/health/ready)
+- [Inspect the persisted scenario](https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios)
 
 ## Run locally
 
@@ -56,13 +61,13 @@ Open <http://127.0.0.1:8766>. The local API serves the compiled UI and exposes i
 
 The Compose database is CockroachDB 25.4.5, bound insecurely to localhost for development only. `make dev-down` stops services but preserves the named database volume.
 
-For the production-aligned local acceptance runner, controlled CloudWatch fixture, frontend workflow, tests, and fresh-database guidance, see [Development](docs/development.md).
+For the local development workflow, controlled CloudWatch fixture, frontend checks, and fresh-database guidance, see [Development](docs/development.md).
 
-## Verified boundaries
+## Product boundaries
 
-The repository tests and exact-revision acceptance cover schema upgrades, server-bound tenant isolation, Cognito roles, one-time realtime tickets, transactional run dispatch, worker leasing and recovery, bounded Gemini/CloudWatch decisions, semantic retrieval, governed correction, historical replay, database roles, changefeeds, WebSockets, and deployed revision identity.
+Hindsight records recommendations and governed-memory operations; it does not execute infrastructure remediation or assert service recovery. Historical inspection is read-only, while product rewind changes only the governed memory state through new audited versions. Generated lessons cannot enter positive-guidance retrieval until approved. Terminal run redrive creates an idempotent fresh run from the persisted source inputs rather than resuming or rewriting the failed run.
 
-These checks establish a bounded reference deployment, not an availability or production-capacity guarantee. A resource diagnostic has exercised 75,000 synthetic vectors across 15 tenants; it is not capacity qualification. The larger 100,000-vector, 20-tenant qualification target has not been established. Provider quotas, CockroachDB sizing, concurrency, queue recovery, regional resilience, and operating objectives must be measured for each deployment.
+Capacity, availability, provider quotas, CockroachDB sizing, concurrency, backlog time, regional resilience, and recovery objectives remain deployment-specific operating concerns.
 
 ## Documentation
 
@@ -71,6 +76,8 @@ These checks establish a bounded reference deployment, not an availability or pr
 - [API and security](docs/api-security.md)
 - [Operations](docs/operations.md)
 - [Governed memory correction decision](docs/adr/0001-governed-memory-correction.md)
+- [Generated machine-memory admission decision](docs/adr/0002-generated-machine-memory-admission.md)
+- [Controlled causal-evidence decision](docs/adr/0003-controlled-causal-evidence.md)
 - [Database roles](infra/db/README.md)
 - [Application infrastructure](infra/terraform/app/README.md)
 
