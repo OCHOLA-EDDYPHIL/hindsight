@@ -461,6 +461,8 @@ def test_observability_log_query_is_bounded_and_rejects_secret_fields():
     assert client.started["limit"] == module.MAX_LOG_EVENTS
     assert client.started["logGroupNames"] == groups
     assert 'filter @message like /"event":' in client.started["queryString"]
+    assert "| sort @timestamp desc " in client.started["queryString"]
+    assert f"| limit {module.MAX_LOG_EVENTS}" in client.started["queryString"]
 
     client = Logs({**safe, "api_key": "never"})
     with pytest.raises(RuntimeError, match="unexpected field"):
