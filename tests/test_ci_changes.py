@@ -146,10 +146,6 @@ def test_ci_control_and_unknown_paths_fail_closed(event_name: str, path: str):
             selection("python_static", "lambda_artifacts", "terraform"),
         ),
         (
-            ".github/workflows/evidence-reuse.yml",
-            selection("python_static", "database", "main_qualification"),
-        ),
-        (
             ".github/workflows/live-acceptance.yml",
             selection(*COMPONENTS),
         ),
@@ -164,15 +160,6 @@ def test_ci_control_and_unknown_paths_fail_closed(event_name: str, path: str):
         (
             ".github/workflows/recovery-drill.yml",
             selection("python_static", "database", "main_qualification"),
-        ),
-        (
-            ".github/workflows/provision-lifecycle-fixture.yml",
-            selection(
-                "python_static",
-                "database",
-                "main_qualification",
-                "terraform",
-            ),
         ),
         (
             ".github/workflows/tenant-lifecycle.yml",
