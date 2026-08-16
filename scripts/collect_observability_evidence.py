@@ -518,7 +518,7 @@ def collect_logs(
             '| filter @message like /"event":"(api_request|run_dispatch|realtime_changefeed)"/ '
             'or (@message like /"event":"worker_record"/ '
             'and @message like /"status":"completed"/) '
-            "| sort @timestamp asc "
+            "| sort @timestamp desc "
             f"| limit {MAX_LOG_EVENTS}"
         ),
         limit=MAX_LOG_EVENTS,
