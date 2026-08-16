@@ -43,17 +43,11 @@ CI_STATIC_FILES = frozenset(
     }
 )
 WORKFLOW_COMPONENTS = {
-    ".github/workflows/capacity-qualification.yml": frozenset(
-        {"database", "main_qualification"}
-    ),
     ".github/workflows/deploy-demo.yml": frozenset(
         {"database", "main_qualification", "lambda_artifacts", "terraform"}
     ),
     ".github/workflows/destroy-demo.yml": frozenset(
         {"lambda_artifacts", "terraform"}
-    ),
-    ".github/workflows/evidence-reuse.yml": frozenset(
-        {"database", "main_qualification"}
     ),
     ".github/workflows/live-acceptance.yml": frozenset(
         {"database", "main_qualification", "frontend", "lambda_artifacts", "terraform"}
@@ -62,9 +56,6 @@ WORKFLOW_COMPONENTS = {
         {"database", "main_qualification"}
     ),
     ".github/workflows/plan-bootstrap.yml": frozenset({"terraform"}),
-    ".github/workflows/provision-lifecycle-fixture.yml": frozenset(
-        {"database", "main_qualification", "terraform"}
-    ),
     ".github/workflows/recovery-drill.yml": frozenset(
         {"database", "main_qualification"}
     ),
