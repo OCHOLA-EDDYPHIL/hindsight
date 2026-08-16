@@ -20,6 +20,10 @@ flowchart LR
     Changefeed --> Relay[Changefeed Lambda]
     Relay --> WS[API Gateway WebSocket]
     WS --> Browser
+    API -. OpenTelemetry .-> ADOT[AWS ADOT]
+    Worker -. OpenTelemetry .-> ADOT
+    Relay -. OpenTelemetry .-> ADOT
+    ADOT --> XRay[AWS X-Ray]
     API -. parameter names .-> SSM[SSM SecureString]
     Worker -. parameter names .-> SSM
 ```
@@ -88,6 +92,8 @@ Embeddings are rebuildable indexes. A content-addressed profile is built alongsi
 Tenant identity is server-owned. Public `/v1` reads bind the fixed public tenant. Protected `/v2` requests use API Gateway-verified Cognito claims, an opaque database principal mapping, and the intersection of token and mapped roles. Queue commands carry the server-selected tenant. Tenant-leading keys, relationships, row-level policies, and lifecycle guards preserve the boundary in CockroachDB.
 
 The HTTP API issues 60-second, single-use realtime tickets. DynamoDB stores only ticket digests and bound claims; WebSocket connect atomically consumes one ticket. Connection, subscription, and delivery-idempotency records are expiring projections. CockroachDB outbox events feed the changefeed relay, and reconnecting clients reload authoritative HTTP state rather than treating socket history as durable truth.
+
+Runtime instrumentation emits OpenTelemetry spans with bounded sampling through AWS Distro for OpenTelemetry (ADOT) to AWS X-Ray. Trace attributes correlate API ingress, dispatch, worker processing, memory reads, reflection, and memory writes. Realtime processing is separately traced and correlated by run and tenant. Span attributes and structured logs exclude model payloads, memory content, and credentials.
 
 ## Tenant retirement
 

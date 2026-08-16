@@ -46,7 +46,7 @@ CloudWatch alarms cover Lambda errors, queue age and depth, scheduler failures, 
 
 The controlled receiver is not an on-call destination and does not prove delivery to a person, email provider, webhook, or another external subscriber. Configure and confirm the optional email subscriber or additional operational SNS actions for the deployment's notification policy. Keep the SQS receiver as a bounded delivery-inspection surface rather than treating it as incident response.
 
-OpenTelemetry and structured logs correlate API, dispatch, worker, operation, and realtime boundaries without intentionally persisting model payloads or credentials. Operators must still keep credentials out of incident text and model input.
+Runtime instrumentation emits OpenTelemetry spans with bounded sampling through AWS Distro for OpenTelemetry (ADOT) to AWS X-Ray. Trace attributes correlate API, dispatch, worker, memory-read, reflection, and memory-write boundaries. Realtime is separately traced and correlated by run and tenant. Span attributes and structured logs exclude model payloads, memory content, and credentials; operators must still keep credentials out of incident text and model input.
 
 ## Queue attempts, terminal quarantine, and redrive
 
