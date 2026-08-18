@@ -1,33 +1,56 @@
 # Hindsight
 
-Stale runbooks teach incident agents the wrong lesson. Hindsight gives those agents governed memory: every recalled belief is versioned, recorded influence is traceable, and every correction preserves the history that explains why a recommendation changed.
+**An incident agent's memory can be confidently wrong.** A stale runbook lesson gets recalled first during the next outage and steers the agent toward the same bad recommendation. Hindsight lets an operator answer three questions before acting: *which memory shaped this recommendation, how do I correct it without destroying history, and did the correction actually change what the agent recommended?*
 
-## Rewind what your incident agent learned
+Hindsight is a governed-memory incident-response cockpit built on CockroachDB and AWS. Every recalled belief is versioned, its influence on a recommendation is recorded, and every correction preserves the history that explains why the recommendation changed.
 
-When guidance goes bad, Hindsight does not erase the audit trail. An operator can inspect the exact memory versions an agent used, preview a correction, approve a new current belief state, and compare a later recorded recommendation against the earlier one under a controlled evidence contract.
+- **Live cockpit (no login):** <https://hindsight.strathmoreedu.qzz.io>
+- **Walkthrough video:** <https://vimeo.com/1218738316>
+- **Service readiness:** <https://hindsight.strathmoreedu.qzz.io/v1/health/ready>
+- **Persisted scenario (raw):** <https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios>
 
-CockroachDB is the product's system of record, not a cache behind the model. Bi-temporal memory versions, vector embeddings, provenance, run events, correction operations, and dispatch identities share one transactional store. CockroachDB historical reads expose what was persisted at a past cutoff; a Hindsight rewind is a separate governed write that creates new versions while retaining the old ones.
+## The loop, in one scenario
 
-The product includes:
+The public cockpit replays one persisted payments incident. It holds the incident input and the normalized CloudWatch observations **constant**, and allows exactly one intervention — a governed change to memory:
 
-- a React incident cockpit with a public, redacted walkthrough and protected operator controls;
-- FastAPI HTTP APIs, Cognito authorization-code sign-in with PKCE, and tenant-bound WebSocket notifications;
-- CockroachDB-backed incidents, runs, checkpoints, vector memory, provenance, immutable memory history, and transactional dispatch;
-- schema-constrained Gemini reasoning and bounded, read-only CloudWatch diagnostics;
-- generated lesson candidates that remain audit-only until an authenticated, fingerprint-bound review approves a successor; and
-- AWS Lambda, SQS, EventBridge, DynamoDB, S3, SSM, API Gateway, and CloudFront deployment components.
+1. **A trusted belief exists**, with a stale successor version recorded above it. History is retained; nothing is silently replaced.
+2. **The incident runs.** CockroachDB Distributed Vector Indexing ranks the *stale* version first among tenant-scoped memory.
+3. **The agent records a recommendation.** Reasoning cites that exact memory version and produces `scale_workers`.
+4. **The operator rejects it.** No infrastructure action runs — Hindsight waits for human control.
+5. **A governed correction is previewed and applied.** CockroachDB invalidates the stale version while keeping it in history, and reasserts the trusted belief.
+6. **The same incident replays.** The trusted version now ranks first, and the recorded recommendation changes to `throttle_retries`.
 
-The public cockpit is available at <https://hindsight.strathmoreedu.qzz.io>.
+The before/after comparison **fails closed**: Hindsight shows "recorded recommendation changed after correction" *only* when both structured recommendation fingerprints are valid, the incident input and observations match, the governed-memory intervention is canonical, and durable correction lineage connects the two runs. It never infers the result from recommendation prose.
 
-## Public walkthrough
+## Why CockroachDB is the point
 
-The credential-free cockpit presents a persisted payments scenario. It shows the stale guidance selected before one rejected recommendation, the governed rewind that retains that guidance as history, and a later recommendation recorded from the corrected memory selection.
+CockroachDB is the system of record, not a cache behind the model. Bi-temporal memory versions, vector embeddings, provenance, run events, correction operations, and dispatch identities share **one transactional store**. A single serializable transaction binds the selected memory read to the incident run, the decision, the operator verdict, the governed correction, the temporal lineage, and the transactional outbox.
 
-The comparison is deliberately narrow. Hindsight reports a controlled recommendation change only when the structured action fingerprints differ, the invariant inputs match, and the declared memory intervention is bound to the completed correction. It does not claim that either recommendation was executed, that the service recovered, or that one comparison establishes a repeatable causal effect.
+That co-location is the design bet: provenance is trivial when the versioned belief, the run that used it, the model recommendation, the human decision, and the correction that followed all live in the same database — instead of being stitched across a separate vector store.
 
-- [Open the cockpit](https://hindsight.strathmoreedu.qzz.io)
-- [Inspect service readiness](https://hindsight.strathmoreedu.qzz.io/v1/health/ready)
-- [Inspect the persisted scenario](https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios)
+> CockroachDB's own historical reads expose what was persisted at a past cutoff. A Hindsight *rewind* is different: a separate governed write that creates new versions while retaining the old ones.
+
+## Required-tool integration
+
+**CockroachDB (two tools):**
+- **Distributed Vector Indexing — on the runtime path.** A tenant-scoped cosine vector index ranks semantic memory for every incident run, and the selected version is recorded with the decision. Vector-plan evidence comes from DVI qualification (`EXPLAIN` over the tenant-leading access path).
+- **Cloud Managed MCP Server — development-side inspection.** An earlier audit client used `get-table-schema` and `select-query` under read-only OAuth to reconstruct persisted decision, retrieval, memory, rewind, lineage, and embedding-profile identities. This is a development inspection surface, **not** the application's runtime connection.
+- *Supplementary:* a deterministic privilege audit informed by pinned CockroachDB Skill SQL, executed through a restricted auditor role — separate from Managed MCP.
+
+**AWS (application and durable execution plane):** Lambda runs the API, worker, and realtime/changefeed components behind API Gateway and CloudFront. SQS carries durable agent commands and EventBridge reclaims expired work. DynamoDB holds fenced realtime connection state. CloudWatch supplies allow-listed, time-bounded diagnostic observations. Cognito guards operator controls while the replay stays publicly inspectable. SSM stores runtime configuration; S3 retains bounded evidence. OpenTelemetry is exported through AWS ADOT to X-Ray with bounded sampling, correlating API, dispatch, worker, and memory spans.
+
+**Reasoning:** schema-constrained Gemini reasoning. The model can request one server-owned diagnostic or return one bounded terminal recommendation — it cannot execute infrastructure changes. Gemini embeddings produce 1,024-dimensional vectors, partitioned by tenant, namespace, provider, model, and representation profile.
+
+## Scope and boundaries
+
+Hindsight records recommendations and governed-memory operations. It deliberately does **not**:
+
+- execute infrastructure remediation, or claim either recommendation was run;
+- assert that the service recovered;
+- claim a repeatable causal effect across trials, or that it detects every poisoned memory;
+- claim production-scale capacity, multi-region resilience, or customer adoption.
+
+This is one controlled scenario that proves a bounded causal chain — memory correction, a recorded recommendation delta, and controlled-pair eligibility under equal inputs — not a general learning result. A direct diagnostic exercised 75,000 vectors across 15 tenants; a larger 100,000-vector, 20-tenant target was not established within its bounded attempt.
 
 ## Run locally
 
@@ -62,12 +85,6 @@ Open <http://127.0.0.1:8766>. The local API serves the compiled UI and exposes i
 The Compose database is CockroachDB 25.4.5, bound insecurely to localhost for development only. `make dev-down` stops services but preserves the named database volume.
 
 For the local development workflow, controlled CloudWatch fixture, frontend checks, and fresh-database guidance, see [Development](docs/development.md).
-
-## Product boundaries
-
-Hindsight records recommendations and governed-memory operations; it does not execute infrastructure remediation or assert service recovery. Historical inspection is read-only, while product rewind changes only the governed memory state through new audited versions. Generated lessons cannot enter positive-guidance retrieval until approved. Terminal run redrive creates an idempotent fresh run from the persisted source inputs rather than resuming or rewriting the failed run.
-
-Capacity, availability, provider quotas, CockroachDB sizing, concurrency, backlog time, regional resilience, and recovery objectives remain deployment-specific operating concerns.
 
 ## Documentation
 
