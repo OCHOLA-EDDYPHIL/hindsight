@@ -8,6 +8,7 @@ Hindsight is a governed-memory incident-response cockpit built on CockroachDB an
 - **Walkthrough video:** <https://vimeo.com/1218738316>
 - **Service readiness:** <https://hindsight.strathmoreedu.qzz.io/v1/health/ready>
 - **Persisted scenario (raw):** <https://hindsight.strathmoreedu.qzz.io/v1/signature-scenarios>
+- **Verified submission release:** [`v0.1.0`](https://github.com/OCHOLA-EDDYPHIL/hindsight/releases/tag/v0.1.0) — the deployed application and retained evidence are bound to this release.
 
 ## The loop, in one scenario
 
@@ -24,18 +25,18 @@ The before/after comparison **fails closed**: Hindsight shows "recorded recommen
 
 ## Why CockroachDB is the point
 
-CockroachDB is the system of record, not a cache behind the model. Bi-temporal memory versions, vector embeddings, provenance, run events, correction operations, and dispatch identities share **one transactional store**. A single serializable transaction binds the selected memory read to the incident run, the decision, the operator verdict, the governed correction, the temporal lineage, and the transactional outbox.
+CockroachDB is the system of record, not a cache behind the model. Bi-temporal memory versions, vector embeddings, provenance, run events, correction operations, and dispatch identities share **one transactional store**. Serializable transactions bind selected memory reads to their runs and decisions, record operator verdicts, apply governed corrections with temporal lineage, and commit dispatch through the transactional outbox.
 
-That co-location is the design bet: provenance is trivial when the versioned belief, the run that used it, the model recommendation, the human decision, and the correction that followed all live in the same database — instead of being stitched across a separate vector store.
+That co-location is the design bet: provenance remains transactionally auditable because the versioned belief, the run that used it, the model recommendation, the human decision, and the correction that followed all live in the same database — instead of being stitched across a separate vector store.
 
 > CockroachDB's own historical reads expose what was persisted at a past cutoff. A Hindsight *rewind* is different: a separate governed write that creates new versions while retaining the old ones.
 
 ## Required-tool integration
 
-**CockroachDB (two tools):**
+**CockroachDB tools:**
 - **Distributed Vector Indexing — on the runtime path.** A tenant-scoped cosine vector index ranks semantic memory for every incident run, and the selected version is recorded with the decision. Vector-plan evidence comes from DVI qualification (`EXPLAIN` over the tenant-leading access path).
 - **Cloud Managed MCP Server — development-side inspection.** An earlier audit client used `get-table-schema` and `select-query` under read-only OAuth to reconstruct persisted decision, retrieval, memory, rewind, lineage, and embedding-profile identities. This is a development inspection surface, **not** the application's runtime connection.
-- *Supplementary:* a deterministic privilege audit informed by pinned CockroachDB Skill SQL, executed through a restricted auditor role — separate from Managed MCP.
+- **Agent Skills Repo — supplementary audit guidance.** A deterministic audit authenticates a pinned security-and-governance Skill and its SQL reference, then runs an application-owned fixed read-only catalog and restricted-role denial probes. It is separate from Managed MCP and is not an autonomous runtime Skill invocation.
 
 **AWS (application and durable execution plane):** Lambda runs the API, worker, and realtime/changefeed components behind API Gateway and CloudFront. SQS carries durable agent commands and EventBridge reclaims expired work. DynamoDB holds fenced realtime connection state. CloudWatch supplies allow-listed, time-bounded diagnostic observations. Cognito guards operator controls while the replay stays publicly inspectable. SSM stores runtime configuration; S3 retains bounded evidence. OpenTelemetry is exported through AWS ADOT to X-Ray with bounded sampling, correlating API, dispatch, worker, and memory spans.
 
