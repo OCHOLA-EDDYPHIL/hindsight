@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type destroy-<environment> to remove that application plane
+        description: Type destroy-<environment>-<exact main SHA> to remove that application plane
         required: true
         type: string
       deployment_environment:
@@ -16,9 +16,7 @@ on:
           - demo
           - demo-candidate
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 concurrency:
   group: hindsight-${{ inputs.deployment_environment || 'demo' }}-environment-v2
@@ -40,10 +38,58 @@ env:
   TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
 
 jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      source_sha: ${{ steps.authorization.outputs.source_sha }}
+      deployment_environment: ${{ steps.authorization.outputs.deployment_environment }}
+    steps:
+      - id: authorization
+        name: Require repository owner on protected exact main
+        env:
+          ACTOR: ${{ github.actor }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
+          REF_NAME: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "workflow_dispatch" \
+            && "$REPOSITORY" == "OCHOLA-EDDYPHIL/hindsight" \
+            && "$REPOSITORY_OWNER" == "OCHOLA-EDDYPHIL" \
+            && "$PRIVATE_REPOSITORY" == "false" \
+            && "$REPOSITORY_VISIBILITY" == "public" \
+            && "$REF_NAME" == "refs/heads/main" \
+            && "$REF_PROTECTED" == "true" \
+            && "$WORKFLOW_REF" == "$REPOSITORY/.github/workflows/destroy-demo.yml@$REF_NAME" \
+            && "$ACTOR" == "$REPOSITORY_OWNER" \
+            && "$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER" \
+            && "$EVENT_SHA" =~ ^[0-9a-f]{40}$ \
+            && "$CONFIRMATION" == "destroy-$DEPLOYMENT_ENVIRONMENT-$EVENT_SHA" ]] || {
+            echo "Demo destruction requires the repository owner, protected exact main, and the SHA-bound confirmation phrase." >&2
+            exit 1
+          }
+          echo "source_sha=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "deployment_environment=$DEPLOYMENT_ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
   destroy:
-    if: github.ref == 'refs/heads/main'
+    needs: authorize
     runs-on: ${{ vars.HINDSIGHT_RUNNER_LABEL }}
+    timeout-minutes: 60
     environment: ${{ inputs.deployment_environment }}
+    permissions:
+      contents: read
+      id-token: write
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
@@ -68,13 +114,19 @@ jobs:
       TF_VAR_acm_certificate_arn: ${{ vars.HINDSIGHT_ACM_CERTIFICATE_ARN }}
       TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      SOURCE_SHA: ${{ needs.authorize.outputs.source_sha }}
     steps:
-      - name: Confirm destructive operation
-        env:
-          CONFIRMATION: ${{ inputs.confirmation }}
-          DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment_environment }}
-        run: test "$CONFIRMATION" = "destroy-$DEPLOYMENT_ENVIRONMENT"
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$GITHUB_REPOSITORY" = "OCHOLA-EDDYPHIL/hindsight"
+          test "$GITHUB_REF" = "refs/heads/main"
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

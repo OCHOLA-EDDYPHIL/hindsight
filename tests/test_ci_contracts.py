@@ -74,14 +74,21 @@ def test_ci_workflow_has_one_fail_closed_aggregate_over_every_component():
 
 
 @pytest.mark.parametrize("workflow_path", WORKFLOW_PATHS, ids=lambda path: path.name)
-def test_every_workflow_job_uses_owner_controlled_runner(workflow_path: Path):
+def test_every_privileged_workflow_job_uses_owner_controlled_runner(workflow_path: Path):
     workflow = yaml.safe_load(workflow_path.read_text())
-    jobs = list(workflow["jobs"].values())
-    executable_jobs = [job for job in jobs if "runs-on" in job]
+    jobs = workflow["jobs"]
 
     assert jobs
-    assert all(("runs-on" in job) != ("uses" in job) for job in jobs)
-    assert all(job["runs-on"] == RUNNER_EXPRESSION for job in executable_jobs)
+    assert all(("runs-on" in job) != ("uses" in job) for job in jobs.values())
+    for job_name, job in jobs.items():
+        if "runs-on" not in job:
+            continue
+        if workflow_path.name == "destroy-demo.yml" and job_name == "authorize":
+            assert job["runs-on"] == "ubuntu-latest"
+            assert job["permissions"] == {}
+            assert not any("uses" in step for step in job["steps"])
+            continue
+        assert job["runs-on"] == RUNNER_EXPRESSION
 
 
 def test_reusable_deploy_workflow_uses_owner_controlled_runner():

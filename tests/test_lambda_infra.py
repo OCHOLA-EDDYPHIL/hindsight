@@ -492,8 +492,21 @@ def test_candidate_plane_separates_runtime_aliases_and_dns_ownership():
 
 def test_destroy_workflow_pauses_changefeed_and_requires_confirmation():
     workflow = pathlib.Path(".github/workflows/destroy-demo.yml").read_text()
+    authorize = workflow.split("  authorize:\n", 1)[1].split("  destroy:\n", 1)[0]
+    destroy = workflow.split("  destroy:\n", 1)[1]
 
-    assert '"destroy-$DEPLOYMENT_ENVIRONMENT"' in workflow
+    assert "runs-on: ubuntu-latest" in authorize
+    assert '"$REPOSITORY" == "OCHOLA-EDDYPHIL/hindsight"' in authorize
+    assert '"$REPOSITORY_OWNER" == "OCHOLA-EDDYPHIL"' in authorize
+    assert '"$REF_NAME" == "refs/heads/main"' in authorize
+    assert '"$REF_PROTECTED" == "true"' in authorize
+    assert '"$ACTOR" == "$REPOSITORY_OWNER"' in authorize
+    assert '"$TRIGGERING_ACTOR" == "$REPOSITORY_OWNER"' in authorize
+    assert '"$CONFIRMATION" == "destroy-$DEPLOYMENT_ENVIRONMENT-$EVENT_SHA"' in authorize
+    assert 'echo "source_sha=$EVENT_SHA"' in authorize
+    assert "needs: authorize" in destroy
+    assert "ref: ${{ needs.authorize.outputs.source_sha }}" in destroy
+    assert 'test "$(git rev-parse HEAD)" = "$SOURCE_SHA"' in destroy
     assert "configure_changefeed.py pause" in workflow
     assert "environment: ${{ inputs.deployment_environment }}" in workflow
     assert "CLOUDFLARE_API_TOKEN" in workflow
